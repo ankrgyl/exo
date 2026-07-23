@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
+use clap::{CommandFactory, Parser, Subcommand};
 use executor::{
     ConversationHandle, EventData, EventId, EventKind, EventQuery, EventQueryDirection,
     ExecutionStreamEvent, HarnessAgent, HarnessConversation, SandboxId, SandboxProvider,
@@ -347,6 +348,71 @@ fn fetch_remote_user_messages(
     })
 }
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "",
+    no_binary_name = true,
+    disable_help_flag = true,
+    disable_help_subcommand = true
+)]
+#[command(help_template = "repl commands:\n{subcommands}")]
+struct SlashCommand {
+    #[command(subcommand)]
+    cmd: Slash,
+}
+
+#[derive(Debug, Subcommand)]
+enum Slash {
+    /// exit the repl
+    #[command(name = "/quit", visible_alias = "/exit")]
+    Quit,
+    /// reprint the conversation transcript
+    #[command(name = "/history")]
+    History,
+    /// set tool output detail: minimal, compact, or full (no arg prints current)
+    #[command(name = "/verbosity")]
+    Verbosity { level: Option<String> },
+    /// summarize token usage and dollar cost
+    #[command(name = "/cost", visible_alias = "/usage")]
+    Cost,
+    /// run a command in the sandbox
+    #[command(name = "/shell", visible_alias = "/sandbox", disable_help_flag = true)]
+    Shell {
+        /// tokens are used only for arity validation; the handler runs the
+        /// raw tail of the input line (see `shell_command_tail`)
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            required = true,
+            value_name = "COMMAND"
+        )]
+        command: Vec<String>,
+    },
+    /// snapshot a sandbox in this conversation (latest if no id)
+    #[command(name = "/snapshot")]
+    Snapshot { sandbox_id: Option<String> },
+    /// list snapshots taken in this conversation
+    #[command(name = "/snapshots")]
+    Snapshots,
+    /// restore the sandbox to a previous snapshot
+    #[command(name = "/rewind")]
+    Rewind { snapshot_id: String },
+    /// move the live sandbox to another provider (e.g. daytona)
+    #[command(name = "/teleport")]
+    Teleport { provider: String },
+    /// show this message
+    #[command(name = "/help")]
+    Help,
+}
+
+/// Everything after the first token of `trimmed`, by slicing the original
+/// line rather than re-joining the whitespace-split tokens: re-joining would
+/// destroy quoting and internal spacing (e.g. `/shell echo "a  b"`).
+fn shell_command_tail(trimmed: &str) -> &str {
+    let first_token_len = trimmed.split_whitespace().next().map_or(0, str::len);
+    trimmed[first_token_len..].trim()
+}
+
 struct ChatRepl {
     agent: Arc<dyn HarnessAgent>,
     conversation: Arc<dyn HarnessConversation>,
@@ -398,117 +464,69 @@ impl ChatRepl {
                     if trimmed.is_empty() {
                         continue;
                     }
-                    match trimmed {
-                        "/quit" | "/exit" => break,
-                        "/history" => self.print_transcript().await?,
-                        "/cost" | "/usage" => {
-                            print_lines(cost_lines(self.conversation.as_ref()).await);
+                    if !trimmed.starts_with('/') {
+                        self.editor.add_history_entry(line.as_str())?;
+                        if let Err(error) = self.send(trimmed).await {
+                            println!();
+                            println!("turn failed: {error:#}");
                         }
-                        "/help" => print_help(),
-                        "/verbosity" => {
-                            println!("verbosity: {}", self.verbosity);
-                            println!("usage: /verbosity <minimal|compact|full>");
-                        }
-                        other if other.starts_with("/verbosity ") => {
-                            let arg = other
-                                .strip_prefix("/verbosity ")
-                                .expect("prefix checked")
-                                .trim();
-                            match arg.parse::<Verbosity>() {
-                                Ok(verbosity) => {
-                                    self.verbosity = verbosity;
-                                    println!("verbosity set to {verbosity}");
+                        continue;
+                    }
+                    match SlashCommand::try_parse_from(trimmed.split_whitespace()) {
+                        Ok(parsed) => match parsed.cmd {
+                            Slash::Quit => break,
+                            Slash::History => self.print_transcript().await?,
+                            Slash::Verbosity { level } => match level {
+                                None => {
+                                    println!("verbosity: {}", self.verbosity);
+                                    println!("usage: /verbosity <minimal|compact|full>");
                                 }
-                                Err(error) => println!("{error}"),
+                                Some(level) => match level.parse::<Verbosity>() {
+                                    Ok(verbosity) => {
+                                        self.verbosity = verbosity;
+                                        println!("verbosity set to {verbosity}");
+                                    }
+                                    Err(error) => println!("{error}"),
+                                },
+                            },
+                            Slash::Cost => {
+                                print_lines(cost_lines(self.conversation.as_ref()).await);
                             }
-                        }
-                        "/shell" | "/sandbox" => {
-                            println!("usage: /shell <command>");
-                            println!("alias: /sandbox <command>");
-                        }
-                        other
-                            if other
-                                .strip_prefix("/shell ")
-                                .or_else(|| other.strip_prefix("/sandbox "))
-                                .is_some() =>
-                        {
-                            let command = other
-                                .strip_prefix("/shell ")
-                                .or_else(|| other.strip_prefix("/sandbox "))
-                                .expect("shell prefix should exist")
-                                .trim();
-                            if command.is_empty() {
-                                println!("usage: /shell <command>");
-                                println!("alias: /sandbox <command>");
-                            } else {
+                            Slash::Help => print!("{}", SlashCommand::command().render_help()),
+                            Slash::Shell { .. } => {
                                 self.editor.add_history_entry(line.as_str())?;
-                                self.run_shell(command).await?;
+                                self.run_shell(shell_command_tail(trimmed)).await?;
                             }
-                        }
-                        "/snapshot" => {
-                            print_lines(snapshot_lines(self.conversation.as_ref(), None).await);
-                        }
-                        other if other.starts_with("/snapshot ") => {
-                            let arg = other
-                                .strip_prefix("/snapshot ")
-                                .expect("prefix checked")
-                                .trim();
-                            if arg.is_empty() {
-                                println!("usage: /snapshot [<sandbox-id>]");
-                            } else if arg.contains(char::is_whitespace) {
-                                println!("/snapshot takes at most one sandbox id; got: {arg:?}");
-                            } else {
+                            Slash::Snapshot { sandbox_id } => {
                                 print_lines(
-                                    snapshot_lines(
-                                        self.conversation.as_ref(),
-                                        Some(arg.to_string()),
-                                    )
-                                    .await,
+                                    snapshot_lines(self.conversation.as_ref(), sandbox_id).await,
                                 );
                             }
-                        }
-                        "/snapshots" => {
-                            print_lines(snapshots_lines(self.conversation.as_ref()).await);
-                        }
-                        "/teleport" => {
-                            println!("usage: /teleport <provider> (e.g. /teleport daytona)");
-                        }
-                        other if other.starts_with("/teleport ") => {
-                            let arg = other
-                                .strip_prefix("/teleport ")
-                                .expect("prefix checked")
-                                .trim();
-                            if arg.is_empty() || arg.contains(char::is_whitespace) {
-                                println!("usage: /teleport <provider> (e.g. /teleport daytona)");
-                            } else {
-                                match self.teleport_sandbox(arg).await {
+                            Slash::Snapshots => {
+                                print_lines(snapshots_lines(self.conversation.as_ref()).await);
+                            }
+                            Slash::Teleport { provider } => {
+                                match self.teleport_sandbox(&provider).await {
                                     Ok((sandbox_id, provider)) => {
                                         println!("sandbox {sandbox_id} teleported to {provider}");
                                     }
                                     Err(error) => println!("teleport failed: {error:#}"),
                                 }
                             }
-                        }
-                        other if other.starts_with("/rewind ") => {
-                            let arg = other
-                                .strip_prefix("/rewind ")
-                                .expect("prefix checked")
-                                .trim();
-                            if arg.is_empty() {
-                                println!("usage: /rewind <snapshot-id>");
-                            } else if arg.contains(char::is_whitespace) {
-                                println!("/rewind takes exactly one snapshot id; got: {arg:?}");
-                            } else {
-                                print_lines(rewind_lines(self.conversation.as_ref(), arg).await);
+                            Slash::Rewind { snapshot_id } => {
+                                print_lines(
+                                    rewind_lines(self.conversation.as_ref(), &snapshot_id).await,
+                                );
                             }
-                        }
-                        _ => {
+                        },
+                        Err(error) if error.kind() == clap::error::ErrorKind::InvalidSubcommand => {
                             self.editor.add_history_entry(line.as_str())?;
                             if let Err(error) = self.send(trimmed).await {
                                 println!();
                                 println!("turn failed: {error:#}");
                             }
                         }
+                        Err(error) => print!("{}", error.render()),
                     }
                 }
                 Err(ReadlineError::Interrupted) => {
@@ -832,21 +850,6 @@ fn print_lines(lines: Vec<String>) {
     for line in lines {
         println!("{line}");
     }
-}
-
-fn print_help() {
-    println!("repl commands:");
-    println!("  /quit | /exit        exit the repl");
-    println!("  /history             reprint the conversation transcript");
-    println!("  /verbosity <level>   set tool output detail: minimal, compact, or full");
-    println!("  /cost | /usage       summarize token usage and dollar cost");
-    println!("  /snapshot [<id>]     snapshot a sandbox in this conversation");
-    println!("                       (defaults to the latest one if no id is given)");
-    println!("  /snapshots           list snapshots taken in this conversation");
-    println!("  /rewind <id>         restore the sandbox to a previous snapshot");
-    println!("  /teleport <provider> move the live sandbox to another provider");
-    println!("                       (e.g. /teleport daytona: snapshot + restore there)");
-    println!("  /help                show this message");
 }
 
 /// `/cost` output: summarize token usage and dollar cost for the conversation
@@ -1195,7 +1198,12 @@ async fn sandbox_id_for_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::{Verbosity, render_external_event, render_user_content_for_history};
+    use super::{
+        Slash, SlashCommand, Verbosity, render_external_event, render_user_content_for_history,
+        shell_command_tail,
+    };
+    use clap::error::ErrorKind;
+    use clap::{CommandFactory, Parser};
     use executor::EventData;
     use lingua::Message;
     use lingua::universal::UserContent;
@@ -1225,5 +1233,114 @@ mod tests {
         let content = UserContent::String("first second".to_string());
 
         assert_eq!(render_user_content_for_history(&content), "first second");
+    }
+
+    #[test]
+    fn quit_and_exit_alias_parse_to_quit() {
+        let quit = SlashCommand::try_parse_from(["/quit"]).unwrap();
+        assert!(matches!(quit.cmd, Slash::Quit));
+
+        let exit = SlashCommand::try_parse_from(["/exit"]).unwrap();
+        assert!(matches!(exit.cmd, Slash::Quit));
+    }
+
+    #[test]
+    fn cost_usage_and_shell_sandbox_aliases_parse() {
+        let cost = SlashCommand::try_parse_from(["/cost"]).unwrap();
+        assert!(matches!(cost.cmd, Slash::Cost));
+
+        let usage = SlashCommand::try_parse_from(["/usage"]).unwrap();
+        assert!(matches!(usage.cmd, Slash::Cost));
+
+        let shell = SlashCommand::try_parse_from(["/shell", "x"]).unwrap();
+        assert!(matches!(shell.cmd, Slash::Shell { .. }));
+
+        let sandbox = SlashCommand::try_parse_from(["/sandbox", "x"]).unwrap();
+        assert!(matches!(sandbox.cmd, Slash::Shell { .. }));
+    }
+
+    #[test]
+    fn verbosity_parses_bare_and_with_level() {
+        // Bare `/verbosity` parses to `None`; the handler prints the current
+        // level. A level is captured verbatim as a string and parsed in the
+        // handler (matching #163), so even an unknown level parses cleanly
+        // here and only fails at `Verbosity::from_str` time.
+        let bare = SlashCommand::try_parse_from(["/verbosity"]).unwrap();
+        assert!(matches!(bare.cmd, Slash::Verbosity { level: None }));
+
+        let full = SlashCommand::try_parse_from(["/verbosity", "full"]).unwrap();
+        assert!(matches!(full.cmd, Slash::Verbosity { level: Some(ref l) } if l == "full"));
+
+        let bogus = SlashCommand::try_parse_from(["/verbosity", "bogus"]).unwrap();
+        assert!(matches!(bogus.cmd, Slash::Verbosity { level: Some(ref l) } if l == "bogus"));
+        // The unknown level is a handler-time error, not a parse error.
+        assert!("bogus".parse::<Verbosity>().is_err());
+    }
+
+    #[test]
+    fn shell_parses_hyphenated_pipeline_tokens() {
+        let parsed =
+            SlashCommand::try_parse_from(["/shell", "ls", "-la", "|", "grep", "foo"]).unwrap();
+
+        assert!(matches!(parsed.cmd, Slash::Shell { .. }));
+    }
+
+    #[test]
+    fn shell_raw_tail_preserves_quotes_and_spacing() {
+        assert_eq!(shell_command_tail("/shell echo \"a b\""), "echo \"a b\"");
+        assert_eq!(shell_command_tail("/sandbox  ls   -la"), "ls   -la");
+    }
+
+    #[test]
+    fn bare_shell_is_missing_required_argument() {
+        let error = SlashCommand::try_parse_from(["/shell"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn snapshot_without_id_parses_to_none() {
+        let parsed = SlashCommand::try_parse_from(["/snapshot"]).unwrap();
+
+        assert!(matches!(parsed.cmd, Slash::Snapshot { sandbox_id: None }));
+    }
+
+    #[test]
+    fn snapshot_with_two_args_is_unknown_argument() {
+        let error = SlashCommand::try_parse_from(["/snapshot", "a", "b"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn bare_rewind_is_missing_required_argument() {
+        let error = SlashCommand::try_parse_from(["/rewind"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn unknown_slash_command_is_invalid_subcommand() {
+        let unknown = SlashCommand::try_parse_from(["/foo"]).unwrap_err();
+        assert_eq!(unknown.kind(), ErrorKind::InvalidSubcommand);
+
+        let uppercase = SlashCommand::try_parse_from(["/QUIT"]).unwrap_err();
+        assert_eq!(uppercase.kind(), ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn quit_with_extra_arg_is_unknown_argument() {
+        let error = SlashCommand::try_parse_from(["/quit", "extra"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn generated_help_lists_shell_and_sandbox_alias() {
+        let help = SlashCommand::command().render_help().to_string();
+        println!("{help}");
+
+        assert!(help.contains("/shell"));
+        assert!(help.contains("/sandbox"));
     }
 }
