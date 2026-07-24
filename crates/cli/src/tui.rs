@@ -526,7 +526,13 @@ impl ChatRepl {
                                 println!("turn failed: {error:#}");
                             }
                         }
-                        Err(error) => print!("{}", error.render()),
+                        Err(error) => {
+                            // Keep the rejected line in history so a long
+                            // mistyped command can be recalled and edited;
+                            // it is not sent to the model.
+                            self.editor.add_history_entry(line.as_str())?;
+                            print!("{}", error.render());
+                        }
                     }
                 }
                 Err(ReadlineError::Interrupted) => {
@@ -1331,6 +1337,18 @@ mod tests {
     #[test]
     fn quit_with_extra_arg_is_unknown_argument() {
         let error = SlashCommand::try_parse_from(["/quit", "extra"]).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn recognized_command_with_trailing_text_is_unknown_argument_not_chat() {
+        // `/help me write a function` parses `/help` then rejects the stray
+        // args. UnknownArgument (not InvalidSubcommand) routes the repl loop
+        // to the error branch, which keeps the line in history so it can be
+        // recalled and edited, and never sends it to the model.
+        let error =
+            SlashCommand::try_parse_from(["/help", "me", "write", "a", "function"]).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::UnknownArgument);
     }
