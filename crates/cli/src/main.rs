@@ -292,12 +292,16 @@ fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
 
 /// Conversation events go to a Groundhog engine when `EXO_GROUNDHOG_SOCKET`
 /// points at a running `groundhog serve` Unix socket. `EXO_GROUNDHOG_SOURCE`
-/// overrides the Groundhog source name (default `exo`).
+/// overrides the Groundhog source name (default `exo`), and
+/// `EXO_GROUNDHOG_KERNEL_CONFIG` names a file whose content hash binds the
+/// harness identity: changing the file retires the old identity's log and
+/// starts a recorded successor.
 fn groundhog_store_config_from_env() -> Option<executor::GroundhogStoreConfig> {
     let socket = std::env::var_os("EXO_GROUNDHOG_SOCKET")?;
     Some(executor::GroundhogStoreConfig {
         socket: PathBuf::from(socket),
         source: std::env::var("EXO_GROUNDHOG_SOURCE").unwrap_or_else(|_| "exo".to_string()),
+        kernel_config: std::env::var_os("EXO_GROUNDHOG_KERNEL_CONFIG").map(PathBuf::from),
     })
 }
 

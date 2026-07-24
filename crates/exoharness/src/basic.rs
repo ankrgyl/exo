@@ -348,6 +348,15 @@ pub struct GroundhogStoreConfig {
     /// Groundhog `source` this harness writes under. Must match
     /// `[a-z0-9_][a-z0-9_.-]*` (no slashes, no uppercase).
     pub source: String,
+    /// When set, the harness identity is bound to this file's content: the
+    /// effective source becomes `<source>.k<first 12 hex of SHA-256>`. A
+    /// changed file names a different source, so a new kernel cannot append
+    /// to its predecessor's log. On first use after a change, the store
+    /// retires the predecessor source (its log stays readable forever) and
+    /// commits a successor lineage marker that the engine validates against
+    /// the predecessor's exact final frontier. Reads walk the recorded
+    /// lineage chain, so conversation history spans retired identities.
+    pub kernel_config: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -837,7 +846,9 @@ impl BasicExoHarness {
         let secret_cipher =
             build_secret_cipher(secret_backend, root.to_string_lossy().to_string())?;
         let event_store = match &groundhog {
-            Some(config) => ConversationEventStore::Groundhog(GroundhogEventStore::new(config)),
+            Some(config) => {
+                ConversationEventStore::Groundhog(Box::new(GroundhogEventStore::new(config)))
+            }
             None => ConversationEventStore::LocalFiles,
         };
         Ok(Self {
@@ -3918,7 +3929,7 @@ async fn load_events(storage: &BasicObjectStore, events_dir: &Path) -> Result<Ve
 /// writes in this backend go through these three primitives.
 enum ConversationEventStore {
     LocalFiles,
-    Groundhog(GroundhogEventStore),
+    Groundhog(Box<GroundhogEventStore>),
 }
 
 impl ConversationEventStore {
@@ -3993,59 +4004,232 @@ const GROUNDHOG_APPEND_CHUNK: usize = 500;
 /// failing the append.
 struct GroundhogEventStore {
     client: crate::groundhog::GroundhogClient,
-    source: String,
-    frontiers: AsyncMutex<GroundhogFrontiers>,
+    configured_source: String,
+    kernel_config: Option<PathBuf>,
+    identity: AsyncMutex<GroundhogIdentity>,
 }
 
-enum GroundhogFrontiers {
-    Unseeded,
-    Seeded(HashMap<ConversationId, String>),
+enum GroundhogIdentity {
+    Unresolved,
+    Resolved(ResolvedIdentity),
+}
+
+/// The store's durable identity, established once per process on first use.
+struct ResolvedIdentity {
+    /// The source every append targets: the configured source, suffixed with
+    /// the kernel hash when the identity is kernel-bound.
+    source: String,
+    /// Sources reads traverse: recorded predecessors oldest-first, then
+    /// `source`. Length 1 unless the identity is kernel-bound and has lineage.
+    read_sources: Vec<String>,
+    /// Cached stream frontiers of `source`; absence means the stream does not
+    /// exist yet, which the append precondition encodes as an explicit null.
+    frontiers: HashMap<ConversationId, String>,
 }
 
 impl GroundhogEventStore {
     fn new(config: &GroundhogStoreConfig) -> Self {
         Self {
             client: crate::groundhog::GroundhogClient::new(&config.socket),
-            source: config.source.clone(),
-            frontiers: AsyncMutex::new(GroundhogFrontiers::Unseeded),
+            configured_source: config.source.clone(),
+            kernel_config: config.kernel_config.clone(),
+            identity: AsyncMutex::new(GroundhogIdentity::Unresolved),
         }
     }
 
-    /// The frontier map, seeded from `/v1/streams` on first use. Absence from
-    /// the map means the stream does not exist yet, which the precondition
-    /// encodes as an explicit null.
-    async fn seeded<'a>(
+    async fn resolved<'a>(
         &self,
-        frontiers: &'a mut GroundhogFrontiers,
-    ) -> Result<&'a mut HashMap<ConversationId, String>> {
-        if let GroundhogFrontiers::Unseeded = frontiers {
-            let mut map = HashMap::new();
-            for info in self.client.streams(Some(&self.source)).await? {
-                let conversation_id = info.stream.parse::<Uuid7>().with_context(|| {
-                    format!(
-                        "non-uuid stream {} under source {}",
-                        info.stream, self.source
-                    )
-                })?;
-                map.insert(conversation_id, info.frontier_event_id);
+        identity: &'a mut GroundhogIdentity,
+    ) -> Result<&'a mut ResolvedIdentity> {
+        if let GroundhogIdentity::Unresolved = identity {
+            *identity = GroundhogIdentity::Resolved(self.resolve().await?);
+        }
+        match identity {
+            GroundhogIdentity::Resolved(resolved) => Ok(resolved),
+            GroundhogIdentity::Unresolved => unreachable!("resolved above"),
+        }
+    }
+
+    /// Establish the effective source, adopt lineage from a predecessor
+    /// kernel when one exists, and seed the frontier cache.
+    async fn resolve(&self) -> Result<ResolvedIdentity> {
+        let source = match &self.kernel_config {
+            None => self.configured_source.clone(),
+            Some(path) => {
+                let bytes = tokio::fs::read(path)
+                    .await
+                    .with_context(|| format!("reading kernel config {}", path.display()))?;
+                format!("{}.k{}", self.configured_source, kernel_hash_suffix(&bytes))
             }
-            *frontiers = GroundhogFrontiers::Seeded(map);
+        };
+        // Kernel-bound identities enumerate every source so sibling
+        // identities are visible; unbound ones only need their own streams.
+        let rows = match &self.kernel_config {
+            Some(_) => self.client.streams(None).await?,
+            None => self.client.streams(Some(&source)).await?,
+        };
+        if self.kernel_config.is_some() {
+            self.adopt_lineage(&source, &rows).await?;
         }
-        match frontiers {
-            GroundhogFrontiers::Seeded(map) => Ok(map),
-            GroundhogFrontiers::Unseeded => unreachable!("seeded above"),
+        let mut frontiers = HashMap::new();
+        for info in rows.iter().filter(|info| info.source == source) {
+            if info.stream == crate::groundhog::LINEAGE_STREAM {
+                continue;
+            }
+            let conversation_id = info.stream.parse::<Uuid7>().with_context(|| {
+                format!("non-uuid stream {} under source {source}", info.stream)
+            })?;
+            frontiers.insert(conversation_id, info.frontier_event_id.clone());
         }
+        let read_sources = self.lineage_chain(&source).await?;
+        Ok(ResolvedIdentity {
+            source,
+            read_sources,
+            frontiers,
+        })
+    }
+
+    /// When another kernel's identity exists under the configured source
+    /// prefix, retire it and commit the succession marker as this source's
+    /// first event. Idempotent across crashes: retirement repeats return the
+    /// original receipt, the marker batch is content-bound, and a sibling
+    /// already claimed by a recorded marker is never claimed again.
+    async fn adopt_lineage(
+        &self,
+        source: &str,
+        rows: &[crate::groundhog::StreamInfo],
+    ) -> Result<()> {
+        let prefix = format!("{}.k", self.configured_source);
+        let mut siblings: Vec<&str> = rows
+            .iter()
+            .map(|row| row.source.as_str())
+            .filter(|candidate| {
+                *candidate != source && candidate.strip_prefix(&prefix).is_some_and(is_kernel_hash)
+            })
+            .collect();
+        siblings.sort_unstable();
+        siblings.dedup();
+        if siblings.is_empty() {
+            return Ok(());
+        }
+        // A sibling is claimed when any recorded marker names it; retired
+        // when the engine's lifecycle stream records its retirement.
+        let mut claimed = std::collections::HashSet::new();
+        for row in rows {
+            if row.stream != crate::groundhog::LINEAGE_STREAM {
+                continue;
+            }
+            for envelope in self
+                .client
+                .replay_all(&crate::groundhog::ReplayQuery {
+                    source: Some(row.source.clone()),
+                    stream: Some(crate::groundhog::LINEAGE_STREAM.to_owned()),
+                    kind: Some(crate::groundhog::LINEAGE_KIND.to_owned()),
+                    ..Default::default()
+                })
+                .await?
+            {
+                let marker: crate::groundhog::LineageMarker =
+                    serde_json::from_value(envelope.payload).with_context(|| {
+                        format!("undecodable lineage marker under {}", row.source)
+                    })?;
+                claimed.insert(marker.predecessor_source);
+            }
+        }
+        let unclaimed: Vec<&str> = siblings
+            .iter()
+            .copied()
+            .filter(|sibling| !claimed.contains(*sibling))
+            .collect();
+        let ours_exists = rows.iter().any(|row| row.source == source);
+        match (unclaimed.as_slice(), ours_exists) {
+            // Every sibling identity is already part of a recorded lineage.
+            ([], _) => Ok(()),
+            ([predecessor], false) => {
+                let receipt = self.client.retire_source(predecessor).await?;
+                let marker = crate::groundhog::LineageMarker {
+                    v: 1,
+                    predecessor_source: (*predecessor).to_owned(),
+                    predecessor_final_frontier: receipt.final_frontier,
+                };
+                let batch = crate::groundhog::IngestBatch {
+                    batch_id: format!("lineage-{predecessor}"),
+                    source: source.to_owned(),
+                    events: vec![crate::groundhog::IngestEvent {
+                        stream: crate::groundhog::LINEAGE_STREAM.to_owned(),
+                        record_key: (*predecessor).to_owned(),
+                        kind: crate::groundhog::LINEAGE_KIND.to_owned(),
+                        occurred_at: None,
+                        payload: serde_json::to_value(&marker)?,
+                    }],
+                    stream_precondition: Some(crate::groundhog::StreamPrecondition {
+                        stream: crate::groundhog::LINEAGE_STREAM.to_owned(),
+                        expected_frontier: None,
+                    }),
+                };
+                self.client.append(batch).await?;
+                Ok(())
+            }
+            ([predecessor], true) => bail!(
+                "kernel identity {source} already has history, but sibling \
+                 identity {predecessor} is not part of any recorded lineage; \
+                 refusing to guess which log this kernel succeeds"
+            ),
+            (many, _) => bail!(
+                "multiple unclaimed kernel identities under {prefix}*: {many:?}; \
+                 refusing to guess lineage"
+            ),
+        }
+    }
+
+    /// The read chain: walk `source_succeeded` markers back from `source`.
+    /// Every source records at most one marker (the engine enforces
+    /// first-event placement), so the chain is a simple path.
+    async fn lineage_chain(&self, source: &str) -> Result<Vec<String>> {
+        let mut chain = vec![source.to_owned()];
+        let mut current = source.to_owned();
+        loop {
+            let markers = self
+                .client
+                .replay_all(&crate::groundhog::ReplayQuery {
+                    source: Some(current.clone()),
+                    stream: Some(crate::groundhog::LINEAGE_STREAM.to_owned()),
+                    kind: Some(crate::groundhog::LINEAGE_KIND.to_owned()),
+                    ..Default::default()
+                })
+                .await?;
+            let Some(envelope) = markers.into_iter().next() else {
+                break;
+            };
+            let marker: crate::groundhog::LineageMarker = serde_json::from_value(envelope.payload)
+                .with_context(|| format!("undecodable lineage marker under {current}"))?;
+            if chain.contains(&marker.predecessor_source) {
+                bail!("lineage cycle at {}", marker.predecessor_source);
+            }
+            chain.push(marker.predecessor_source.clone());
+            current = marker.predecessor_source;
+        }
+        chain.reverse();
+        Ok(chain)
+    }
+
+    /// Sources reads traverse, resolving the identity on first use.
+    async fn read_sources(&self) -> Result<Vec<String>> {
+        let mut identity = self.identity.lock().await;
+        Ok(self.resolved(&mut identity).await?.read_sources.clone())
     }
 
     async fn append(&self, conversation_id: ConversationId, events: &[Event]) -> Result<()> {
         let stream = conversation_id.to_string();
-        let mut frontiers = self.frontiers.lock().await;
-        let map = self.seeded(&mut frontiers).await?;
+        let mut identity = self.identity.lock().await;
+        let resolved = self.resolved(&mut identity).await?;
+        let source = resolved.source.clone();
+        let map = &mut resolved.frontiers;
         let mut expected = map.get(&conversation_id).cloned();
         for chunk in events.chunks(GROUNDHOG_APPEND_CHUNK) {
             let batch = crate::groundhog::IngestBatch {
                 batch_id: chunk[0].id.to_string(),
-                source: self.source.clone(),
+                source: source.clone(),
                 events: chunk
                     .iter()
                     .map(|event| {
@@ -4080,6 +4264,13 @@ impl GroundhogEventStore {
                          (expected frontier {expected:?}, actual {actual_frontier:?})"
                     );
                 }
+                Err(retired @ crate::groundhog::GroundhogError::SourceRetired { .. }) => {
+                    bail!(
+                        "this harness identity was retired by a successor kernel: \
+                         {retired}; its history is readable, but only the current \
+                         kernel identity may append"
+                    );
+                }
                 Err(error) => return Err(anyhow::Error::new(error)),
             }
         }
@@ -4087,44 +4278,65 @@ impl GroundhogEventStore {
     }
 
     async fn load_all(&self, conversation_id: ConversationId) -> Result<Vec<Event>> {
-        let replayed = self
-            .client
-            .replay_all(&crate::groundhog::ReplayQuery {
-                source: Some(self.source.clone()),
-                stream: Some(conversation_id.to_string()),
-                ..Default::default()
-            })
-            .await?;
-        let mut events = replayed
-            .into_iter()
-            .map(|envelope| {
-                serde_json::from_value::<Event>(envelope.payload).with_context(|| {
+        let mut events = Vec::new();
+        for source in self.read_sources().await? {
+            let replayed = self
+                .client
+                .replay_all(&crate::groundhog::ReplayQuery {
+                    source: Some(source),
+                    stream: Some(conversation_id.to_string()),
+                    ..Default::default()
+                })
+                .await?;
+            for envelope in replayed {
+                let event = serde_json::from_value::<Event>(envelope.payload).with_context(|| {
                     format!(
                         "groundhog event {} in stream {conversation_id} does not decode as an exo event",
                         envelope.event_id
                     )
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+                })?;
+                events.push(event);
+            }
+        }
         events.sort_by_key(|event| event.id);
         Ok(events)
     }
 
     async fn get(&self, conversation_id: ConversationId, id: EventId) -> Result<Option<Event>> {
-        let replayed = self
-            .client
-            .replay_all(&crate::groundhog::ReplayQuery {
-                source: Some(self.source.clone()),
-                stream: Some(conversation_id.to_string()),
-                record_key: Some(id.to_string()),
-                ..Default::default()
-            })
-            .await?;
-        let Some(envelope) = replayed.into_iter().next() else {
-            return Ok(None);
-        };
-        Ok(Some(serde_json::from_value::<Event>(envelope.payload)?))
+        for source in self.read_sources().await? {
+            let replayed = self
+                .client
+                .replay_all(&crate::groundhog::ReplayQuery {
+                    source: Some(source),
+                    stream: Some(conversation_id.to_string()),
+                    record_key: Some(id.to_string()),
+                    ..Default::default()
+                })
+                .await?;
+            if let Some(envelope) = replayed.into_iter().next() {
+                return Ok(Some(serde_json::from_value::<Event>(envelope.payload)?));
+            }
+        }
+        Ok(None)
     }
+}
+
+/// First 12 hex characters of the SHA-256 of the kernel config bytes: the
+/// kernel identity segment of the effective source name.
+fn kernel_hash_suffix(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Whether a source-name suffix has the shape `kernel_hash_suffix` produces.
+fn is_kernel_hash(suffix: &str) -> bool {
+    suffix.len() == 12
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 async fn load_artifact_versions(

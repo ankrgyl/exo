@@ -25,6 +25,18 @@ const TRANSPORT_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 /// Rows requested per page during full stream enumeration (the server's cap).
 const STREAMS_PAGE_LIMIT: u32 = 1000;
 
+/// Stream that carries successor lineage markers. The engine validates that a
+/// marker is the successor source's first committed event.
+pub const LINEAGE_STREAM: &str = "groundhog.source_lineage";
+/// Event kind of a successor lineage marker.
+pub const LINEAGE_KIND: &str = "source_succeeded";
+/// Source the engine itself writes lifecycle events under (e.g. retirements).
+pub const SYSTEM_SOURCE: &str = "system";
+/// Stream of engine lifecycle events; `record_key` is the affected source.
+pub const LIFECYCLE_STREAM: &str = "groundhog.source_lifecycle";
+/// Event kind of a source retirement in the lifecycle stream.
+pub const RETIRED_KIND: &str = "source_retired";
+
 /// One event submitted for ingest.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IngestEvent {
@@ -122,6 +134,36 @@ pub struct ReplayPage {
     pub snapshot_through_event_id: Option<String>,
 }
 
+/// Payload of a successor lineage marker: the first event a successor source
+/// commits, naming the retired predecessor and its exact final frontier. The
+/// engine rejects the batch when the referenced retirement does not match.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LineageMarker {
+    pub v: u32,
+    pub predecessor_source: String,
+    pub predecessor_final_frontier: String,
+}
+
+/// Terminal status of POST /v1/sources/retire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetireStatus {
+    Retired,
+    AlreadyRetired,
+}
+
+/// Durable receipt for a source retirement. A repeat returns the original
+/// receipt with `status: AlreadyRetired`, so retirement is retry-safe.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RetireReceipt {
+    pub status: RetireStatus,
+    pub source: String,
+    /// The source's frontier at retirement; the exact value a successor must
+    /// reference in its lineage marker.
+    pub final_frontier: String,
+    pub retirement_event_id: String,
+}
+
 /// One durable stream row from GET /v1/streams.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct StreamInfo {
@@ -156,6 +198,21 @@ pub enum GroundhogError {
     /// 409 batch identity: the same `batch_id` was already committed with
     /// different content (per-source scope).
     BatchConflict,
+    /// 409 `source_retired`: the batch's source has been retired; the log is
+    /// readable forever but admits no new events. Nothing was committed.
+    SourceRetired {
+        source: String,
+        final_frontier: String,
+        retirement_event_id: String,
+    },
+    /// 409 `source_lineage_conflict`: a successor's lineage marker does not
+    /// reference the predecessor's actual retirement.
+    LineageConflict {
+        predecessor_source: String,
+        expected_predecessor_frontier: Option<String>,
+        actual_predecessor_frontier: Option<String>,
+        detail: String,
+    },
     /// 400: the request was rejected by validation; carries the server's
     /// error text.
     Invalid(String),
@@ -194,6 +251,26 @@ impl std::fmt::Display for GroundhogError {
                     "batch_id already committed with different content"
                 )
             }
+            GroundhogError::SourceRetired {
+                source,
+                final_frontier,
+                ..
+            } => write!(
+                formatter,
+                "source {source} is retired at frontier {final_frontier}; \
+                 its log is readable but admits no new events"
+            ),
+            GroundhogError::LineageConflict {
+                predecessor_source,
+                expected_predecessor_frontier,
+                actual_predecessor_frontier,
+                detail,
+            } => write!(
+                formatter,
+                "lineage marker for predecessor {predecessor_source} rejected \
+                 (expected frontier {expected_predecessor_frontier:?}, actual \
+                 {actual_predecessor_frontier:?}): {detail}"
+            ),
             GroundhogError::Invalid(message) => write!(formatter, "invalid request: {message}"),
             GroundhogError::Unauthorized => write!(formatter, "unauthorized"),
             GroundhogError::TooLarge(message) => write!(formatter, "request too large: {message}"),
@@ -251,6 +328,23 @@ impl GroundhogClient {
         let request = self.build_request("POST", "/v1/events", Some(&body));
         let response = self.send_with_retry(&request).await?;
         parse_json(&expect_ok(response)?, "ingest receipt")
+    }
+
+    /// POST /v1/sources/retire. Idempotent: a repeat returns the original
+    /// receipt with `status: AlreadyRetired`, so the verbatim transport retry
+    /// is safe here too.
+    pub async fn retire_source(&self, source: &str) -> Result<RetireReceipt, GroundhogError> {
+        #[derive(Serialize)]
+        struct RetireRequest<'a> {
+            v: u32,
+            source: &'a str,
+        }
+        let body = serde_json::to_vec(&RetireRequest { v: 1, source }).map_err(|error| {
+            GroundhogError::Protocol(format!("unserializable retirement: {error}"))
+        })?;
+        let request = self.build_request("POST", "/v1/sources/retire", Some(&body));
+        let response = self.send_with_retry(&request).await?;
+        parse_json(&expect_ok(response)?, "retirement receipt")
     }
 
     /// GET /v1/events: one page.
@@ -573,6 +667,23 @@ struct WireFrontierConflict {
     actual_frontier: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct WireSourceRetired {
+    error: String,
+    source: String,
+    final_frontier: String,
+    retirement_event_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireLineageConflict {
+    error: String,
+    predecessor_source: String,
+    expected_predecessor_frontier: Option<String>,
+    actual_predecessor_frontier: Option<String>,
+    detail: String,
+}
+
 /// Map a complete response to its success body or the typed error.
 fn expect_ok(response: RawResponse) -> Result<Vec<u8>, GroundhogError> {
     match response.status {
@@ -605,7 +716,8 @@ fn error_message(body: &[u8]) -> String {
     }
 }
 
-/// Distinguish the stream-frontier 409 from the batch-identity 409.
+/// Distinguish the four 409 shapes: stream-frontier, source-retired,
+/// lineage, and (the fallback) batch-identity conflicts.
 fn conflict_error(body: &[u8]) -> GroundhogError {
     if let Ok(conflict) = serde_json::from_slice::<WireFrontierConflict>(body)
         && conflict.error == "stream_frontier_conflict"
@@ -615,6 +727,25 @@ fn conflict_error(body: &[u8]) -> GroundhogError {
             stream: conflict.stream,
             expected_frontier: conflict.expected_frontier,
             actual_frontier: conflict.actual_frontier,
+        };
+    }
+    if let Ok(retired) = serde_json::from_slice::<WireSourceRetired>(body)
+        && retired.error == "source_retired"
+    {
+        return GroundhogError::SourceRetired {
+            source: retired.source,
+            final_frontier: retired.final_frontier,
+            retirement_event_id: retired.retirement_event_id,
+        };
+    }
+    if let Ok(conflict) = serde_json::from_slice::<WireLineageConflict>(body)
+        && conflict.error == "source_lineage_conflict"
+    {
+        return GroundhogError::LineageConflict {
+            predecessor_source: conflict.predecessor_source,
+            expected_predecessor_frontier: conflict.expected_predecessor_frontier,
+            actual_predecessor_frontier: conflict.actual_predecessor_frontier,
+            detail: conflict.detail,
         };
     }
     GroundhogError::BatchConflict

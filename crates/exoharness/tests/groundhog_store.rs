@@ -85,8 +85,20 @@ fn harness_config(root: PathBuf, socket: PathBuf) -> BasicExoHarnessConfig {
         groundhog: Some(GroundhogStoreConfig {
             socket,
             source: "exo".to_string(),
+            kernel_config: None,
         }),
     }
+}
+
+/// `harness_config` with the identity bound to a kernel-config file.
+fn kernel_bound_config(root: PathBuf, socket: PathBuf, kernel: PathBuf) -> BasicExoHarnessConfig {
+    let mut config = harness_config(root, socket);
+    config
+        .groundhog
+        .as_mut()
+        .expect("groundhog config present")
+        .kernel_config = Some(kernel);
+    config
 }
 
 macro_rules! skip_without_groundhog {
@@ -304,4 +316,297 @@ fn walkdir(root: &std::path::Path) -> Vec<PathBuf> {
         }
     }
     found
+}
+
+fn note(n: u64) -> AddEventsRequest {
+    AddEventsRequest {
+        session_id: None,
+        turn_id: None,
+        data: vec![EventData::Custom {
+            event_type: "demo_note".into(),
+            payload: serde_json::json!({ "n": n }),
+        }],
+    }
+}
+
+/// Sources under the kernel-bound identity prefix, sorted, deduplicated.
+async fn kernel_sources(client: &exoharness::groundhog::GroundhogClient) -> Vec<String> {
+    let mut sources: Vec<String> = client
+        .streams(None)
+        .await
+        .expect("streams")
+        .into_iter()
+        .map(|info| info.source)
+        .filter(|source| source.starts_with("exo.k"))
+        .collect();
+    sources.sort();
+    sources.dedup();
+    sources
+}
+
+/// Changing the kernel config file retires the old identity's log, records
+/// succession, and serves the full conversation history across the seam.
+#[tokio::test]
+async fn kernel_flip_retires_predecessor_and_preserves_history() {
+    let bin = skip_without_groundhog!();
+    let server = spawn_groundhog(&bin);
+    let root = tempfile::tempdir().expect("root");
+    let kernel = root.path().join("kernel.toml");
+    std::fs::write(&kernel, "mutability = \"full\"\n").expect("kernel v1");
+
+    let (agent_id, conversation_id, v1_event_ids) = {
+        let harness = BasicExoHarness::new(kernel_bound_config(
+            root.path().to_path_buf(),
+            server.socket.clone(),
+            kernel.clone(),
+        ))
+        .await
+        .expect("harness v1");
+        let agent = harness
+            .new_agent(NewAgentRequest {
+                slug: "demo".into(),
+                name: "Demo".into(),
+            })
+            .await
+            .expect("agent");
+        let conversation = agent
+            .new_conversation(NewConversationRequest::default())
+            .await
+            .expect("conversation");
+        let added = conversation.add_events(note(1)).await.expect("v1 write");
+        (agent.record().id, conversation.record().id, added.event_ids)
+    };
+
+    let client = exoharness::groundhog::GroundhogClient::new(server.socket.clone());
+    let sources_before = kernel_sources(&client).await;
+    assert_eq!(sources_before.len(), 1, "one identity before the flip");
+    let old_source = sources_before[0].clone();
+
+    // The kernel contract changes; the next harness is a different identity.
+    std::fs::write(&kernel, "mutability = \"frozen\"\n").expect("kernel v2");
+    let harness = BasicExoHarness::new(kernel_bound_config(
+        root.path().to_path_buf(),
+        server.socket.clone(),
+        kernel.clone(),
+    ))
+    .await
+    .expect("harness v2");
+    let agent = harness
+        .get_agent(&agent_id)
+        .await
+        .expect("get agent")
+        .expect("agent exists");
+    let conversation = agent
+        .get_conversation(&conversation_id)
+        .await
+        .expect("get conversation")
+        .expect("conversation exists");
+
+    // History spans the retired identity; the point lookup crosses the seam.
+    let events = conversation.get_events(None).await.expect("events");
+    let replayed_ids: Vec<_> = events.events.iter().map(|event| event.id).collect();
+    assert!(
+        v1_event_ids.iter().all(|id| replayed_ids.contains(id)),
+        "pre-flip history must remain readable"
+    );
+    assert!(
+        conversation
+            .get_event(v1_event_ids[0])
+            .await
+            .expect("get_event")
+            .is_some(),
+        "point lookup must cross the lineage seam"
+    );
+
+    // The successor keeps writing; the predecessor admits nothing.
+    conversation.add_events(note(2)).await.expect("v2 write");
+    let sources_after = kernel_sources(&client).await;
+    assert_eq!(sources_after.len(), 2, "both identities visible in the log");
+    let new_source = sources_after
+        .iter()
+        .find(|source| **source != old_source)
+        .expect("successor source")
+        .clone();
+    let refused = client
+        .append(exoharness::groundhog::IngestBatch {
+            batch_id: "post-retirement".into(),
+            source: old_source.clone(),
+            events: vec![exoharness::groundhog::IngestEvent {
+                stream: "x1".into(),
+                record_key: "x1".into(),
+                kind: "demo_note".into(),
+                occurred_at: None,
+                payload: serde_json::json!(1),
+            }],
+            stream_precondition: None,
+        })
+        .await
+        .expect_err("retired source must refuse appends");
+    assert!(
+        matches!(
+            refused,
+            exoharness::groundhog::GroundhogError::SourceRetired { .. }
+        ),
+        "unexpected error: {refused}"
+    );
+
+    // Succession is recorded as the successor's first event.
+    let markers = client
+        .replay_all(&exoharness::groundhog::ReplayQuery {
+            source: Some(new_source.clone()),
+            stream: Some(exoharness::groundhog::LINEAGE_STREAM.to_owned()),
+            kind: Some(exoharness::groundhog::LINEAGE_KIND.to_owned()),
+            ..Default::default()
+        })
+        .await
+        .expect("lineage replay");
+    assert_eq!(markers.len(), 1, "exactly one succession marker");
+    let marker: exoharness::groundhog::LineageMarker =
+        serde_json::from_value(markers[0].payload.clone()).expect("marker decodes");
+    assert_eq!(marker.predecessor_source, old_source);
+}
+
+/// An unchanged kernel config is the same identity: restarts reuse the
+/// source and never write lineage.
+#[tokio::test]
+async fn same_kernel_restart_reuses_source_without_lineage() {
+    let bin = skip_without_groundhog!();
+    let server = spawn_groundhog(&bin);
+    let root = tempfile::tempdir().expect("root");
+    let kernel = root.path().join("kernel.toml");
+    std::fs::write(&kernel, "mutability = \"full\"\n").expect("kernel");
+
+    let (agent_id, conversation_id) = {
+        let harness = BasicExoHarness::new(kernel_bound_config(
+            root.path().to_path_buf(),
+            server.socket.clone(),
+            kernel.clone(),
+        ))
+        .await
+        .expect("harness");
+        let agent = harness
+            .new_agent(NewAgentRequest {
+                slug: "demo".into(),
+                name: "Demo".into(),
+            })
+            .await
+            .expect("agent");
+        let conversation = agent
+            .new_conversation(NewConversationRequest::default())
+            .await
+            .expect("conversation");
+        conversation.add_events(note(1)).await.expect("write");
+        (agent.record().id, conversation.record().id)
+    };
+
+    let harness = BasicExoHarness::new(kernel_bound_config(
+        root.path().to_path_buf(),
+        server.socket.clone(),
+        kernel.clone(),
+    ))
+    .await
+    .expect("harness restart");
+    let agent = harness
+        .get_agent(&agent_id)
+        .await
+        .expect("get agent")
+        .expect("agent exists");
+    let conversation = agent
+        .get_conversation(&conversation_id)
+        .await
+        .expect("get conversation")
+        .expect("conversation exists");
+    conversation.add_events(note(2)).await.expect("write again");
+
+    let client = exoharness::groundhog::GroundhogClient::new(server.socket.clone());
+    assert_eq!(
+        kernel_sources(&client).await.len(),
+        1,
+        "restart must not mint a new identity"
+    );
+    let lineage_rows: Vec<_> = client
+        .streams(None)
+        .await
+        .expect("streams")
+        .into_iter()
+        .filter(|info| info.stream == exoharness::groundhog::LINEAGE_STREAM)
+        .collect();
+    assert_eq!(
+        lineage_rows,
+        vec![],
+        "no succession without a kernel change"
+    );
+}
+
+/// Two kernel changes leave a three-identity chain; reads traverse all of it.
+#[tokio::test]
+async fn second_flip_walks_the_full_lineage_chain() {
+    let bin = skip_without_groundhog!();
+    let server = spawn_groundhog(&bin);
+    let root = tempfile::tempdir().expect("root");
+    let kernel = root.path().join("kernel.toml");
+
+    let mut agent_id = None;
+    let mut conversation_id = None;
+    for generation in 1..=3u64 {
+        std::fs::write(&kernel, format!("generation = {generation}\n")).expect("kernel");
+        let harness = BasicExoHarness::new(kernel_bound_config(
+            root.path().to_path_buf(),
+            server.socket.clone(),
+            kernel.clone(),
+        ))
+        .await
+        .expect("harness");
+        let (agent, conversation) = match (agent_id, conversation_id) {
+            (None, None) => {
+                let agent = harness
+                    .new_agent(NewAgentRequest {
+                        slug: "demo".into(),
+                        name: "Demo".into(),
+                    })
+                    .await
+                    .expect("agent");
+                let conversation = agent
+                    .new_conversation(NewConversationRequest::default())
+                    .await
+                    .expect("conversation");
+                agent_id = Some(agent.record().id);
+                conversation_id = Some(conversation.record().id);
+                (agent, conversation)
+            }
+            (Some(agent_id), Some(conversation_id)) => {
+                let agent = harness
+                    .get_agent(&agent_id)
+                    .await
+                    .expect("get agent")
+                    .expect("agent exists");
+                let conversation = agent
+                    .get_conversation(&conversation_id)
+                    .await
+                    .expect("get conversation")
+                    .expect("conversation exists");
+                (agent, conversation)
+            }
+            _ => unreachable!("ids are set together"),
+        };
+        let _ = agent;
+        conversation
+            .add_events(note(generation))
+            .await
+            .expect("write");
+        let events = conversation.get_events(None).await.expect("events");
+        assert_eq!(
+            events.events.len() as u64,
+            // One conversation_created event, then one note per generation.
+            1 + generation,
+            "generation {generation} must see the whole chain"
+        );
+    }
+
+    let client = exoharness::groundhog::GroundhogClient::new(server.socket.clone());
+    assert_eq!(
+        kernel_sources(&client).await.len(),
+        3,
+        "three identities in the log"
+    );
 }

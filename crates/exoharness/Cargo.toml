@@ -13,6 +13,7 @@ basic-backend = [
   "dep:base64",
   "dep:object_store",
   "dep:reqwest",
+  "dep:sha2",
   "dep:tokio",
   "dep:tokio-stream",
   "dep:tokio-tungstenite",
@@ -48,6 +49,7 @@ object_store = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = { version = "0.10.9", optional = true }
 thiserror.workspace = true
 tokio = { version = "1.52.1", default-features = false, features = [
   "fs",
