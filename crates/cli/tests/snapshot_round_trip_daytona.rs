@@ -36,6 +36,7 @@ async fn daytona_snapshot_and_rewind_round_trip() {
         sandbox_backends: vec![SandboxBackendRegistration::daytona(
             DaytonaBackendSpec::with_conventional_secrets(),
         )],
+        groundhog: None,
     })
     .await
     .expect("harness");

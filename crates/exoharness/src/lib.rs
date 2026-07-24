@@ -10,6 +10,8 @@ mod basic_tests;
 pub mod contract_tests;
 mod error;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+pub mod groundhog;
+#[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 mod http;
 #[cfg(all(test, not(target_arch = "wasm32"), feature = "basic-backend"))]
 mod http_tests;

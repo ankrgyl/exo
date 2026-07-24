@@ -48,6 +48,7 @@ async fn filesystem_snapshot_and_rewind_round_trip() {
         secret_backend: SecretBackendChoice::Static([7u8; 32]),
         sandbox_default: SandboxProvider::Docker,
         sandbox_backends: vec![SandboxBackendRegistration::docker()],
+        groundhog: None,
     })
     .await
     .expect("BasicExoHarness::new should succeed");

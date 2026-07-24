@@ -50,6 +50,7 @@ async fn teleport_docker_sandbox_to_daytona_keeps_files() {
             SandboxBackendRegistration::docker(),
             SandboxBackendRegistration::daytona(DaytonaBackendSpec::with_conventional_secrets()),
         ],
+        groundhog: None,
     })
     .await
     .expect("harness");

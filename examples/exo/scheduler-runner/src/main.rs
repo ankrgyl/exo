@@ -196,11 +196,25 @@ async fn exo_harness(
         secret_backend: default_secret_backend(),
         sandbox_default: sandbox_backend.provider(),
         sandbox_backends: vec![sandbox_backend],
+        // The runner must write to the same event store as the main process,
+        // so it honors the same environment selection.
+        groundhog: groundhog_store_config_from_env(),
     };
     Ok(Arc::new(
         TypeScriptHarness::<ExoToolRuntime>::exo_from_root(root, exo_config, runtime_config, env)
             .await?,
     ))
+}
+
+/// Conversation events go to a Groundhog engine when `EXO_GROUNDHOG_SOCKET`
+/// points at a running `groundhog serve` Unix socket. `EXO_GROUNDHOG_SOURCE`
+/// overrides the Groundhog source name (default `exo`).
+fn groundhog_store_config_from_env() -> Option<executor::GroundhogStoreConfig> {
+    let socket = std::env::var_os("EXO_GROUNDHOG_SOCKET")?;
+    Some(executor::GroundhogStoreConfig {
+        socket: std::path::PathBuf::from(socket),
+        source: std::env::var("EXO_GROUNDHOG_SOURCE").unwrap_or_else(|_| "exo".to_string()),
+    })
 }
 
 #[cfg(target_os = "macos")]

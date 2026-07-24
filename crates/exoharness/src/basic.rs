@@ -333,6 +333,21 @@ pub struct BasicExoHarnessConfig {
     pub sandbox_default: SandboxProvider,
     /// Supported providers; anything not listed is rejected.
     pub sandbox_backends: Vec<SandboxBackendRegistration>,
+    /// When set, conversation events are stored in a Groundhog event-history
+    /// engine instead of per-event JSON files. Records, bindings, secrets,
+    /// artifacts, and sandbox state stay in local storage.
+    pub groundhog: Option<GroundhogStoreConfig>,
+}
+
+/// Connection settings for a Groundhog-backed conversation event store.
+#[derive(Debug, Clone)]
+pub struct GroundhogStoreConfig {
+    /// Unix socket of a running `groundhog serve`. Platform limits cap socket
+    /// paths at ~104 bytes; keep this short.
+    pub socket: PathBuf,
+    /// Groundhog `source` this harness writes under. Must match
+    /// `[a-z0-9_][a-z0-9_.-]*` (no slashes, no uppercase).
+    pub source: String,
 }
 
 #[derive(Clone)]
@@ -342,6 +357,7 @@ pub struct BasicExoHarness {
 
 struct BasicExoHarnessInner {
     storage: BasicObjectStore,
+    event_store: ConversationEventStore,
     write_lock: AsyncMutex<()>,
     subscribers: Mutex<HashMap<ConversationId, Vec<mpsc::UnboundedSender<Result<Event>>>>>,
     sandbox_registry: HashMap<SandboxProvider, SandboxBackendRegistration>,
@@ -798,6 +814,7 @@ impl BasicExoHarness {
             secret_backend,
             sandbox_default,
             sandbox_backends,
+            groundhog,
         } = config;
 
         let mut registry = HashMap::new();
@@ -819,9 +836,14 @@ impl BasicExoHarness {
         let storage = BasicObjectStore::local_filesystem(&root).await?;
         let secret_cipher =
             build_secret_cipher(secret_backend, root.to_string_lossy().to_string())?;
+        let event_store = match &groundhog {
+            Some(config) => ConversationEventStore::Groundhog(GroundhogEventStore::new(config)),
+            None => ConversationEventStore::LocalFiles,
+        };
         Ok(Self {
             inner: Arc::new(BasicExoHarnessInner {
                 storage,
+                event_store,
                 write_lock: AsyncMutex::new(()),
                 subscribers: Mutex::new(HashMap::new()),
                 sandbox_registry: registry,
@@ -1895,7 +1917,22 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         let Some(name) = &request.name else {
             return Ok(None);
         };
-        let mut events = load_events(&self.harness.inner.storage, &self.owner_dir.join("events"))
+        let conversation_id = match &self.event_sink {
+            BasicSandboxEventSink::None => return Ok(None),
+            BasicSandboxEventSink::Conversation { conversation_id } => *conversation_id,
+            BasicSandboxEventSink::Turn {
+                conversation_id, ..
+            } => *conversation_id,
+        };
+        let mut events = self
+            .harness
+            .inner
+            .event_store
+            .load_all(
+                &self.harness.inner.storage,
+                &self.owner_dir,
+                conversation_id,
+            )
             .await?
             .into_iter()
             .filter(|event| event.data.kind() == EventKind::SANDBOX_CREATED)
@@ -2122,7 +2159,7 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn turn_handle(&self, record: TurnRecord) -> Result<Arc<dyn TurnHandle>> {
-        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let events = self.load_conversation_events().await?;
         let mut latest_event_id = None;
         let mut finished = false;
         for event in events
@@ -2153,7 +2190,7 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn get_events(&self, query: Option<EventQuery>) -> Result<GetEventsResult> {
-        let mut events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let mut events = self.load_conversation_events().await?;
         if let Some(query) = query {
             if let Some(session_id) = query.session_id {
                 events.retain(|event| event.session_id == Some(session_id));
@@ -2190,7 +2227,7 @@ impl ConversationHandle for BasicConversationHandle {
         let existing = match after_exclusive {
             Bound::Unbounded => Vec::new(),
             _ => {
-                let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+                let events = self.load_conversation_events().await?;
                 events
                     .into_iter()
                     .filter(|event| matches_bound(event.id, &after_exclusive))
@@ -2213,8 +2250,16 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn get_event(&self, id: EventId) -> Result<Option<Event>> {
-        let path = self.events_dir().join(format!("{id}.json"));
-        self.harness.inner.storage.get_json_if_exists(&path).await
+        self.harness
+            .inner
+            .event_store
+            .get(
+                &self.harness.inner.storage,
+                &self.conversation_dir(),
+                self.record.id,
+                id,
+            )
+            .await
     }
 
     async fn add_events(&self, request: AddEventsRequest) -> Result<AddEventsResult> {
@@ -2249,7 +2294,7 @@ impl ConversationHandle for BasicConversationHandle {
             }
             None => derive_unique_slug("fork", &existing),
         };
-        let mut events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let mut events = self.load_conversation_events().await?;
         if let Some(limit) = request.up_to_inclusive {
             events.retain(|event| event.id <= limit);
         }
@@ -2281,24 +2326,25 @@ impl ConversationHandle for BasicConversationHandle {
             .copy_prefix(self.sandboxes_dir(), conversation_dir.join("sandboxes"))
             .await?;
 
-        let mut latest_event_id = None;
+        let mut copied = Vec::with_capacity(events.len());
         for mut event in events {
             let new_event_id = Uuid7::now();
             event.id = new_event_id;
             event.conversation_id = record.id;
             event.created_at = new_event_id.timestamp().expect("uuid7 timestamp");
-            latest_event_id = Some(new_event_id);
-            self.harness
-                .inner
-                .storage
-                .put_json(
-                    conversation_dir
-                        .join("events")
-                        .join(format!("{}.json", event.id)),
-                    &event,
-                )
-                .await?;
+            copied.push(event);
         }
+        let latest_event_id = copied.last().map(|event| event.id);
+        self.harness
+            .inner
+            .event_store
+            .append(
+                &self.harness.inner.storage,
+                &conversation_dir,
+                record.id,
+                &copied,
+            )
+            .await?;
 
         let mut fork_record = record.clone();
         fork_record.latest_event_id = latest_event_id;
@@ -2529,10 +2575,6 @@ impl BasicConversationHandle {
             .join(self.record.id.to_string())
     }
 
-    fn events_dir(&self) -> PathBuf {
-        self.conversation_dir().join("events")
-    }
-
     fn bindings_dir(&self) -> PathBuf {
         self.conversation_dir().join("bindings")
     }
@@ -2554,6 +2596,18 @@ impl BasicConversationHandle {
             .inner
             .storage
             .get_json(self.conversation_dir().join("record.json"))
+            .await
+    }
+
+    async fn load_conversation_events(&self) -> Result<Vec<Event>> {
+        self.harness
+            .inner
+            .event_store
+            .load_all(
+                &self.harness.inner.storage,
+                &self.conversation_dir(),
+                self.record.id,
+            )
             .await
     }
 
@@ -2939,10 +2993,13 @@ async fn load_sandbox_provider_state(
     provider: SandboxProvider,
     state_key: &str,
 ) -> Result<Option<Value>> {
-    let SandboxOwner::Conversation(_) = owner else {
+    let SandboxOwner::Conversation(conversation_id) = owner else {
         return Ok(None);
     };
-    let mut events = load_events(&harness.inner.storage, &owner_dir.join("events"))
+    let mut events = harness
+        .inner
+        .event_store
+        .load_all(&harness.inner.storage, owner_dir, conversation_id)
         .await?
         .into_iter()
         .filter(|event| event.data.kind() == EventKind::custom(SANDBOX_PROVIDER_STATE_EVENT))
@@ -3742,32 +3799,27 @@ async fn append_events_to_conversation(
             turn_id,
         )?;
     }
-    let mut event_ids = Vec::new();
-    let mut latest_event_id = None;
+    let mut events = Vec::with_capacity(data.len());
     for data in data {
         let id = Uuid7::now();
-        let event = Event {
+        events.push(Event {
             id,
             conversation_id,
             session_id,
             turn_id,
             created_at: id.timestamp().expect("uuid7 timestamp"),
             data,
-        };
-        inner
-            .storage
-            .put_json(
-                conversation_dir
-                    .join("events")
-                    .join(format!("{}.json", event.id)),
-                &event,
-            )
-            .await?;
-        notify_subscribers(inner, conversation_id, event.clone());
-        latest_event_id = Some(event.id);
-        event_ids.push(event.id);
+        });
     }
-    let latest_event_id = latest_event_id.expect("at least one event");
+    inner
+        .event_store
+        .append(&inner.storage, conversation_dir, conversation_id, &events)
+        .await?;
+    let event_ids = events.iter().map(|event| event.id).collect::<Vec<_>>();
+    let latest_event_id = *event_ids.last().expect("at least one event");
+    for event in events {
+        notify_subscribers(inner, conversation_id, event);
+    }
     record.latest_event_id = Some(latest_event_id);
     Ok(AddEventsResult {
         event_ids,
@@ -3857,6 +3909,222 @@ async fn load_events(storage: &BasicObjectStore, events_dir: &Path) -> Result<Ve
         .await?;
     events.sort_by_key(|event| event.id);
     Ok(events)
+}
+
+/// Where a conversation's canonical events live. `LocalFiles` is the original
+/// layout: one JSON file per event under `<conversation>/events/`. `Groundhog`
+/// stores events in an external append-only event-history engine; nothing is
+/// written under `<conversation>/events/` in that mode. All event reads and
+/// writes in this backend go through these three primitives.
+enum ConversationEventStore {
+    LocalFiles,
+    Groundhog(GroundhogEventStore),
+}
+
+impl ConversationEventStore {
+    async fn append(
+        &self,
+        storage: &BasicObjectStore,
+        conversation_dir: &Path,
+        conversation_id: ConversationId,
+        events: &[Event],
+    ) -> Result<()> {
+        match self {
+            Self::LocalFiles => {
+                for event in events {
+                    storage
+                        .put_json(
+                            conversation_dir
+                                .join("events")
+                                .join(format!("{}.json", event.id)),
+                            event,
+                        )
+                        .await?;
+                }
+                Ok(())
+            }
+            Self::Groundhog(store) => store.append(conversation_id, events).await,
+        }
+    }
+
+    async fn load_all(
+        &self,
+        storage: &BasicObjectStore,
+        conversation_dir: &Path,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<Event>> {
+        match self {
+            Self::LocalFiles => load_events(storage, &conversation_dir.join("events")).await,
+            Self::Groundhog(store) => store.load_all(conversation_id).await,
+        }
+    }
+
+    async fn get(
+        &self,
+        storage: &BasicObjectStore,
+        conversation_dir: &Path,
+        conversation_id: ConversationId,
+        id: EventId,
+    ) -> Result<Option<Event>> {
+        match self {
+            Self::LocalFiles => {
+                storage
+                    .get_json_if_exists(&conversation_dir.join("events").join(format!("{id}.json")))
+                    .await
+            }
+            Self::Groundhog(store) => store.get(conversation_id, id).await,
+        }
+    }
+}
+
+/// Events in one ingest batch. Bounds request size so forking a long
+/// conversation cannot exceed the engine's request-size limits.
+const GROUNDHOG_APPEND_CHUNK: usize = 500;
+
+/// Conversation events stored in a Groundhog engine: one Groundhog `stream`
+/// per conversation under a single harness-wide `source`. The full exo
+/// [`Event`] is the payload, the exo event id is the `record_key`, and the
+/// event kind is the Groundhog `kind`, so replay filters work server-side.
+///
+/// Every append carries a stream-frontier precondition. Frontiers are seeded
+/// once per process from `/v1/streams`, then advanced from ingest receipts;
+/// a frontier conflict means another writer appended to this conversation's
+/// stream, and resyncs the cached frontier from the conflict response before
+/// failing the append.
+struct GroundhogEventStore {
+    client: crate::groundhog::GroundhogClient,
+    source: String,
+    frontiers: AsyncMutex<GroundhogFrontiers>,
+}
+
+enum GroundhogFrontiers {
+    Unseeded,
+    Seeded(HashMap<ConversationId, String>),
+}
+
+impl GroundhogEventStore {
+    fn new(config: &GroundhogStoreConfig) -> Self {
+        Self {
+            client: crate::groundhog::GroundhogClient::new(&config.socket),
+            source: config.source.clone(),
+            frontiers: AsyncMutex::new(GroundhogFrontiers::Unseeded),
+        }
+    }
+
+    /// The frontier map, seeded from `/v1/streams` on first use. Absence from
+    /// the map means the stream does not exist yet, which the precondition
+    /// encodes as an explicit null.
+    async fn seeded<'a>(
+        &self,
+        frontiers: &'a mut GroundhogFrontiers,
+    ) -> Result<&'a mut HashMap<ConversationId, String>> {
+        if let GroundhogFrontiers::Unseeded = frontiers {
+            let mut map = HashMap::new();
+            for info in self.client.streams(Some(&self.source)).await? {
+                let conversation_id = info.stream.parse::<Uuid7>().with_context(|| {
+                    format!(
+                        "non-uuid stream {} under source {}",
+                        info.stream, self.source
+                    )
+                })?;
+                map.insert(conversation_id, info.frontier_event_id);
+            }
+            *frontiers = GroundhogFrontiers::Seeded(map);
+        }
+        match frontiers {
+            GroundhogFrontiers::Seeded(map) => Ok(map),
+            GroundhogFrontiers::Unseeded => unreachable!("seeded above"),
+        }
+    }
+
+    async fn append(&self, conversation_id: ConversationId, events: &[Event]) -> Result<()> {
+        let stream = conversation_id.to_string();
+        let mut frontiers = self.frontiers.lock().await;
+        let map = self.seeded(&mut frontiers).await?;
+        let mut expected = map.get(&conversation_id).cloned();
+        for chunk in events.chunks(GROUNDHOG_APPEND_CHUNK) {
+            let batch = crate::groundhog::IngestBatch {
+                batch_id: chunk[0].id.to_string(),
+                source: self.source.clone(),
+                events: chunk
+                    .iter()
+                    .map(|event| {
+                        Ok(crate::groundhog::IngestEvent {
+                            stream: stream.clone(),
+                            record_key: event.id.to_string(),
+                            kind: event.data.kind().as_str().to_owned(),
+                            occurred_at: Some(event.created_at),
+                            payload: serde_json::to_value(event)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                stream_precondition: Some(crate::groundhog::StreamPrecondition {
+                    stream: stream.clone(),
+                    expected_frontier: expected.clone(),
+                }),
+            };
+            match self.client.append(batch).await {
+                Ok(receipt) => {
+                    map.insert(conversation_id, receipt.last_event_id.clone());
+                    expected = Some(receipt.last_event_id);
+                }
+                Err(crate::groundhog::GroundhogError::FrontierConflict {
+                    actual_frontier, ..
+                }) => {
+                    match actual_frontier.clone() {
+                        Some(actual) => map.insert(conversation_id, actual),
+                        None => map.remove(&conversation_id),
+                    };
+                    bail!(
+                        "groundhog stream {stream} was appended to by another writer \
+                         (expected frontier {expected:?}, actual {actual_frontier:?})"
+                    );
+                }
+                Err(error) => return Err(anyhow::Error::new(error)),
+            }
+        }
+        Ok(())
+    }
+
+    async fn load_all(&self, conversation_id: ConversationId) -> Result<Vec<Event>> {
+        let replayed = self
+            .client
+            .replay_all(&crate::groundhog::ReplayQuery {
+                source: Some(self.source.clone()),
+                stream: Some(conversation_id.to_string()),
+                ..Default::default()
+            })
+            .await?;
+        let mut events = replayed
+            .into_iter()
+            .map(|envelope| {
+                serde_json::from_value::<Event>(envelope.payload).with_context(|| {
+                    format!(
+                        "groundhog event {} in stream {conversation_id} does not decode as an exo event",
+                        envelope.event_id
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        events.sort_by_key(|event| event.id);
+        Ok(events)
+    }
+
+    async fn get(&self, conversation_id: ConversationId, id: EventId) -> Result<Option<Event>> {
+        let replayed = self
+            .client
+            .replay_all(&crate::groundhog::ReplayQuery {
+                source: Some(self.source.clone()),
+                stream: Some(conversation_id.to_string()),
+                record_key: Some(id.to_string()),
+                ..Default::default()
+            })
+            .await?;
+        let Some(envelope) = replayed.into_iter().next() else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_value::<Event>(envelope.payload)?))
+    }
 }
 
 async fn load_artifact_versions(
