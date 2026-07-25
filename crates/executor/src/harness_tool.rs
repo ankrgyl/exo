@@ -94,8 +94,8 @@ impl ToolRuntime for ExoToolRuntime {
         agent_config: &AgentConfig,
         config: &ConversationConfig,
     ) -> Result<()> {
+        // No need to create a new sandbox if one is already attached to the conversation.
         if attached_conversation_sandbox(conversation).await?.is_some() {
-            ensure_conversation_sandbox(conversation, agent_config, config).await?;
             return Ok(());
         }
         match effective_sandbox_scope(agent_config, config) {
