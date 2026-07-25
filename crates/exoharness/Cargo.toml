@@ -81,3 +81,7 @@ tokio = { version = "1.52.1", features = [
   "time",
 ] }
 tracing-subscriber.workspace = true
+
+[[example]]
+name = "groundhog_demo"
+required-features = ["basic-backend"]
