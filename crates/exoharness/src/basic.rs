@@ -4,7 +4,7 @@ use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow, bail, ensure};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -346,16 +346,18 @@ pub struct GroundhogStoreConfig {
     /// paths at ~104 bytes; keep this short.
     pub socket: PathBuf,
     /// Groundhog `source` this harness writes under. Must match
-    /// `[a-z0-9_][a-z0-9_.-]*` (no slashes, no uppercase).
+    /// `[a-z0-9_][a-z0-9_.-]*` (no slashes, no uppercase) and be at most 128
+    /// bytes. When `kernel_config` is set, the configured source must be at
+    /// most 62 bytes so the kernel identity suffix fits.
     pub source: String,
     /// When set, the harness identity is bound to this file's content: the
-    /// effective source becomes `<source>.k<first 12 hex of SHA-256>`. A
-    /// changed file names a different source, so a new kernel cannot append
-    /// to its predecessor's log. On first use after a change, the store
-    /// retires the predecessor source (its log stays readable forever) and
-    /// commits a successor lineage marker that the engine validates against
-    /// the predecessor's exact final frontier. Reads walk the recorded
-    /// lineage chain, so conversation history spans retired identities.
+    /// effective source becomes `<source>.k<full SHA-256 hex digest>`. A
+    /// changed file names a different source, so a new kernel cannot append to
+    /// its predecessor's log. On first use after a change, the store retires
+    /// the predecessor source (its log stays readable forever) and commits a
+    /// successor lineage marker that the engine validates against the
+    /// predecessor's exact final frontier. Reads walk the recorded lineage
+    /// chain, so conversation history spans retired identities.
     pub kernel_config: Option<PathBuf>,
 }
 
@@ -2234,30 +2236,37 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn watch_events(&self, after_exclusive: Bound<EventId>) -> Result<EventStream> {
-        let _guard = self.harness.inner.write_lock.lock().await;
-        let existing = match after_exclusive {
-            Bound::Unbounded => Vec::new(),
-            _ => {
-                let events = self.load_conversation_events().await?;
-                events
-                    .into_iter()
-                    .filter(|event| matches_bound(event.id, &after_exclusive))
-                    .collect::<Vec<_>>()
+        match &self.harness.inner.event_store {
+            ConversationEventStore::Groundhog(store) => {
+                store.watch(self.record.id, after_exclusive).await
             }
-        };
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.harness
-            .inner
-            .subscribers
-            .lock()
-            .expect("subscribers poisoned")
-            .entry(self.record.id)
-            .or_default()
-            .push(tx);
-        let existing_stream: BoxStream<'static, Result<Event>> =
-            stream::iter(existing.into_iter().map(Ok)).boxed();
-        let live_stream = UnboundedReceiverStream::new(rx);
-        Ok(Box::pin(existing_stream.chain(live_stream)))
+            ConversationEventStore::LocalFiles => {
+                let _guard = self.harness.inner.write_lock.lock().await;
+                let existing = match after_exclusive {
+                    Bound::Unbounded => Vec::new(),
+                    _ => {
+                        let events = self.load_conversation_events().await?;
+                        events
+                            .into_iter()
+                            .filter(|event| matches_bound(event.id, &after_exclusive))
+                            .collect::<Vec<_>>()
+                    }
+                };
+                let (tx, rx) = mpsc::unbounded_channel();
+                self.harness
+                    .inner
+                    .subscribers
+                    .lock()
+                    .expect("subscribers poisoned")
+                    .entry(self.record.id)
+                    .or_default()
+                    .push(tx);
+                let existing_stream: BoxStream<'static, Result<Event>> =
+                    stream::iter(existing.into_iter().map(Ok)).boxed();
+                let live_stream = UnboundedReceiverStream::new(rx);
+                Ok(Box::pin(existing_stream.chain(live_stream)))
+            }
+        }
     }
 
     async fn get_event(&self, id: EventId) -> Result<Option<Event>> {
@@ -3992,6 +4001,12 @@ impl ConversationEventStore {
 /// conversation cannot exceed the engine's request-size limits.
 const GROUNDHOG_APPEND_CHUNK: usize = 500;
 
+/// Maximum UTF-8 byte length accepted for a Groundhog source name.
+const GROUNDHOG_SOURCE_MAX_BYTES: usize = 128;
+
+/// Lowercase hexadecimal characters in a SHA-256 digest.
+const KERNEL_HASH_SUFFIX_BYTES: usize = 64;
+
 /// Conversation events stored in a Groundhog engine: one Groundhog `stream`
 /// per conversation under a single harness-wide `source`. The full exo
 /// [`Event`] is the payload, the exo event id is the `record_key`, and the
@@ -4059,7 +4074,7 @@ impl GroundhogEventStore {
                 let bytes = tokio::fs::read(path)
                     .await
                     .with_context(|| format!("reading kernel config {}", path.display()))?;
-                format!("{}.k{}", self.configured_source, kernel_hash_suffix(&bytes))
+                kernel_bound_source(&self.configured_source, &bytes)?
             }
         };
         // Kernel-bound identities enumerate every source so sibling
@@ -4219,6 +4234,94 @@ impl GroundhogEventStore {
         Ok(self.resolved(&mut identity).await?.read_sources.clone())
     }
 
+    /// Snapshot-then-live conversation events. Predecessor identities are
+    /// immutable, so bounded catch-up reads them once; the current identity is
+    /// held open through Groundhog replay and receives commits from any exo
+    /// process using the same source.
+    async fn watch(
+        &self,
+        conversation_id: ConversationId,
+        after_exclusive: Bound<EventId>,
+    ) -> Result<EventStream> {
+        let (source, predecessors) = {
+            let mut identity = self.identity.lock().await;
+            let resolved = self.resolved(&mut identity).await?;
+            let predecessor_count = resolved.read_sources.len().saturating_sub(1);
+            (
+                resolved.source.clone(),
+                resolved.read_sources[..predecessor_count].to_vec(),
+            )
+        };
+        let stream_name = conversation_id.to_string();
+        let unbounded = matches!(after_exclusive, Bound::Unbounded);
+
+        let mut existing = Vec::new();
+        if !unbounded {
+            for predecessor in predecessors {
+                for envelope in self
+                    .client
+                    .replay_all(&crate::groundhog::ReplayQuery {
+                        source: Some(predecessor),
+                        stream: Some(stream_name.clone()),
+                        ..Default::default()
+                    })
+                    .await?
+                {
+                    let event = decode_groundhog_exo_event(envelope, conversation_id)?;
+                    if matches_bound(event.id, &after_exclusive) {
+                        existing.push(event);
+                    }
+                }
+            }
+            existing.sort_by_key(|event| event.id);
+        }
+
+        // Unbounded means live-only. Capture the current durable stream
+        // frontier before opening follow; a commit racing with this query is
+        // returned in the follow connection's initial snapshot and must be
+        // delivered. Bounded watches start at the beginning of the current
+        // identity and filter by the producer event id.
+        let after = if unbounded {
+            self.client
+                .streams(Some(&source))
+                .await?
+                .into_iter()
+                .find(|info| info.stream == stream_name)
+                .map(|info| info.frontier_event_id)
+        } else {
+            None
+        };
+        let followed = self
+            .client
+            .follow(&crate::groundhog::ReplayQuery {
+                source: Some(source),
+                stream: Some(stream_name),
+                after,
+                ..Default::default()
+            })
+            .await?;
+        let bound = after_exclusive;
+        let live = followed.filter_map(move |result| {
+            let bound = bound;
+            async move {
+                match result {
+                    Ok(followed) => {
+                        match decode_groundhog_exo_event(followed.event, conversation_id) {
+                            Ok(event) if unbounded || matches_bound(event.id, &bound) => {
+                                Some(Ok(event))
+                            }
+                            Ok(_) => None,
+                            Err(error) => Some(Err(error)),
+                        }
+                    }
+                    Err(error) => Some(Err(anyhow::Error::new(error))),
+                }
+            }
+        });
+        let existing = stream::iter(existing.into_iter().map(Ok));
+        Ok(Box::pin(existing.chain(live)))
+    }
+
     async fn append(&self, conversation_id: ConversationId, events: &[Event]) -> Result<()> {
         let stream = conversation_id.to_string();
         let mut identity = self.identity.lock().await;
@@ -4289,13 +4392,7 @@ impl GroundhogEventStore {
                 })
                 .await?;
             for envelope in replayed {
-                let event = serde_json::from_value::<Event>(envelope.payload).with_context(|| {
-                    format!(
-                        "groundhog event {} in stream {conversation_id} does not decode as an exo event",
-                        envelope.event_id
-                    )
-                })?;
-                events.push(event);
+                events.push(decode_groundhog_exo_event(envelope, conversation_id)?);
             }
         }
         events.sort_by_key(|event| event.id);
@@ -4321,19 +4418,50 @@ impl GroundhogEventStore {
     }
 }
 
-/// First 12 hex characters of the SHA-256 of the kernel config bytes: the
-/// kernel identity segment of the effective source name.
+fn decode_groundhog_exo_event(
+    envelope: crate::groundhog::GroundhogEvent,
+    conversation_id: ConversationId,
+) -> Result<Event> {
+    let event_id = envelope.event_id;
+    let event = serde_json::from_value::<Event>(envelope.payload).with_context(|| {
+        format!(
+            "groundhog event {event_id} in stream {conversation_id} does not decode as an exo event"
+        )
+    })?;
+    ensure!(
+        event.conversation_id == conversation_id,
+        "groundhog event {event_id} payload names conversation {}, expected {conversation_id}",
+        event.conversation_id
+    );
+    Ok(event)
+}
+
+/// Full SHA-256 of the kernel config bytes, encoded as lowercase hex.
 fn kernel_hash_suffix(bytes: &[u8]) -> String {
     use sha2::Digest;
-    sha2::Sha256::digest(bytes)[..6]
+
+    sha2::Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
 
+fn kernel_bound_source(configured_source: &str, kernel_config: &[u8]) -> Result<String> {
+    let source = format!("{configured_source}.k{}", kernel_hash_suffix(kernel_config));
+    ensure!(
+        source.len() <= GROUNDHOG_SOURCE_MAX_BYTES,
+        "kernel-bound Groundhog source is {} bytes, exceeding the {}-byte limit; \
+         configured source must be at most {} bytes",
+        source.len(),
+        GROUNDHOG_SOURCE_MAX_BYTES,
+        GROUNDHOG_SOURCE_MAX_BYTES - ".k".len() - KERNEL_HASH_SUFFIX_BYTES
+    );
+    Ok(source)
+}
+
 /// Whether a source-name suffix has the shape `kernel_hash_suffix` produces.
 fn is_kernel_hash(suffix: &str) -> bool {
-    suffix.len() == 12
+    suffix.len() == KERNEL_HASH_SUFFIX_BYTES
         && suffix
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -4558,4 +4686,51 @@ fn build_secret_cipher(
         SecretBackendChoice::Static(key) => Arc::new(StaticSecretKeyProvider::new(key)),
     };
     Ok(SecretCipher::new(provider))
+}
+
+#[cfg(test)]
+mod groundhog_identity_tests {
+    use super::{
+        GROUNDHOG_SOURCE_MAX_BYTES, is_kernel_hash, kernel_bound_source, kernel_hash_suffix,
+    };
+
+    #[test]
+    fn kernel_hash_suffix_is_full_sha256() {
+        let suffix = kernel_hash_suffix(b"abc");
+
+        assert_eq!(
+            suffix,
+            "ba7816bf8f01cfea414140de5dae2223\
+             b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(is_kernel_hash(&suffix));
+    }
+
+    #[test]
+    fn kernel_hash_shape_rejects_truncated_and_non_lowercase_digests() {
+        assert!(!is_kernel_hash("ba7816bf8f01"));
+        assert!(!is_kernel_hash(
+            "BA7816BF8F01CFEA414140DE5DAE2223\
+             B00361A396177A9CB410FF61F20015AD"
+        ));
+        assert!(!is_kernel_hash(
+            "za7816bf8f01cfea414140de5dae2223\
+             b00361a396177a9cb410ff61f20015ad"
+        ));
+    }
+
+    #[test]
+    fn kernel_bound_source_enforces_groundhog_source_limit() {
+        let maximum_prefix = "x".repeat(62);
+        let source = kernel_bound_source(&maximum_prefix, b"kernel").unwrap();
+        assert_eq!(source.len(), GROUNDHOG_SOURCE_MAX_BYTES);
+
+        let oversized_prefix = "x".repeat(63);
+        let error = kernel_bound_source(&oversized_prefix, b"kernel").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "kernel-bound Groundhog source is 129 bytes, exceeding the 128-byte limit; \
+             configured source must be at most 62 bytes"
+        );
+    }
 }

@@ -66,3 +66,34 @@ jobs:
 
       - name: Run Rust tests
         run: cargo test --workspace --all-targets
+
+  groundhog-integration-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check out compatible Groundhog revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: GroundSystems/groundhog
+          ref: 929590d2df6a3b00bcb2e93f3552a21c22cd4536
+          path: groundhog
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - name: Cache Rust dependencies and build output
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          shared-key: groundhog-integration
+
+      - name: Build Groundhog
+        run: cargo build --release --manifest-path groundhog/Cargo.toml
+
+      - name: Run Groundhog integration tests
+        env:
+          GROUNDHOG_BIN: ${{ github.workspace }}/groundhog/target/release/groundhog
+        run: cargo test --package exoharness --features basic-backend,contract-tests --test groundhog_client --test groundhog_store -- --ignored

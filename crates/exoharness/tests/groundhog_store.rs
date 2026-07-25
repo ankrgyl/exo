@@ -2,11 +2,11 @@
 //! public harness API against a real `groundhog serve` process — including
 //! exo's own harness contract tests.
 //!
-//! Tests self-skip when no groundhog binary is available: set `GROUNDHOG_BIN`
-//! or build ground-core at the fallback path below.
+//! `GROUNDHOG_BIN` must name the binary to test.
 
-#![cfg(feature = "basic-backend")]
+#![cfg(all(feature = "basic-backend", feature = "contract-tests"))]
 
+use std::ops::Bound;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -17,14 +17,19 @@ use exoharness::{
     GroundhogStoreConfig, NewAgentRequest, NewConversationRequest, SandboxBackendRegistration,
     SandboxProvider, SecretBackendChoice,
 };
+use futures::StreamExt;
 
-const FALLBACK_GROUNDHOG_BIN: &str = "/Users/arvind/GroundCo/ground-core/target/debug/groundhog";
-
-fn groundhog_bin() -> Option<PathBuf> {
-    let bin = std::env::var_os("GROUNDHOG_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(FALLBACK_GROUNDHOG_BIN));
-    bin.exists().then_some(bin)
+fn groundhog_bin() -> PathBuf {
+    let path = PathBuf::from(
+        std::env::var_os("GROUNDHOG_BIN")
+            .expect("GROUNDHOG_BIN must point to a compatible groundhog binary"),
+    );
+    assert!(
+        path.is_file(),
+        "GROUNDHOG_BIN does not identify a file: {}",
+        path.display()
+    );
+    path
 }
 
 /// A `groundhog init` + `groundhog serve` child, killed on drop.
@@ -37,8 +42,12 @@ struct GroundhogServer {
 
 impl Drop for GroundhogServer {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Err(error) = self.child.kill() {
+            eprintln!("failed to kill groundhog serve child: {error}");
+        }
+        if let Err(error) = self.child.wait() {
+            eprintln!("failed to reap groundhog serve child: {error}");
+        }
     }
 }
 
@@ -68,8 +77,12 @@ fn spawn_groundhog(bin: &PathBuf) -> GroundhogServer {
         "socket path too long for sockaddr_un: {}",
         socket.display()
     );
+    let mut child = child;
     let deadline = Instant::now() + Duration::from_secs(10);
     while !socket.exists() {
+        if let Some(status) = child.try_wait().expect("poll groundhog serve") {
+            panic!("groundhog serve exited before binding its socket: {status}");
+        }
         assert!(Instant::now() < deadline, "groundhog socket never appeared");
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -101,23 +114,12 @@ fn kernel_bound_config(root: PathBuf, socket: PathBuf, kernel: PathBuf) -> Basic
     config
 }
 
-macro_rules! skip_without_groundhog {
-    () => {
-        match groundhog_bin() {
-            Some(bin) => bin,
-            None => {
-                eprintln!("skipping: no groundhog binary (set GROUNDHOG_BIN)");
-                return;
-            }
-        }
-    };
-}
-
 /// Exo's own harness contract tests, with every conversation event stored in
 /// and served from Groundhog.
 #[tokio::test]
+#[ignore = "requires GROUNDHOG_BIN"]
 async fn contract_tests_pass_with_groundhog_event_store() {
-    let bin = skip_without_groundhog!();
+    let bin = groundhog_bin();
     let server = spawn_groundhog(&bin);
     let root = tempfile::tempdir().expect("root");
     let harness: Arc<dyn ExoHarness> = Arc::new(
@@ -145,8 +147,9 @@ async fn contract_tests_pass_with_groundhog_event_store() {
 /// The log is the only copy: no local event files exist, and a fresh harness
 /// process on the same root serves the full history from Groundhog replay.
 #[tokio::test]
+#[ignore = "requires GROUNDHOG_BIN"]
 async fn history_survives_restart_with_no_local_event_files() {
-    let bin = skip_without_groundhog!();
+    let bin = groundhog_bin();
     let server = spawn_groundhog(&bin);
     let root = tempfile::tempdir().expect("root");
 
@@ -238,8 +241,9 @@ async fn history_survives_restart_with_no_local_event_files() {
 /// A second writer on the same stream is detected by the frontier
 /// precondition instead of silently interleaving history.
 #[tokio::test]
+#[ignore = "requires GROUNDHOG_BIN"]
 async fn concurrent_writer_is_detected_by_frontier_precondition() {
-    let bin = skip_without_groundhog!();
+    let bin = groundhog_bin();
     let server = spawn_groundhog(&bin);
     let root = tempfile::tempdir().expect("root");
 
@@ -347,8 +351,9 @@ async fn kernel_sources(client: &exoharness::groundhog::GroundhogClient) -> Vec<
 /// Changing the kernel config file retires the old identity's log, records
 /// succession, and serves the full conversation history across the seam.
 #[tokio::test]
+#[ignore = "requires GROUNDHOG_BIN"]
 async fn kernel_flip_retires_predecessor_and_preserves_history() {
-    let bin = skip_without_groundhog!();
+    let bin = groundhog_bin();
     let server = spawn_groundhog(&bin);
     let root = tempfile::tempdir().expect("root");
     let kernel = root.path().join("kernel.toml");
@@ -469,8 +474,9 @@ async fn kernel_flip_retires_predecessor_and_preserves_history() {
 /// An unchanged kernel config is the same identity: restarts reuse the
 /// source and never write lineage.
 #[tokio::test]
+#[ignore = "requires GROUNDHOG_BIN"]
 async fn same_kernel_restart_reuses_source_without_lineage() {
-    let bin = skip_without_groundhog!();
+    let bin = groundhog_bin();
     let server = spawn_groundhog(&bin);
     let root = tempfile::tempdir().expect("root");
     let kernel = root.path().join("kernel.toml");
@@ -540,8 +546,9 @@ async fn same_kernel_restart_reuses_source_without_lineage() {
 
 /// Two kernel changes leave a three-identity chain; reads traverse all of it.
 #[tokio::test]
+#[ignore = "requires GROUNDHOG_BIN"]
 async fn second_flip_walks_the_full_lineage_chain() {
-    let bin = skip_without_groundhog!();
+    let bin = groundhog_bin();
     let server = spawn_groundhog(&bin);
     let root = tempfile::tempdir().expect("root");
     let kernel = root.path().join("kernel.toml");
@@ -609,4 +616,75 @@ async fn second_flip_walks_the_full_lineage_chain() {
         3,
         "three identities in the log"
     );
+}
+
+/// A watcher attached through one harness instance receives a commit made by
+/// another instance through Groundhog held replay, not process-local fanout.
+#[tokio::test]
+#[ignore = "requires GROUNDHOG_BIN"]
+async fn watch_events_receives_cross_process_groundhog_commit() {
+    let bin = groundhog_bin();
+    let server = spawn_groundhog(&bin);
+    let root = tempfile::tempdir().expect("root");
+    let first = BasicExoHarness::new(harness_config(
+        root.path().to_path_buf(),
+        server.socket.clone(),
+    ))
+    .await
+    .expect("first harness");
+    let agent = first
+        .new_agent(NewAgentRequest {
+            slug: "watch-demo".into(),
+            name: "Watch Demo".into(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    conversation
+        .add_events(note(1))
+        .await
+        .expect("seed conversation frontier");
+    let agent_id = agent.record().id;
+    let conversation_id = conversation.record().id;
+    let mut watched = conversation
+        .watch_events(Bound::Unbounded)
+        .await
+        .expect("open Groundhog watch");
+
+    let second = BasicExoHarness::new(harness_config(
+        root.path().to_path_buf(),
+        server.socket.clone(),
+    ))
+    .await
+    .expect("second harness");
+    let second_conversation = second
+        .get_agent(&agent_id)
+        .await
+        .expect("get agent")
+        .expect("agent exists")
+        .get_conversation(&conversation_id)
+        .await
+        .expect("get conversation")
+        .expect("conversation exists");
+    let appended = second_conversation
+        .add_events(note(2))
+        .await
+        .expect("append from second harness");
+
+    let received = tokio::time::timeout(Duration::from_secs(3), watched.next())
+        .await
+        .expect("watch timed out")
+        .expect("watch ended")
+        .expect("watch returned an error");
+    assert_eq!(received.id, appended.event_ids[0]);
+    assert!(matches!(
+        received.data,
+        EventData::Custom {
+            ref event_type,
+            ref payload,
+        } if event_type == "demo_note" && payload == &serde_json::json!({"n": 2})
+    ));
 }

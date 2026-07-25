@@ -1,9 +1,14 @@
 //! Driver for the Groundhog-backend demo (`demo/groundhog-backend/demo.sh`).
 //!
-//! Each invocation is a fresh harness process, so every `read` after a `seed`
-//! demonstrates restart-from-log. Subcommands:
+//! This is a harness-level storage demo. `seed` directly constructs synthetic
+//! events; it does not call a model or execute a tool. Each invocation is a
+//! fresh harness process, so every `read` after a `seed` demonstrates replay
+//! from Groundhog. The kernel-config mismatch behavior is a policy prototype,
+//! not a complete implementation of the current scope of exo issue #154.
 //!
-//! - `seed`             create an agent + conversation and one worked turn
+//! Subcommands:
+//!
+//! - `seed`             create an agent + conversation and synthetic events
 //! - `read`             replay the conversation through the harness API
 //! - `append <text>`    add one note event
 //! - `retired-append`   raw-append to the predecessor identity (must fail)
@@ -148,7 +153,7 @@ async fn seed() -> Result<()> {
     };
     std::fs::write(state_path()?, serde_json::to_vec_pretty(&state)?)?;
     println!(
-        "seeded agent {} conversation {} with {} events",
+        "synthetically seeded agent {} conversation {} with {} events",
         state.agent_id,
         state.conversation_id,
         added.event_ids.len()
@@ -256,21 +261,7 @@ async fn read_local() -> Result<()> {
     Ok(())
 }
 
-/// The source the current kernel config resolves to (same derivation as the
-/// harness: `exo.k` + first 12 hex of the file's SHA-256).
-fn current_source() -> Result<String> {
-    use sha2::Digest;
-    let path = std::env::var_os("EXO_GROUNDHOG_KERNEL_CONFIG")
-        .context("EXO_GROUNDHOG_KERNEL_CONFIG not set")?;
-    let digest = sha2::Sha256::digest(std::fs::read(PathBuf::from(path))?);
-    let suffix: String = digest[..6]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    Ok(format!("exo.k{suffix}"))
-}
-
-/// Identity sources present in the log, oldest first.
+/// Deduplicated identity sources present in the log.
 async fn identity_sources(client: &GroundhogClient) -> Result<Vec<String>> {
     let mut sources: Vec<String> = client
         .streams(None)
@@ -284,14 +275,35 @@ async fn identity_sources(client: &GroundhogClient) -> Result<Vec<String>> {
     Ok(sources)
 }
 
+async fn lineage_marker(
+    client: &GroundhogClient,
+    source: &str,
+) -> Result<Option<exoharness::groundhog::LineageMarker>> {
+    let markers = client
+        .replay_all(&ReplayQuery {
+            source: Some(source.to_owned()),
+            stream: Some(exoharness::groundhog::LINEAGE_STREAM.to_owned()),
+            kind: Some(exoharness::groundhog::LINEAGE_KIND.to_owned()),
+            ..Default::default()
+        })
+        .await?;
+    markers
+        .first()
+        .map(|envelope| serde_json::from_value(envelope.payload.clone()))
+        .transpose()
+        .map_err(Into::into)
+}
+
 async fn retired_append() -> Result<()> {
     let client = GroundhogClient::new(socket()?);
-    let current = current_source()?;
-    let Some(retired) = identity_sources(&client)
-        .await?
-        .into_iter()
-        .find(|source| *source != current)
-    else {
+    let mut retired = None;
+    for source in identity_sources(&client).await? {
+        if let Some(marker) = lineage_marker(&client, &source).await? {
+            retired = Some(marker.predecessor_source);
+            break;
+        }
+    }
+    let Some(retired) = retired else {
         bail!("no predecessor identity in the log yet");
     };
     println!("appending to retired identity {retired} ...");
@@ -321,18 +333,8 @@ async fn retired_append() -> Result<()> {
 async fn lineage() -> Result<()> {
     let client = GroundhogClient::new(socket()?);
     for source in identity_sources(&client).await? {
-        let markers = client
-            .replay_all(&ReplayQuery {
-                source: Some(source.clone()),
-                stream: Some(exoharness::groundhog::LINEAGE_STREAM.to_owned()),
-                kind: Some(exoharness::groundhog::LINEAGE_KIND.to_owned()),
-                ..Default::default()
-            })
-            .await?;
-        match markers.first() {
-            Some(envelope) => {
-                let marker: exoharness::groundhog::LineageMarker =
-                    serde_json::from_value(envelope.payload.clone())?;
+        match lineage_marker(&client, &source).await? {
+            Some(marker) => {
                 println!(
                     "{source}\n  succeeds {} at its final frontier {}",
                     marker.predecessor_source, marker.predecessor_final_frontier

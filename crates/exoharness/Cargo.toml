@@ -85,3 +85,7 @@ tracing-subscriber.workspace = true
 [[example]]
 name = "groundhog_demo"
 required-features = ["basic-backend"]
+
+[[test]]
+name = "groundhog_store"
+required-features = ["basic-backend", "contract-tests"]

@@ -11,11 +11,13 @@
 //! transport failure triggers exactly one verbatim retry; the server's
 //! duplicate-precedence guarantee makes a verbatim ingest retry idempotent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use futures::{Stream, stream};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -24,6 +26,9 @@ use tokio::net::UnixStream;
 const TRANSPORT_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 /// Rows requested per page during full stream enumeration (the server's cap).
 const STREAMS_PAGE_LIMIT: u32 = 1000;
+/// Groundhog follow pages target one MiB. Keep a bounded amount of additional
+/// framing space while rejecting a peer that never terminates an NDJSON line.
+const MAX_FOLLOW_LINE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Stream that carries successor lineage markers. The engine validates that a
 /// marker is the successor source's first committed event.
@@ -134,6 +139,26 @@ pub struct ReplayPage {
     pub snapshot_through_event_id: Option<String>,
 }
 
+/// Whether a followed event came from the connection's coherent initial
+/// snapshot or from a commit observed after that snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FollowPhase {
+    Snapshot,
+    Live,
+}
+
+/// One event delivered by a held replay connection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FollowEvent {
+    pub phase: FollowPhase,
+    pub event: GroundhogEvent,
+}
+
+/// A held replay stream. Dropping it closes the underlying Unix connection.
+pub type FollowStream =
+    Pin<Box<dyn Stream<Item = Result<FollowEvent, GroundhogError>> + Send + 'static>>;
+
 /// Payload of a successor lineage marker: the first event a successor source
 /// commits, naming the retired predecessor and its exact final frontier. The
 /// engine rejects the batch when the referenced retirement does not match.
@@ -226,6 +251,12 @@ pub enum GroundhogError {
     /// 503: the writer is poisoned; the server needs a supervised restart.
     /// Treat as session-fatal.
     Poisoned,
+    /// A held replay ended with Groundhog's explicit terminal record. Reopen
+    /// from `last_event_id` to resume without a gap or duplicate.
+    FollowEnded {
+        reason: String,
+        last_event_id: Option<String>,
+    },
     /// Connection, read, or write failure before a complete response.
     Transport(std::io::Error),
     /// The server sent bytes this client could not interpret.
@@ -281,6 +312,13 @@ impl std::fmt::Display for GroundhogError {
             GroundhogError::Poisoned => write!(
                 formatter,
                 "groundhog writer poisoned; server requires supervised restart"
+            ),
+            GroundhogError::FollowEnded {
+                reason,
+                last_event_id,
+            } => write!(
+                formatter,
+                "groundhog follow ended ({reason}); resume after {last_event_id:?}"
             ),
             GroundhogError::Transport(error) => write!(formatter, "transport error: {error}"),
             GroundhogError::Protocol(message) => write!(formatter, "protocol error: {message}"),
@@ -396,6 +434,28 @@ impl GroundhogClient {
         }
     }
 
+    /// GET /v1/events with `follow=true`. The returned stream includes both
+    /// the coherent initial snapshot and later live commits. An explicit
+    /// Groundhog terminal record is surfaced as [`GroundhogError::FollowEnded`];
+    /// EOF without one is a transport failure.
+    pub async fn follow(&self, query: &ReplayQuery) -> Result<FollowStream, GroundhogError> {
+        let path = follow_path(query);
+        let request = self.build_request("GET", &path, None);
+        let state = FollowState::open(&self.socket_path, &request).await?;
+        Ok(Box::pin(stream::unfold(state, |mut state| async move {
+            if state.finished {
+                return None;
+            }
+            match state.next_event().await {
+                Ok(event) => Some((Ok(event), state)),
+                Err(error) => {
+                    state.finished = true;
+                    Some((Err(error), state))
+                }
+            }
+        })))
+    }
+
     /// GET /v1/streams: full enumeration, following the documented
     /// continuation (`after=<source>/<stream>` anchored by the first page's
     /// `through` frontier) until `next_after` is null.
@@ -507,6 +567,274 @@ impl GroundhogClient {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum FollowRecord {
+    Events {
+        phase: FollowPhase,
+        events: Vec<GroundhogEvent>,
+    },
+    CaughtUp,
+    End {
+        reason: String,
+        last_event_id: Option<String>,
+    },
+}
+
+struct FollowState {
+    body: FollowBody,
+    pending: VecDeque<FollowEvent>,
+    finished: bool,
+}
+
+impl FollowState {
+    async fn open(socket_path: &PathBuf, request: &[u8]) -> Result<Self, GroundhogError> {
+        let mut stream = UnixStream::connect(socket_path)
+            .await
+            .map_err(GroundhogError::Transport)?;
+        stream
+            .write_all(request)
+            .await
+            .map_err(GroundhogError::Transport)?;
+
+        let mut raw = Vec::new();
+        let split = loop {
+            if let Some(split) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+                break split;
+            }
+            if raw.len() > 64 * 1024 {
+                return Err(GroundhogError::Protocol(
+                    "follow response head exceeds 64 KiB".to_owned(),
+                ));
+            }
+            let read = stream
+                .read_buf(&mut raw)
+                .await
+                .map_err(GroundhogError::Transport)?;
+            if read == 0 {
+                return Err(GroundhogError::Transport(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before the follow response head completed",
+                )));
+            }
+        };
+
+        let head = std::str::from_utf8(&raw[..split])
+            .map_err(|_| GroundhogError::Protocol("non-UTF-8 response head".to_owned()))?;
+        let mut lines = head.split("\r\n");
+        let status_line = lines
+            .next()
+            .ok_or_else(|| GroundhogError::Protocol("empty response head".to_owned()))?;
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .ok_or_else(|| {
+                GroundhogError::Protocol(format!("unparseable status line: {status_line}"))
+            })?;
+        let mut headers = HashMap::new();
+        for line in lines {
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
+            }
+        }
+
+        if status != 200 {
+            stream
+                .read_to_end(&mut raw)
+                .await
+                .map_err(GroundhogError::Transport)?;
+            return Err(expect_ok(parse_response(&raw)?)
+                .expect_err("non-200 follow response cannot be successful"));
+        }
+        if headers.get("content-type").map(String::as_str) != Some("application/x-ndjson") {
+            return Err(GroundhogError::Protocol(format!(
+                "follow response has unexpected content-type {:?}",
+                headers.get("content-type")
+            )));
+        }
+        let chunked = headers
+            .get("transfer-encoding")
+            .is_some_and(|value| value.eq_ignore_ascii_case("chunked"));
+        let body_start = split + 4;
+        let body = FollowBody {
+            stream,
+            wire: raw[body_start..].to_vec(),
+            decoded: Vec::new(),
+            chunked,
+            eof: false,
+        };
+        Ok(Self {
+            body,
+            pending: VecDeque::new(),
+            finished: false,
+        })
+    }
+
+    async fn next_event(&mut self) -> Result<FollowEvent, GroundhogError> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(event);
+            }
+            let Some(line) = self.body.next_line().await? else {
+                return Err(GroundhogError::Transport(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "groundhog follow reached EOF without a terminal record",
+                )));
+            };
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let record: FollowRecord = serde_json::from_slice(&line).map_err(|error| {
+                GroundhogError::Protocol(format!("unparseable follow record: {error}"))
+            })?;
+            match record {
+                FollowRecord::Events { phase, events } => {
+                    self.pending
+                        .extend(events.into_iter().map(|event| FollowEvent { phase, event }));
+                }
+                FollowRecord::CaughtUp => {}
+                FollowRecord::End {
+                    reason,
+                    last_event_id,
+                } => {
+                    return Err(GroundhogError::FollowEnded {
+                        reason,
+                        last_event_id,
+                    });
+                }
+            }
+        }
+    }
+}
+
+struct FollowBody {
+    stream: UnixStream,
+    wire: Vec<u8>,
+    decoded: Vec<u8>,
+    chunked: bool,
+    eof: bool,
+}
+
+impl FollowBody {
+    async fn next_line(&mut self) -> Result<Option<Vec<u8>>, GroundhogError> {
+        loop {
+            if let Some(newline) = self.decoded.iter().position(|byte| *byte == b'\n') {
+                let mut line: Vec<u8> = self.decoded.drain(..=newline).collect();
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                return Ok(Some(line));
+            }
+            if self.decoded.len() > MAX_FOLLOW_LINE_BYTES {
+                return Err(GroundhogError::Protocol(format!(
+                    "follow record exceeds {MAX_FOLLOW_LINE_BYTES} bytes"
+                )));
+            }
+            if self.eof {
+                if self.decoded.is_empty() {
+                    return Ok(None);
+                }
+                return Err(GroundhogError::Protocol(
+                    "follow response ended with an unterminated record".to_owned(),
+                ));
+            }
+            if self.chunked {
+                self.decode_next_chunk().await?;
+            } else {
+                self.read_close_delimited().await?;
+            }
+        }
+    }
+
+    async fn decode_next_chunk(&mut self) -> Result<(), GroundhogError> {
+        let line_end = loop {
+            if let Some(line_end) = self.wire.windows(2).position(|window| window == b"\r\n") {
+                break line_end;
+            }
+            self.read_wire().await?;
+            if self.eof {
+                return Err(GroundhogError::Protocol(
+                    "chunked follow body ended before a size line".to_owned(),
+                ));
+            }
+        };
+        let size_text = std::str::from_utf8(&self.wire[..line_end])
+            .map_err(|_| GroundhogError::Protocol("non-UTF-8 chunk size line".to_owned()))?;
+        let size_text = size_text
+            .split_once(';')
+            .map_or(size_text, |(size, _extensions)| size)
+            .trim();
+        let size = usize::from_str_radix(size_text, 16).map_err(|_| {
+            GroundhogError::Protocol(format!("unparseable chunk size: {size_text}"))
+        })?;
+        let chunk_start = line_end + 2;
+        if size == 0 {
+            self.wire.drain(..chunk_start);
+            self.eof = true;
+            return Ok(());
+        }
+        if size > MAX_FOLLOW_LINE_BYTES {
+            return Err(GroundhogError::Protocol(format!(
+                "follow chunk exceeds {MAX_FOLLOW_LINE_BYTES} bytes"
+            )));
+        }
+        let required = chunk_start
+            .checked_add(size)
+            .and_then(|end| end.checked_add(2))
+            .ok_or_else(|| GroundhogError::Protocol("follow chunk size overflow".to_owned()))?;
+        while self.wire.len() < required {
+            self.read_wire().await?;
+            if self.eof {
+                return Err(GroundhogError::Protocol(
+                    "chunked follow body ended mid-chunk".to_owned(),
+                ));
+            }
+        }
+        if &self.wire[chunk_start + size..required] != b"\r\n" {
+            return Err(GroundhogError::Protocol(
+                "follow chunk is missing its trailing CRLF".to_owned(),
+            ));
+        }
+        self.decoded
+            .extend_from_slice(&self.wire[chunk_start..chunk_start + size]);
+        self.wire.drain(..required);
+        Ok(())
+    }
+
+    async fn read_close_delimited(&mut self) -> Result<(), GroundhogError> {
+        if !self.wire.is_empty() {
+            self.decoded.append(&mut self.wire);
+            return Ok(());
+        }
+        let mut buffer = [0u8; 8192];
+        let read = self
+            .stream
+            .read(&mut buffer)
+            .await
+            .map_err(GroundhogError::Transport)?;
+        if read == 0 {
+            self.eof = true;
+        } else {
+            self.decoded.extend_from_slice(&buffer[..read]);
+        }
+        Ok(())
+    }
+
+    async fn read_wire(&mut self) -> Result<(), GroundhogError> {
+        let read = self
+            .stream
+            .read_buf(&mut self.wire)
+            .await
+            .map_err(GroundhogError::Transport)?;
+        if read == 0 {
+            self.eof = true;
+        }
+        Ok(())
+    }
+}
+
 /// GET /v1/events path with percent-encoded exact-match parameters.
 fn replay_path(query: &ReplayQuery) -> String {
     let mut params = Vec::new();
@@ -529,6 +857,12 @@ fn replay_path(query: &ReplayQuery) -> String {
         params.push(("limit", limit.to_string()));
     }
     format!("/v1/events{}", query_string(&params))
+}
+
+fn follow_path(query: &ReplayQuery) -> String {
+    let path = replay_path(query);
+    let separator = if path.contains('?') { '&' } else { '?' };
+    format!("{path}{separator}follow=true")
 }
 
 fn query_string(params: &[(&str, String)]) -> String {

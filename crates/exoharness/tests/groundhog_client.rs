@@ -1,6 +1,5 @@
 //! Integration tests for the Groundhog client against a real `groundhog`
-//! server child process. The binary comes from `GROUNDHOG_BIN` or the local
-//! ground-core debug build; when neither exists, every test self-skips.
+//! server child process. `GROUNDHOG_BIN` must name the binary to test.
 #![cfg(feature = "basic-backend")]
 
 use std::path::PathBuf;
@@ -8,21 +7,22 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use exoharness::groundhog::{
-    GroundhogClient, GroundhogError, IngestBatch, IngestEvent, IngestStatus, ReplayQuery,
-    StreamPrecondition,
+    FollowPhase, GroundhogClient, GroundhogError, IngestBatch, IngestEvent, IngestStatus,
+    ReplayQuery, StreamPrecondition,
 };
+use futures::StreamExt;
 
-const FALLBACK_BINARY: &str = "/Users/arvind/GroundCo/ground-core/target/debug/groundhog";
-
-fn groundhog_binary() -> Option<PathBuf> {
-    if let Ok(configured) = std::env::var("GROUNDHOG_BIN") {
-        let path = PathBuf::from(configured);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    let fallback = PathBuf::from(FALLBACK_BINARY);
-    fallback.exists().then_some(fallback)
+fn groundhog_binary() -> PathBuf {
+    let path = PathBuf::from(
+        std::env::var_os("GROUNDHOG_BIN")
+            .expect("GROUNDHOG_BIN must point to a compatible groundhog binary"),
+    );
+    assert!(
+        path.is_file(),
+        "GROUNDHOG_BIN does not identify a file: {}",
+        path.display()
+    );
+    path
 }
 
 /// Kills and reaps the serve child even when a test panics.
@@ -48,9 +48,8 @@ struct TestServer {
 
 impl TestServer {
     /// `groundhog init` + `groundhog serve` in a fresh short-path tempdir.
-    /// Returns None (test self-skips) only when no binary is available.
-    fn start(token: Option<&str>) -> Option<TestServer> {
-        let binary = groundhog_binary()?;
+    fn start(token: Option<&str>) -> TestServer {
+        let binary = groundhog_binary();
         let dir = tempfile::tempdir().expect("create deployment tempdir");
         let root = dir.path().join("gh");
         let init = Command::new(&binary)
@@ -102,28 +101,12 @@ impl TestServer {
             std::thread::sleep(Duration::from_millis(25));
         }
 
-        Some(TestServer {
+        TestServer {
             _child: child,
             socket,
             _dir: dir,
-        })
-    }
-}
-
-/// Self-skip when no groundhog binary is available (exo backend-absent style).
-macro_rules! require_server {
-    ($token:expr) => {
-        match TestServer::start($token) {
-            Some(server) => server,
-            None => {
-                eprintln!(
-                    "skipping groundhog client integration test: no groundhog binary \
-                     (set GROUNDHOG_BIN or build {FALLBACK_BINARY})"
-                );
-                return;
-            }
         }
-    };
+    }
 }
 
 fn event(stream: &str, record_key: &str, kind: &str, payload: serde_json::Value) -> IngestEvent {
@@ -146,8 +129,9 @@ fn batch(batch_id: &str, source: &str, events: Vec<IngestEvent>) -> IngestBatch 
 }
 
 #[tokio::test]
+#[ignore = "requires GROUNDHOG_BIN"]
 async fn groundhog_commit_receipt_frontier_chaining_and_duplicate_precedence() {
-    let server = require_server!(None);
+    let server = TestServer::start(None);
     let client = GroundhogClient::new(&server.socket);
 
     // Commit receipt fields, guarded by a "stream must not exist" precondition.
@@ -225,8 +209,9 @@ async fn groundhog_commit_receipt_frontier_chaining_and_duplicate_precedence() {
 }
 
 #[tokio::test]
+#[ignore = "requires GROUNDHOG_BIN"]
 async fn groundhog_frontier_conflict_maps_to_typed_error_and_reserves_nothing() {
-    let server = require_server!(None);
+    let server = TestServer::start(None);
     let client = GroundhogClient::new(&server.socket);
 
     let seeded = client
@@ -299,8 +284,9 @@ async fn groundhog_frontier_conflict_maps_to_typed_error_and_reserves_nothing() 
 }
 
 #[tokio::test]
+#[ignore = "requires GROUNDHOG_BIN"]
 async fn groundhog_replay_paginates_to_a_consistent_snapshot() {
-    let server = require_server!(None);
+    let server = TestServer::start(None);
     let client = GroundhogClient::new(&server.socket);
 
     for index in 0..5 {
@@ -368,8 +354,9 @@ async fn groundhog_replay_paginates_to_a_consistent_snapshot() {
 }
 
 #[tokio::test]
+#[ignore = "requires GROUNDHOG_BIN"]
 async fn groundhog_record_key_point_lookup_is_exact_and_percent_encoded() {
-    let server = require_server!(None);
+    let server = TestServer::start(None);
     let client = GroundhogClient::new(&server.socket);
     let key = "space & equals=percent% café";
 
@@ -420,8 +407,9 @@ async fn groundhog_record_key_point_lookup_is_exact_and_percent_encoded() {
 }
 
 #[tokio::test]
+#[ignore = "requires GROUNDHOG_BIN"]
 async fn groundhog_streams_enumeration_follows_the_anchored_continuation() {
-    let server = require_server!(None);
+    let server = TestServer::start(None);
     let client = GroundhogClient::new(&server.socket);
 
     // 1,001 alpha streams force a second page under the client's 1,000-row
@@ -482,8 +470,9 @@ async fn groundhog_streams_enumeration_follows_the_anchored_continuation() {
 }
 
 #[tokio::test]
+#[ignore = "requires GROUNDHOG_BIN"]
 async fn groundhog_source_charset_violation_maps_to_invalid() {
-    let server = require_server!(None);
+    let server = TestServer::start(None);
     let client = GroundhogClient::new(&server.socket);
 
     let rejected = client
@@ -501,8 +490,9 @@ async fn groundhog_source_charset_violation_maps_to_invalid() {
 }
 
 #[tokio::test]
+#[ignore = "requires GROUNDHOG_BIN"]
 async fn groundhog_bearer_token_is_required_and_sufficient_when_configured() {
-    let server = require_server!(Some("sekrit"));
+    let server = TestServer::start(Some("sekrit"));
 
     let unauthorized = GroundhogClient::new(&server.socket);
     let rejected = unauthorized
@@ -529,4 +519,61 @@ async fn groundhog_bearer_token_is_required_and_sufficient_when_configured() {
         .await
         .expect("authorized replay succeeds");
     assert_eq!(events.len(), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires GROUNDHOG_BIN"]
+async fn groundhog_follow_delivers_snapshot_then_cross_client_commit() {
+    let server = TestServer::start(None);
+    let writer = GroundhogClient::new(&server.socket);
+    writer
+        .append(batch(
+            "follow-snapshot",
+            "exo",
+            vec![event(
+                "conversation",
+                "snapshot",
+                "message",
+                serde_json::json!({"n": 1}),
+            )],
+        ))
+        .await
+        .expect("seed follow stream");
+
+    let mut followed = GroundhogClient::new(&server.socket)
+        .follow(&ReplayQuery {
+            source: Some("exo".to_owned()),
+            stream: Some("conversation".to_owned()),
+            ..Default::default()
+        })
+        .await
+        .expect("open follow");
+    let snapshot = tokio::time::timeout(Duration::from_secs(3), followed.next())
+        .await
+        .expect("snapshot timed out")
+        .expect("follow closed")
+        .expect("snapshot failed");
+    assert_eq!(snapshot.phase, FollowPhase::Snapshot);
+    assert_eq!(snapshot.event.record_key, "snapshot");
+
+    writer
+        .append(batch(
+            "follow-live",
+            "exo",
+            vec![event(
+                "conversation",
+                "live",
+                "message",
+                serde_json::json!({"n": 2}),
+            )],
+        ))
+        .await
+        .expect("append live event");
+    let live = tokio::time::timeout(Duration::from_secs(3), followed.next())
+        .await
+        .expect("live event timed out")
+        .expect("follow closed")
+        .expect("live event failed");
+    assert_eq!(live.phase, FollowPhase::Live);
+    assert_eq!(live.event.record_key, "live");
 }
