@@ -2,14 +2,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AddEventsRequest, AddEventsResult, AgentId, AgentRecord, Artifact, ArtifactVersion,
-    BeginTurnRequest, Binding, BindingId, BindingRecord, CancelSandboxProcessRequest,
-    CloseSandboxProcessInputRequest, ConversationId, ConversationRecord, CreateSandboxRequest,
-    Event, EventData, EventId, EventQuery, ForkConversationRequest, GetEventsResult,
-    GetSandboxProcessEventsResult, ListConversationsRequest, ListConversationsResult,
-    NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest, SandboxId,
-    SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId,
-    SecretMetadata, SessionId, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnId,
-    TurnRecord, WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
+    CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, ConversationId,
+    ConversationRecord, CreateSandboxRequest, Event, EventData, EventId, EventQuery,
+    ForkConversationRequest, GetEventsResult, GetSandboxProcessEventsResult,
+    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
+    PutSecretRequest, ReadArtifactRequest, SandboxAttachment, SandboxId, SandboxProcessEventQuery,
+    SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId, SecretMetadata, SessionId,
+    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnId, TurnRecord,
+    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,6 +127,14 @@ pub enum Request {
     CreateSandbox {
         scope: SandboxScope,
         request: CreateSandboxRequest,
+    },
+    AttachSandbox {
+        scope: SandboxScope,
+        request: AttachSandboxRequest,
+    },
+    DetachSandbox {
+        scope: SandboxScope,
+        sandbox_id: SandboxId,
     },
     SnapshotSandbox {
         scope: SandboxScope,
@@ -304,6 +313,8 @@ impl Request {
             Self::AgentReadArtifact { .. } => "agent_read_artifact",
             Self::AgentWriteArtifact { .. } => "agent_write_artifact",
             Self::CreateSandbox { .. } => "create_sandbox",
+            Self::AttachSandbox { .. } => "attach_sandbox",
+            Self::DetachSandbox { .. } => "detach_sandbox",
             Self::SnapshotSandbox { .. } => "snapshot_sandbox",
             Self::StartSandbox { .. } => "start_sandbox",
             Self::StopSandbox { .. } => "stop_sandbox",
@@ -384,6 +395,9 @@ pub enum Response {
     SandboxId {
         sandbox_id: SandboxId,
     },
+    SandboxAttachment {
+        attachment: SandboxAttachment,
+    },
     SnapshotId {
         snapshot_id: SnapshotId,
     },
@@ -439,6 +453,7 @@ impl Response {
             Self::Artifact { .. } => "artifact",
             Self::ArtifactVersion { .. } => "artifact_version",
             Self::SandboxId { .. } => "sandbox_id",
+            Self::SandboxAttachment { .. } => "sandbox_attachment",
             Self::SnapshotId { .. } => "snapshot_id",
             Self::SandboxProcess { .. } => "sandbox_process",
             Self::SandboxProcessEvents { .. } => "sandbox_process_events",

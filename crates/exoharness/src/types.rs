@@ -42,6 +42,8 @@ pub trait SnapshotHandle: Send + Sync {
 #[async_trait]
 pub trait SandboxHandle: SnapshotHandle {
     async fn create_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId>;
+    async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId>;
+    async fn detach_sandbox(&self, id: SandboxId) -> Result<SandboxAttachment>;
     async fn stop_sandbox(&self, id: SandboxId) -> Result<()>;
     async fn start_sandbox_process(
         &self,
@@ -234,6 +236,8 @@ impl EventKind {
     pub const SANDBOX_CREATED: EventKind = EventKind(Cow::Borrowed("sandbox_created"));
     pub const SANDBOX_STARTED: EventKind = EventKind(Cow::Borrowed("sandbox_started"));
     pub const SANDBOX_STOPPED: EventKind = EventKind(Cow::Borrowed("sandbox_stopped"));
+    pub const SANDBOX_ATTACHED: EventKind = EventKind(Cow::Borrowed("sandbox_attached"));
+    pub const SANDBOX_DETACHED: EventKind = EventKind(Cow::Borrowed("sandbox_detached"));
     pub const SANDBOX_SNAPSHOTTED: EventKind = EventKind(Cow::Borrowed("sandbox_snapshotted"));
     pub const SANDBOX_PROCESS_STARTED: EventKind =
         EventKind(Cow::Borrowed("sandbox_process_started"));
@@ -388,6 +392,15 @@ pub enum EventData {
     SandboxStopped {
         sandbox_id: SandboxId,
     },
+    SandboxAttached {
+        sandbox_id: SandboxId,
+        attachment: SandboxAttachment,
+        default_workdir: String,
+    },
+    SandboxDetached {
+        sandbox_id: SandboxId,
+        attachment: SandboxAttachment,
+    },
     SandboxSnapshotted {
         sandbox_id: SandboxId,
         snapshot_id: SnapshotId,
@@ -445,6 +458,8 @@ impl EventData {
             Self::SandboxCreated { .. } => EventKind::SANDBOX_CREATED,
             Self::SandboxStarted { .. } => EventKind::SANDBOX_STARTED,
             Self::SandboxStopped { .. } => EventKind::SANDBOX_STOPPED,
+            Self::SandboxAttached { .. } => EventKind::SANDBOX_ATTACHED,
+            Self::SandboxDetached { .. } => EventKind::SANDBOX_DETACHED,
             Self::SandboxSnapshotted { .. } => EventKind::SANDBOX_SNAPSHOTTED,
             Self::SandboxProcessStarted { .. } => EventKind::SANDBOX_PROCESS_STARTED,
             Self::SandboxProcessStateUpdated { .. } => EventKind::SANDBOX_PROCESS_STATE_UPDATED,
@@ -522,6 +537,26 @@ pub struct CreateSandboxRequest {
     pub durable_file_systems: Option<Vec<DurableFileSystem>>,
     pub enable_networking: Option<bool>,
     pub idle_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachSandboxRequest {
+    pub attachment: SandboxAttachment,
+    pub default_workdir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SandboxAttachment {
+    DockerContainer { container_id: String },
+}
+
+impl SandboxAttachment {
+    pub fn provider(&self) -> SandboxProvider {
+        match self {
+            Self::DockerContainer { .. } => SandboxProvider::Docker,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]

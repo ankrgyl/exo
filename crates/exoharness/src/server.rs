@@ -7,11 +7,11 @@ use crate::protocol::{
     ClientMessage, ConversationHandleInfo, Request, Response, SandboxScope, ServerMessage,
 };
 use crate::{
-    AgentHandle, AgentId, CancelSandboxProcessRequest, CloseSandboxProcessInputRequest,
-    ConversationHandle, ConversationId, CreateSandboxRequest, ExoHarness,
-    GetSandboxProcessEventsResult, ListConversationsResult, Result, SandboxId,
-    SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, SessionId, SnapshotId,
-    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord,
+    AgentHandle, AgentId, AttachSandboxRequest, CancelSandboxProcessRequest,
+    CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, CreateSandboxRequest,
+    ExoHarness, GetSandboxProcessEventsResult, ListConversationsResult, Result, SandboxAttachment,
+    SandboxId, SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, SessionId,
+    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord,
     WaitSandboxProcessRequest, WriteSandboxProcessInputRequest,
 };
 
@@ -139,6 +139,12 @@ impl ExoHarnessServer {
             }
             Request::CreateSandbox { scope, request } => Ok(Response::SandboxId {
                 sandbox_id: self.create_sandbox(scope, request).await?,
+            }),
+            Request::AttachSandbox { scope, request } => Ok(Response::SandboxId {
+                sandbox_id: self.attach_sandbox(scope, request).await?,
+            }),
+            Request::DetachSandbox { scope, sandbox_id } => Ok(Response::SandboxAttachment {
+                attachment: self.detach_sandbox(scope, sandbox_id).await?,
             }),
             Request::SnapshotSandbox { scope, sandbox_id } => Ok(Response::SnapshotId {
                 snapshot_id: self.snapshot_sandbox(scope, sandbox_id).await?,
@@ -484,6 +490,60 @@ impl ExoHarnessServer {
             }
             SandboxScope::Turn { .. } => {
                 Err(anyhow!("create_sandbox is not supported on a turn scope"))
+            }
+        }
+    }
+
+    async fn attach_sandbox(
+        &self,
+        scope: SandboxScope,
+        request: AttachSandboxRequest,
+    ) -> Result<SandboxId> {
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id)
+                    .await?
+                    .attach_sandbox(request)
+                    .await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .attach_sandbox(request)
+                    .await
+            }
+            SandboxScope::Turn { .. } => {
+                Err(anyhow!("attach_sandbox is not supported on a turn scope"))
+            }
+        }
+    }
+
+    async fn detach_sandbox(
+        &self,
+        scope: SandboxScope,
+        sandbox_id: SandboxId,
+    ) -> Result<SandboxAttachment> {
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id)
+                    .await?
+                    .detach_sandbox(sandbox_id)
+                    .await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .detach_sandbox(sandbox_id)
+                    .await
+            }
+            SandboxScope::Turn { .. } => {
+                Err(anyhow!("detach_sandbox is not supported on a turn scope"))
             }
         }
     }

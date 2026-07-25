@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
+use crate::SandboxAttachment;
 use crate::sandbox::{
     DEFAULT_SANDBOX_IMAGE, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
     SandboxCommandOutput, SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotKind,
@@ -256,6 +257,14 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
         }))
     }
 
+    async fn attach(
+        &self,
+        _request: SandboxRequest,
+        _attachment: SandboxAttachment,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        bail!("E2B sandbox backend does not support external attachments")
+    }
+
     async fn acquire_from_snapshot(
         &self,
         request: SandboxRequest,
@@ -360,6 +369,10 @@ impl ManagedSandboxHandle for E2bSandboxHandle {
 
     async fn stop(&self) -> Result<()> {
         pause_via_backend(&self.backend, &self.sandbox_id).await
+    }
+
+    async fn detach(&self) -> Result<SandboxAttachment> {
+        bail!("E2B sandboxes cannot be detached")
     }
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {

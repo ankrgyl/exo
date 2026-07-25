@@ -19,6 +19,7 @@ use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
+use crate::SandboxAttachment;
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput,
     SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotPayload, WARM_SANDBOX_KEY_LABEL,
@@ -171,6 +172,14 @@ impl ManagedSandboxBackend for VercelSandboxBackend {
         }))
     }
 
+    async fn attach(
+        &self,
+        _request: SandboxRequest,
+        _attachment: SandboxAttachment,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        bail!("Vercel sandbox backend does not support external attachments")
+    }
+
     async fn acquire_from_snapshot(
         &self,
         _request: SandboxRequest,
@@ -229,6 +238,10 @@ impl ManagedSandboxHandle for VercelSandboxHandle {
         stop_session(&self.backend, &self.session_id)
             .await
             .with_context(|| format!("stopping Vercel sandbox {}", self.sandbox_name))
+    }
+
+    async fn detach(&self) -> Result<SandboxAttachment> {
+        bail!("Vercel sandboxes cannot be detached")
     }
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {

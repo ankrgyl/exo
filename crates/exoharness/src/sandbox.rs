@@ -20,7 +20,7 @@ use tokio::time;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
-use crate::DurableFileSystem;
+use crate::{DurableFileSystem, SandboxAttachment};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SandboxKey {
@@ -162,6 +162,10 @@ pub trait ManagedSandboxHandle: Send + Sync {
 
     async fn stop(&self) -> Result<()>;
 
+    /// Relinquish lifecycle ownership without stopping the sandbox and return
+    /// the descriptor required to attach to it elsewhere.
+    async fn detach(&self) -> Result<SandboxAttachment>;
+
     /// Capture the sandbox's current state as an opaque blob. Returns an
     /// error if this backend doesn't (yet) support snapshotting.
     async fn snapshot(&self) -> Result<SnapshotPayload>;
@@ -170,6 +174,11 @@ pub trait ManagedSandboxHandle: Send + Sync {
 #[async_trait]
 pub trait ManagedSandboxBackend: Send + Sync {
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>>;
+    async fn attach(
+        &self,
+        request: SandboxRequest,
+        attachment: SandboxAttachment,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>>;
 
     /// Acquire a sandbox initialised from a previously-captured snapshot.
     /// The request is honoured for mounts, network, lifecycle, etc., but the
@@ -264,6 +273,37 @@ struct DockerInspectState {
 struct DockerInspectConfiguration {
     #[serde(rename = "Labels", default)]
     labels: HashMap<String, String>,
+}
+
+async fn inspect_running_docker_container(
+    container_bin: &Path,
+    container_id: &str,
+) -> Result<String> {
+    let container_id = container_id.trim();
+    if container_id.is_empty() {
+        bail!("Docker container id must not be empty");
+    }
+    let output = run_container_admin_command(
+        container_bin,
+        WARM_SANDBOX_CLEANUP_TIMEOUT,
+        ["inspect", container_id],
+    )
+    .await
+    .with_context(|| missing_container_cli_message(ContainerCliFlavor::Docker, container_bin))?;
+    if !output.status.success() {
+        bail!(
+            "failed to inspect Docker container {container_id}: {}",
+            render_command_error(&output.stderr)
+        );
+    }
+    let mut containers = serde_json::from_slice::<Vec<DockerInspectItem>>(&output.stdout)?;
+    let container = containers
+        .pop()
+        .ok_or_else(|| anyhow!("Docker inspect returned no container for {container_id}"))?;
+    if container.state.status.as_deref() != Some("running") {
+        bail!("Docker container {container_id} is not running");
+    }
+    Ok(container.id)
 }
 
 #[derive(Debug)]
@@ -519,6 +559,25 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
         }))
     }
 
+    async fn attach(
+        &self,
+        request: SandboxRequest,
+        attachment: SandboxAttachment,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        if self.cli != ContainerCliFlavor::Docker {
+            bail!("Docker container attachments require the Docker sandbox provider");
+        }
+        let SandboxAttachment::DockerContainer { container_id } = attachment;
+        let container_id =
+            inspect_running_docker_container(&self.container_bin, &container_id).await?;
+        Ok(Arc::new(BorrowedDockerSandboxHandle {
+            id: format!("borrowed-docker:{container_id}"),
+            container_bin: self.container_bin.clone(),
+            container_id,
+            spec: request.spec,
+        }))
+    }
+
     async fn acquire_from_snapshot(
         &self,
         request: SandboxRequest,
@@ -588,6 +647,44 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
     }
 }
 
+struct BorrowedDockerSandboxHandle {
+    id: String,
+    container_bin: PathBuf,
+    container_id: String,
+    spec: SandboxSpec,
+}
+
+#[async_trait]
+impl ManagedSandboxHandle for BorrowedDockerSandboxHandle {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn exec(&self, command: &SandboxCommand) -> Result<SandboxCommandOutput> {
+        inspect_running_docker_container(&self.container_bin, &self.container_id).await?;
+        exec_warm(&self.container_bin, &self.container_id, &self.spec, command).await
+    }
+
+    async fn start_process(&self, command: &SandboxCommand) -> Result<crate::SandboxProcessParts> {
+        inspect_running_docker_container(&self.container_bin, &self.container_id).await?;
+        start_warm_process(&self.container_bin, &self.container_id, &self.spec, command).await
+    }
+
+    async fn stop(&self) -> Result<()> {
+        bail!("borrowed Docker containers must be detached, not stopped")
+    }
+
+    async fn detach(&self) -> Result<SandboxAttachment> {
+        Ok(SandboxAttachment::DockerContainer {
+            container_id: self.container_id.clone(),
+        })
+    }
+
+    async fn snapshot(&self) -> Result<SnapshotPayload> {
+        bail!("borrowed Docker containers cannot be snapshotted")
+    }
+}
+
 struct OneShotSandboxHandle {
     id: String,
     container_bin: PathBuf,
@@ -622,6 +719,10 @@ impl ManagedSandboxHandle for OneShotSandboxHandle {
 
     async fn stop(&self) -> Result<()> {
         Ok(())
+    }
+
+    async fn detach(&self) -> Result<SandboxAttachment> {
+        bail!("one-shot sandboxes cannot be detached")
     }
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {
@@ -690,6 +791,26 @@ impl ManagedSandboxHandle for WarmSandboxHandle {
         }
     }
 
+    async fn detach(&self) -> Result<SandboxAttachment> {
+        if self.cli != ContainerCliFlavor::Docker {
+            bail!("detaching an Exo-created sandbox is only supported by Docker");
+        }
+        let name = ensure_warm_sandbox_ready(
+            &self.container_bin,
+            self.cli,
+            &self.request,
+            &self.warm_sandboxes,
+        )
+        .await?;
+        let container_id = inspect_running_docker_container(&self.container_bin, &name).await?;
+        let mut warm_sandboxes = self.warm_sandboxes.lock().await;
+        let entry = warm_sandboxes
+            .get_mut(&self.request.key)
+            .ok_or_else(|| anyhow!("warm sandbox disappeared while detaching"))?;
+        entry.owned = false;
+        Ok(SandboxAttachment::DockerContainer { container_id })
+    }
+
     async fn snapshot(&self) -> Result<SnapshotPayload> {
         match self.cli {
             ContainerCliFlavor::Docker => {
@@ -737,6 +858,14 @@ impl ManagedSandboxBackend for LocalProcessSandboxBackend {
             id: format!("local:{}", request.key),
             request,
         }))
+    }
+
+    async fn attach(
+        &self,
+        _request: SandboxRequest,
+        _attachment: SandboxAttachment,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        bail!("local-process sandbox backend does not support attachments")
     }
 
     async fn acquire_from_snapshot(
@@ -797,6 +926,10 @@ impl ManagedSandboxHandle for LocalProcessSandboxHandle {
 
     async fn stop(&self) -> Result<()> {
         Ok(())
+    }
+
+    async fn detach(&self) -> Result<SandboxAttachment> {
+        bail!("local-process sandboxes cannot be detached")
     }
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {
@@ -1297,7 +1430,10 @@ async fn exec_warm(
         .unwrap_or_else(|| spec.default_workdir.clone());
 
     let mut process = Command::new(container_bin);
-    process.arg("exec").arg("--workdir").arg(&cwd);
+    process.arg("exec");
+    if !cwd.is_empty() {
+        process.arg("--workdir").arg(&cwd);
+    }
     configure_env_args(&mut process, &command.env);
     process.arg(name);
     process.args(&command.argv);
@@ -1322,11 +1458,10 @@ async fn start_warm_process(
         .unwrap_or_else(|| spec.default_workdir.clone());
 
     let mut process = Command::new(container_bin);
-    process
-        .arg("exec")
-        .arg("--interactive")
-        .arg("--workdir")
-        .arg(&cwd);
+    process.arg("exec").arg("--interactive");
+    if !cwd.is_empty() {
+        process.arg("--workdir").arg(&cwd);
+    }
     configure_env_args(&mut process, &command.env);
     process.arg(name);
     process.args(&command.argv);
@@ -2180,5 +2315,101 @@ esac
         assert!(message.contains("apple-container sandbox backend requires"));
         assert!(message.contains("install Apple container CLI"));
         assert!(message.contains("--sandbox-backend local-process"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn borrowed_docker_sandbox_execs_without_taking_container_ownership() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let script_path = temp_dir.path().join("docker");
+        let args_path = temp_dir.path().join("args");
+        fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+for arg in "$@"; do
+  printf '%s\n' "$arg" >> '{}'
+done
+printf '%s\n' '---' >> '{}'
+case "$1" in
+  inspect)
+    printf '%s\n' '[{{"Id":"canonical-id","Config":{{"Image":"task-image","WorkingDir":"/task","Labels":{{}}}},"State":{{"Status":"running"}}}}]'
+    ;;
+  exec)
+    printf 'borrowed output'
+    ;;
+esac
+"#,
+                args_path.display(),
+                args_path.display(),
+            ),
+        )
+        .expect("write fake docker script");
+        let mut permissions = fs::metadata(&script_path)
+            .expect("fake docker metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("chmod fake docker");
+
+        let backend = CliContainerSandboxBackend {
+            cli: ContainerCliFlavor::Docker,
+            container_bin: script_path,
+            durable_file_system_root: None,
+            system_started: Mutex::new(false),
+            network_created: Mutex::new(false),
+            warm_sandboxes: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let request = SandboxRequest {
+            key: SandboxKey::ConversationSandbox {
+                conversation_id: "conversation".to_string(),
+                sandbox_id: "sandbox".to_string(),
+            },
+            spec: SandboxSpec {
+                image: "task-image".to_string(),
+                mounts: Vec::new(),
+                durable_file_systems: Vec::new(),
+                network: SandboxNetworkPolicy::Enabled,
+                default_workdir: "/task".to_string(),
+            },
+            lifecycle: SandboxLifecycleConfig::default(),
+            provider_state: None,
+        };
+        let handle = backend
+            .attach(
+                request,
+                SandboxAttachment::DockerContainer {
+                    container_id: "harbor-task".to_string(),
+                },
+            )
+            .await
+            .expect("attach container");
+        let output = handle
+            .exec(&SandboxCommand {
+                argv: vec!["sh".to_string(), "-lc".to_string(), "pwd".to_string()],
+                env: HashMap::new(),
+                display_argv: None,
+                cwd: None,
+                timeout: None,
+            })
+            .await
+            .expect("exec in borrowed container");
+        assert_eq!(output.stdout, "borrowed output");
+        assert!(handle.stop().await.is_err());
+        assert_eq!(
+            handle.detach().await.expect("detach borrowed container"),
+            SandboxAttachment::DockerContainer {
+                container_id: "canonical-id".to_string(),
+            }
+        );
+
+        let args = fs::read_to_string(&args_path).expect("read fake docker args");
+        assert!(args.contains("inspect\nharbor-task\n---"));
+        assert!(args.contains("exec\n--workdir\n/task\ncanonical-id"));
+        assert!(!args.lines().any(|arg| arg == "rm"));
+        assert!(!args.lines().any(|arg| arg == "stop"));
+        assert!(!args.lines().any(|arg| arg == "kill"));
     }
 }

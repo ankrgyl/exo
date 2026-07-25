@@ -8,6 +8,7 @@ use aws_sdk_bedrockagentcore::Client;
 use aws_sdk_bedrockagentcore::primitives::Blob;
 use serde::{Deserialize, Serialize};
 
+use crate::SandboxAttachment;
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput,
     SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotPayload, sandbox_spec_hash,
@@ -108,6 +109,14 @@ impl ManagedSandboxBackend for AwsAgentCoreSandboxBackend {
         }))
     }
 
+    async fn attach(
+        &self,
+        _request: SandboxRequest,
+        _attachment: SandboxAttachment,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        bail!("AWS AgentCore sandbox backend does not support external attachments")
+    }
+
     async fn acquire_from_snapshot(
         &self,
         _request: SandboxRequest,
@@ -181,6 +190,10 @@ impl ManagedSandboxHandle for AwsAgentCoreSandboxHandle {
             )
         })?;
         Ok(())
+    }
+
+    async fn detach(&self) -> Result<SandboxAttachment> {
+        bail!("AWS AgentCore sandboxes cannot be detached")
     }
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {

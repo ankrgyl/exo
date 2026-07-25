@@ -9,8 +9,8 @@ use crate::adapter::tools::{
 use crate::agent_sandbox::{current_agent_sandbox, ensure_agent_sandbox};
 use crate::conversation_events::execute_list_conversation_events_tool;
 use crate::conversation_sandbox::{
-    agent_sandbox_spec, conversation_sandbox_spec, conversation_sandboxes,
-    ensure_conversation_sandbox,
+    agent_sandbox_spec, attached_conversation_sandbox, conversation_sandbox_spec,
+    conversation_sandboxes, ensure_conversation_sandbox,
 };
 use crate::scheduler_store::SchedulerStore;
 use crate::scheduler_types::{
@@ -21,9 +21,9 @@ use crate::{SandboxScope, effective_sandbox_scope};
 use async_trait::async_trait;
 use exoharness::{
     AgentHandle, Artifact, ArtifactVersion, ConversationHandle, CreateSandboxRequest, EventData,
-    EventKind, EventQuery, EventQueryDirection, FileSystemMount, FileSystemMountMode,
-    ReadArtifactRequest, Result, RunInSandboxRequest, SandboxProcess, SandboxProvider, SnapshotId,
-    StartSandboxRequest, ToolRequest, ToolResult, TurnHandle, WriteArtifactRequest,
+    FileSystemMount, FileSystemMountMode, ReadArtifactRequest, Result, RunInSandboxRequest,
+    SandboxProcess, SandboxProvider, SnapshotId, StartSandboxRequest, ToolRequest, ToolResult,
+    TurnHandle, WriteArtifactRequest,
 };
 use futures::io::AsyncReadExt;
 use serde::{Deserialize, Serialize};
@@ -94,6 +94,10 @@ impl ToolRuntime for ExoToolRuntime {
         agent_config: &AgentConfig,
         config: &ConversationConfig,
     ) -> Result<()> {
+        if attached_conversation_sandbox(conversation).await?.is_some() {
+            ensure_conversation_sandbox(conversation, agent_config, config).await?;
+            return Ok(());
+        }
         match effective_sandbox_scope(agent_config, config) {
             SandboxScope::Agent => {
                 ensure_agent_sandbox(agent, agent_config).await?;
@@ -871,7 +875,9 @@ async fn execute_exo_shell_tool(
     config: &ConversationConfig,
     request: &ToolRequest,
 ) -> Result<ToolResult> {
-    if effective_sandbox_scope(agent_config, config) == SandboxScope::Conversation {
+    if attached_conversation_sandbox(conversation).await?.is_some()
+        || effective_sandbox_scope(agent_config, config) == SandboxScope::Conversation
+    {
         return execute_shell_tool(conversation, agent_config, config, request).await;
     }
 
@@ -897,6 +903,9 @@ pub(crate) async fn ensure_shell_sandbox(
     agent_config: &AgentConfig,
     config: &ConversationConfig,
 ) -> Result<String> {
+    if let Some(sandbox_id) = attached_conversation_sandbox(conversation).await? {
+        return Ok(sandbox_id);
+    }
     let desired_default_workdir = config
         .mounts
         .first()
@@ -989,52 +998,23 @@ async fn latest_shell_sandbox(
     conversation: &dyn ConversationHandle,
     desired_provider: SandboxProvider,
 ) -> Result<Option<ShellSandboxInfo>> {
-    let events = conversation
-        .get_events(Some(EventQuery {
-            cursor: None,
-            direction: Some(EventQueryDirection::Desc),
-            limit: Some(50),
-            session_id: None,
-            turn_id: None,
-            types: Some(vec![EventKind::SANDBOX_CREATED]),
-        }))
+    let Some(sandbox) = conversation_sandboxes(conversation)
         .await?
-        .events;
-
-    let Some(event) = events.into_iter().next() else {
+        .into_iter()
+        .rev()
+        .find(|sandbox| sandbox.provider == desired_provider)
+    else {
         return Ok(None);
     };
-    match event.data {
-        EventData::SandboxCreated {
-            sandbox_id,
-            provider,
-            image,
-            default_workdir,
-            file_system_mounts,
-            durable_file_systems,
-            enable_networking,
-            idle_seconds,
-            ..
-        } => {
-            if provider != desired_provider {
-                return Ok(None);
-            }
-            Ok(Some(ShellSandboxInfo {
-                id: sandbox_id,
-                image,
-                default_workdir,
-                file_system_mounts,
-                durable_file_systems,
-                enable_networking,
-                idle_seconds,
-            }))
-        }
-        other => Err(anyhow::anyhow!(
-            "type-filtered query for {} returned unexpected variant {}",
-            EventKind::SANDBOX_CREATED.as_str(),
-            other.kind().as_str(),
-        )),
-    }
+    Ok(Some(ShellSandboxInfo {
+        id: sandbox.id,
+        image: sandbox.image,
+        default_workdir: sandbox.default_workdir,
+        file_system_mounts: sandbox.file_system_mounts,
+        durable_file_systems: sandbox.durable_file_systems,
+        enable_networking: sandbox.enable_networking,
+        idle_seconds: sandbox.idle_seconds,
+    }))
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{AgentConfig, ConversationConfig};
@@ -52,13 +52,116 @@ pub(crate) async fn ensure_conversation_sandbox(
     let _guard = sandbox_lock.lock().await;
     let spec = conversation_sandbox_spec(agent_config, config);
 
-    for sandbox in conversation_sandboxes(conversation).await? {
-        if sandbox.matches_spec(&spec) {
-            return Ok(sandbox.id);
+    for candidate in conversation_sandbox_candidates(conversation)
+        .await?
+        .into_iter()
+        .rev()
+    {
+        match candidate {
+            ConversationSandboxCandidate::Attached { id } => return Ok(id),
+            ConversationSandboxCandidate::Created(sandbox) if sandbox.matches_spec(&spec) => {
+                return Ok(sandbox.id);
+            }
+            ConversationSandboxCandidate::Created(_) => {}
         }
     }
 
     create_conversation_sandbox(conversation, agent_config, config).await
+}
+
+pub async fn attached_conversation_sandbox(
+    conversation: &dyn ConversationHandle,
+) -> Result<Option<String>> {
+    Ok(
+        match conversation_sandbox_candidates(conversation)
+            .await?
+            .into_iter()
+            .next_back()
+        {
+            Some(ConversationSandboxCandidate::Attached { id }) => Some(id),
+            Some(ConversationSandboxCandidate::Created(_)) | None => None,
+        },
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConversationSandboxCandidate {
+    Created(ConversationSandboxInfo),
+    Attached { id: String },
+}
+
+impl ConversationSandboxCandidate {
+    fn id(&self) -> &str {
+        match self {
+            Self::Created(sandbox) => &sandbox.id,
+            Self::Attached { id } => id,
+        }
+    }
+}
+
+async fn conversation_sandbox_candidates(
+    conversation: &dyn ConversationHandle,
+) -> Result<Vec<ConversationSandboxCandidate>> {
+    let events = conversation
+        .get_events(Some(EventQuery {
+            cursor: None,
+            direction: Some(EventQueryDirection::Asc),
+            limit: None,
+            session_id: None,
+            turn_id: None,
+            types: Some(vec![
+                EventKind::SANDBOX_CREATED,
+                EventKind::SANDBOX_STARTED,
+                EventKind::SANDBOX_STOPPED,
+                EventKind::SANDBOX_ATTACHED,
+                EventKind::SANDBOX_DETACHED,
+            ]),
+        }))
+        .await?
+        .events;
+    let mut candidates = Vec::new();
+    let mut inactive = HashSet::new();
+    for event in events {
+        match event.data {
+            EventData::SandboxCreated {
+                sandbox_id,
+                provider,
+                image,
+                default_workdir,
+                file_system_mounts,
+                durable_file_systems,
+                enable_networking,
+                idle_seconds,
+                ..
+            } => {
+                candidates.push(ConversationSandboxCandidate::Created(
+                    ConversationSandboxInfo {
+                        id: sandbox_id,
+                        provider,
+                        image,
+                        default_workdir,
+                        file_system_mounts,
+                        durable_file_systems,
+                        enable_networking,
+                        idle_seconds,
+                    },
+                ));
+            }
+            EventData::SandboxAttached { sandbox_id, .. } => {
+                candidates.push(ConversationSandboxCandidate::Attached { id: sandbox_id });
+            }
+            EventData::SandboxStarted { sandbox_id, .. } => {
+                inactive.remove(&sandbox_id);
+            }
+            EventData::SandboxStopped { sandbox_id }
+            | EventData::SandboxDetached { sandbox_id, .. } => {
+                inactive.insert(sandbox_id);
+            }
+            _ => {}
+        }
+    }
+    candidates.retain(|candidate| !inactive.contains(candidate.id()));
+    Ok(candidates)
 }
 
 pub(crate) async fn create_conversation_sandbox(
@@ -84,46 +187,14 @@ pub(crate) async fn create_conversation_sandbox(
 pub(crate) async fn conversation_sandboxes(
     conversation: &dyn ConversationHandle,
 ) -> Result<Vec<ConversationSandboxInfo>> {
-    let events = conversation
-        .get_events(Some(EventQuery {
-            cursor: None,
-            direction: Some(EventQueryDirection::Asc),
-            limit: None,
-            session_id: None,
-            turn_id: None,
-            types: Some(vec![EventKind::SANDBOX_CREATED]),
-        }))
+    Ok(conversation_sandbox_candidates(conversation)
         .await?
-        .events;
-
-    let mut sandboxes = Vec::new();
-    for event in events {
-        if let EventData::SandboxCreated {
-            sandbox_id,
-            provider,
-            image,
-            default_workdir,
-            file_system_mounts,
-            durable_file_systems,
-            enable_networking,
-            idle_seconds,
-            ..
-        } = event.data
-        {
-            sandboxes.push(ConversationSandboxInfo {
-                id: sandbox_id,
-                provider,
-                image,
-                default_workdir,
-                file_system_mounts,
-                durable_file_systems,
-                enable_networking,
-                idle_seconds,
-            });
-        }
-    }
-
-    Ok(sandboxes)
+        .into_iter()
+        .filter_map(|candidate| match candidate {
+            ConversationSandboxCandidate::Created(sandbox) => Some(sandbox),
+            ConversationSandboxCandidate::Attached { .. } => None,
+        })
+        .collect())
 }
 
 // The agent-scoped sandbox is shared by every conversation, so its spec must

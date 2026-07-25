@@ -4,16 +4,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use exoharness::{
-    AddEventsRequest, AddEventsResult, AgentHandle, AgentId, Artifact, ArtifactVersion, Binding,
-    BindingId, BindingRecord, CancelSandboxProcessRequest, CloseSandboxProcessInputRequest,
-    ConversationHandle, ConversationId, CreateSandboxRequest, Event, EventData, EventId, EventKind,
-    EventStream, ExoHarness, ForkConversationRequest, GetEventsResult, ListConversationsRequest,
-    ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
-    ReadArtifactRequest, Result, RunInSandboxRequest, SandboxHandle, SandboxId, SandboxProcess,
-    SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId,
-    SecretMetadata, SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest,
-    TurnHandle, TurnRecord, Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest,
-    WriteSandboxProcessInputRequest,
+    AddEventsRequest, AddEventsResult, AgentHandle, AgentId, Artifact, ArtifactVersion,
+    AttachSandboxRequest, Binding, BindingId, BindingRecord, CancelSandboxProcessRequest,
+    CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, CreateSandboxRequest,
+    Event, EventData, EventId, EventKind, EventStream, ExoHarness, ForkConversationRequest,
+    GetEventsResult, ListConversationsRequest, ListConversationsResult, NewAgentRequest,
+    NewConversationRequest, PutSecretRequest, ReadArtifactRequest, Result, RunInSandboxRequest,
+    SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery,
+    SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId, SecretMetadata, SnapshotHandle,
+    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnRecord, Uuid7,
+    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -39,6 +39,7 @@ struct LocalSandboxState {
     conversations: Mutex<HashMap<ConversationId, Arc<dyn ConversationHandle>>>,
     conversation_init: Mutex<()>,
     sandboxes: Mutex<HashMap<SandboxId, SandboxId>>,
+    detached_sandboxes: Mutex<HashMap<SandboxId, SandboxAttachment>>,
     force_local: bool,
 }
 
@@ -60,6 +61,7 @@ impl LocalSandboxExoHarness {
                 conversations: Mutex::new(HashMap::new()),
                 conversation_init: Mutex::new(()),
                 sandboxes: Mutex::new(HashMap::new()),
+                detached_sandboxes: Mutex::new(HashMap::new()),
                 force_local,
             }),
         }
@@ -312,6 +314,26 @@ impl SandboxHandle for LocalSandboxAgent {
         let remote_id = local_id.clone();
         self.map_local_sandbox(remote_id.clone(), local_id).await;
         Ok(remote_id)
+    }
+
+    async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {
+        self.remote.attach_sandbox(request).await
+    }
+
+    async fn detach_sandbox(&self, id: SandboxId) -> Result<SandboxAttachment> {
+        if let Some(attachment) = self.state.detached_sandboxes.lock().await.get(&id).cloned() {
+            return Ok(attachment);
+        }
+        let Some(local_id) = self.local_sandbox_id(&id).await? else {
+            return self.remote.detach_sandbox(id).await;
+        };
+        let attachment = self.local_agent().await?.detach_sandbox(local_id).await?;
+        self.state
+            .detached_sandboxes
+            .lock()
+            .await
+            .insert(id, attachment.clone());
+        Ok(attachment)
     }
 
     async fn stop_sandbox(&self, id: SandboxId) -> Result<()> {
@@ -829,6 +851,35 @@ impl SandboxHandle for LocalSandboxConversation {
         ])
         .await?;
         Ok(remote_id)
+    }
+
+    async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {
+        self.remote.attach_sandbox(request).await
+    }
+
+    async fn detach_sandbox(&self, id: SandboxId) -> Result<SandboxAttachment> {
+        if let Some(attachment) = self.state.detached_sandboxes.lock().await.get(&id).cloned() {
+            return Ok(attachment);
+        }
+        let Some(local_id) = self.local_sandbox_id(&id).await? else {
+            return self.remote.detach_sandbox(id).await;
+        };
+        let attachment = self
+            .local_conversation()
+            .await?
+            .detach_sandbox(local_id)
+            .await?;
+        self.append_remote_sandbox_events(vec![EventData::SandboxDetached {
+            sandbox_id: id.clone(),
+            attachment: attachment.clone(),
+        }])
+        .await?;
+        self.state
+            .detached_sandboxes
+            .lock()
+            .await
+            .insert(id, attachment.clone());
+        Ok(attachment)
     }
 
     async fn stop_sandbox(&self, id: SandboxId) -> Result<()> {

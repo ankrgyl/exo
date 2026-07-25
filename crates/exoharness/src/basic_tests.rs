@@ -23,8 +23,8 @@ use crate::{
     BoxAsyncWrite, CloseSandboxProcessInputRequest, CreateSandboxRequest, DurableFileSystem,
     EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness, FileSystemMountMode,
     ForkConversationRequest, ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest,
-    NewConversationRequest, PutSecretRequest, RunInSandboxRequest, SandboxCommand,
-    SandboxCommandOutput, SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy,
+    NewConversationRequest, PutSecretRequest, RunInSandboxRequest, SandboxAttachment,
+    SandboxCommand, SandboxCommandOutput, SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy,
     SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
     SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec,
     Secret, SnapshotKind, SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
@@ -1800,6 +1800,14 @@ impl ManagedSandboxBackend for TestProviderStateBackend {
         }))
     }
 
+    async fn attach(
+        &self,
+        _request: SandboxRequest,
+        _attachment: SandboxAttachment,
+    ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        bail!("test provider-state backend does not support attachment")
+    }
+
     async fn acquire_from_snapshot(
         &self,
         _request: SandboxRequest,
@@ -1835,6 +1843,10 @@ impl ManagedSandboxHandle for TestProviderStateHandle {
         Ok(())
     }
 
+    async fn detach(&self) -> crate::Result<SandboxAttachment> {
+        bail!("test provider-state handle does not support detachment")
+    }
+
     async fn snapshot(&self) -> crate::Result<SnapshotPayload> {
         bail!("test provider-state handle does not support snapshots")
     }
@@ -1861,6 +1873,14 @@ impl ManagedSandboxBackend for TestSandboxBackend {
         Ok(Arc::new(TestSandboxHandle {
             process: Arc::clone(&self.process),
         }))
+    }
+
+    async fn attach(
+        &self,
+        _request: SandboxRequest,
+        _attachment: SandboxAttachment,
+    ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        bail!("test sandbox backend does not support attachment")
     }
 
     async fn acquire_from_snapshot(
@@ -1903,6 +1923,10 @@ impl ManagedSandboxHandle for TestSandboxHandle {
 
     async fn stop(&self) -> crate::Result<()> {
         Ok(())
+    }
+
+    async fn detach(&self) -> crate::Result<SandboxAttachment> {
+        bail!("test sandbox handle does not support detachment")
     }
 
     async fn snapshot(&self) -> crate::Result<SnapshotPayload> {
@@ -2061,6 +2085,14 @@ impl ManagedSandboxBackend for RestoreImageTestBackend {
         }))
     }
 
+    async fn attach(
+        &self,
+        _request: SandboxRequest,
+        _attachment: SandboxAttachment,
+    ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        bail!("restore-image test backend does not support attachment")
+    }
+
     async fn acquire_from_snapshot(
         &self,
         _request: SandboxRequest,
@@ -2098,6 +2130,10 @@ impl ManagedSandboxHandle for RestoreImageTestHandle {
 
     async fn stop(&self) -> crate::Result<()> {
         Ok(())
+    }
+
+    async fn detach(&self) -> crate::Result<SandboxAttachment> {
+        bail!("restore-image test handle does not support detachment")
     }
 
     async fn snapshot(&self) -> crate::Result<SnapshotPayload> {
