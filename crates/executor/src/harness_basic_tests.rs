@@ -238,6 +238,7 @@ async fn usage_record_is_persisted_with_computed_cost() {
         .put_binding(Binding::Llm {
             name: "claude-sonnet-4-6".to_string(),
             model: "claude-sonnet-4-6".to_string(),
+            provider: None,
             base_url: None,
             secret_id: Some(secret_id),
         })
@@ -385,6 +386,7 @@ async fn usage_record_with_anthropic_cache_hits() {
         .put_binding(Binding::Llm {
             name: "claude-sonnet-4-6".to_string(),
             model: "claude-sonnet-4-6".to_string(),
+            provider: None,
             base_url: None,
             secret_id: Some(secret_id),
         })
@@ -507,6 +509,7 @@ async fn usage_record_with_openai_inclusive_accounting() {
         .put_binding(Binding::Llm {
             name: "gpt-4o-mini".to_string(),
             model: "gpt-4o-mini".to_string(),
+            provider: None,
             base_url: None,
             secret_id: Some(secret_id),
         })
@@ -1438,6 +1441,7 @@ async fn register_test_models(exoharness: &dyn ExoHarness) {
             .put_binding(Binding::Llm {
                 name: model.to_string(),
                 model: model.to_string(),
+                provider: None,
                 base_url: None,
                 secret_id: Some(secret_id),
             })

@@ -23,12 +23,12 @@ use crate::{
     ConversationId, ConversationRecord, CreateSandboxRequest, Event, EventData, EventId,
     EventQuery, EventStream, ExoHarness, ForkConversationRequest, GetEventsResult,
     GetSandboxProcessEventsResult, ListConversationsRequest, ListConversationsResult,
-    NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest, Result,
-    RunInSandboxRequest, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery,
-    SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId,
-    SecretMetadata, SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
-    StartSandboxRequest, TurnHandle, TurnRecord, WaitSandboxProcessRequest, WriteArtifactRequest,
-    WriteSandboxProcessInputRequest,
+    LogoutOauthResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
+    ReadArtifactRequest, Result, RunInSandboxRequest, SandboxHandle, SandboxId, SandboxProcess,
+    SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus,
+    Secret, SecretId, SecretMetadata, SessionId, SnapshotHandle, SnapshotId,
+    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnRecord,
+    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 #[derive(Clone)]
@@ -103,6 +103,13 @@ impl HttpExoHarness {
 
 #[async_trait]
 impl ExoHarness for HttpExoHarness {
+    async fn preflight_secret_storage(&self) -> Result<()> {
+        match self.request(Request::PreflightSecretStorage).await? {
+            Response::Unit => Ok(()),
+            response => unexpected_response(response, "unit"),
+        }
+    }
+
     async fn list_agents(&self) -> Result<Vec<Arc<dyn AgentHandle>>> {
         match self.request(Request::ListAgents).await? {
             Response::Agents { agents } => Ok(agents
@@ -181,6 +188,16 @@ impl ExoHarness for HttpExoHarness {
         match self.request(Request::GetSecret { secret_id: *id }).await? {
             Response::Secret { secret } => Ok(secret),
             response => unexpected_response(response, "secret"),
+        }
+    }
+
+    async fn logout_oauth_secret(&self, id: &SecretId) -> Result<LogoutOauthResult> {
+        match self
+            .request(Request::LogoutOauthSecret { secret_id: *id })
+            .await?
+        {
+            Response::LogoutOauth { result } => Ok(result),
+            response => unexpected_response(response, "logout_oauth"),
         }
     }
 }

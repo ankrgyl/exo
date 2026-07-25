@@ -26,6 +26,10 @@ impl ExoHarnessServer {
 
     pub async fn handle_request(&self, request: Request) -> Result<Response> {
         match request {
+            Request::PreflightSecretStorage => {
+                self.root.preflight_secret_storage().await?;
+                Ok(Response::Unit)
+            }
             Request::ListAgents => Ok(Response::Agents {
                 agents: self
                     .root
@@ -68,6 +72,9 @@ impl ExoHarnessServer {
             }),
             Request::GetSecret { secret_id } => Ok(Response::Secret {
                 secret: self.root.get_secret(&secret_id).await?,
+            }),
+            Request::LogoutOauthSecret { secret_id } => Ok(Response::LogoutOauth {
+                result: self.root.logout_oauth_secret(&secret_id).await?,
             }),
             Request::ListConversations { agent_id, request } => {
                 let agent = self.require_agent(&agent_id).await?;

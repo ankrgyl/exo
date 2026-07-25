@@ -13,7 +13,7 @@ use lingua::universal::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::ConversationModelConfig;
+use crate::{ConversationModelConfig, ModelRequestAuth};
 
 pub(crate) const CONVERSATION_MODEL_CONFIG_EVENT_TYPE: &str = "conversation_model_config";
 
@@ -190,7 +190,8 @@ pub(crate) async fn put_conversation_model_override(
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedModelBinding {
     pub(crate) model: String,
-    pub(crate) api_key: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) auth: Option<ModelRequestAuth>,
     pub(crate) base_url: Option<String>,
 }
 
@@ -210,6 +211,7 @@ pub(crate) async fn resolve_model_binding(
         })?;
     let Binding::Llm {
         model,
+        provider,
         base_url,
         secret_id,
         ..
@@ -217,28 +219,108 @@ pub(crate) async fn resolve_model_binding(
     else {
         return Err(anyhow::anyhow!("binding is not a model: {name}"));
     };
-    let api_key = match secret_id {
+    let effective_provider = model_provider(provider.as_deref(), &model, base_url.as_deref());
+    let auth = match secret_id {
         Some(secret_id) => {
             let secret = conversation
                 .get_secret(&secret_id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("model secret does not exist for {name}"))?;
-            match secret {
-                Secret::Key { value } => Some(value),
-                Secret::Oauth { .. } => {
-                    return Err(anyhow::anyhow!(
-                        "model secret must be a key secret, got oauth for {name}"
-                    ));
-                }
-            }
+            Some(request_auth_for_secret(effective_provider, secret)?)
         }
         None => None,
     };
     Ok(ResolvedModelBinding {
         model,
-        api_key,
+        provider,
+        auth,
         base_url,
     })
+}
+
+pub(crate) fn model_provider<'a>(
+    provider: Option<&'a str>,
+    model: &str,
+    base_url: Option<&str>,
+) -> &'a str {
+    if is_openrouter_binding(provider, base_url) {
+        "openrouter"
+    } else if is_anthropic_binding(provider, model) {
+        "anthropic"
+    } else {
+        provider.unwrap_or("openai")
+    }
+}
+
+/// OpenRouter is an OpenAI-compatible aggregator selected by its base URL (it
+/// has no Responses API, so it can't be detected by model name the way native
+/// Anthropic is). A binding pointed at `openrouter.ai` routes through the
+/// OpenAI provider in Chat Completions mode.
+fn is_openrouter_binding(provider: Option<&str>, base_url: Option<&str>) -> bool {
+    provider == Some("openrouter")
+        || (provider.is_none() && base_url.is_some_and(|url| url.contains("openrouter.ai")))
+}
+
+/// Anthropic model bindings route to the native Messages API. We detect them by
+/// model name (`claude*`). Bedrock/Vertex Anthropic ids carry provider prefixes
+/// (e.g. `us.anthropic.claude-...`) so they do not match here and keep falling
+/// through to the OpenAI-compatible path.
+fn is_anthropic_binding(provider: Option<&str>, model: &str) -> bool {
+    provider == Some("anthropic")
+        || (provider.is_none() && model.to_ascii_lowercase().starts_with("claude"))
+}
+
+fn request_auth_for_secret(provider: &str, secret: Secret) -> Result<ModelRequestAuth> {
+    match secret {
+        Secret::Key { .. } if provider == exoharness::OPENAI_CHATGPT_PROVIDER_ID => Err(
+            anyhow::anyhow!("model provider `{provider}` requires an OAuth credential"),
+        ),
+        Secret::Key { value } if provider == "anthropic" => Ok(ModelRequestAuth {
+            authorization: None,
+            headers: HashMap::from([("x-api-key".to_string(), value)]),
+        }),
+        Secret::Key { value } => Ok(ModelRequestAuth {
+            authorization: Some(format!("Bearer {value}")),
+            headers: HashMap::new(),
+        }),
+        Secret::Oauth {
+            provider: credential_provider,
+            account_id,
+            access_token,
+            ..
+        } => {
+            let credential_provider = credential_provider
+                .ok_or_else(|| anyhow::anyhow!("OAuth credential has no provider; log in again"))?;
+            let access_token = access_token.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OAuth credential for provider `{credential_provider}` is logged out"
+                )
+            })?;
+            if credential_provider != provider {
+                return Err(anyhow::anyhow!(
+                    "model provider `{provider}` cannot use an OAuth credential for `{credential_provider}`"
+                ));
+            }
+            if provider != exoharness::OPENAI_CHATGPT_PROVIDER_ID {
+                return Err(anyhow::anyhow!(
+                    "OAuth request authentication is not implemented for provider `{provider}`"
+                ));
+            }
+            let account_id = account_id.ok_or_else(|| {
+                anyhow::anyhow!("OpenAI ChatGPT credential has no account id; log in again")
+            })?;
+            Ok(ModelRequestAuth {
+                authorization: Some(format!("Bearer {access_token}")),
+                headers: HashMap::from([
+                    ("chatgpt-account-id".to_string(), account_id),
+                    (
+                        "OpenAI-Beta".to_string(),
+                        "responses=experimental".to_string(),
+                    ),
+                ]),
+            })
+        }
+    }
 }
 
 pub(crate) fn to_lingua_value(value: serde_json::Value) -> lingua::serde_json::Value {
@@ -355,7 +437,7 @@ fn parse_uuid7(raw: &str) -> Option<Uuid7> {
     Uuid7::from_str(raw).ok()
 }
 
-fn render_user_content(content: &UserContent) -> String {
+pub(crate) fn render_user_content(content: &UserContent) -> String {
     match content {
         UserContent::String(text) => text.clone(),
         UserContent::Array(parts) => parts
@@ -394,9 +476,10 @@ fn render_assistant_content(content: &AssistantContent) -> String {
 
 #[cfg(test)]
 mod tests {
+    use exoharness::Secret;
     use serde_json::json;
 
-    use super::to_lingua_value;
+    use super::{request_auth_for_secret, to_lingua_value};
 
     #[test]
     fn converts_std_json_to_lingua_json_structurally() {
@@ -413,5 +496,18 @@ mod tests {
             lingua::serde_json::from_str(&encoded).expect("test json should parse as lingua json");
 
         assert_eq!(to_lingua_value(value), expected);
+    }
+
+    #[test]
+    fn chatgpt_rejects_api_keys() {
+        let error = request_auth_for_secret(
+            exoharness::OPENAI_CHATGPT_PROVIDER_ID,
+            Secret::Key {
+                value: "api-key".to_string(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("requires an OAuth credential"));
     }
 }

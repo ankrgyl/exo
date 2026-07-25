@@ -36,6 +36,7 @@ import {
 
 import {
   appendEvents,
+  apiKeyFromModelBinding,
   appendAndTraceObservedToolEvents,
   asRecord,
   markFirstTextDelta,
@@ -726,8 +727,9 @@ function claudeSandboxBaseEnv(
       key === "BRAINTRUST_API_URL"
     );
   });
-  if (modelBinding.apiKey) {
-    env.ANTHROPIC_API_KEY = modelBinding.apiKey;
+  const apiKey = apiKeyFromModelBinding(modelBinding);
+  if (apiKey) {
+    env.ANTHROPIC_API_KEY = apiKey;
   }
   if (modelBinding.baseUrl) {
     env.ANTHROPIC_BASE_URL = modelBinding.baseUrl;

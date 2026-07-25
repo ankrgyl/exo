@@ -13,6 +13,8 @@ mod error;
 mod http;
 #[cfg(all(test, not(target_arch = "wasm32"), feature = "basic-backend"))]
 mod http_tests;
+#[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+mod oauth;
 pub mod protocol;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 mod sandbox;
@@ -33,6 +35,8 @@ pub use basic::*;
 pub use error::*;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use http::*;
+#[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+pub use oauth::*;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use sandbox::*;
 pub use sandbox_provider::*;

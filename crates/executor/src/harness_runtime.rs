@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::harness_helpers::to_lingua_value;
+use crate::harness_helpers::{model_provider, render_user_content, to_lingua_value};
 use crate::{
     ModelClient, ModelRequest, ModelResponse, ModelResponseStream, PendingToolCall, ToolDefinition,
 };
@@ -14,6 +14,8 @@ use bytes::Bytes;
 use exoharness::{Result, Uuid7};
 use futures::{Stream, StreamExt};
 use lingua::processing::adapter_for_format;
+use lingua::providers::openai::generated::InputItem;
+use lingua::providers::openai::universal_to_responses_input;
 use lingua::serde_json as lingua_json;
 use lingua::universal::{
     AssistantContent, AssistantContentPart, TextContentPart, TokenBudget, ToolCallArguments,
@@ -22,6 +24,7 @@ use lingua::universal::{
 };
 use lingua::{Message, ProviderFormat};
 use reqwest::Url;
+use serde::Serialize;
 
 type RawChunkStream = Pin<
     Box<
@@ -48,6 +51,11 @@ impl RouterModelClient {
 #[async_trait]
 impl ModelClient for RouterModelClient {
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
+        if is_openai_chatgpt_request(&request) {
+            let mut stream = self.complete_stream(request).await?;
+            while stream.next_chunk().await?.is_some() {}
+            return stream.finish().await;
+        }
         let config = resolve_runtime_config(&request, self.env.as_ref())?;
         let format = config.format;
         let router = build_router(&request, format, &config)?;
@@ -55,7 +63,7 @@ impl ModelClient for RouterModelClient {
         let payload = serialize_request(format, &universal_request)?;
         let route = resolve_provider_route(&router, &request.model, format)?;
         let (prepared, _router_metadata) = router.create_request(payload, format, &route).await?;
-        let body = router.complete(prepared, &ClientHeaders::new()).await?;
+        let body = router.complete(prepared, &config.client_headers).await?;
         let provider_cost_usd = extract_provider_cost(&body);
         let response = lingua::response_to_universal(body)?;
         let mut model_response = normalize_model_response(response)?;
@@ -68,13 +76,17 @@ impl ModelClient for RouterModelClient {
         let format = config.format;
         let router = build_router(&request, format, &config)?;
         let universal_request = build_universal_request(&request, true)?;
-        let payload = serialize_request(format, &universal_request)?;
+        let payload = if is_openai_chatgpt_request(&request) {
+            build_chatgpt_codex_payload(&universal_request, request.session_id.as_deref())?
+        } else {
+            serialize_request(format, &universal_request)?
+        };
         let route = resolve_provider_route(&router, &request.model, format)?;
         let (prepared, _router_metadata) = router
             .create_stream_request(payload, format, &route)
             .await?;
         let raw_stream = router
-            .complete_stream(prepared, &ClientHeaders::new(), None)
+            .complete_stream(prepared, &config.client_headers, None)
             .await?;
         Ok(Box::new(RouterModelResponseStream {
             raw: Box::pin(raw_stream),
@@ -83,6 +95,10 @@ impl ModelClient for RouterModelClient {
             provider_cost_usd: None,
         }))
     }
+}
+
+fn is_openai_chatgpt_request(request: &ModelRequest) -> bool {
+    request.provider.as_deref() == Some(exoharness::OPENAI_CHATGPT_PROVIDER_ID)
 }
 
 struct RouterModelResponseStream {
@@ -135,41 +151,34 @@ struct ResolvedRuntimeConfig {
     endpoint_template: Option<String>,
     metadata: HashMap<String, lingua_json::Value>,
     auth: AuthConfig,
+    client_headers: ClientHeaders,
 }
 
 fn resolve_runtime_config(
     request: &ModelRequest,
     env: &HashMap<String, String>,
 ) -> Result<ResolvedRuntimeConfig> {
-    if is_anthropic_model(&request.model) {
-        resolve_anthropic_config(request, env)
-    } else if is_openrouter_request(request) {
-        resolve_openrouter_config(request, env)
-    } else {
-        resolve_openai_config(request, env)
+    let provider = model_provider(
+        request.provider.as_deref(),
+        &request.model,
+        request.base_url.as_deref(),
+    );
+    match provider {
+        "anthropic" => resolve_anthropic_config(request, env),
+        "openrouter" => resolve_openrouter_config(request, env),
+        "openai" => resolve_openai_config(request, env),
+        exoharness::OPENAI_CHATGPT_PROVIDER_ID => resolve_openai_chatgpt_config(request),
+        provider => Err(anyhow::anyhow!("unsupported model provider `{provider}`")),
     }
-}
-
-/// OpenRouter is an OpenAI-compatible aggregator selected by its base URL (it
-/// has no Responses API, so it can't be detected by model name the way native
-/// Anthropic is). A binding pointed at `openrouter.ai` routes through the
-/// OpenAI provider in Chat Completions mode.
-fn is_openrouter_request(request: &ModelRequest) -> bool {
-    request
-        .base_url
-        .as_deref()
-        .is_some_and(|url| url.contains("openrouter.ai"))
 }
 
 fn resolve_openrouter_config(
     request: &ModelRequest,
     env: &HashMap<String, String>,
 ) -> Result<ResolvedRuntimeConfig> {
-    let key = request
-        .api_key
-        .clone()
+    let key = request_auth_value(request, "authorization", Some("Bearer"))
         .or_else(|| optional_env(env, "OPENROUTER_API_KEY"))
-        .ok_or_else(|| anyhow::anyhow!("model request is missing an API key"))?;
+        .ok_or_else(|| anyhow::anyhow!("model request is missing authorization"))?;
     let endpoint = request
         .base_url
         .clone()
@@ -189,26 +198,17 @@ fn resolve_openrouter_config(
             header: Some("authorization".to_string()),
             prefix: Some("Bearer".to_string()),
         },
+        client_headers: request_headers(request, Some("authorization"))?,
     })
-}
-
-/// Anthropic model bindings route to the native Messages API. We detect them by
-/// model name (`claude*`). Bedrock/Vertex Anthropic ids carry provider prefixes
-/// (e.g. `us.anthropic.claude-...`) so they do not match here and keep falling
-/// through to the OpenAI-compatible path.
-fn is_anthropic_model(model: &str) -> bool {
-    model.to_ascii_lowercase().starts_with("claude")
 }
 
 fn resolve_anthropic_config(
     request: &ModelRequest,
     env: &HashMap<String, String>,
 ) -> Result<ResolvedRuntimeConfig> {
-    let key = request
-        .api_key
-        .clone()
+    let key = request_auth_value(request, "x-api-key", None)
         .or_else(|| optional_env(env, "ANTHROPIC_API_KEY"))
-        .ok_or_else(|| anyhow::anyhow!("model request is missing an API key"))?;
+        .ok_or_else(|| anyhow::anyhow!("model request is missing authorization"))?;
     // `None` lets the provider use its built-in default
     // (`https://api.anthropic.com/v1/`).
     let endpoint = request
@@ -229,6 +229,7 @@ fn resolve_anthropic_config(
             header: Some("x-api-key".to_string()),
             prefix: None,
         },
+        client_headers: request_headers(request, Some("x-api-key"))?,
     })
 }
 
@@ -236,11 +237,9 @@ fn resolve_openai_config(
     request: &ModelRequest,
     env: &HashMap<String, String>,
 ) -> Result<ResolvedRuntimeConfig> {
-    let key = request
-        .api_key
-        .clone()
+    let key = request_auth_value(request, "authorization", Some("Bearer"))
         .or_else(|| optional_env(env, "OPENAI_API_KEY"))
-        .ok_or_else(|| anyhow::anyhow!("model request is missing an API key"))?;
+        .ok_or_else(|| anyhow::anyhow!("model request is missing authorization"))?;
     let endpoint = request
         .base_url
         .clone()
@@ -269,7 +268,73 @@ fn resolve_openai_config(
             header: Some("authorization".to_string()),
             prefix: Some("Bearer".to_string()),
         },
+        client_headers: request_headers(request, Some("authorization"))?,
     })
+}
+
+fn resolve_openai_chatgpt_config(request: &ModelRequest) -> Result<ResolvedRuntimeConfig> {
+    let key = request_auth_value(request, "authorization", Some("Bearer"))
+        .ok_or_else(|| anyhow::anyhow!("OpenAI ChatGPT credential is logged out"))?;
+    let endpoint = Some(Url::parse(
+        request
+            .base_url
+            .as_deref()
+            .unwrap_or("https://chatgpt.com/backend-api/codex"),
+    )?);
+    let mut client_headers = request_headers(request, Some("authorization"))?;
+    for (name, value) in chatgpt_codex_headers(request) {
+        client_headers.insert_user_configured(name, value)?;
+    }
+    Ok(ResolvedRuntimeConfig {
+        provider_alias: exoharness::OPENAI_CHATGPT_PROVIDER_ID.to_string(),
+        provider_kind: "openai".to_string(),
+        format: ProviderFormat::Responses,
+        endpoint,
+        endpoint_template: None,
+        metadata: HashMap::new(),
+        auth: AuthConfig::ApiKey {
+            key,
+            header: Some("authorization".to_string()),
+            prefix: Some("Bearer".to_string()),
+        },
+        client_headers,
+    })
+}
+
+fn request_auth_value(
+    request: &ModelRequest,
+    header: &str,
+    prefix: Option<&str>,
+) -> Option<String> {
+    let auth = request.auth.as_ref()?;
+    if header.eq_ignore_ascii_case("authorization") {
+        let authorization = auth.authorization.as_deref()?;
+        return match prefix {
+            Some(prefix) => {
+                let (scheme, value) = authorization.split_once(char::is_whitespace)?;
+                (scheme.eq_ignore_ascii_case(prefix) && !value.trim().is_empty())
+                    .then(|| value.trim().to_string())
+            }
+            None => Some(authorization.to_string()),
+        };
+    }
+    auth.headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(header))
+        .map(|(_, value)| value.clone())
+}
+
+fn request_headers(request: &ModelRequest, auth_header: Option<&str>) -> Result<ClientHeaders> {
+    let mut headers = ClientHeaders::new();
+    if let Some(auth) = &request.auth {
+        for (name, value) in &auth.headers {
+            if auth_header.is_some_and(|auth_header| name.eq_ignore_ascii_case(auth_header)) {
+                continue;
+            }
+            headers.insert_user_configured(name.clone(), value.clone())?;
+        }
+    }
+    Ok(headers)
 }
 
 fn optional_env(env: &HashMap<String, String>, key: &str) -> Option<String> {
@@ -361,6 +426,147 @@ fn build_universal_request(request: &ModelRequest, stream: bool) -> Result<Unive
     })
 }
 
+#[derive(Serialize)]
+struct ChatGptCodexBody {
+    model: String,
+    input: Vec<ChatGptInputItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<lingua_json::Value>>,
+    tool_choice: &'static str,
+    parallel_tool_calls: bool,
+    reasoning: ChatGptReasoning,
+    include: [&'static str; 1],
+    prompt_cache_key: String,
+    store: bool,
+    stream: bool,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ChatGptInputItem {
+    AdditionalTools(ChatGptAdditionalTools),
+    Input(Box<InputItem>),
+}
+
+#[derive(Serialize)]
+struct ChatGptAdditionalTools {
+    #[serde(rename = "type")]
+    item_type: &'static str,
+    role: &'static str,
+    tools: Vec<lingua_json::Value>,
+}
+
+#[derive(Serialize)]
+struct ChatGptReasoning {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<&'static str>,
+}
+
+fn build_chatgpt_codex_payload(
+    request: &UniversalRequest,
+    session_id: Option<&str>,
+) -> Result<Bytes> {
+    let model = request
+        .model
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("OpenAI ChatGPT request is missing a model"))?;
+    let responses_lite = chatgpt_codex_uses_responses_lite(model);
+    let leading_instruction_count = request
+        .messages
+        .iter()
+        .take_while(|message| matches!(message, Message::System { .. } | Message::Developer { .. }))
+        .count();
+    let leading_instructions = request
+        .messages
+        .iter()
+        .take(leading_instruction_count)
+        .map(|message| match message {
+            Message::System { content } | Message::Developer { content } => {
+                render_user_content(content)
+            }
+            _ => unreachable!("take_while only retains instruction messages"),
+        })
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    let input_messages = if responses_lite {
+        request.messages.as_slice()
+    } else {
+        &request.messages[leading_instruction_count..]
+    };
+    let tools = request
+        .params
+        .tools
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(UniversalTool::to_responses_value)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut input = universal_to_responses_input(input_messages)?
+        .into_iter()
+        .map(|item| ChatGptInputItem::Input(Box::new(item)))
+        .collect::<Vec<_>>();
+    let parallel_tool_calls = !responses_lite && !tools.is_empty();
+    let body_tools = if responses_lite {
+        if !tools.is_empty() {
+            input.insert(
+                0,
+                ChatGptInputItem::AdditionalTools(ChatGptAdditionalTools {
+                    item_type: "additional_tools",
+                    role: "developer",
+                    tools,
+                }),
+            );
+        }
+        None
+    } else {
+        Some(tools)
+    };
+    let body = ChatGptCodexBody {
+        model: model.to_string(),
+        input,
+        instructions: (!responses_lite && !leading_instructions.is_empty())
+            .then(|| leading_instructions.join("\n\n")),
+        tools: body_tools,
+        tool_choice: "auto",
+        parallel_tool_calls,
+        reasoning: ChatGptReasoning {
+            context: responses_lite.then_some("all_turns"),
+        },
+        include: ["reasoning.encrypted_content"],
+        prompt_cache_key: session_id.unwrap_or("exo").to_string(),
+        store: false,
+        stream: true,
+    };
+    Ok(Bytes::from(lingua_json::to_vec(&body)?))
+}
+
+fn chatgpt_codex_headers(request: &ModelRequest) -> HashMap<String, String> {
+    let session_id = request
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "exo".to_string());
+    let mut headers = HashMap::from([
+        ("session-id".to_string(), session_id.clone()),
+        ("x-client-request-id".to_string(), session_id),
+        ("accept".to_string(), "text/event-stream".to_string()),
+        ("content-type".to_string(), "application/json".to_string()),
+    ]);
+    if chatgpt_codex_uses_responses_lite(&request.model) {
+        headers.insert(
+            "x-openai-internal-codex-responses-lite".to_string(),
+            "true".to_string(),
+        );
+    }
+    headers
+}
+
+fn chatgpt_codex_uses_responses_lite(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower == "gpt-5.6" || lower.starts_with("gpt-5.6-")
+}
+
 fn build_universal_tools(tools: &[ToolDefinition]) -> Result<Vec<UniversalTool>> {
     tools.iter().map(tool_definition_to_universal).collect()
 }
@@ -393,20 +599,50 @@ mod tests {
     #[derive(Debug, Deserialize)]
     struct SerializedResponsesStreamRequest {
         stream: Option<bool>,
+        store: Option<bool>,
         stream_options: Option<SerializedResponsesStreamOptions>,
     }
 
     #[derive(Debug, Deserialize)]
     struct SerializedResponsesStreamOptions {}
 
+    #[derive(Debug, Deserialize)]
+    struct SerializedChatGptBody {
+        input: Vec<SerializedChatGptInput>,
+        instructions: Option<String>,
+        tools: Option<Vec<SerializedChatGptTool>>,
+        parallel_tool_calls: bool,
+        reasoning: SerializedChatGptReasoning,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SerializedChatGptInput {
+        #[serde(rename = "type")]
+        item_type: Option<String>,
+        role: Option<String>,
+        tools: Option<Vec<SerializedChatGptTool>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SerializedChatGptTool {
+        name: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SerializedChatGptReasoning {
+        context: Option<String>,
+    }
+
     fn model_request() -> ModelRequest {
         ModelRequest {
             model: "gpt-5.4".to_string(),
-            api_key: None,
+            provider: Some("openai".to_string()),
+            auth: None,
             base_url: None,
             messages: Vec::new(),
             tools: Vec::new(),
             max_output_tokens: None,
+            session_id: None,
         }
     }
 
@@ -418,14 +654,101 @@ mod tests {
             lingua_json::from_slice(&serialized).unwrap();
 
         assert_eq!(payload.stream, Some(true));
+        assert_eq!(payload.store, None);
         assert!(payload.stream_options.is_none());
+    }
+
+    #[test]
+    fn openai_chatgpt_uses_subscription_endpoint() {
+        let mut request = model_request();
+        request.provider = Some(exoharness::OPENAI_CHATGPT_PROVIDER_ID.to_string());
+        request.auth = Some(crate::ModelRequestAuth {
+            authorization: Some("Bearer subscription-token".to_string()),
+            headers: HashMap::new(),
+        });
+        let config = resolve_runtime_config(&request, &HashMap::new()).unwrap();
+        assert_eq!(
+            config.endpoint.unwrap().as_str(),
+            "https://chatgpt.com/backend-api/codex"
+        );
+    }
+
+    #[test]
+    fn chatgpt_gpt_5_6_uses_responses_lite_contract() {
+        let mut request = model_request();
+        request.model = "gpt-5.6-terra".to_string();
+        request.provider = Some(exoharness::OPENAI_CHATGPT_PROVIDER_ID.to_string());
+        request.messages = vec![Message::Developer {
+            content: lingua::universal::UserContent::String("Be concise.".to_string()),
+        }];
+        request.tools = vec![ToolDefinition {
+            name: "weather".to_string(),
+            description: "Get the weather".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        request.max_output_tokens = Some(100);
+
+        let universal = build_universal_request(&request, true).unwrap();
+        let serialized =
+            build_chatgpt_codex_payload(&universal, request.session_id.as_deref()).unwrap();
+        let payload: SerializedChatGptBody = lingua_json::from_slice(&serialized).unwrap();
+
+        assert!(payload.instructions.is_none());
+        assert!(payload.tools.is_none());
+        assert!(!payload.parallel_tool_calls);
+        assert_eq!(payload.reasoning.context.as_deref(), Some("all_turns"));
+        assert_eq!(
+            payload.input[0].item_type.as_deref(),
+            Some("additional_tools")
+        );
+        assert_eq!(payload.input[0].role.as_deref(), Some("developer"));
+        assert_eq!(payload.input[0].tools.as_ref().unwrap()[0].name, "weather");
+        assert_eq!(
+            chatgpt_codex_headers(&request)["x-openai-internal-codex-responses-lite"],
+            "true"
+        );
+        assert!(
+            !serialized
+                .windows(b"max_output_tokens".len())
+                .any(|window| { window == b"max_output_tokens" })
+        );
+    }
+
+    #[test]
+    fn pre_5_6_chatgpt_moves_leading_instructions_out_of_input() {
+        let mut request = model_request();
+        request.provider = Some(exoharness::OPENAI_CHATGPT_PROVIDER_ID.to_string());
+        request.messages = vec![
+            Message::Developer {
+                content: lingua::universal::UserContent::String("Be concise.".to_string()),
+            },
+            Message::User {
+                content: lingua::universal::UserContent::String("Hello".to_string()),
+            },
+        ];
+
+        let universal = build_universal_request(&request, true).unwrap();
+        let serialized =
+            build_chatgpt_codex_payload(&universal, request.session_id.as_deref()).unwrap();
+        let payload: SerializedChatGptBody = lingua_json::from_slice(&serialized).unwrap();
+
+        assert_eq!(payload.instructions.as_deref(), Some("Be concise."));
+        assert!(payload.tools.is_some());
+        assert!(!payload.parallel_tool_calls);
+        assert!(payload.reasoning.context.is_none());
+        assert_eq!(payload.input.len(), 1);
+        assert_eq!(payload.input[0].role.as_deref(), Some("user"));
     }
 
     #[test]
     fn anthropic_models_route_to_the_native_messages_api() {
         let mut request = model_request();
         request.model = "claude-sonnet-4-6".to_string();
-        request.api_key = Some("sk-ant-test".to_string());
+        request.provider = None;
+        request.auth = Some(crate::ModelRequestAuth {
+            authorization: None,
+            headers: HashMap::from([("x-api-key".to_string(), "sk-ant-test".to_string())]),
+        });
 
         let config = resolve_runtime_config(&request, &HashMap::new()).unwrap();
 
@@ -441,7 +764,10 @@ mod tests {
     #[test]
     fn non_anthropic_models_keep_the_openai_responses_route() {
         let mut request = model_request();
-        request.api_key = Some("sk-test".to_string());
+        request.auth = Some(crate::ModelRequestAuth {
+            authorization: Some("Bearer sk-test".to_string()),
+            headers: HashMap::new(),
+        });
 
         let config = resolve_runtime_config(&request, &HashMap::new()).unwrap();
 
@@ -453,7 +779,11 @@ mod tests {
     fn openrouter_bindings_use_openai_chat_completions() {
         let mut request = model_request();
         request.model = "openai/gpt-4o-mini".to_string();
-        request.api_key = Some("sk-or-test".to_string());
+        request.provider = None;
+        request.auth = Some(crate::ModelRequestAuth {
+            authorization: Some("Bearer sk-or-test".to_string()),
+            headers: HashMap::new(),
+        });
         request.base_url = Some("https://openrouter.ai/api/v1".to_string());
 
         let config = resolve_runtime_config(&request, &HashMap::new()).unwrap();

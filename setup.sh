@@ -404,7 +404,8 @@ missing_has() {
 
 is_exo_checkout() {
   local dir="$1"
-  [[ -d "$dir/.git" && -f "$dir/exo.sh" ]]
+  # In linked Git worktrees, .git is a file rather than a directory.
+  [[ -e "$dir/.git" && -f "$dir/exo.sh" ]]
 }
 
 prompt_yes_no() {
@@ -460,16 +461,18 @@ prompt_text() {
 }
 
 choose_model_provider() {
-  echo "Choose the API provider Exo should use:" >&2
-  echo "1) OpenAI" >&2
-  echo "2) OpenRouter" >&2
+  echo "Choose how Exo should access a model:" >&2
+  echo "1) ChatGPT subscription" >&2
+  echo "2) OpenAI API key" >&2
+  echo "3) OpenRouter API key" >&2
   local choice
   while true; do
-    read -r -p "Provider [1-2, default 1]: " choice
+    read -r -p "Provider [1-3, default 1]: " choice
     case "${choice:-1}" in
-      1) printf '%s' openai; return ;;
-      2) printf '%s' openrouter; return ;;
-      *) echo "Please choose 1 or 2." >&2 ;;
+      1) printf '%s' openai-chatgpt; return ;;
+      2) printf '%s' openai; return ;;
+      3) printf '%s' openrouter; return ;;
+      *) echo "Please choose 1, 2, or 3." >&2 ;;
     esac
   done
 }
@@ -477,6 +480,12 @@ choose_model_provider() {
 configure_model_provider() {
   local provider="$1"
   case "$provider" in
+    openai-chatgpt)
+      MODEL_PROVIDER_LABEL="ChatGPT subscription"
+      MODEL_API_KEY_ENV=""
+      MODEL_BASE_URL=""
+      DEFAULT_UPSTREAM_MODEL="$MODEL_NAME"
+      ;;
     openai)
       MODEL_PROVIDER_LABEL="OpenAI"
       MODEL_API_KEY_ENV="OPENAI_API_KEY"
@@ -491,7 +500,7 @@ configure_model_provider() {
       ;;
     *)
       die "unsupported model provider: $provider" \
-        "(expected openai or openrouter)"
+        "(expected openai-chatgpt, openai, or openrouter)"
       ;;
   esac
 }
@@ -788,6 +797,11 @@ main() {
   configure_model_provider "$MODEL_PROVIDER"
   echo "Using $MODEL_PROVIDER_LABEL."
 
+  if [[ "$MODEL_PROVIDER" == "openai-chatgpt" ]]; then
+    info "Log in to ChatGPT"
+    ./exo.sh auth login openai-chatgpt
+  fi
+
   if [[ -z "$UPSTREAM_MODEL" ]]; then
     if [[ "$MODEL_PROVIDER" == "openrouter" ]]; then
       UPSTREAM_MODEL="$(prompt_text "OpenRouter model id" \
@@ -797,9 +811,11 @@ main() {
     fi
   fi
 
-  info "Configure API keys"
-  prompt_env_secret "$MODEL_API_KEY_ENV" "$env_file" \
-    "$MODEL_PROVIDER_LABEL API key" true
+  if [[ "$MODEL_PROVIDER" != "openai-chatgpt" ]]; then
+    info "Configure API keys"
+    prompt_env_secret "$MODEL_API_KEY_ENV" "$env_file" \
+      "$MODEL_PROVIDER_LABEL API key" true
+  fi
   set_env_default "EXO_CHAT_BASE_URL" "${EXO_CHAT_BASE_URL:-$DEFAULT_EXO_CHAT_BASE_URL}" "$env_file"
   echo "Canonical setup uses ExoChat as the default external adapter and will show a browser URL to open."
 
@@ -808,11 +824,18 @@ main() {
   AGENT_NAME="$(prompt_text "Agent display name" "$AGENT_NAME")"
   ./exo.sh write-profile ${USER_NAME:+--user-name "$USER_NAME"}
 
-  info "Store secrets and register model"
-  ./exo.sh register-model --model "$MODEL_NAME" \
-    --upstream-model "$UPSTREAM_MODEL" \
-    --secret-name "$MODEL_PROVIDER" --secret-env "$MODEL_API_KEY_ENV" \
-    ${MODEL_BASE_URL:+--base-url "$MODEL_BASE_URL"}
+  if [[ "$MODEL_PROVIDER" == "openai-chatgpt" ]]; then
+    info "Register model"
+    ./exo.sh register-model --model "$MODEL_NAME" \
+      --upstream-model "$UPSTREAM_MODEL" --secret-name openai-chatgpt \
+      --provider openai-chatgpt
+  else
+    info "Store secret and register model"
+    ./exo.sh register-model --model "$MODEL_NAME" \
+      --upstream-model "$UPSTREAM_MODEL" --provider "$MODEL_PROVIDER" \
+      --secret-name "$MODEL_PROVIDER" --secret-env "$MODEL_API_KEY_ENV" \
+      ${MODEL_BASE_URL:+--base-url "$MODEL_BASE_URL"}
+  fi
 
   info "Create your agent"
   ./exo.sh setup-agent --agent-name "$AGENT_NAME"

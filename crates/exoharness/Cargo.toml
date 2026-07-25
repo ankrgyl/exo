@@ -70,6 +70,7 @@ uuid = { workspace = true, features = ["serde", "v4", "v7", "js"] }
 
 [dev-dependencies]
 tempfile = "3.23.0"
+wiremock = "0.6"
 tokio = { version = "1.52.1", features = [
   "fs",
   "macros",

@@ -33,6 +33,7 @@ import {
 
 import {
   appendEvents,
+  apiKeyFromModelBinding,
   asRecord,
   instructionsText,
   isRecord,
@@ -1098,8 +1099,9 @@ function codexSandboxEnv(
     CODEX_HOME: "/tmp/exo-codex-home",
     HOME: "/tmp/exo-home",
   };
-  if (modelBinding.apiKey) {
-    env.OPENAI_API_KEY = modelBinding.apiKey;
+  const apiKey = apiKeyFromModelBinding(modelBinding);
+  if (apiKey) {
+    env.OPENAI_API_KEY = apiKey;
   }
   if (modelBinding.baseUrl) {
     env.OPENAI_BASE_URL = modelBinding.baseUrl;

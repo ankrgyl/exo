@@ -137,6 +137,7 @@ type RawBinding =
       type: "llm";
       name: string;
       model: string;
+      provider?: string | null;
       base_url?: string | null;
       secret_id?: string | null;
     };
@@ -156,9 +157,17 @@ type RawSecret =
     }
   | {
       type: "oauth";
-      access_token: string;
+      provider?: string | null;
+      account_id?: string | null;
+      access_token?: string | null;
       refresh_token?: string | null;
+      expires_at?: string | null;
     };
+
+interface RawLogoutOauthResult {
+  was_logged_in: boolean;
+  remote_revocation_confirmed: boolean;
+}
 
 interface RawSecretMetadata {
   id: string;
@@ -251,6 +260,7 @@ type RawRuntimeEvent =
     };
 
 type RawExoRequest =
+  | { type: "preflight_secret_storage" }
   | { type: "list_agents" }
   | { type: "get_agent"; agent_id: string }
   | { type: "new_agent"; request: { slug: string; name: string } }
@@ -259,6 +269,7 @@ type RawExoRequest =
   | { type: "get_binding"; binding_id: string }
   | { type: "list_secrets" }
   | { type: "get_secret"; secret_id: string }
+  | { type: "logout_oauth_secret"; secret_id: string }
   | { type: "list_conversations"; agent_id: string }
   | { type: "get_conversation"; agent_id: string; conversation_id: string }
   | {
@@ -412,6 +423,7 @@ type RawExoResponse =
   | { type: "binding"; binding: RawBinding | null }
   | { type: "secrets"; secrets: RawSecretMetadata[] }
   | { type: "secret"; secret: RawSecret | null }
+  | { type: "logout_oauth"; result: RawLogoutOauthResult }
   | { type: "turn"; turn: RawTurnHandleInfo }
   | { type: "event_id"; event_id: string }
   | { type: "unit" };
@@ -958,6 +970,7 @@ function toBinding(raw: RawBinding): Binding {
     type: "llm",
     name: raw.name,
     model: raw.model,
+    provider: raw.provider ?? null,
     baseUrl: raw.base_url ?? null,
     secretId: raw.secret_id ?? null,
   };
@@ -981,8 +994,20 @@ function toSecret(raw: RawSecret): Secret {
   }
   return {
     type: "oauth",
-    accessToken: raw.access_token,
+    provider: raw.provider ?? null,
+    accountId: raw.account_id ?? null,
+    accessToken: raw.access_token ?? null,
     refreshToken: raw.refresh_token ?? null,
+    expiresAt: raw.expires_at ?? null,
+  };
+}
+
+function toLogoutOauthResult(
+  raw: RawLogoutOauthResult,
+): import("./index.js").LogoutOauthResult {
+  return {
+    wasLoggedIn: raw.was_logged_in,
+    remoteRevocationConfirmed: raw.remote_revocation_confirmed,
   };
 }
 
@@ -1267,6 +1292,15 @@ function createExoHarness(
   return {
     current,
 
+    async preflightSecretStorage(): Promise<void> {
+      const payload = await client.requestExo({
+        type: "preflight_secret_storage",
+      });
+      if (payload.type !== "unit") {
+        throw new Error(`expected unit payload, got ${payload.type}`);
+      }
+    },
+
     async listAgents(): Promise<Agent[]> {
       const payload = await client.requestExo({ type: "list_agents" });
       if (payload.type !== "agents") {
@@ -1344,6 +1378,17 @@ function createExoHarness(
         throw new Error(`expected secret payload, got ${payload.type}`);
       }
       return payload.secret ? toSecret(payload.secret) : null;
+    },
+
+    async logoutOauthSecret(id) {
+      const payload = await client.requestExo({
+        type: "logout_oauth_secret",
+        secret_id: id,
+      });
+      if (payload.type !== "logout_oauth") {
+        throw new Error(`expected logout_oauth payload, got ${payload.type}`);
+      }
+      return toLogoutOauthResult(payload.result);
     },
   };
 }

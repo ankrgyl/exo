@@ -31,6 +31,7 @@ import {
 } from "@exo/cursor/protocol";
 import {
   appendAndTraceObservedToolEvents,
+  apiKeyFromModelBinding,
   materializePriorConversationMessages,
   resolveLlmBinding,
   sandboxCwd,
@@ -586,8 +587,9 @@ function cursorSandboxEnv(
       env[key] = value;
     }
   }
-  if (modelBinding.apiKey) {
-    env.CURSOR_API_KEY = modelBinding.apiKey;
+  const apiKey = apiKeyFromModelBinding(modelBinding);
+  if (apiKey) {
+    env.CURSOR_API_KEY = apiKey;
   }
   return env;
 }

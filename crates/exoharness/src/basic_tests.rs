@@ -27,8 +27,9 @@ use crate::{
     SandboxCommandOutput, SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy,
     SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
     SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec,
-    Secret, SnapshotKind, SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    Secret, SecretBackendChoice, SnapshotKind, SnapshotPayload, StartSandboxProcessRequest,
+    StartSandboxRequest, Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest,
+    WriteSandboxProcessInputRequest,
 };
 
 const DEFAULT_DURABLE_CONTRACT_MOUNT_PATH: &str = "/home/exo/workspace";
@@ -866,6 +867,29 @@ async fn secrets_are_encrypted_at_rest() {
     assert!(!stored_text.contains("super-secret-token"));
     assert!(stored_text.contains("\"ciphertext\""));
     assert!(stored_text.contains("\"algorithm\""));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn secret_storage_preflight_fails_before_secret_persistence() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let master_key_path = tempdir.path().join("invalid-master.key");
+    fs::write(&master_key_path, b"not-a-valid-master-key")
+        .await
+        .expect("invalid master key fixture");
+    let mut config = local_test_config(tempdir.path().join("store"));
+    config.secret_backend = SecretBackendChoice::File {
+        path: Some(master_key_path),
+    };
+    let harness = BasicExoHarness::new(config)
+        .await
+        .expect("harness initialization remains lazy");
+
+    let error = harness
+        .preflight_secret_storage()
+        .await
+        .expect_err("invalid master key should fail preflight");
+    assert!(format!("{error:#}").contains("invalid master key length"));
+    assert!(harness.list_secrets().await.unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "current_thread")]

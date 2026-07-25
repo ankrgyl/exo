@@ -19,6 +19,8 @@ use crate::{Result, Uuid7};
 
 #[async_trait]
 pub trait ExoHarness: Send + Sync {
+    async fn preflight_secret_storage(&self) -> Result<()>;
+
     async fn list_agents(&self) -> Result<Vec<Arc<dyn AgentHandle>>>;
     async fn get_agent(&self, id: &AgentId) -> Result<Option<Arc<dyn AgentHandle>>>;
     async fn new_agent(&self, request: NewAgentRequest) -> Result<Arc<dyn AgentHandle>>;
@@ -31,6 +33,9 @@ pub trait ExoHarness: Send + Sync {
     async fn list_secrets(&self) -> Result<Vec<SecretMetadata>>;
     async fn put_secret(&self, request: PutSecretRequest) -> Result<SecretId>;
     async fn get_secret(&self, id: &SecretId) -> Result<Option<Secret>>;
+    async fn logout_oauth_secret(&self, _id: &SecretId) -> Result<LogoutOauthResult> {
+        anyhow::bail!("OAuth logout is not supported by this harness")
+    }
 }
 
 #[async_trait]
@@ -815,6 +820,8 @@ pub enum Binding {
     Llm {
         name: String,
         model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
         base_url: Option<String>,
         secret_id: Option<SecretId>,
     },
@@ -928,9 +935,23 @@ pub enum Secret {
         value: String,
     },
     Oauth {
-        access_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        access_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         refresh_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<DateTimeUtc>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogoutOauthResult {
+    pub was_logged_in: bool,
+    pub remote_revocation_confirmed: bool,
 }
 
 pub type AgentId = Uuid7;

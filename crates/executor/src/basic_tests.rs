@@ -648,6 +648,10 @@ impl FakeExoHarness {
 
 #[async_trait]
 impl ExoHarness for FakeExoHarness {
+    async fn preflight_secret_storage(&self) -> Result<()> {
+        Ok(())
+    }
+
     async fn list_agents(&self) -> Result<Vec<Arc<dyn AgentHandle>>> {
         let state = self.state.lock().expect("state poisoned");
         Ok(vec![Arc::new(FakeAgentHandle {
@@ -1267,6 +1271,7 @@ fn test_model_binding() -> Binding {
     Binding::Llm {
         name: "test-model".to_string(),
         model: "test-model".to_string(),
+        provider: None,
         base_url: None,
         secret_id: Some(Uuid7::now()),
     }

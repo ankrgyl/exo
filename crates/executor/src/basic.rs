@@ -600,11 +600,13 @@ async fn build_model_request(
     let model_binding = resolve_model_binding(conversation, &agent_config.model).await?;
     Ok(ModelRequest {
         model: model_binding.model,
-        api_key: model_binding.api_key,
+        provider: model_binding.provider,
+        auth: model_binding.auth,
         base_url: model_binding.base_url,
         messages,
         tools: build_tool_definitions(conversation_config),
         max_output_tokens: agent_config.max_output_tokens,
+        session_id: Some(conversation.record().id.to_string()),
     })
 }
 

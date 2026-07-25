@@ -123,6 +123,7 @@ async function runResponsesTurnLoop(
     );
     const request: NativeResponsesRequest = {
       model,
+      sessionId: context.exoharness.current.turn.record.sessionId,
       messages,
       tools: tools.definitions(),
       maxOutputTokens: context.agentConfig.maxOutputTokens,

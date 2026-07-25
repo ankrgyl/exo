@@ -6,10 +6,11 @@ use crate::{
     CloseSandboxProcessInputRequest, ConversationId, ConversationRecord, CreateSandboxRequest,
     Event, EventData, EventId, EventQuery, ForkConversationRequest, GetEventsResult,
     GetSandboxProcessEventsResult, ListConversationsRequest, ListConversationsResult,
-    NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest, SandboxId,
-    SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId,
-    SecretMetadata, SessionId, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnId,
-    TurnRecord, WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    LogoutOauthResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
+    ReadArtifactRequest, SandboxId, SandboxProcessEventQuery, SandboxProcessRecord,
+    SandboxProcessStatus, Secret, SecretId, SecretMetadata, SessionId, SnapshotId,
+    StartSandboxProcessRequest, StartSandboxRequest, TurnId, TurnRecord, WaitSandboxProcessRequest,
+    WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,6 +73,7 @@ pub enum ServerMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
+    PreflightSecretStorage,
     ListAgents,
     GetAgent {
         agent_id: AgentId,
@@ -94,6 +96,9 @@ pub enum Request {
         request: PutSecretRequest,
     },
     GetSecret {
+        secret_id: SecretId,
+    },
+    LogoutOauthSecret {
         secret_id: SecretId,
     },
     ListConversations {
@@ -286,6 +291,7 @@ pub enum Request {
 impl Request {
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::PreflightSecretStorage => "preflight_secret_storage",
             Self::ListAgents => "list_agents",
             Self::GetAgent { .. } => "get_agent",
             Self::NewAgent { .. } => "new_agent",
@@ -296,6 +302,7 @@ impl Request {
             Self::ListSecrets => "list_secrets",
             Self::PutSecret { .. } => "put_secret",
             Self::GetSecret { .. } => "get_secret",
+            Self::LogoutOauthSecret { .. } => "logout_oauth_secret",
             Self::ListConversations { .. } => "list_conversations",
             Self::GetConversation { .. } => "get_conversation",
             Self::NewConversation { .. } => "new_conversation",
@@ -408,6 +415,9 @@ pub enum Response {
     Secret {
         secret: Option<Secret>,
     },
+    LogoutOauth {
+        result: LogoutOauthResult,
+    },
     BindingId {
         binding_id: BindingId,
     },
@@ -447,6 +457,7 @@ impl Response {
             Self::Binding { .. } => "binding",
             Self::Secrets { .. } => "secrets",
             Self::Secret { .. } => "secret",
+            Self::LogoutOauth { .. } => "logout_oauth",
             Self::BindingId { .. } => "binding_id",
             Self::SecretId { .. } => "secret_id",
             Self::Turn { .. } => "turn",

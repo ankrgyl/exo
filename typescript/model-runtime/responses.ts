@@ -20,6 +20,7 @@ import type {
   ResponseCreateParamsNonStreaming,
   ResponseCreateParamsStreaming,
   ResponseInput,
+  ResponseOutputItem,
   ResponseStreamEvent,
   Tool,
 } from "openai/resources/responses/responses";
@@ -37,6 +38,13 @@ import {
   type TurnContext,
 } from "../harness";
 import { computeCostUsd, getTable } from "./cost";
+import {
+  CHATGPT_CODEX_BASE_URL,
+  buildChatGptCodexBody,
+  buildChatGptCodexHeaders,
+  partitionChatGptCodexMessages,
+  type ChatGptCodexRequest,
+} from "./chatgpt-codex";
 import type {
   ChatCompletion,
   ChatCompletionChunk,
@@ -57,7 +65,10 @@ export interface NativeBraintrustOptions {
 
 export interface ResponsesRuntimeOptions {
   apiKey?: string;
+  authorization?: string;
+  headers?: Record<string, string>;
   baseURL?: string;
+  provider?: string;
   organization?: string;
   project?: string;
   braintrust?: NativeBraintrustOptions | null;
@@ -65,12 +76,17 @@ export interface ResponsesRuntimeOptions {
 
 export interface ResponsesModelBinding {
   model?: string;
-  apiKey?: string;
+  provider?: string | null;
+  auth?: {
+    authorization?: string;
+    headers?: Record<string, string>;
+  };
   baseUrl?: string | null;
 }
 
 export interface NativeResponsesRequest {
   model: string;
+  sessionId?: string;
   messages?: Message[];
   input?: string | ResponseInput;
   tools?: ToolDefinition[];
@@ -126,17 +142,20 @@ interface NativeLlmTraceOptions extends NativeTraceOptions {
 
 export class ResponsesRuntime implements ResponsesRuntimeLike {
   private readonly client: OpenAI;
+  private readonly provider: string | undefined;
 
   constructor(options: ResponsesRuntimeOptions = {}) {
     ensureBraintrustLogger(options.braintrust ?? null);
+    this.provider = options.provider;
     // wrapOpenAI auto-instruments chat.completions/responses calls with a
     // braintrust LLM span. Also covers the OpenRouter path (same OpenAI client,
     // just a different base URL) — braintrust's wrapOpenRouter is for their
     // native SDK, not the OpenAI SDK, so it doesn't apply here.
     this.client = wrapOpenAI(
       new OpenAI({
-        apiKey: options.apiKey,
+        apiKey: options.apiKey ?? bearerToken(options.authorization),
         baseURL: options.baseURL,
+        defaultHeaders: options.headers,
         organization: options.organization,
         project: options.project,
       }),
@@ -157,9 +176,21 @@ export class ResponsesRuntime implements ResponsesRuntimeLike {
     agentConfig: AgentConfig | undefined,
     binding: ResponsesModelBinding,
   ): ResponsesRuntime {
+    if (
+      binding.provider === "openai-chatgpt" &&
+      !bearerToken(binding.auth?.authorization)
+    ) {
+      throw new Error("OpenAI ChatGPT credential is logged out");
+    }
     return new ResponsesRuntime({
-      apiKey: binding.apiKey,
-      baseURL: binding.baseUrl ?? undefined,
+      authorization: binding.auth?.authorization,
+      headers: binding.auth?.headers,
+      provider: binding.provider ?? undefined,
+      baseURL:
+        binding.baseUrl ??
+        (binding.provider === "openai-chatgpt"
+          ? CHATGPT_CODEX_BASE_URL
+          : undefined),
       organization: process.env.OPENAI_ORG_ID,
       project: process.env.OPENAI_PROJECT,
       braintrust: braintrustOptionsFromAgentConfig(agentConfig),
@@ -233,11 +264,17 @@ export class ResponsesRuntime implements ResponsesRuntimeLike {
     request: NativeResponsesRequest,
     options: NativeLlmTraceOptions,
   ): Promise<Response> {
-    if (options.streamed) {
+    const handlers = options.streamed ? options.handlers : undefined;
+    if (this.provider === "openai-chatgpt") {
+      const chatGptRequest = buildChatGptCodexRequest(request);
       return this.completeStreamRaw(
-        buildStreamingBody(request),
-        options.handlers,
+        buildChatGptCodexBody(chatGptRequest),
+        handlers,
+        buildChatGptCodexHeaders(chatGptRequest),
       );
+    }
+    if (options.streamed) {
+      return this.completeStreamRaw(buildStreamingBody(request), handlers);
     }
     return this.completeRaw(buildNonStreamingBody(request));
   }
@@ -251,12 +288,16 @@ export class ResponsesRuntime implements ResponsesRuntimeLike {
   private async completeStreamRaw(
     body: ResponseCreateParamsStreaming,
     handlers: NativeStreamHandlers = {},
+    headers?: Record<string, string>,
   ): Promise<Response> {
     const startedAt = performance.now();
     let sawFirstChunk = false;
     let ttftMs: number | null = null;
     let finalResponse: Response | null = null;
-    const stream = await this.client.responses.create(body);
+    const output: ResponseOutputItem[] = [];
+    const stream = await this.client.responses.create(body, {
+      headers,
+    });
 
     for await (const event of stream) {
       if (!sawFirstChunk) {
@@ -266,10 +307,15 @@ export class ResponsesRuntime implements ResponsesRuntimeLike {
       }
 
       await handlers.onStreamEvent?.(event);
-      if (event.type === "response.output_text.delta") {
+      if (event.type === "response.output_item.done") {
+        output.push(event.item);
+      } else if (event.type === "response.output_text.delta") {
         await handlers.onTextDelta?.(event.delta);
       } else if (event.type === "response.completed") {
-        finalResponse = event.response;
+        finalResponse =
+          event.response.output.length === 0 && output.length > 0
+            ? { ...event.response, output }
+            : event.response;
       } else if (event.type === "response.failed") {
         throw new Error(
           event.response.error?.message ?? "Responses API response failed",
@@ -288,14 +334,23 @@ export function runtimeFromModelBinding(
   agentConfig: AgentConfig | undefined,
   binding: ResponsesModelBinding,
 ): ResponsesRuntimeLike {
+  const provider = modelProvider(binding);
+  if (
+    !["openai", "openai-chatgpt", "openrouter", "anthropic"].includes(provider)
+  ) {
+    throw new Error(`unsupported model provider ${provider}`);
+  }
   const model = binding.model ?? "";
-  if (isAnthropicModel(model)) {
+  if (isAnthropicBinding(binding)) {
     return AnthropicRuntime.fromModelBinding(agentConfig, binding);
   }
   // OpenRouter is OpenAI-compatible but Chat Completions only (no Responses
   // API), so force the chat path regardless of how the model name looks.
   if (isOpenRouterBinding(binding)) {
     return ChatCompletionsRuntime.fromModelBinding(agentConfig, binding);
+  }
+  if (binding.provider === "openai-chatgpt") {
+    return ResponsesRuntime.fromModelBinding(agentConfig, binding);
   }
   return modelRequiresResponsesApi(model)
     ? ResponsesRuntime.fromModelBinding(agentConfig, binding)
@@ -305,14 +360,23 @@ export function runtimeFromModelBinding(
 // Anthropic model bindings call the native Messages API. We detect them by
 // model name (`claude*`), mirroring the Rust runtime; Bedrock/Vertex Anthropic
 // ids carry provider prefixes and intentionally don't match here.
-export function isAnthropicModel(model: string): boolean {
-  return model.toLowerCase().startsWith("claude");
+export function isAnthropicBinding(binding: ResponsesModelBinding): boolean {
+  return modelProvider(binding) === "anthropic";
 }
 
 // OpenRouter is selected by its base URL (it aggregates many vendors, so the
 // model name isn't a reliable signal), mirroring the Rust runtime.
 export function isOpenRouterBinding(binding: ResponsesModelBinding): boolean {
-  return (binding.baseUrl ?? "").includes("openrouter.ai");
+  return modelProvider(binding) === "openrouter";
+}
+
+export function modelProvider(binding: ResponsesModelBinding): string {
+  if (binding.provider) return binding.provider;
+  if ((binding.baseUrl ?? "").includes("openrouter.ai")) return "openrouter";
+  if ((binding.model ?? "").toLowerCase().startsWith("claude")) {
+    return "anthropic";
+  }
+  return "openai";
 }
 
 export function modelRequiresResponsesApi(model: string): boolean {
@@ -327,6 +391,23 @@ export function modelRequiresResponsesApi(model: string): boolean {
   );
 }
 
+function bearerToken(authorization?: string): string | undefined {
+  if (!authorization) {
+    return undefined;
+  }
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  return match?.[1];
+}
+
+function headerValue(
+  headers: Record<string, string> | undefined,
+  name: string,
+): string | undefined {
+  return Object.entries(headers ?? {}).find(
+    ([key]) => key.toLowerCase() === name.toLowerCase(),
+  )?.[1];
+}
+
 export class ChatCompletionsRuntime implements ResponsesRuntimeLike {
   private readonly client: OpenAI;
 
@@ -338,8 +419,9 @@ export class ChatCompletionsRuntime implements ResponsesRuntimeLike {
     // native SDK, not the OpenAI SDK, so it doesn't apply here.
     this.client = wrapOpenAI(
       new OpenAI({
-        apiKey: options.apiKey,
+        apiKey: options.apiKey ?? bearerToken(options.authorization),
         baseURL: options.baseURL,
+        defaultHeaders: options.headers,
         organization: options.organization,
         project: options.project,
       }),
@@ -351,7 +433,8 @@ export class ChatCompletionsRuntime implements ResponsesRuntimeLike {
     binding: ResponsesModelBinding,
   ): ChatCompletionsRuntime {
     return new ChatCompletionsRuntime({
-      apiKey: binding.apiKey,
+      authorization: binding.auth?.authorization,
+      headers: binding.auth?.headers,
       baseURL: binding.baseUrl ?? undefined,
       organization: process.env.OPENAI_ORG_ID,
       project: process.env.OPENAI_PROJECT,
@@ -487,8 +570,12 @@ export class AnthropicRuntime implements ResponsesRuntimeLike {
     // braintrust LLM span (input/output/usage), so we don't hand-roll spans.
     this.client = wrapAnthropic(
       new Anthropic({
-        apiKey: options.apiKey,
+        apiKey:
+          options.apiKey ??
+          headerValue(options.headers, "x-api-key") ??
+          bearerToken(options.authorization),
         baseURL: options.baseURL,
+        defaultHeaders: options.headers,
       }),
     );
   }
@@ -498,7 +585,8 @@ export class AnthropicRuntime implements ResponsesRuntimeLike {
     binding: ResponsesModelBinding,
   ): AnthropicRuntime {
     return new AnthropicRuntime({
-      apiKey: binding.apiKey,
+      authorization: binding.auth?.authorization,
+      headers: binding.auth?.headers,
       baseURL: binding.baseUrl ?? undefined,
       braintrust: braintrustOptionsFromAgentConfig(agentConfig),
     });
@@ -821,6 +909,31 @@ function buildStreamingBody(
     metadata: request.metadata ?? null,
     stream: true,
     store: false,
+  };
+}
+
+function buildChatGptCodexRequest(
+  request: NativeResponsesRequest,
+): ChatGptCodexRequest {
+  const { inputMessages, instructionMessages } = partitionChatGptCodexMessages(
+    request.model,
+    request.messages,
+  );
+  const body = buildStreamingBody({ ...request, messages: inputMessages });
+  const rawInput = body.input ?? [];
+  const instructions = instructionMessages
+    .map((message) => messageContentText(message.content))
+    .filter(Boolean)
+    .join("\n\n");
+  return {
+    model: body.model ?? request.model,
+    sessionId: request.sessionId,
+    input:
+      typeof rawInput === "string"
+        ? linguaMessagesToResponsesInput([{ role: "user", content: rawInput }])
+        : rawInput,
+    instructions: instructions || undefined,
+    tools: body.tools,
   };
 }
 

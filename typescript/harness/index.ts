@@ -65,6 +65,7 @@ export type Binding =
       type: "llm";
       name: string;
       model: string;
+      provider?: string | null;
       baseUrl?: string | null;
       secretId?: string | null;
     };
@@ -84,9 +85,17 @@ export type Secret =
     }
   | {
       type: "oauth";
-      accessToken: string;
+      provider?: string | null;
+      accountId?: string | null;
+      accessToken?: string | null;
       refreshToken?: string | null;
+      expiresAt?: string | null;
     };
+
+export interface LogoutOauthResult {
+  wasLoggedIn: boolean;
+  remoteRevocationConfirmed: boolean;
+}
 
 export interface SecretMetadata {
   id: string;
@@ -280,6 +289,7 @@ export interface Agent {
 
 export interface ExoHarness {
   readonly current: ExoHarnessCurrent;
+  preflightSecretStorage(): Promise<void>;
   listAgents(): Promise<Agent[]>;
   getAgent(id: string): Promise<Agent | null>;
   newAgent(request: { slug: string; name: string }): Promise<Agent>;
@@ -288,6 +298,7 @@ export interface ExoHarness {
   getBinding(id: string): Promise<Binding | null>;
   listSecrets(): Promise<SecretMetadata[]>;
   getSecret(id: string): Promise<Secret | null>;
+  logoutOauthSecret(id: string): Promise<LogoutOauthResult>;
 }
 
 export interface ExoHarnessCurrent {

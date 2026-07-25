@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,6 +18,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+use crate::oauth::OAuthProviderRegistry;
 use crate::sandbox::{
     CliContainerSandboxBackend, LocalProcessSandboxBackend, ManagedSandboxBackend,
     ManagedSandboxHandle, SANDBOX_MAIN_MOUNT_DIR, SandboxCommand, SandboxKey,
@@ -25,7 +26,7 @@ use crate::sandbox::{
     SandboxSpec, SnapshotKind, SnapshotPayload, sandbox_spec_hash,
 };
 #[cfg(feature = "apple-keychain")]
-use crate::secrets::AppleKeychainSecretKeyProvider;
+use crate::secrets::{AppleKeychainSecretKeyProvider, migrate_apple_keychain_master_key};
 use crate::secrets::{
     EncryptedSecret, FileBackedSecretKeyProvider, SecretCipher, SecretKeyProvider,
     StaticSecretKeyProvider, default_master_key_path,
@@ -39,13 +40,14 @@ use crate::{
     DurableFileSystem, Event, EventData, EventId, EventKind, EventQuery, EventQueryDirection,
     EventStream, ExoHarness, FileSystemMount, ForkConversationRequest, GetEventsResult,
     GetSandboxProcessEventsResult, ListConversationsRequest, ListConversationsResult,
-    NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest, Result,
-    RunInSandboxRequest, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEvent,
-    SandboxProcessEventQuery, SandboxProcessId, SandboxProcessMode, SandboxProcessParts,
-    SandboxProcessRecord, SandboxProcessStatus, SandboxProcessStdin, SandboxProvider,
-    SandboxProviderConfig, Secret, SecretId, SecretMetadata, SecretType, SessionId, SnapshotHandle,
-    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord,
-    Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    LogoutOauthResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
+    ReadArtifactRequest, Result, RunInSandboxRequest, SandboxHandle, SandboxId, SandboxProcess,
+    SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessId, SandboxProcessMode,
+    SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus, SandboxProcessStdin,
+    SandboxProvider, SandboxProviderConfig, Secret, SecretId, SecretMetadata, SecretType,
+    SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest,
+    TurnHandle, TurnId, TurnRecord, Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest,
+    WriteSandboxProcessInputRequest,
 };
 
 const SANDBOX_PROVIDER_STATE_EVENT: &str = "sandbox_provider_state";
@@ -343,6 +345,8 @@ pub struct BasicExoHarness {
 struct BasicExoHarnessInner {
     storage: BasicObjectStore,
     write_lock: AsyncMutex<()>,
+    secret_locks: AsyncMutex<HashMap<SecretId, Weak<AsyncMutex<()>>>>,
+    oauth_providers: OAuthProviderRegistry,
     subscribers: Mutex<HashMap<ConversationId, Vec<mpsc::UnboundedSender<Result<Event>>>>>,
     sandbox_registry: HashMap<SandboxProvider, SandboxBackendRegistration>,
     /// Backends built (and secrets read) lazily on first use, cached by provider.
@@ -816,13 +820,21 @@ impl BasicExoHarness {
             cache.insert(sandbox_default, backend);
         }
 
+        let keychain_account = root.to_string_lossy().to_string();
         let storage = BasicObjectStore::local_filesystem(&root).await?;
-        let secret_cipher =
-            build_secret_cipher(secret_backend, root.to_string_lossy().to_string())?;
+        #[cfg(feature = "apple-keychain")]
+        let keychain_account = if matches!(&secret_backend, SecretBackendChoice::AppleKeychain) {
+            keychain_migration::prepare_keychain_account(&storage, &keychain_account).await?
+        } else {
+            keychain_account
+        };
+        let secret_cipher = build_secret_cipher(secret_backend, keychain_account)?;
         Ok(Self {
             inner: Arc::new(BasicExoHarnessInner {
                 storage,
                 write_lock: AsyncMutex::new(()),
+                secret_locks: AsyncMutex::new(HashMap::new()),
+                oauth_providers: OAuthProviderRegistry::built_in(),
                 subscribers: Mutex::new(HashMap::new()),
                 sandbox_registry: registry,
                 sandbox_backends: AsyncMutex::new(cache),
@@ -888,6 +900,10 @@ impl BasicExoHarness {
 
 #[async_trait]
 impl ExoHarness for BasicExoHarness {
+    async fn preflight_secret_storage(&self) -> Result<()> {
+        self.inner.secret_cipher.verify_key_access()
+    }
+
     async fn list_agents(&self) -> Result<Vec<Arc<dyn AgentHandle>>> {
         let mut handles: Vec<Arc<dyn AgentHandle>> = Vec::new();
         for record in self.list_agent_records().await? {
@@ -1004,37 +1020,15 @@ impl ExoHarness for BasicExoHarness {
     }
 
     async fn put_secret(&self, request: PutSecretRequest) -> Result<SecretId> {
-        let _guard = self.inner.write_lock.lock().await;
-        let id = Uuid7::now();
-        let record = StoredSecret {
-            metadata: SecretMetadata {
-                id,
-                r#type: secret_type(&request.secret),
-                name: request.name,
-                created_at: id.timestamp().expect("uuid7 timestamp"),
-            },
-            secret: self.inner.secret_cipher.encrypt_secret(&request.secret)?,
-        };
-        self.inner
-            .storage
-            .put_json(self.secrets_dir().join(format!("{id}.json")), &record)
-            .await?;
-        Ok(id)
+        put_secret_in_dir(&self.inner, &self.secrets_dir(), request).await
     }
 
     async fn get_secret(&self, id: &SecretId) -> Result<Option<Secret>> {
-        let path = self.secrets_dir().join(format!("{id}.json"));
-        let Some(record) = self
-            .inner
-            .storage
-            .get_json_if_exists::<StoredSecret>(&path)
-            .await?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(
-            self.inner.secret_cipher.decrypt_secret(&record.secret)?,
-        ))
+        get_secret_in_scopes(&self.inner, &[self.secrets_dir()], id).await
+    }
+
+    async fn logout_oauth_secret(&self, id: &SecretId) -> Result<LogoutOauthResult> {
+        logout_oauth_secret_in_dir(&self.inner, &self.secrets_dir(), id).await
     }
 }
 
@@ -1317,46 +1311,16 @@ impl AgentHandle for BasicAgentHandle {
     }
 
     async fn put_secret(&self, request: PutSecretRequest) -> Result<SecretId> {
-        let _guard = self.harness.inner.write_lock.lock().await;
-        let id = Uuid7::now();
-        let record = StoredSecret {
-            metadata: SecretMetadata {
-                id,
-                r#type: secret_type(&request.secret),
-                name: request.name,
-                created_at: id.timestamp().expect("uuid7 timestamp"),
-            },
-            secret: self
-                .harness
-                .inner
-                .secret_cipher
-                .encrypt_secret(&request.secret)?,
-        };
-        self.harness
-            .inner
-            .storage
-            .put_json(self.secrets_dir().join(format!("{id}.json")), &record)
-            .await?;
-        Ok(id)
+        put_secret_in_dir(&self.harness.inner, &self.secrets_dir(), request).await
     }
 
     async fn get_secret(&self, id: &SecretId) -> Result<Option<Secret>> {
-        let path = self.secrets_dir().join(format!("{id}.json"));
-        let Some(record) = self
-            .harness
-            .inner
-            .storage
-            .get_json_if_exists::<StoredSecret>(&path)
-            .await?
-        else {
-            return self.harness.get_secret(id).await;
-        };
-        Ok(Some(
-            self.harness
-                .inner
-                .secret_cipher
-                .decrypt_secret(&record.secret)?,
-        ))
+        get_secret_in_scopes(
+            &self.harness.inner,
+            &[self.secrets_dir(), self.harness.secrets_dir()],
+            id,
+        )
+        .await
     }
 
     async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion> {
@@ -2448,61 +2412,20 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn put_secret(&self, request: PutSecretRequest) -> Result<SecretId> {
-        let _guard = self.harness.inner.write_lock.lock().await;
-        let id = Uuid7::now();
-        let record = StoredSecret {
-            metadata: SecretMetadata {
-                id,
-                r#type: secret_type(&request.secret),
-                name: request.name,
-                created_at: id.timestamp().expect("uuid7 timestamp"),
-            },
-            secret: self
-                .harness
-                .inner
-                .secret_cipher
-                .encrypt_secret(&request.secret)?,
-        };
-        self.harness
-            .inner
-            .storage
-            .put_json(self.secrets_dir().join(format!("{id}.json")), &record)
-            .await?;
-        Ok(id)
+        put_secret_in_dir(&self.harness.inner, &self.secrets_dir(), request).await
     }
 
     async fn get_secret(&self, id: &SecretId) -> Result<Option<Secret>> {
-        let local_path = self.secrets_dir().join(format!("{id}.json"));
-        if let Some(record) = self
-            .harness
-            .inner
-            .storage
-            .get_json_if_exists::<StoredSecret>(&local_path)
-            .await?
-        {
-            return Ok(Some(
-                self.harness
-                    .inner
-                    .secret_cipher
-                    .decrypt_secret(&record.secret)?,
-            ));
-        }
-        let agent_path = agent_secrets_dir(&self.harness, self.agent_id).join(format!("{id}.json"));
-        let Some(record) = self
-            .harness
-            .inner
-            .storage
-            .get_json_if_exists::<StoredSecret>(&agent_path)
-            .await?
-        else {
-            return self.harness.get_secret(id).await;
-        };
-        Ok(Some(
-            self.harness
-                .inner
-                .secret_cipher
-                .decrypt_secret(&record.secret)?,
-        ))
+        get_secret_in_scopes(
+            &self.harness.inner,
+            &[
+                self.secrets_dir(),
+                agent_secrets_dir(&self.harness, self.agent_id),
+                self.harness.secrets_dir(),
+            ],
+            id,
+        )
+        .await
     }
 }
 
@@ -3171,6 +3094,259 @@ struct StoredBinding {
 struct StoredSecret {
     metadata: SecretMetadata,
     secret: EncryptedSecret,
+}
+
+impl BasicExoHarnessInner {
+    async fn secret_lock(&self, id: SecretId) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.secret_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(id, Arc::downgrade(&lock));
+        lock
+    }
+}
+
+async fn put_secret_in_dir(
+    inner: &BasicExoHarnessInner,
+    secrets_dir: &Path,
+    request: PutSecretRequest,
+) -> Result<SecretId> {
+    if let Secret::Oauth {
+        provider: requested_provider,
+        ..
+    } = &request.secret
+        && let Some(existing) = inner
+            .storage
+            .list_json_matching_suffix::<StoredSecret>(secrets_dir, ".json")
+            .await?
+            .into_iter()
+            .filter(|record| record.metadata.name == request.name)
+            .max_by_key(|record| record.metadata.id)
+    {
+        let secret_lock = inner.secret_lock(existing.metadata.id).await;
+        let _secret_guard = secret_lock.lock().await;
+        let _write_guard = inner.write_lock.lock().await;
+        let path = secrets_dir.join(format!("{}.json", existing.metadata.id));
+        let Some(current) = inner
+            .storage
+            .get_json_if_exists::<StoredSecret>(&path)
+            .await?
+        else {
+            bail!("OAuth credential changed while login was being saved; retry login");
+        };
+        match inner.secret_cipher.decrypt_secret(&current.secret)? {
+            Secret::Oauth {
+                provider,
+                access_token: None,
+                ..
+            } if provider == *requested_provider => {
+                let record = StoredSecret {
+                    metadata: current.metadata,
+                    secret: inner.secret_cipher.encrypt_secret(&request.secret)?,
+                };
+                inner.storage.put_json(path, &record).await?;
+                return Ok(record.metadata.id);
+            }
+            Secret::Oauth {
+                provider,
+                access_token: None,
+                ..
+            } => {
+                bail!(
+                    "credential `{}` belongs to OAuth provider {:?}, not {:?}",
+                    request.name,
+                    provider,
+                    requested_provider
+                );
+            }
+            Secret::Oauth { .. } => {
+                bail!(
+                    "OAuth credential `{}` is already logged in; log out before replacing it",
+                    request.name
+                );
+            }
+            Secret::Key { .. } => {
+                bail!(
+                    "credential `{}` is an API key, not an OAuth credential",
+                    request.name
+                );
+            }
+        }
+    }
+
+    let _write_guard = inner.write_lock.lock().await;
+    if matches!(&request.secret, Secret::Oauth { .. })
+        && inner
+            .storage
+            .list_json_matching_suffix::<StoredSecret>(secrets_dir, ".json")
+            .await?
+            .into_iter()
+            .any(|record| record.metadata.name == request.name)
+    {
+        bail!(
+            "OAuth credential `{}` changed while login was being saved; retry login",
+            request.name
+        );
+    }
+    let id = Uuid7::now();
+    let record = StoredSecret {
+        metadata: SecretMetadata {
+            id,
+            r#type: secret_type(&request.secret),
+            name: request.name,
+            created_at: id.timestamp().expect("uuid7 timestamp"),
+        },
+        secret: inner.secret_cipher.encrypt_secret(&request.secret)?,
+    };
+    inner
+        .storage
+        .put_json(secrets_dir.join(format!("{id}.json")), &record)
+        .await?;
+    Ok(id)
+}
+
+async fn find_secret_record(
+    inner: &BasicExoHarnessInner,
+    scopes: &[PathBuf],
+    id: &SecretId,
+) -> Result<Option<(PathBuf, StoredSecret)>> {
+    for scope in scopes {
+        let path = scope.join(format!("{id}.json"));
+        if let Some(record) = inner
+            .storage
+            .get_json_if_exists::<StoredSecret>(&path)
+            .await?
+        {
+            return Ok(Some((path, record)));
+        }
+    }
+    Ok(None)
+}
+
+async fn get_secret_in_scopes(
+    inner: &BasicExoHarnessInner,
+    scopes: &[PathBuf],
+    id: &SecretId,
+) -> Result<Option<Secret>> {
+    let Some((_, record)) = find_secret_record(inner, scopes, id).await? else {
+        return Ok(None);
+    };
+    let secret = inner.secret_cipher.decrypt_secret(&record.secret)?;
+    let Secret::Oauth {
+        provider: Some(_),
+        refresh_token: Some(_),
+        expires_at: Some(expires_at),
+        ..
+    } = &secret
+    else {
+        return Ok(Some(secret));
+    };
+    if *expires_at > Utc::now() + TimeDelta::minutes(5) {
+        return Ok(Some(secret));
+    }
+
+    let secret_lock = inner.secret_lock(*id).await;
+    let _secret_guard = secret_lock.lock().await;
+    let Some((path, record)) = find_secret_record(inner, scopes, id).await? else {
+        return Ok(None);
+    };
+    let secret = inner.secret_cipher.decrypt_secret(&record.secret)?;
+    let Secret::Oauth {
+        provider: Some(provider),
+        account_id,
+        refresh_token: Some(refresh_token),
+        expires_at: Some(expires_at),
+        ..
+    } = &secret
+    else {
+        return Ok(Some(secret));
+    };
+    if *expires_at > Utc::now() + TimeDelta::minutes(5) {
+        return Ok(Some(secret));
+    }
+
+    let refreshed = inner
+        .oauth_providers
+        .get(provider)?
+        .refresh(refresh_token)
+        .await?;
+    let refreshed_secret = Secret::Oauth {
+        provider: Some(provider.clone()),
+        account_id: refreshed.account_id.or_else(|| account_id.clone()),
+        access_token: Some(refreshed.access_token),
+        refresh_token: refreshed.refresh_token,
+        expires_at: Some(refreshed.expires_at),
+    };
+    let updated = StoredSecret {
+        metadata: record.metadata,
+        secret: inner.secret_cipher.encrypt_secret(&refreshed_secret)?,
+    };
+    let _write_guard = inner.write_lock.lock().await;
+    inner.storage.put_json(path, &updated).await?;
+    Ok(Some(refreshed_secret))
+}
+
+async fn logout_oauth_secret_in_dir(
+    inner: &BasicExoHarnessInner,
+    secrets_dir: &Path,
+    id: &SecretId,
+) -> Result<LogoutOauthResult> {
+    let secret_lock = inner.secret_lock(*id).await;
+    let _secret_guard = secret_lock.lock().await;
+    let path = secrets_dir.join(format!("{id}.json"));
+    let Some(record) = inner
+        .storage
+        .get_json_if_exists::<StoredSecret>(&path)
+        .await?
+    else {
+        bail!("OAuth credential `{id}` does not exist");
+    };
+    let secret = inner.secret_cipher.decrypt_secret(&record.secret)?;
+    let Secret::Oauth {
+        provider,
+        access_token,
+        refresh_token,
+        ..
+    } = secret
+    else {
+        bail!("secret `{id}` is an API key, not an OAuth credential");
+    };
+
+    let was_logged_in = access_token.is_some() || refresh_token.is_some();
+    let remote_revocation_confirmed = if !was_logged_in {
+        false
+    } else if let Some(provider_id) = provider.as_deref() {
+        match inner.oauth_providers.get(provider_id) {
+            Ok(oauth_provider) => oauth_provider
+                .revoke(access_token.as_deref(), refresh_token.as_deref())
+                .await
+                .is_ok(),
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+
+    let logged_out = Secret::Oauth {
+        provider,
+        account_id: None,
+        access_token: None,
+        refresh_token: None,
+        expires_at: None,
+    };
+    let updated = StoredSecret {
+        metadata: record.metadata,
+        secret: inner.secret_cipher.encrypt_secret(&logged_out)?,
+    };
+    let _write_guard = inner.write_lock.lock().await;
+    inner.storage.put_json(path, &updated).await?;
+    Ok(LogoutOauthResult {
+        was_logged_in,
+        remote_revocation_confirmed,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4078,4 +4254,203 @@ fn build_secret_cipher(
         SecretBackendChoice::Static(key) => Arc::new(StaticSecretKeyProvider::new(key)),
     };
     Ok(SecretCipher::new(provider))
+}
+
+#[cfg(feature = "apple-keychain")]
+mod keychain_migration {
+    use super::*;
+
+    const SECRET_STORE_ID_PATH: &str = "metadata/secret-store.json";
+    const KEYCHAIN_MIGRATION_PATH: &str = "metadata/keychain-migration-v1.json";
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    struct SecretStoreIdentity {
+        id: uuid::Uuid,
+    }
+
+    pub(super) async fn prepare_keychain_account(
+        storage: &BasicObjectStore,
+        legacy_account: &str,
+    ) -> Result<String> {
+        let account = keychain_account_for_store(storage).await?;
+        migrate_keychain_account_if_needed(storage, &account, legacy_account).await?;
+        Ok(account)
+    }
+
+    async fn keychain_account_for_store(storage: &BasicObjectStore) -> Result<String> {
+        let identity = secret_store_identity(storage).await?;
+        Ok(format!("exo-secret-store:{}", identity.id))
+    }
+
+    async fn migrate_keychain_account_if_needed(
+        storage: &BasicObjectStore,
+        account: &str,
+        legacy_account: &str,
+    ) -> Result<()> {
+        let marker = Path::new(KEYCHAIN_MIGRATION_PATH);
+        if storage
+            .get_json_if_exists::<bool>(marker)
+            .await?
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        if has_stored_secret_records(storage).await? {
+            migrate_apple_keychain_master_key(account, legacy_account)?;
+        }
+        storage.put_json(marker, &true).await
+    }
+
+    async fn has_stored_secret_records(storage: &BasicObjectStore) -> Result<bool> {
+        Ok(storage.list_keys("").await?.iter().any(|key| {
+            let components = key.split('/').collect::<Vec<_>>();
+            matches!(
+                components.as_slice(),
+                ["secrets", file]
+                    | ["agents", _, "secrets", file]
+                    | ["agents", _, "conversations", _, "secrets", file]
+                    if file.ends_with(".json")
+            )
+        }))
+    }
+
+    async fn secret_store_identity(storage: &BasicObjectStore) -> Result<SecretStoreIdentity> {
+        let path = Path::new(SECRET_STORE_ID_PATH);
+        if let Some(identity) = storage
+            .get_json_if_exists::<SecretStoreIdentity>(path)
+            .await?
+        {
+            return Ok(identity);
+        }
+        let candidate = SecretStoreIdentity {
+            id: uuid::Uuid::new_v4(),
+        };
+        storage.put_json(path, &candidate).await?;
+        Ok(candidate)
+    }
+
+    #[cfg(test)]
+    mod keychain_account_tests {
+        use tempfile::TempDir;
+
+        use super::{
+            BasicObjectStore, KEYCHAIN_MIGRATION_PATH, has_stored_secret_records,
+            keychain_account_for_store, migrate_keychain_account_if_needed,
+        };
+
+        #[tokio::test]
+        async fn fresh_store_identity_is_stable_across_paths() {
+            let parent = TempDir::new().expect("parent tempdir");
+            let original_path = parent.path().join("original");
+            let moved_path = parent.path().join("moved");
+            tokio::fs::create_dir(&original_path)
+                .await
+                .expect("create original store");
+            let storage = BasicObjectStore::local_filesystem(&original_path)
+                .await
+                .expect("object store");
+            let first = keychain_account_for_store(&storage)
+                .await
+                .expect("first account");
+            drop(storage);
+            tokio::fs::rename(&original_path, &moved_path)
+                .await
+                .expect("move store");
+            let moved_storage = BasicObjectStore::local_filesystem(&moved_path)
+                .await
+                .expect("moved object store");
+            let moved = keychain_account_for_store(&moved_storage)
+                .await
+                .expect("moved account");
+
+            assert_eq!(first, moved);
+            assert!(first.starts_with("exo-secret-store:"));
+        }
+
+        #[tokio::test]
+        async fn distinct_stores_have_distinct_identities() {
+            let first_dir = TempDir::new().expect("first tempdir");
+            let second_dir = TempDir::new().expect("second tempdir");
+            let first_storage = BasicObjectStore::local_filesystem(first_dir.path())
+                .await
+                .expect("first object store");
+            let second_storage = BasicObjectStore::local_filesystem(second_dir.path())
+                .await
+                .expect("second object store");
+
+            let first = keychain_account_for_store(&first_storage)
+                .await
+                .expect("first account");
+            let second = keychain_account_for_store(&second_storage)
+                .await
+                .expect("second account");
+
+            assert_ne!(first, second);
+        }
+
+        #[tokio::test]
+        async fn fresh_stores_complete_migration_without_keychain_access() {
+            let tempdir = TempDir::new().expect("tempdir");
+            let storage = BasicObjectStore::local_filesystem(tempdir.path())
+                .await
+                .expect("object store");
+
+            migrate_keychain_account_if_needed(
+                &storage,
+                "unused-current-account",
+                "unused-legacy-account",
+            )
+            .await
+            .expect("complete migration");
+
+            assert!(
+                storage
+                    .get_json::<bool>(KEYCHAIN_MIGRATION_PATH)
+                    .await
+                    .expect("migration marker")
+            );
+        }
+
+        #[tokio::test]
+        async fn stored_secret_detection_checks_each_supported_scope() {
+            for secret_path in [
+                "secrets/root.json",
+                "agents/agent-id/secrets/agent.json",
+                "agents/agent-id/conversations/conversation-id/secrets/conversation.json",
+            ] {
+                let tempdir = TempDir::new().expect("tempdir");
+                let storage = BasicObjectStore::local_filesystem(tempdir.path())
+                    .await
+                    .expect("object store");
+                storage
+                    .put_json(secret_path, &"encrypted fixture")
+                    .await
+                    .expect("encrypted secret marker");
+
+                assert!(
+                    has_stored_secret_records(&storage)
+                        .await
+                        .expect("detect stored secret"),
+                    "failed to detect {secret_path}"
+                );
+            }
+
+            let tempdir = TempDir::new().expect("tempdir");
+            let storage = BasicObjectStore::local_filesystem(tempdir.path())
+                .await
+                .expect("object store");
+            storage
+                .put_json(
+                    "agents/agent-id/artifacts/secrets/not-a-secret.json",
+                    &"fixture",
+                )
+                .await
+                .expect("unrelated fixture");
+            assert!(
+                !has_stored_secret_records(&storage)
+                    .await
+                    .expect("check unrelated json")
+            );
+        }
+    }
 }

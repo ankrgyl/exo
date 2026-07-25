@@ -68,6 +68,10 @@ impl LocalSandboxExoHarness {
 
 #[async_trait]
 impl ExoHarness for LocalSandboxExoHarness {
+    async fn preflight_secret_storage(&self) -> Result<()> {
+        self.state.remote.preflight_secret_storage().await
+    }
+
     async fn list_agents(&self) -> Result<Vec<Arc<dyn AgentHandle>>> {
         Ok(self
             .state

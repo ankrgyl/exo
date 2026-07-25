@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/macos-keychain.sh
+. "$ROOT_DIR/scripts/macos-keychain.sh"
 
 # setup.sh installs node/pnpm/rust through mise; make its shims available even
 # in shells where mise was never activated (the harness runner spawns node).
@@ -36,6 +38,7 @@ SHELL_PROGRAM="${EXO_SHELL_PROGRAM:-/bin/bash}"
 SANDBOX_SCOPE="${EXO_SANDBOX_SCOPE:-}"
 SCHEDULER_INTERVAL_SECONDS="${EXO_SCHEDULER_INTERVAL_SECONDS:-10}"
 COMMAND="repl"
+declare -a AUTH_ARGS=()
 USE_SANDBOX=true
 PULL_SANDBOX=false
 START_SCHEDULER="${EXO_START_SCHEDULER:-true}"
@@ -58,6 +61,7 @@ UPSTREAM_MODEL="${EXO_UPSTREAM_MODEL:-}"
 SECRET_NAME=""
 SECRET_ENV=""
 MODEL_BASE_URL=""
+MODEL_PROVIDER_ID=""
 USER_NAME="${EXO_USER_NAME:-}"
 export EXO_LOCAL_PROMPT_FILE="$LOCAL_PROMPT_FILE"
 
@@ -70,6 +74,7 @@ Usage:
   ./exo.sh fresh
   ./exo.sh stop-all
   ./exo.sh build
+  ./exo.sh auth <login|logout> <provider> [provider options]
   ./exo.sh register-model
   ./exo.sh write-profile
   ./exo.sh setup-profile
@@ -87,9 +92,9 @@ Subcommands:
   fresh            Rebuild, delete all state, and start a clean REPL
   stop-all         Stop the scheduler and adapter runners, preserving .exo state
   build            Install JS dependencies and build the exo CLI and scheduler
-  register-model   Store an API-key secret and register a model binding; uses
-                   --model, --upstream-model, --secret-name, --secret-env, and
-                   optionally --base-url
+  auth             Log in to or out of an external model provider
+  register-model   Register a model binding; uses --model, --upstream-model,
+                   --secret-name, and optionally --secret-env and --base-url
   write-profile    Write the local profile prompt non-interactively; uses
                    --user-name and --local-prompt-file
   setup-profile    Prompt interactively and write the local profile prompt
@@ -101,8 +106,9 @@ Options:
   --model <model>              Model binding name (default: gpt-5.6-terra)
   --upstream-model <model>     Upstream model id for register-model (default: --model)
   --secret-name <name>         Secret name for register-model (e.g. openai)
-  --secret-env <env-var>       Environment variable holding the API key for register-model
+  --secret-env <env-var>       Optional environment variable holding an API key to store
   --base-url <url>             Optional API base URL for register-model
+  --provider <provider>        Optional model provider id for register-model
   --user-name <name>           User name for write-profile (default: none)
   --agent <slug>               Agent slug (default: exo-agent)
   --conversation <slug>        Conversation slug (default: dev)
@@ -306,6 +312,7 @@ configure_guardian_for_current_launch() {
 build_exo() {
   echo "Building exo binary..."
   (cd "$ROOT_DIR" && CARGO_TARGET_DIR=target cargo build -p exo --ignore-rust-version)
+  codesign_binary "$EXO_BIN"
 }
 
 build_exo_scheduler() {
@@ -313,6 +320,26 @@ build_exo_scheduler() {
   (cd "$ROOT_DIR" && CARGO_TARGET_DIR=target cargo build \
     --manifest-path examples/exo/scheduler-runner/Cargo.toml \
     --ignore-rust-version)
+  codesign_binary "$SCHEDULER_BIN"
+}
+
+# Give all macOS development binaries one stable, worktree-specific designated
+# requirement. Keychain records this identity when a binary creates an item, so
+# sharing it lets the CLI and scheduler retain access across rebuilds.
+codesign_binary() {
+  local binary="$1"
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    return
+  fi
+
+  local root_digest identifier requirement
+  root_digest="$(printf '%s' "$ROOT_DIR" | shasum -a 256)"
+  root_digest="${root_digest%% *}"
+  identifier="ai.exoharness.exo.dev.${root_digest:0:16}"
+  requirement="=designated => identifier \"$identifier\""
+  echo "Applying local development signature to $(basename "$binary")..."
+  codesign --force --sign - --identifier "$identifier" \
+    --requirements "$requirement" "$binary"
 }
 
 build_all() {
@@ -324,17 +351,34 @@ build_all() {
 
 register_model() {
   [[ -n "$SECRET_NAME" ]] || die "register-model requires --secret-name"
-  [[ -n "$SECRET_ENV" ]] || die "register-model requires --secret-env"
   ensure_exo_bin
+  # Repair access to an existing master key before the CLI opens the secret store.
+  exo_macos_prepare_keychain_for_ssh "$ROOT_DIR" "$EXO_BIN" "$SCHEDULER_BIN"
   local upstream="${UPSTREAM_MODEL:-$MODEL}"
-  echo "Storing secret $SECRET_NAME from \$$SECRET_ENV..."
-  exo secret set "$SECRET_NAME" --env "$SECRET_ENV"
+  if [[ -n "$SECRET_ENV" ]]; then
+    echo "Storing secret $SECRET_NAME from \$$SECRET_ENV..."
+    exo secret set "$SECRET_NAME" --env "$SECRET_ENV"
+    # A fresh secret store creates its master key above; authorize the scheduler now.
+    exo_macos_prepare_keychain_for_ssh "$ROOT_DIR" "$EXO_BIN" "$SCHEDULER_BIN"
+  fi
   echo "Registering model $MODEL -> $upstream..."
   local args=(model register "$MODEL" --model "$upstream" --secret "$SECRET_NAME")
+  if [[ -n "$MODEL_PROVIDER_ID" ]]; then
+    args+=(--provider "$MODEL_PROVIDER_ID")
+  fi
   if [[ -n "$MODEL_BASE_URL" ]]; then
     args+=(--base-url "$MODEL_BASE_URL")
   fi
   exo "${args[@]}"
+}
+
+run_provider_auth() {
+  ensure_exo_bin
+  # Repair access to an existing master key before provider auth opens the store.
+  exo_macos_prepare_keychain_for_ssh "$ROOT_DIR" "$EXO_BIN" "$SCHEDULER_BIN"
+  exo auth "${AUTH_ARGS[@]}"
+  # Login may create the master key; authorize the scheduler for the new item.
+  exo_macos_prepare_keychain_for_ssh "$ROOT_DIR" "$EXO_BIN" "$SCHEDULER_BIN"
 }
 
 write_local_profile() {
@@ -890,6 +934,10 @@ fresh_start() {
 
 run_repl() {
   ensure_exo_bin
+  if [[ "$START_SCHEDULER" == true ]]; then
+    ensure_scheduler_bin
+  fi
+  exo_macos_prepare_keychain_for_ssh "$ROOT_DIR" "$EXO_BIN" "$SCHEDULER_BIN"
   if [[ "$SETUP_PROFILE" == true ]]; then
     setup_local_profile
   fi
@@ -1300,6 +1348,13 @@ while [[ $# -gt 0 ]]; do
       [[ $# -eq 0 ]] || die "build does not accept additional arguments"
       COMMAND="build"
       ;;
+    auth)
+      shift
+      [[ $# -gt 0 ]] || die "auth requires a login or logout command"
+      COMMAND="auth"
+      AUTH_ARGS=("$@")
+      break
+      ;;
     register-model)
       shift
       COMMAND="register-model"
@@ -1331,6 +1386,11 @@ while [[ $# -gt 0 ]]; do
     --base-url)
       MODEL_BASE_URL="${2:-}"
       [[ -n "$MODEL_BASE_URL" ]] || die "--base-url requires a value"
+      shift 2
+      ;;
+    --provider)
+      MODEL_PROVIDER_ID="${2:-}"
+      [[ -n "$MODEL_PROVIDER_ID" ]] || die "--provider requires a value"
       shift 2
       ;;
     --user-name)
@@ -1558,6 +1618,9 @@ case "$COMMAND" in
     ;;
   build)
     build_all
+    ;;
+  auth)
+    run_provider_auth
     ;;
   register-model)
     register_model

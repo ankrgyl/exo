@@ -14,6 +14,7 @@ import {
 } from "@exo/harness";
 import {
   errorMessage,
+  modelProvider,
   tracedUnderParent,
   type TraceParent,
 } from "@exo/model-runtime/responses";
@@ -29,7 +30,11 @@ export interface TextDeltaTraceState {
 export interface ResolvedLlmBinding {
   name: string;
   model: string;
-  apiKey?: string;
+  provider: string;
+  auth?: {
+    authorization?: string;
+    headers: Record<string, string>;
+  };
   baseUrl?: string | null;
 }
 
@@ -247,7 +252,8 @@ export async function resolveLlmBinding(
   if (!binding || binding.type !== "llm") {
     throw new Error(`registered model binding disappeared: ${name}`);
   }
-  let apiKey: string | undefined;
+  const provider = modelProvider(binding);
+  let auth: ResolvedLlmBinding["auth"];
   if (binding.secretId) {
     const secret = await context.exoharness.current.conversation.getSecret(
       binding.secretId,
@@ -255,17 +261,71 @@ export async function resolveLlmBinding(
     if (!secret) {
       throw new Error(`model secret does not exist for ${name}`);
     }
-    if (secret.type !== "key") {
-      throw new Error(`model secret must be a key secret for ${name}`);
+    if (secret.type === "key") {
+      if (provider === "openai-chatgpt") {
+        throw new Error(
+          `model provider ${provider} requires an OAuth credential`,
+        );
+      }
+      auth =
+        provider === "anthropic"
+          ? { headers: { "x-api-key": secret.value } }
+          : {
+              authorization: `Bearer ${secret.value}`,
+              headers: {},
+            };
+    } else {
+      if (!secret.provider) {
+        throw new Error("OAuth credential has no provider; log in again");
+      }
+      if (!secret.accessToken) {
+        throw new Error(
+          `OAuth credential for provider ${secret.provider} is logged out`,
+        );
+      }
+      if (secret.provider !== provider) {
+        throw new Error(
+          `model provider ${provider} cannot use an OAuth credential for ${secret.provider}`,
+        );
+      }
+      if (provider !== "openai-chatgpt") {
+        throw new Error(
+          `OAuth request authentication is not implemented for ${provider}`,
+        );
+      }
+      if (!secret.accountId) {
+        throw new Error(
+          "OpenAI ChatGPT credential has no account id; log in again",
+        );
+      }
+      auth = {
+        authorization: `Bearer ${secret.accessToken}`,
+        headers: {
+          "chatgpt-account-id": secret.accountId,
+          "OpenAI-Beta": "responses=experimental",
+        },
+      };
     }
-    apiKey = secret.value;
   }
   return {
     name,
     model: binding.model,
-    apiKey,
+    provider,
+    auth,
     baseUrl: binding.baseUrl ?? null,
   };
+}
+
+export function apiKeyFromModelBinding(
+  binding: ResolvedLlmBinding,
+): string | undefined {
+  const headerKey = Object.entries(binding.auth?.headers ?? {}).find(
+    ([name]) => name.toLowerCase() === "x-api-key",
+  )?.[1];
+  if (headerKey) {
+    return headerKey;
+  }
+  return binding.auth?.authorization?.replace(/^Bearer\s+/i, "");
 }
 
 export function markFirstTextDelta(state: TextDeltaTraceState): number | null {

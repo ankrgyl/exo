@@ -644,6 +644,7 @@ async fn register_test_model(exoharness: &dyn ExoHarness) {
         .put_binding(Binding::Llm {
             name: "gpt-5.4".to_string(),
             model: "gpt-5.4".to_string(),
+            provider: None,
             base_url: None,
             secret_id: Some(secret_id),
         })
