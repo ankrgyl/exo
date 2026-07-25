@@ -22,18 +22,23 @@ one with `--harness`:
 
 Whatever the runtime, the canonical loop is the same:
 
-1. `beginTurn(...)` — durably accept the user input, get a turn handle
-2. Read or derive prompt history from events
-3. Call the model
-4. Append messages and tool requests through the turn handle
-5. Execute tools and append results through the turn handle
-6. `finish()`
+1. Resolve the effective config, visible bindings, and executor source identity
+2. Ensure a content-addressed execution epoch
+3. `beginTurn(...)` with the observed agent head and epoch id
+4. Read or derive prompt history from events
+5. Call the model
+6. Append messages and tool requests through the turn handle
+7. Execute tools and append results through the turn handle
+8. `finish()`
 
 Everything in steps 2–5 is executor policy: which slice of history to
 send, which model to call, which tools to expose, when to compact. The
 exoharness can even be exposed *to the model* — e.g. a tool for querying
 the agent's own history — but that exposure is still configured by the
 executor.
+
+The epoch and agent head make executor policy changes explicit in durable
+history. See [Causal Execution](./causal-execution).
 
 ## TypeScript harnesses
 

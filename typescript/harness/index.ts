@@ -159,6 +159,8 @@ export interface AgentRecord {
   id: string;
   slug: string;
   name: string;
+  latestEventId?: string | null;
+  activeExecutionEpochId?: string | null;
 }
 
 export interface ConversationRecord {
@@ -171,6 +173,8 @@ export interface ConversationRecord {
 export interface TurnRecord {
   id: string;
   sessionId: string;
+  agentEventId?: string | null;
+  executionEpochId?: string | null;
 }
 
 export interface ArtifactVersion {
@@ -212,6 +216,63 @@ export interface AddEventsResult {
   latestEventId: string;
 }
 
+export interface AgentEventOrigin {
+  conversationId: string;
+  sessionId?: string | null;
+  turnId?: string | null;
+}
+
+export type AgentEventData = { type: string } & Record<string, unknown>;
+
+export interface AgentEvent {
+  id: string;
+  agentId: string;
+  createdAt: string;
+  origin?: AgentEventOrigin | null;
+  data: AgentEventData;
+}
+
+export interface AgentEventQuery {
+  cursor?: string | null;
+  direction?: EventQueryDirection | null;
+  limit?: number | null;
+  types?: string[] | null;
+}
+
+export interface GetAgentEventsResult {
+  events: AgentEvent[];
+  cursor?: string | null;
+}
+
+export interface AddAgentEventsRequest {
+  origin?: AgentEventOrigin | null;
+  data: AgentEventData[];
+}
+
+export interface AddAgentEventsResult {
+  eventIds: string[];
+  latestEventId: string;
+}
+
+export interface ExecutionEpochRecord {
+  id: string;
+  manifestDigest: string;
+  manifest: JsonValue;
+  createdAt: string;
+}
+
+export interface EnsureExecutionEpochRequest {
+  manifest: JsonValue;
+  origin?: AgentEventOrigin | null;
+  expectedAgentEventId?: string | null;
+}
+
+export interface EnsureExecutionEpochResult {
+  epoch: ExecutionEpochRecord;
+  agentEventId: string;
+  created: boolean;
+}
+
 export interface NewConversationRequest {
   slug?: string | null;
   name?: string | null;
@@ -243,6 +304,12 @@ export interface HistoryMessage {
 
 export interface Agent {
   readonly record: AgentRecord;
+  getEvents(query?: AgentEventQuery): Promise<GetAgentEventsResult>;
+  getEvent(id: string): Promise<AgentEvent | null>;
+  addEvents(request: AddAgentEventsRequest): Promise<AddAgentEventsResult>;
+  ensureExecutionEpoch(
+    request: EnsureExecutionEpochRequest,
+  ): Promise<EnsureExecutionEpochResult>;
   listConversations(): Promise<Conversation[]>;
   getConversation(id: string): Promise<Conversation | null>;
   newConversation(request?: NewConversationRequest): Promise<Conversation>;

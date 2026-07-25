@@ -4,16 +4,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use exoharness::{
-    AddEventsRequest, AddEventsResult, AgentHandle, AgentId, Artifact, ArtifactVersion, Binding,
-    BindingId, BindingRecord, CancelSandboxProcessRequest, CloseSandboxProcessInputRequest,
-    ConversationHandle, ConversationId, CreateSandboxRequest, Event, EventData, EventId, EventKind,
-    EventStream, ExoHarness, ForkConversationRequest, GetEventsResult, ListConversationsRequest,
-    ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
-    ReadArtifactRequest, Result, RunInSandboxRequest, SandboxHandle, SandboxId, SandboxProcess,
-    SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId,
-    SecretMetadata, SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest,
-    TurnHandle, TurnRecord, Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest,
-    WriteSandboxProcessInputRequest,
+    AddAgentEventsRequest, AddAgentEventsResult, AddEventsRequest, AddEventsResult, AgentEvent,
+    AgentEventId, AgentEventQuery, AgentEventStream, AgentHandle, AgentId, Artifact,
+    ArtifactVersion, Binding, BindingId, BindingRecord, CancelSandboxProcessRequest,
+    CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, CreateSandboxRequest,
+    EnsureExecutionEpochRequest, EnsureExecutionEpochResult, Event, EventData, EventId, EventKind,
+    EventStream, ExoHarness, ForkConversationRequest, GetAgentEventsResult, GetEventsResult,
+    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
+    PutSecretRequest, ReadArtifactRequest, Result, RunInSandboxRequest, SandboxHandle, SandboxId,
+    SandboxProcess, SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, Secret,
+    SecretId, SecretMetadata, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
+    StartSandboxRequest, TurnHandle, TurnRecord, Uuid7, WaitSandboxProcessRequest,
+    WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -199,6 +201,29 @@ impl LocalSandboxAgent {
 impl AgentHandle for LocalSandboxAgent {
     fn record(&self) -> &exoharness::AgentRecord {
         self.remote.record()
+    }
+
+    async fn get_events(&self, query: Option<AgentEventQuery>) -> Result<GetAgentEventsResult> {
+        self.remote.get_events(query).await
+    }
+
+    async fn watch_events(&self, after_exclusive: Bound<AgentEventId>) -> Result<AgentEventStream> {
+        self.remote.watch_events(after_exclusive).await
+    }
+
+    async fn get_event(&self, id: AgentEventId) -> Result<Option<AgentEvent>> {
+        self.remote.get_event(id).await
+    }
+
+    async fn add_events(&self, request: AddAgentEventsRequest) -> Result<AddAgentEventsResult> {
+        self.remote.add_events(request).await
+    }
+
+    async fn ensure_execution_epoch(
+        &self,
+        request: EnsureExecutionEpochRequest,
+    ) -> Result<EnsureExecutionEpochResult> {
+        self.remote.ensure_execution_epoch(request).await
     }
 
     async fn list_conversations(

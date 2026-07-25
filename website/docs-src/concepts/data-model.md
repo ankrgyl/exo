@@ -12,6 +12,11 @@ apply across all conversations with an agent — for example, an MCP server
 every user of the agent can access, with a shared secret. The same
 configuration can also be scoped to an individual conversation.
 
+An agent also owns an append-only event timeline. It records shared state
+changes that conversation logs cannot see, including agent artifacts,
+binding and secret-metadata updates, conversation lifecycle, agent-scoped
+sandbox activity, and execution epochs. Secret values are not included.
+
 ## Conversation, session, turn
 
 - A **conversation** is a sequence of interactions with an agent. It can
@@ -27,6 +32,10 @@ Explicit session lifecycle exists, but the common hot path is
 handle** the executor uses to append events and finish the turn. Head
 tracking and write ordering stay inside the exoharness, so the executor can
 start the model call as quickly as possible after input arrives.
+
+Each turn pins an agent event id and an execution epoch id. Together with
+the turn's position in the conversation log, these are its
+[causal execution coordinates](./causal-execution).
 
 ## Event
 

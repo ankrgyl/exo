@@ -137,6 +137,30 @@ impl ExoHarnessServer {
                     artifact: agent.write_artifact(request).await?,
                 })
             }
+            Request::AgentGetEvents { agent_id, query } => {
+                let agent = self.require_agent(&agent_id).await?;
+                Ok(Response::AgentEvents {
+                    result: agent.get_events(query).await?,
+                })
+            }
+            Request::AgentGetEvent { agent_id, event_id } => {
+                let agent = self.require_agent(&agent_id).await?;
+                Ok(Response::AgentEvent {
+                    event: agent.get_event(event_id).await?,
+                })
+            }
+            Request::AgentAddEvents { agent_id, request } => {
+                let agent = self.require_agent(&agent_id).await?;
+                Ok(Response::AddAgentEvents {
+                    result: agent.add_events(request).await?,
+                })
+            }
+            Request::AgentEnsureExecutionEpoch { agent_id, request } => {
+                let agent = self.require_agent(&agent_id).await?;
+                Ok(Response::ExecutionEpoch {
+                    result: agent.ensure_execution_epoch(request).await?,
+                })
+            }
             Request::CreateSandbox { scope, request } => Ok(Response::SandboxId {
                 sandbox_id: self.create_sandbox(scope, request).await?,
             }),
@@ -770,6 +794,8 @@ impl ExoHarnessServer {
             .turn_handle(TurnRecord {
                 id: turn_id,
                 session_id,
+                agent_event_id: None,
+                execution_epoch_id: None,
             })
             .await
     }

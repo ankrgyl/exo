@@ -5,11 +5,12 @@ description: Fork and rewind agents from any point in the event log.
 
 # Time Travel
 
-At any point in time, the entire state of an agent is defined by the
-version of its event log. That single invariant is what makes time travel
-possible: you can **rewind or fork from any point in the log**, and every
-part of the data model — conversations, artifacts, sandbox state — can be
-recreated as of that point.
+At any point in time, the durable state of an agent is defined by an agent
+timeline position plus positions in its conversation logs. A turn also pins
+the [execution epoch](./causal-execution) that interpreted that state. Those
+coordinates are what make time travel possible: you can **rewind or fork from
+a known point**, and identify the configuration and executor that produced
+the original result.
 
 ## Rewind and fork
 

@@ -2,7 +2,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use exoharness::{AgentHandle, BeginTurnRequest, ConversationHandle, Result, TurnHandle};
+use exoharness::{
+    AgentEventOrigin, AgentEventQuery, AgentHandle, BeginTurnRequest, BindingRecord,
+    ConversationHandle, EnsureExecutionEpochRequest, EnsureExecutionEpochResult,
+    EventQueryDirection, Result, SecretMetadata, TurnHandle,
+};
+use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::braintrust::{BraintrustRuntimeConfig, BraintrustTracer};
@@ -18,9 +23,34 @@ use crate::shared::{
     spawn_prepared_turn_stream,
 };
 use crate::{
-    AgentConfig, ConversationConfig, ConversationModelConfig, ExecutionStreamEvent,
-    ExecutionStreamHandle, SendRequest, SendResult,
+    AgentConfig, AgentHarnessKind, ConversationConfig, ConversationModelConfig,
+    ExecutionStreamEvent, ExecutionStreamHandle, SendRequest, SendResult,
 };
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ExecutionSourceDigest {
+    pub(crate) role: String,
+    pub(crate) path: String,
+    pub(crate) sha256: String,
+}
+
+#[derive(Serialize)]
+struct ExecutionEpochManifest {
+    schema_version: u32,
+    executor: ExecutionExecutorIdentity,
+    agent_config: AgentConfig,
+    conversation_config: ConversationConfig,
+    visible_bindings: Vec<BindingRecord>,
+    visible_secrets: Vec<SecretMetadata>,
+}
+
+#[derive(Serialize)]
+struct ExecutionExecutorIdentity {
+    crate_name: &'static str,
+    crate_version: &'static str,
+    harness: AgentHarnessKind,
+    sources: Vec<ExecutionSourceDigest>,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum ExecutorStreamMode<'a> {
@@ -31,6 +61,13 @@ pub(crate) enum ExecutorStreamMode<'a> {
 #[async_trait]
 pub(crate) trait HarnessExecutor: Send + Sync + Clone + 'static {
     type Prepared: Send + Sync + 'static;
+
+    async fn execution_sources(
+        &self,
+        _agent_config: &AgentConfig,
+    ) -> Result<Vec<ExecutionSourceDigest>> {
+        Ok(Vec::new())
+    }
 
     async fn prepare_conversation(
         &self,
@@ -72,6 +109,59 @@ impl<E> ExecutorHarnessRuntime<E> {
             agent_config_cache: Arc::new(RwLock::new(HashMap::new())),
             conversation_config_cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+}
+
+impl<E> ExecutorHarnessRuntime<E>
+where
+    E: HarnessExecutor,
+{
+    async fn ensure_execution_epoch(
+        &self,
+        agent: &dyn AgentHandle,
+        conversation: &dyn ConversationHandle,
+        agent_config: &AgentConfig,
+        conversation_config: &ConversationConfig,
+    ) -> Result<EnsureExecutionEpochResult> {
+        let expected_agent_event_id = agent
+            .get_events(Some(AgentEventQuery {
+                direction: Some(EventQueryDirection::Desc),
+                limit: Some(1),
+                ..Default::default()
+            }))
+            .await?
+            .cursor;
+        let (sources, mut visible_bindings, mut visible_secrets) = tokio::try_join!(
+            self.executor.execution_sources(agent_config),
+            conversation.list_bindings(),
+            conversation.list_secrets(),
+        )?;
+        visible_bindings.sort_by_key(|binding| binding.id);
+        visible_secrets.sort_by_key(|secret| secret.id);
+        let manifest = ExecutionEpochManifest {
+            schema_version: 1,
+            executor: ExecutionExecutorIdentity {
+                crate_name: env!("CARGO_PKG_NAME"),
+                crate_version: env!("CARGO_PKG_VERSION"),
+                harness: agent_config.harness,
+                sources,
+            },
+            agent_config: agent_config.clone(),
+            conversation_config: conversation_config.clone(),
+            visible_bindings,
+            visible_secrets,
+        };
+        agent
+            .ensure_execution_epoch(EnsureExecutionEpochRequest {
+                manifest: serde_json::to_value(manifest)?,
+                origin: Some(AgentEventOrigin {
+                    conversation_id: conversation.record().id,
+                    session_id: None,
+                    turn_id: None,
+                }),
+                expected_agent_event_id,
+            })
+            .await
     }
 }
 
@@ -169,10 +259,20 @@ where
             )
             .await?;
         let prepared = self.executor.prepare_request(&request)?;
+        let epoch = self
+            .ensure_execution_epoch(
+                agent.as_ref(),
+                conversation.as_ref(),
+                &agent_config,
+                &conversation_config,
+            )
+            .await?;
         let turn = conversation
             .begin_turn(BeginTurnRequest {
                 session_id: request.session_id,
                 input: request.input,
+                agent_event_id: Some(epoch.agent_event_id),
+                execution_epoch_id: Some(epoch.epoch.id),
             })
             .await?;
         let trace_agent_config = agent_config.clone();
@@ -228,10 +328,20 @@ where
             )
             .await?;
         let prepared = self.executor.prepare_request(&request)?;
+        let epoch = self
+            .ensure_execution_epoch(
+                agent.as_ref(),
+                conversation.as_ref(),
+                &agent_config,
+                &conversation_config,
+            )
+            .await?;
         let turn = conversation
             .begin_turn(BeginTurnRequest {
                 session_id: request.session_id,
                 input: request.input,
+                agent_event_id: Some(epoch.agent_event_id),
+                execution_epoch_id: Some(epoch.epoch.id),
             })
             .await?;
         let trace_agent_config = agent_config.clone();

@@ -22,13 +22,16 @@ use exoharness::{
 };
 use lingua::UniversalStreamChunk;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter, Lines};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::execution_tracing::TurnExecutionTrace;
-use crate::harness_executor::{ExecutorHarnessRuntime, ExecutorStreamMode, HarnessExecutor};
+use crate::harness_executor::{
+    ExecutionSourceDigest, ExecutorHarnessRuntime, ExecutorStreamMode, HarnessExecutor,
+};
 use crate::harness_facade::{SharedHarness, SharedHarnessBacked};
 use crate::harness_tool::{BasicToolRuntime, ExoToolRuntime, ensure_shell_sandbox};
 use crate::shared::try_send_stream_event;
@@ -80,6 +83,47 @@ where
     T: ToolRuntime + 'static,
 {
     type Prepared = SendRequest;
+
+    async fn execution_sources(
+        &self,
+        agent_config: &AgentConfig,
+    ) -> Result<Vec<ExecutionSourceDigest>> {
+        let config = agent_config
+            .typescript
+            .as_ref()
+            .ok_or_else(|| anyhow!("typescript harness requires agent.typescript.module_path"))?;
+        let mut source_paths = Vec::with_capacity(1 + config.tool_module_paths.len());
+        source_paths.push(("harness_module", config.module_path.as_str()));
+        source_paths.extend(
+            config
+                .tool_module_paths
+                .iter()
+                .map(|path| ("tool_module", path.as_str())),
+        );
+
+        let mut sources = Vec::with_capacity(source_paths.len());
+        for (role, configured_path) in source_paths {
+            let path = Path::new(configured_path);
+            let resolved_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                self.workspace_root.join(path)
+            };
+            let contents = tokio::fs::read(&resolved_path).await.with_context(|| {
+                format!(
+                    "failed to read {role} source for execution epoch: {}",
+                    resolved_path.display()
+                )
+            })?;
+            let digest = Sha256::digest(contents);
+            sources.push(ExecutionSourceDigest {
+                role: role.to_string(),
+                path: configured_path.to_string(),
+                sha256: format!("{digest:x}"),
+            });
+        }
+        Ok(sources)
+    }
 
     async fn prepare_conversation(
         &self,
@@ -1300,7 +1344,77 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
 
+    use tempfile::TempDir;
+
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn execution_sources_hash_configured_typescript_files() {
+        let tempdir = TempDir::new().expect("tempdir");
+        tokio::fs::write(
+            tempdir.path().join("harness.ts"),
+            b"export const version = 1;",
+        )
+        .await
+        .expect("harness source");
+        tokio::fs::write(
+            tempdir.path().join("tools.ts"),
+            b"export const tool = 'one';",
+        )
+        .await
+        .expect("tool source");
+        let root: Arc<dyn ExoHarness> = Arc::new(
+            BasicExoHarness::new(crate::test_support::local_test_config(
+                tempdir.path().join("state"),
+            ))
+            .await
+            .expect("exoharness"),
+        );
+        let executor = TypeScriptExecutor::new(
+            root,
+            tempdir.path().to_path_buf(),
+            HashMap::new(),
+            Arc::new(BasicToolRuntime),
+        );
+        let config = AgentConfig {
+            instructions: Vec::new(),
+            harness: crate::AgentHarnessKind::TypeScript,
+            typescript: Some(crate::TypeScriptHarnessConfig {
+                module_path: "harness.ts".to_string(),
+                tool_module_paths: vec!["tools.ts".to_string()],
+            }),
+            enable_agent_tool_creation: true,
+            sandbox: crate::AgentSandboxConfig {
+                scope: crate::SandboxScope::Conversation,
+                image: None,
+                provider: exoharness::SandboxProvider::LocalProcess,
+                mounts: Vec::new(),
+                enable_networking: false,
+            },
+            model: "test".to_string(),
+            max_output_tokens: None,
+            max_tool_round_trips: None,
+            braintrust: None,
+        };
+
+        let sources = executor
+            .execution_sources(&config)
+            .await
+            .expect("source digests");
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].role, "harness_module");
+        assert_eq!(sources[0].path, "harness.ts");
+        assert_eq!(
+            sources[0].sha256,
+            format!("{:x}", Sha256::digest(b"export const version = 1;"))
+        );
+        assert_eq!(sources[1].role, "tool_module");
+        assert_eq!(sources[1].path, "tools.ts");
+        assert_eq!(
+            sources[1].sha256,
+            format!("{:x}", Sha256::digest(b"export const tool = 'one';"))
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn latest_sandbox_process_event_cursor_pages_to_latest_cursor() {
