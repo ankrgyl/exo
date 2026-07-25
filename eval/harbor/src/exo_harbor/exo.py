@@ -135,6 +135,9 @@ class ExoClient:
             "--json",
         )
 
+    async def delete_adapter(self, adapter_id: str) -> None:
+        await self.run("adapters", "delete", adapter_id)
+
     async def ensure_runner(self, socket_path: Path, timeout_sec: float) -> None:
         if await probe(socket_path):
             return

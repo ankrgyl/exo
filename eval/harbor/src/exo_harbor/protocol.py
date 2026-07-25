@@ -32,6 +32,38 @@ class TaskComplete:
     type: Literal["task_complete"] = "task_complete"
 
 
+@dataclass(frozen=True)
+class VerificationException:
+    type: str
+    message: str
+    traceback: str | None = None
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    trial_id: str
+    task_name: str
+    conversation_id: str
+    rewards: dict[str, float | int] | None = None
+    verifier_stdout: str | None = None
+    verifier_stderr: str | None = None
+    exception: VerificationException | None = None
+    type: Literal["verification_result"] = "verification_result"
+    message_id: str = ""
+
+    def payload(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["message_id"] = self.message_id or str(uuid4())
+        return payload
+
+
+@dataclass(frozen=True)
+class FeedbackProcessed:
+    trial_id: str
+    summary: str | None
+    type: Literal["feedback_processed"] = "feedback_processed"
+
+
 class HarborAdapterError(RuntimeError):
     pass
 
@@ -57,6 +89,29 @@ async def send_task_started(
     if summary is not None and not isinstance(summary, str):
         raise HarborAdapterError("event.summary must be a string or null")
     return TaskComplete(trial_id=trial_id, summary=summary)
+
+
+async def send_verification_result(
+    socket_path: Path,
+    request: VerificationResult,
+    *,
+    timeout_sec: float,
+) -> FeedbackProcessed:
+    response = await _request(socket_path, request.payload(), timeout_sec=timeout_sec)
+    if response.get("type") != "response":
+        raise HarborAdapterError(_string(response.get("message"), "message"))
+    event = _object(response.get("event"), "event")
+    if event.get("type") != "feedback_processed":
+        raise HarborAdapterError("adapter response must be feedback_processed")
+    trial_id = _string(event.get("trial_id"), "event.trial_id")
+    if trial_id != request.trial_id:
+        raise HarborAdapterError(
+            f"response trial_id {trial_id} does not match {request.trial_id}"
+        )
+    summary = event.get("summary")
+    if summary is not None and not isinstance(summary, str):
+        raise HarborAdapterError("event.summary must be a string or null")
+    return FeedbackProcessed(trial_id=trial_id, summary=summary)
 
 
 async def probe(socket_path: Path) -> bool:
