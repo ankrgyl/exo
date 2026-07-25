@@ -52,6 +52,8 @@ pub(crate) async fn ensure_conversation_sandbox(
     let _guard = sandbox_lock.lock().await;
     let spec = conversation_sandbox_spec(agent_config, config);
 
+    // Of the still-active candidates in conversation history, prefer the most recent one
+    // that was either explicitly attached or matches the spec derived from configuration.
     for candidate in conversation_sandbox_candidates(conversation)
         .await?
         .into_iter()
@@ -99,6 +101,8 @@ impl ConversationSandboxCandidate {
     }
 }
 
+// Replay sandbox lifecycle events and return active candidates in chronological order.
+// Stopped or detached sandboxes are excluded; a later start reactivates a stopped sandbox.
 async fn conversation_sandbox_candidates(
     conversation: &dyn ConversationHandle,
 ) -> Result<Vec<ConversationSandboxCandidate>> {
