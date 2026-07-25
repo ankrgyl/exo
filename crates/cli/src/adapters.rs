@@ -129,6 +129,8 @@ pub async fn handle_adapter_command(
             println!(
                 "{}",
                 serde_json::to_string(&serde_json::json!({
+                    "agent_id": agent.record().id,
+                    "conversation_id": conversation.record().id,
                     "adapter_id": adapter.id,
                     "socket_path": socket_path,
                 }))?

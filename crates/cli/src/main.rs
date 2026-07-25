@@ -632,11 +632,15 @@ enum ConversationSandboxCommands {
         external_id: String,
         #[arg(long)]
         default_workdir: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     Detach {
         agent: String,
         conversation: String,
         sandbox_id: String,
+        #[arg(long)]
+        json: bool,
     },
     Run {
         agent: String,
@@ -1709,6 +1713,7 @@ async fn main() -> Result<()> {
                     provider,
                     external_id,
                     default_workdir,
+                    json,
                 } => {
                     let attachment = match SandboxProvider::from(provider) {
                         SandboxProvider::Docker => SandboxAttachment::DockerContainer {
@@ -1728,16 +1733,26 @@ async fn main() -> Result<()> {
                             default_workdir,
                         })
                         .await?;
-                    println!(
-                        "attached Docker container as sandbox {} for {}",
-                        sandbox_id,
-                        conversation.record().slug
-                    );
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&serde_json::json!({
+                                "sandbox_id": sandbox_id,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "attached Docker container as sandbox {} for {}",
+                            sandbox_id,
+                            conversation.record().slug
+                        );
+                    }
                 }
                 ConversationSandboxCommands::Detach {
                     agent,
                     conversation,
                     sandbox_id,
+                    json,
                 } => {
                     let conversation =
                         must_get_conversation(harness.as_ref(), &agent, &conversation).await?;
@@ -1745,12 +1760,22 @@ async fn main() -> Result<()> {
                         .exoharness_handle()
                         .detach_sandbox(sandbox_id.clone())
                         .await?;
-                    println!(
-                        "detached sandbox {} from {}: {}",
-                        sandbox_id,
-                        conversation.record().slug,
-                        serde_json::to_string(&attachment)?
-                    );
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&serde_json::json!({
+                                "sandbox_id": sandbox_id,
+                                "attachment": attachment,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "detached sandbox {} from {}: {}",
+                            sandbox_id,
+                            conversation.record().slug,
+                            serde_json::to_string(&attachment)?
+                        );
+                    }
                 }
                 ConversationSandboxCommands::Run {
                     agent,
@@ -3125,6 +3150,7 @@ mod create_tests {
             "harbor-task",
             "--default-workdir",
             "/task",
+            "--json",
         ])
         .expect("conversation sandbox attach parses");
         assert!(matches!(
@@ -3137,6 +3163,7 @@ mod create_tests {
                         provider: super::SandboxProviderArg::Docker,
                         external_id,
                         default_workdir: Some(default_workdir),
+                        json: true,
                     },
                 }
             } if agent == "agent"
