@@ -167,9 +167,20 @@ pub trait ManagedSandboxHandle: Send + Sync {
     async fn snapshot(&self) -> Result<SnapshotPayload>;
 }
 
+pub enum ExistingSandboxAcquire {
+    Ready(Arc<dyn ManagedSandboxHandle>),
+    Unavailable,
+}
+
 #[async_trait]
 pub trait ManagedSandboxBackend: Send + Sync {
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>>;
+
+    async fn acquire_existing(&self, request: SandboxRequest) -> Result<ExistingSandboxAcquire> {
+        self.acquire(request)
+            .await
+            .map(ExistingSandboxAcquire::Ready)
+    }
 
     /// Acquire a sandbox initialised from a previously-captured snapshot.
     /// The request is honoured for mounts, network, lifecycle, etc., but the
@@ -376,6 +387,23 @@ impl CliContainerSandboxBackend {
             self.ensure_default_network_created().await?;
         }
 
+        self.normalize_request(request, true)
+    }
+
+    fn prepare_existing_request(&self, request: SandboxRequest) -> Result<SandboxRequest> {
+        validate_durable_file_system_mounts(
+            &request.spec.mounts,
+            &request.spec.durable_file_systems,
+        )?;
+
+        self.normalize_request(request, false)
+    }
+
+    fn normalize_request(
+        &self,
+        request: SandboxRequest,
+        create_durable_file_systems: bool,
+    ) -> Result<SandboxRequest> {
         let mut mounts = request
             .spec
             .mounts
@@ -391,10 +419,11 @@ impl CliContainerSandboxBackend {
                 Ok(SandboxMount { host_path, ..mount })
             })
             .collect::<Result<Vec<_>>>()?;
-        mounts.extend(materialize_durable_file_systems(
+        mounts.extend(durable_file_system_mounts(
             &request.key,
             &request.spec.durable_file_systems,
             self.durable_file_system_root.as_deref(),
+            create_durable_file_systems,
         )?);
 
         Ok(SandboxRequest {
@@ -519,6 +548,28 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
         }))
     }
 
+    async fn acquire_existing(&self, request: SandboxRequest) -> Result<ExistingSandboxAcquire> {
+        let request = self.prepare_existing_request(request)?;
+        if request.lifecycle.idle_ttl.is_none() {
+            return Ok(ExistingSandboxAcquire::Unavailable);
+        }
+
+        let Some(name) = find_running_warm_sandbox(&self.container_bin, self.cli, &request).await?
+        else {
+            return Ok(ExistingSandboxAcquire::Unavailable);
+        };
+
+        Ok(ExistingSandboxAcquire::Ready(Arc::new(
+            ExistingWarmSandboxHandle {
+                id: format!("warm:{}", request.key),
+                cli: self.cli,
+                container_bin: self.container_bin.clone(),
+                name,
+                request,
+            },
+        )))
+    }
+
     async fn acquire_from_snapshot(
         &self,
         request: SandboxRequest,
@@ -637,6 +688,49 @@ struct WarmSandboxHandle {
     container_bin: PathBuf,
     request: SandboxRequest,
     warm_sandboxes: Arc<Mutex<HashMap<SandboxKey, WarmSandboxEntry>>>,
+}
+
+struct ExistingWarmSandboxHandle {
+    id: String,
+    cli: ContainerCliFlavor,
+    container_bin: PathBuf,
+    name: String,
+    request: SandboxRequest,
+}
+
+#[async_trait]
+impl ManagedSandboxHandle for ExistingWarmSandboxHandle {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn effective_image(&self) -> Option<String> {
+        Some(self.request.spec.image.clone())
+    }
+
+    async fn exec(&self, command: &SandboxCommand) -> Result<SandboxCommandOutput> {
+        exec_warm(&self.container_bin, &self.name, &self.request.spec, command).await
+    }
+
+    async fn start_process(&self, command: &SandboxCommand) -> Result<crate::SandboxProcessParts> {
+        start_warm_process(&self.container_bin, &self.name, &self.request.spec, command).await
+    }
+
+    async fn stop(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn snapshot(&self) -> Result<SnapshotPayload> {
+        match self.cli {
+            ContainerCliFlavor::Docker => {
+                docker_snapshot_container(&self.container_bin, &self.name).await
+            }
+            ContainerCliFlavor::AppleContainer => bail!(
+                "snapshot is not yet implemented for the apple-container backend; \
+                 use --sandbox-provider docker for snapshot-using flows"
+            ),
+        }
+    }
 }
 
 #[async_trait]
@@ -824,10 +918,11 @@ fn resolve_local_workdir(spec: &SandboxSpec, cwd: &str) -> Option<PathBuf> {
         .map(|mount| mount.host_path.clone())
 }
 
-fn materialize_durable_file_systems(
+fn durable_file_system_mounts(
     key: &SandboxKey,
     file_systems: &[DurableFileSystem],
     configured_root: Option<&Path>,
+    create: bool,
 ) -> Result<Vec<SandboxMount>> {
     if file_systems.is_empty() {
         return Ok(Vec::new());
@@ -837,13 +932,15 @@ fn materialize_durable_file_systems(
         .iter()
         .map(|file_system| {
             let host_path = root.join(stable_fnv1a_hex(&format!("{}\n{}", key, file_system.name)));
-            std::fs::create_dir_all(&host_path).with_context(|| {
-                format!(
-                    "creating durable file system {} at {}",
-                    file_system.name,
-                    host_path.display()
-                )
-            })?;
+            if create {
+                std::fs::create_dir_all(&host_path).with_context(|| {
+                    format!(
+                        "creating durable file system {} at {}",
+                        file_system.name,
+                        host_path.display()
+                    )
+                })?;
+            }
             let host_path = std::fs::canonicalize(&host_path).with_context(|| {
                 format!(
                     "canonicalizing durable file system {} at {}",
@@ -1924,6 +2021,252 @@ async fn docker_load_image(container_bin: &Path, payload: &Bytes) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn warm_sandbox_request() -> SandboxRequest {
+        SandboxRequest {
+            key: SandboxKey::ConversationSandbox {
+                conversation_id: "conversation".to_string(),
+                sandbox_id: "sandbox".to_string(),
+            },
+            spec: SandboxSpec {
+                image: "docker.io/library/ubuntu:24.04".to_string(),
+                mounts: Vec::new(),
+                durable_file_systems: Vec::new(),
+                network: SandboxNetworkPolicy::Disabled,
+                default_workdir: "/".to_string(),
+            },
+            lifecycle: SandboxLifecycleConfig {
+                idle_ttl: Some(Duration::from_secs(60)),
+            },
+            provider_state: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_sandbox_backend_acquire_existing_defaults_to_ready() {
+        let backend = LocalProcessSandboxBackend::new();
+
+        let result = backend
+            .acquire_existing(warm_sandbox_request())
+            .await
+            .expect("default existing sandbox acquisition");
+
+        match result {
+            ExistingSandboxAcquire::Ready(handle) => {
+                assert_eq!(handle.id(), "local:conversation:conversation:sandbox")
+            }
+            ExistingSandboxAcquire::Unavailable => {
+                panic!("default acquisition should return the acquired sandbox")
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn docker_backend(container_bin: PathBuf) -> CliContainerSandboxBackend {
+        CliContainerSandboxBackend {
+            cli: ContainerCliFlavor::Docker,
+            container_bin,
+            durable_file_system_root: None,
+            system_started: Mutex::new(false),
+            network_created: Mutex::new(false),
+            warm_sandboxes: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_docker(script_path: &Path, script: &str) {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(script_path, script).expect("write fake docker script");
+        let mut permissions = fs::metadata(script_path)
+            .expect("fake docker metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(script_path, permissions).expect("chmod fake docker");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn docker_existing_sandbox_acquisition_returns_ready_for_a_running_match() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let script_path = temp_dir.path().join("docker");
+        write_fake_docker(
+            &script_path,
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"status=running\" ]; then\n    printf 'warm-name\\n'\n  fi\ndone\n",
+        );
+        let backend = docker_backend(script_path);
+
+        let result = backend
+            .acquire_existing(warm_sandbox_request())
+            .await
+            .expect("existing sandbox acquisition");
+
+        match result {
+            ExistingSandboxAcquire::Ready(handle) => {
+                assert_eq!(handle.id(), "warm:conversation:conversation:sandbox");
+            }
+            ExistingSandboxAcquire::Unavailable => panic!("running sandbox should be reusable"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn docker_existing_sandbox_acquisition_does_not_create_a_network() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let script_path = temp_dir.path().join("docker");
+        write_fake_docker(
+            &script_path,
+            "#!/bin/sh\nif [ \"$1\" = \"network\" ]; then\n  printf 'unexpected network creation\\n' >&2\n  exit 1\nfi\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"status=running\" ]; then\n    printf 'warm-name\\n'\n  fi\ndone\n",
+        );
+        let backend = docker_backend(script_path);
+        let mut request = warm_sandbox_request();
+        request.spec.network = SandboxNetworkPolicy::Enabled;
+
+        let result = backend
+            .acquire_existing(request)
+            .await
+            .expect("existing sandbox acquisition");
+
+        assert!(matches!(result, ExistingSandboxAcquire::Ready(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn docker_existing_sandbox_acquisition_does_not_create_durable_file_systems() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let script_path = temp_dir.path().join("docker");
+        write_fake_docker(
+            &script_path,
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"status=running\" ]; then\n    printf 'warm-name\\n'\n  fi\ndone\n",
+        );
+        let durable_root = temp_dir.path().join("durable");
+        let backend = docker_backend(script_path).with_durable_file_system_root(&durable_root);
+        let mut request = warm_sandbox_request();
+        request.spec.durable_file_systems = vec![DurableFileSystem {
+            name: "workspace".to_string(),
+            mount_path: "/workspace".to_string(),
+            mode: crate::FileSystemMountMode::ReadWrite,
+        }];
+
+        assert!(backend.acquire_existing(request).await.is_err());
+        assert!(!durable_root.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn docker_existing_sandbox_handle_does_not_create_a_replacement() {
+        use std::fs;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let script_path = temp_dir.path().join("docker");
+        let calls_path = temp_dir.path().join("calls");
+        write_fake_docker(
+            &script_path,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\ncase \"$1\" in\n  ps)\n    for arg in \"$@\"; do\n      if [ \"$arg\" = \"status=running\" ] && [ ! -e '{}.queried' ]; then\n        touch '{}.queried'\n        printf 'warm-name\\n'\n      fi\n    done\n    ;;\n  exec)\n    printf 'container is not running\\n' >&2\n    exit 1\n    ;;\nesac\n",
+                calls_path.display(),
+                calls_path.display(),
+                calls_path.display(),
+            ),
+        );
+        let backend = docker_backend(script_path);
+
+        let result = backend
+            .acquire_existing(warm_sandbox_request())
+            .await
+            .expect("existing sandbox acquisition");
+        let handle = match result {
+            ExistingSandboxAcquire::Ready(handle) => handle,
+            ExistingSandboxAcquire::Unavailable => panic!("running sandbox should be reusable"),
+        };
+
+        let output = handle
+            .exec(&SandboxCommand {
+                argv: vec!["/bin/true".to_string()],
+                env: HashMap::new(),
+                display_argv: None,
+                cwd: None,
+                timeout: None,
+            })
+            .await
+            .expect("sandbox command should be attempted");
+
+        assert!(!output.ok);
+        assert!(
+            !fs::read_to_string(calls_path)
+                .expect("read docker calls")
+                .lines()
+                .any(|call| call == "run")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn docker_existing_sandbox_acquisition_returns_unavailable_when_no_running_match_exists()
+    {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let script_path = temp_dir.path().join("docker");
+        write_fake_docker(&script_path, "#!/bin/sh\nexit 0\n");
+        let backend = docker_backend(script_path);
+
+        let result = backend
+            .acquire_existing(warm_sandbox_request())
+            .await
+            .expect("existing sandbox acquisition");
+
+        assert!(matches!(result, ExistingSandboxAcquire::Unavailable));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apple_container_existing_sandbox_acquisition_returns_unavailable_when_stopped() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let script_path = temp_dir.path().join("container");
+        let request = warm_sandbox_request();
+        let spec_hash = sandbox_spec_hash(&request.spec);
+        write_fake_docker(
+            &script_path,
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n  list)\n    printf '%s\\n' '[{{\"configuration\":{{\"id\":\"stopped-container\",\"labels\":{{\"{WARM_SANDBOX_KEY_LABEL}\":\"{}\",\"{WARM_SANDBOX_SPEC_HASH_LABEL}\":\"{spec_hash}\"}}}},\"status\":\"stopped\"}}]'\n    ;;\nesac\n",
+                request.key,
+            ),
+        );
+        let backend = CliContainerSandboxBackend {
+            cli: ContainerCliFlavor::AppleContainer,
+            container_bin: script_path,
+            durable_file_system_root: None,
+            system_started: Mutex::new(false),
+            network_created: Mutex::new(false),
+            warm_sandboxes: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let result = backend
+            .acquire_existing(request)
+            .await
+            .expect("existing sandbox acquisition");
+
+        assert!(matches!(result, ExistingSandboxAcquire::Unavailable));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn docker_existing_sandbox_acquisition_preserves_inspection_errors() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let script_path = temp_dir.path().join("docker");
+        write_fake_docker(
+            &script_path,
+            "#!/bin/sh\nprintf 'permission denied\\n' >&2\nexit 1\n",
+        );
+        let backend = docker_backend(script_path);
+
+        let error = match backend.acquire_existing(warm_sandbox_request()).await {
+            Ok(_) => panic!("inspection failures must not be treated as unavailable"),
+            Err(error) => error,
+        };
+
+        assert!(format!("{error:#}").contains("permission denied"));
+    }
 
     #[cfg(unix)]
     #[tokio::test]
