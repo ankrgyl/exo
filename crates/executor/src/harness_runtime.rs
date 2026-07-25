@@ -627,6 +627,7 @@ fn extract_tool_calls(messages: &[Message]) -> Result<Vec<PendingToolCall>> {
                 tool_calls.push(PendingToolCall {
                     tool_call_id: tool_call_id.clone(),
                     request: exoharness::ToolRequest {
+                        namespace: None,
                         function_name: tool_name.clone(),
                         arguments: to_exoharness_arguments(arguments)?,
                     },

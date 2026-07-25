@@ -458,6 +458,11 @@ impl EventData {
 pub struct ToolRequest {
     pub function_name: String,
     pub arguments: ToolArguments,
+    /// Namespace the tool lives in, for providers with namespaced tools (e.g.
+    /// the OpenAI Responses API requires function_call items to be replayed
+    /// with their namespace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -2745,6 +2745,7 @@ async fn run_sandbox_shell_command(
             &agent_config,
             &config,
             &ToolRequest {
+                namespace: None,
                 function_name: "shell".to_string(),
                 arguments,
             },

@@ -140,6 +140,7 @@ mod tests {
 
     fn tool_request(arguments: serde_json::Value) -> ToolRequest {
         ToolRequest {
+            namespace: None,
             function_name: "list_conversation_events".to_string(),
             arguments: arguments.as_object().unwrap().clone(),
         }

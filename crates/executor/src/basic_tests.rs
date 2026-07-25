@@ -137,6 +137,7 @@ async fn send_executes_tool_round_trip() {
             tool_calls: vec![PendingToolCall {
                 tool_call_id: tool_call_id.clone(),
                 request: ToolRequest {
+                    namespace: None,
                     function_name: "shell".to_string(),
                     arguments: Map::new(),
                 },
@@ -258,6 +259,7 @@ async fn send_records_tool_result_when_tool_execution_fails() {
             tool_calls: vec![PendingToolCall {
                 tool_call_id: tool_call_id.clone(),
                 request: ToolRequest {
+                    namespace: None,
                     function_name: "shell".to_string(),
                     arguments: Map::new(),
                 },

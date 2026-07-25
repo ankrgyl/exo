@@ -1115,6 +1115,7 @@ mod tests {
 
     fn tool_request(function_name: &str, arguments: serde_json::Value) -> ToolRequest {
         ToolRequest {
+            namespace: None,
             function_name: function_name.to_string(),
             arguments: arguments.as_object().unwrap().clone(),
         }

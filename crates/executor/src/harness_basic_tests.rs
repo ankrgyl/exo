@@ -753,6 +753,7 @@ async fn send_executes_shell_tool_when_enabled() {
             tool_calls: vec![PendingToolCall {
                 tool_call_id: "call-1".to_string(),
                 request: ToolRequest {
+                    namespace: None,
                     function_name: "shell".to_string(),
                     arguments: shell_command_arguments("printf hello"),
                 },
@@ -945,6 +946,7 @@ async fn updating_mounts_recreates_conversation_sandbox() {
             tool_calls: vec![PendingToolCall {
                 tool_call_id: "call-1".to_string(),
                 request: ToolRequest {
+                    namespace: None,
                     function_name: "shell".to_string(),
                     arguments: shell_command_arguments("printf first"),
                 },
@@ -971,6 +973,7 @@ async fn updating_mounts_recreates_conversation_sandbox() {
             tool_calls: vec![PendingToolCall {
                 tool_call_id: "call-2".to_string(),
                 request: ToolRequest {
+                    namespace: None,
                     function_name: "shell".to_string(),
                     arguments: shell_command_arguments("printf second"),
                 },
