@@ -525,7 +525,8 @@ where
             let max_input_tokens = self.pricing.max_input_tokens(&model);
             // Tools count too: they ride in the same request and consume the
             // same window, and a harness can register a lot of them.
-            let prompt_size = prompt_size(&request.messages) + tool_definition_size(&request.tools);
+            let mut prompt_size =
+                prompt_size(&request.messages) + tool_definition_size(&request.tools);
 
             // Compact *before* sending when the prompt already looks too large.
             //
@@ -563,6 +564,14 @@ where
                 request =
                     build_model_request(conversation, agent_config, conversation_config, messages)
                         .await?;
+                // And re-measure it. The post-response trigger below falls back
+                // to this number when the provider reports no usage, and the
+                // pre-compaction size is exactly the oversized one that just
+                // got fixed — so leaving it stale would pay for a second
+                // summary, and discard more verbatim history, for a prompt that
+                // is now well under the threshold.
+                prompt_size = crate::compaction::prompt_size(&request.messages)
+                    + tool_definition_size(&request.tools);
             }
 
             let response = self
