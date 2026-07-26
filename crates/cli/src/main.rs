@@ -24,16 +24,16 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow, bail};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use executor::{
-    AgentHarnessKind, BasicExoHarness, BasicExoHarnessConfig, BasicHarness, BasicToolRuntime,
-    Binding, BraintrustProject, BraintrustRuntimeConfig, BraintrustTracingConfig,
-    ConversationModelConfig, CreateAgentRequest, CreateConversationRequest, DaytonaBackendSpec,
-    E2bBackendSpec, EventKind, EventQuery, EventQueryDirection, ExoHarness,
-    ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount, FileSystemMountMode,
-    ForkConversationRequest, HTTP_EXOHARNESS_TRACING_TARGET, Harness, HarnessAgent,
-    HarnessConversation, HttpExoHarness, LocalSandboxExoHarness, PutSecretRequest, RlmHarness,
-    SANDBOX_MAIN_MOUNT_DIR, SandboxBackendRegistration, SandboxProvider, SandboxProviderConfig,
-    SandboxScope, Secret, SecretBackendChoice, SpritesBackendSpec, ToolRequest, ToolRuntime,
-    TypeScriptHarness, TypeScriptHarnessConfig, Uuid7, VercelBackendSpec,
+    AgentEventKind, AgentEventQuery, AgentHarnessKind, BasicExoHarness, BasicExoHarnessConfig,
+    BasicHarness, BasicToolRuntime, Binding, BraintrustProject, BraintrustRuntimeConfig,
+    BraintrustTracingConfig, ConversationModelConfig, CreateAgentRequest,
+    CreateConversationRequest, DaytonaBackendSpec, E2bBackendSpec, EventKind, EventQuery,
+    EventQueryDirection, ExoHarness, ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount,
+    FileSystemMountMode, ForkConversationRequest, HTTP_EXOHARNESS_TRACING_TARGET, Harness,
+    HarnessAgent, HarnessConversation, HttpExoHarness, LocalSandboxExoHarness, PutSecretRequest,
+    RlmHarness, SANDBOX_MAIN_MOUNT_DIR, SandboxBackendRegistration, SandboxProvider,
+    SandboxProviderConfig, SandboxScope, Secret, SecretBackendChoice, SpritesBackendSpec,
+    ToolRequest, ToolRuntime, TypeScriptHarness, TypeScriptHarnessConfig, Uuid7, VercelBackendSpec,
     default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
     default_vercel_image, effective_sandbox_scope, load_agent_config, send_conversation_wakeup,
     serve_exoharness_http_listener_with_options,
@@ -512,6 +512,17 @@ enum AgentCommands {
     },
     Show {
         agent: String,
+    },
+    Events {
+        agent: String,
+        #[arg(long = "type")]
+        types: Vec<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        desc: bool,
+        #[arg(long)]
+        cursor: Option<String>,
     },
     Delete {
         agent: String,
@@ -1348,6 +1359,22 @@ async fn main() -> Result<()> {
                 println!("id: {}", agent.record().id);
                 println!("slug: {}", agent.record().slug);
                 println!("name: {}", agent.record().name);
+                println!(
+                    "latest_agent_event: {}",
+                    agent
+                        .record()
+                        .latest_event_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+                println!(
+                    "active_execution_epoch: {}",
+                    agent
+                        .record()
+                        .active_execution_epoch_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
                 println!("harness: {}", format_harness_kind(config.harness));
                 println!(
                     "typescript_module: {}",
@@ -1411,6 +1438,33 @@ async fn main() -> Result<()> {
                     "braintrust: {}",
                     format_braintrust_tracing_config(config.braintrust.as_ref())
                 );
+            }
+            AgentCommands::Events {
+                agent,
+                types,
+                limit,
+                desc,
+                cursor,
+            } => {
+                let agent = must_get_agent(harness.as_ref(), &agent).await?;
+                let result = agent
+                    .exoharness_handle()
+                    .get_events(Some(AgentEventQuery {
+                        cursor: parse_optional_uuid7(cursor.as_deref(), "cursor")?,
+                        direction: Some(if desc {
+                            EventQueryDirection::Desc
+                        } else {
+                            EventQueryDirection::Asc
+                        }),
+                        limit,
+                        types: if types.is_empty() {
+                            None
+                        } else {
+                            Some(types.into_iter().map(AgentEventKind::custom).collect())
+                        },
+                    }))
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
             }
             AgentCommands::Delete { agent } => {
                 if !harness.delete_agent(&agent).await? {
@@ -2096,6 +2150,7 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
         Commands::Agent { command } => match command {
             AgentCommands::Update { agent, .. }
             | AgentCommands::Show { agent }
+            | AgentCommands::Events { agent, .. }
             | AgentCommands::Delete { agent } => Some(agent.as_str()),
             AgentCommands::Mount { command } => match command {
                 AgentMountCommands::List { agent }
@@ -2947,6 +3002,35 @@ mod create_tests {
                     ..
                 }
             }
+        ));
+    }
+
+    #[test]
+    fn agent_events_command_accepts_filters() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from([
+            "exo",
+            "agent",
+            "events",
+            "demo",
+            "--type",
+            "execution_epoch_activated",
+            "--desc",
+            "--limit",
+            "1",
+        ])
+        .expect("agent events parses with filters");
+        assert!(matches!(
+            cli.command,
+            super::Commands::Agent {
+                command: super::AgentCommands::Events {
+                    agent,
+                    types,
+                    desc: true,
+                    limit: Some(1),
+                    ..
+                }
+            } if agent == "demo" && types == ["execution_epoch_activated"]
         ));
     }
 

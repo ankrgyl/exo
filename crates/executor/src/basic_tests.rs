@@ -5,16 +5,18 @@ use std::sync::{Arc, Mutex};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use exoharness::{
-    AddEventsRequest, AddEventsResult, AgentHandle, AgentId, AgentRecord, Artifact,
-    ArtifactVersion, BeginTurnRequest, Binding, BindingRecord, BindingType, ConversationHandle,
-    ConversationId, ConversationRecord, CreateSandboxRequest, Event, EventData, EventQuery,
-    EventQueryDirection, EventStream, ExoHarness, ForkConversationRequest, GetEventsResult,
-    NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest, Result,
-    RunInSandboxRequest, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery,
-    SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus, Secret, SecretMetadata,
-    SecretType, SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
-    StartSandboxRequest, ToolRequest, ToolResult, TurnHandle, TurnId, TurnRecord, Uuid7,
-    WriteArtifactRequest,
+    AddAgentEventsRequest, AddAgentEventsResult, AddEventsRequest, AddEventsResult, AgentEvent,
+    AgentEventData, AgentEventId, AgentEventQuery, AgentEventStream, AgentHandle, AgentId,
+    AgentRecord, Artifact, ArtifactVersion, BeginTurnRequest, Binding, BindingRecord, BindingType,
+    ConversationHandle, ConversationId, ConversationRecord, CreateSandboxRequest,
+    EnsureExecutionEpochRequest, EnsureExecutionEpochResult, Event, EventData, EventQuery,
+    EventQueryDirection, EventStream, ExecutionEpochRecord, ExoHarness, ForkConversationRequest,
+    GetAgentEventsResult, GetEventsResult, NewAgentRequest, NewConversationRequest,
+    PutSecretRequest, ReadArtifactRequest, Result, RunInSandboxRequest, SandboxHandle, SandboxId,
+    SandboxProcess, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessRecord,
+    SandboxProcessStatus, Secret, SecretMetadata, SecretType, SessionId, SnapshotHandle,
+    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, ToolRequest, ToolResult,
+    TurnHandle, TurnId, TurnRecord, Uuid7, WriteArtifactRequest,
 };
 use futures::FutureExt;
 use futures::io::Cursor;
@@ -22,6 +24,7 @@ use futures::stream;
 use lingua::universal::{AssistantContent, UserContent};
 use lingua::{Message, UniversalStreamChunk};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -60,6 +63,7 @@ async fn send_appends_user_and_assistant_messages() {
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("ping")],
+            ..Default::default()
         })
         .await
         .expect("begin turn should succeed");
@@ -106,7 +110,7 @@ async fn send_appends_user_and_assistant_messages() {
         events[0].session_id.expect("session id")
     );
     assert!(matches!(events[0].data, EventData::SessionStarted));
-    assert!(matches!(events[1].data, EventData::TurnStarted));
+    assert!(matches!(events[1].data, EventData::TurnStarted { .. }));
     assert!(matches!(events[2].data, EventData::Messages { .. }));
     assert!(matches!(events[3].data, EventData::Messages { .. }));
     assert!(matches!(events[4].data, EventData::TurnEnded));
@@ -173,6 +177,7 @@ async fn send_executes_tool_round_trip() {
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("run it")],
+            ..Default::default()
         })
         .await
         .expect("begin turn should succeed");
@@ -288,6 +293,7 @@ async fn send_records_tool_result_when_tool_execution_fails() {
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("run it")],
+            ..Default::default()
         })
         .await
         .expect("begin turn should succeed");
@@ -390,6 +396,7 @@ async fn send_stream_emits_chunks_and_persists_final_response() {
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("stream it")],
+            ..Default::default()
         })
         .await
         .expect("begin turn should succeed");
@@ -615,6 +622,7 @@ struct FakeExoHarness {
 
 struct FakeState {
     agent: AgentRecord,
+    agent_events: Vec<AgentEvent>,
     conversation: FakeConversationState,
 }
 
@@ -631,7 +639,10 @@ impl FakeExoHarness {
                     id: agent_id,
                     slug: "agent".to_string(),
                     name: "Agent".to_string(),
+                    latest_event_id: None,
+                    active_execution_epoch_id: None,
                 },
+                agent_events: Vec::new(),
                 conversation: FakeConversationState {
                     record: ConversationRecord {
                         id: conversation_id,
@@ -711,6 +722,142 @@ struct FakeAgentHandle {
 impl AgentHandle for FakeAgentHandle {
     fn record(&self) -> &AgentRecord {
         &self.record
+    }
+
+    async fn get_events(&self, query: Option<AgentEventQuery>) -> Result<GetAgentEventsResult> {
+        let state = self.state.lock().expect("state poisoned");
+        let mut events = state.agent_events.clone();
+        if let Some(query) = query {
+            if let Some(types) = query.types {
+                events.retain(|event| types.contains(&event.data.kind()));
+            }
+            match query.direction.unwrap_or(EventQueryDirection::Asc) {
+                EventQueryDirection::Asc => {
+                    if let Some(cursor) = query.cursor {
+                        events.retain(|event| event.id > cursor);
+                    }
+                }
+                EventQueryDirection::Desc => {
+                    events.reverse();
+                    if let Some(cursor) = query.cursor {
+                        events.retain(|event| event.id < cursor);
+                    }
+                }
+            }
+            if let Some(limit) = query.limit {
+                events.truncate(limit as usize);
+            }
+        }
+        Ok(GetAgentEventsResult {
+            cursor: events.last().map(|event| event.id),
+            events,
+        })
+    }
+
+    async fn watch_events(
+        &self,
+        _after_exclusive: Bound<AgentEventId>,
+    ) -> Result<AgentEventStream> {
+        Ok(Box::pin(stream::empty()))
+    }
+
+    async fn get_event(&self, id: AgentEventId) -> Result<Option<AgentEvent>> {
+        let state = self.state.lock().expect("state poisoned");
+        Ok(state
+            .agent_events
+            .iter()
+            .find(|event| event.id == id)
+            .cloned())
+    }
+
+    async fn add_events(&self, request: AddAgentEventsRequest) -> Result<AddAgentEventsResult> {
+        let mut state = self.state.lock().expect("state poisoned");
+        let agent_id = state.agent.id;
+        let mut event_ids = Vec::with_capacity(request.data.len());
+        for data in request.data {
+            let id = Uuid7::now();
+            state.agent_events.push(AgentEvent {
+                id,
+                agent_id,
+                created_at: id.timestamp().expect("uuid7 timestamp"),
+                origin: request.origin.clone(),
+                data,
+            });
+            event_ids.push(id);
+        }
+        let latest_event_id = *event_ids.last().ok_or_else(|| anyhow!("no events"))?;
+        state.agent.latest_event_id = Some(latest_event_id);
+        Ok(AddAgentEventsResult {
+            event_ids,
+            latest_event_id,
+        })
+    }
+
+    async fn ensure_execution_epoch(
+        &self,
+        request: EnsureExecutionEpochRequest,
+    ) -> Result<EnsureExecutionEpochResult> {
+        let manifest_bytes = serde_json::to_vec(&request.manifest)?;
+        let manifest_digest = format!("sha256:{:x}", Sha256::digest(manifest_bytes));
+        let mut state = self.state.lock().expect("state poisoned");
+        if let Some(expected_agent_event_id) = request.expected_agent_event_id
+            && state.agent.latest_event_id != Some(expected_agent_event_id)
+        {
+            return Err(anyhow!("agent head changed"));
+        }
+        if let Some(epoch) = state.agent_events.iter().rev().find_map(|event| {
+            let AgentEventData::ExecutionEpochCreated { epoch } = &event.data else {
+                return None;
+            };
+            (epoch.manifest_digest == manifest_digest && epoch.manifest == request.manifest)
+                .then(|| epoch.clone())
+        }) {
+            if state.agent.active_execution_epoch_id != Some(epoch.id) {
+                let event_id = Uuid7::now();
+                let agent_id = state.agent.id;
+                state.agent_events.push(AgentEvent {
+                    id: event_id,
+                    agent_id,
+                    created_at: event_id.timestamp().expect("uuid7 timestamp"),
+                    origin: request.origin,
+                    data: AgentEventData::ExecutionEpochActivated {
+                        execution_epoch_id: epoch.id,
+                    },
+                });
+                state.agent.latest_event_id = Some(event_id);
+                state.agent.active_execution_epoch_id = Some(epoch.id);
+            }
+            return Ok(EnsureExecutionEpochResult {
+                epoch,
+                agent_event_id: state.agent.latest_event_id.expect("agent event head"),
+                created: false,
+            });
+        }
+
+        let id = Uuid7::now();
+        let agent_id = state.agent.id;
+        let epoch = ExecutionEpochRecord {
+            id,
+            manifest_digest,
+            manifest: request.manifest,
+            created_at: id.timestamp().expect("uuid7 timestamp"),
+        };
+        state.agent_events.push(AgentEvent {
+            id,
+            agent_id,
+            created_at: epoch.created_at,
+            origin: request.origin,
+            data: AgentEventData::ExecutionEpochCreated {
+                epoch: epoch.clone(),
+            },
+        });
+        state.agent.latest_event_id = Some(id);
+        state.agent.active_execution_epoch_id = Some(epoch.id);
+        Ok(EnsureExecutionEpochResult {
+            epoch,
+            agent_event_id: id,
+            created: true,
+        })
     }
 
     async fn list_conversations(
@@ -894,7 +1041,10 @@ impl ConversationHandle for FakeConversationHandle {
             &self.state,
             session_id,
             Some(turn_id),
-            EventData::TurnStarted,
+            EventData::TurnStarted {
+                agent_event_id: request.agent_event_id,
+                execution_epoch_id: request.execution_epoch_id,
+            },
         ));
         if !request.input.is_empty() {
             latest_event_id = Some(append_event(
@@ -913,6 +1063,8 @@ impl ConversationHandle for FakeConversationHandle {
             record: TurnRecord {
                 id: turn_id,
                 session_id,
+                agent_event_id: request.agent_event_id,
+                execution_epoch_id: request.execution_epoch_id,
             },
             latest_event_id: Mutex::new(latest_event_id),
         }))

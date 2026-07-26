@@ -69,6 +69,17 @@ async fn basic_backend_contract_begin_turn_tracks_events_through_finish() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn basic_backend_contract_agent_timeline_pins_turns_to_execution_epochs() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let harness: Arc<dyn ExoHarness> = Arc::new(
+        BasicExoHarness::new(local_test_config(tempdir.path()))
+            .await
+            .expect("harness should initialize"),
+    );
+    crate::contract_tests::agent_timeline_pins_turns_to_execution_epochs(harness).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn basic_backend_contract_turn_events_continue_after_artifact_writes() {
     let tempdir = TempDir::new().expect("tempdir");
     let harness: std::sync::Arc<dyn ExoHarness> = std::sync::Arc::new(
@@ -483,6 +494,7 @@ async fn turn_events_continue_after_artifact_writes() {
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("ping")],
+            ..Default::default()
         })
         .await
         .expect("turn");
@@ -539,6 +551,7 @@ async fn turn_artifact_write_allows_interleaved_conversation_writes() {
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("ping")],
+            ..Default::default()
         })
         .await
         .expect("turn");
@@ -1072,6 +1085,7 @@ async fn conversation_create_sandbox_is_not_turn_scoped() {
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("start turn")],
+            ..Default::default()
         })
         .await
         .expect("turn should begin");

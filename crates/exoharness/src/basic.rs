@@ -14,6 +14,7 @@ use futures::io::{AsyncReadExt, AsyncWriteExt};
 use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -32,12 +33,15 @@ use crate::secrets::{
 };
 use crate::storage::BasicObjectStore;
 use crate::{
-    AddEventsRequest, AddEventsResult, AgentHandle, AgentId, AgentRecord, Artifact,
-    ArtifactVersion, BeginTurnRequest, Binding, BindingId, BindingRecord, BindingType,
-    BoxAsyncRead, BoxAsyncWrite, CancelSandboxProcessRequest, CloseSandboxProcessInputRequest,
-    ConversationHandle, ConversationId, ConversationRecord, CreateSandboxRequest,
-    DurableFileSystem, Event, EventData, EventId, EventKind, EventQuery, EventQueryDirection,
-    EventStream, ExoHarness, FileSystemMount, ForkConversationRequest, GetEventsResult,
+    AddAgentEventsRequest, AddAgentEventsResult, AddEventsRequest, AddEventsResult, AgentEvent,
+    AgentEventData, AgentEventId, AgentEventQuery, AgentEventStream, AgentHandle, AgentId,
+    AgentRecord, Artifact, ArtifactVersion, BeginTurnRequest, Binding, BindingId, BindingRecord,
+    BindingType, BoxAsyncRead, BoxAsyncWrite, CancelSandboxProcessRequest,
+    CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, ConversationRecord,
+    CreateSandboxRequest, DurableFileSystem, EnsureExecutionEpochRequest,
+    EnsureExecutionEpochResult, Event, EventData, EventId, EventKind, EventQuery,
+    EventQueryDirection, EventStream, ExecutionEpochId, ExecutionEpochRecord, ExoHarness,
+    FileSystemMount, ForkConversationRequest, GetAgentEventsResult, GetEventsResult,
     GetSandboxProcessEventsResult, ListConversationsRequest, ListConversationsResult,
     NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest, Result,
     RunInSandboxRequest, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEvent,
@@ -344,6 +348,7 @@ struct BasicExoHarnessInner {
     storage: BasicObjectStore,
     write_lock: AsyncMutex<()>,
     subscribers: Mutex<HashMap<ConversationId, Vec<mpsc::UnboundedSender<Result<Event>>>>>,
+    agent_subscribers: Mutex<HashMap<AgentId, Vec<mpsc::UnboundedSender<Result<AgentEvent>>>>>,
     sandbox_registry: HashMap<SandboxProvider, SandboxBackendRegistration>,
     /// Backends built (and secrets read) lazily on first use, cached by provider.
     sandbox_backends: AsyncMutex<HashMap<SandboxProvider, Arc<dyn ManagedSandboxBackend>>>,
@@ -824,6 +829,7 @@ impl BasicExoHarness {
                 storage,
                 write_lock: AsyncMutex::new(()),
                 subscribers: Mutex::new(HashMap::new()),
+                agent_subscribers: Mutex::new(HashMap::new()),
                 sandbox_registry: registry,
                 sandbox_backends: AsyncMutex::new(cache),
                 running_sandboxes: AsyncMutex::new(HashMap::new()),
@@ -930,12 +936,26 @@ impl ExoHarness for BasicExoHarness {
             bail!("agent slug already exists: {}", request.slug);
         }
 
-        let record = AgentRecord {
+        let mut record = AgentRecord {
             id: Uuid7::now(),
             slug: request.slug,
             name: request.name,
+            latest_event_id: None,
+            active_execution_epoch_id: None,
         };
         let agent_dir = self.agents_dir().join(record.id.to_string());
+        append_events_to_agent(
+            &self.inner,
+            &agent_dir,
+            record.id,
+            None,
+            vec![AgentEventData::AgentCreated {
+                slug: record.slug.clone(),
+                name: record.name.clone(),
+            }],
+            &mut record,
+        )
+        .await?;
         self.inner
             .storage
             .put_json(agent_dir.join("record.json"), &record)
@@ -1138,6 +1158,181 @@ impl AgentHandle for BasicAgentHandle {
         &self.record
     }
 
+    async fn get_events(&self, query: Option<AgentEventQuery>) -> Result<GetAgentEventsResult> {
+        let mut events = load_agent_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        if let Some(query) = query {
+            if let Some(types) = query.types {
+                events.retain(|event| types.contains(&event.data.kind()));
+            }
+            match query.direction.unwrap_or(EventQueryDirection::Asc) {
+                EventQueryDirection::Asc => {
+                    if let Some(cursor) = query.cursor {
+                        events.retain(|event| event.id > cursor);
+                    }
+                }
+                EventQueryDirection::Desc => {
+                    events.reverse();
+                    if let Some(cursor) = query.cursor {
+                        events.retain(|event| event.id < cursor);
+                    }
+                }
+            }
+            if let Some(limit) = query.limit {
+                events.truncate(limit as usize);
+            }
+        }
+        let cursor = events.last().map(|event| event.id);
+        Ok(GetAgentEventsResult { events, cursor })
+    }
+
+    async fn watch_events(&self, after_exclusive: Bound<AgentEventId>) -> Result<AgentEventStream> {
+        let _guard = self.harness.inner.write_lock.lock().await;
+        let existing = match after_exclusive {
+            Bound::Unbounded => Vec::new(),
+            _ => {
+                let events =
+                    load_agent_events(&self.harness.inner.storage, &self.events_dir()).await?;
+                events
+                    .into_iter()
+                    .filter(|event| matches_bound(event.id, &after_exclusive))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.harness
+            .inner
+            .agent_subscribers
+            .lock()
+            .expect("agent subscribers poisoned")
+            .entry(self.record.id)
+            .or_default()
+            .push(tx);
+        let existing_stream: BoxStream<'static, Result<AgentEvent>> =
+            stream::iter(existing.into_iter().map(Ok)).boxed();
+        let live_stream = UnboundedReceiverStream::new(rx);
+        Ok(Box::pin(existing_stream.chain(live_stream)))
+    }
+
+    async fn get_event(&self, id: AgentEventId) -> Result<Option<AgentEvent>> {
+        self.harness
+            .inner
+            .storage
+            .get_json_if_exists(self.events_dir().join(format!("{id}.json")))
+            .await
+    }
+
+    async fn add_events(&self, request: AddAgentEventsRequest) -> Result<AddAgentEventsResult> {
+        let _guard = self.harness.inner.write_lock.lock().await;
+        let mut record = self.load_record().await?;
+        let result = append_events_to_agent(
+            &self.harness.inner,
+            &self.agent_dir(),
+            self.record.id,
+            request.origin,
+            request.data,
+            &mut record,
+        )
+        .await?;
+        self.store_record(&record).await?;
+        Ok(result)
+    }
+
+    async fn ensure_execution_epoch(
+        &self,
+        request: EnsureExecutionEpochRequest,
+    ) -> Result<EnsureExecutionEpochResult> {
+        let manifest_bytes = serde_json::to_vec(&request.manifest)?;
+        let digest = Sha256::digest(manifest_bytes);
+        let manifest_digest = format!("sha256:{digest:x}");
+
+        let _guard = self.harness.inner.write_lock.lock().await;
+        let mut record = self.load_record().await?;
+        if let Some(expected_agent_event_id) = request.expected_agent_event_id
+            && record.latest_event_id != Some(expected_agent_event_id)
+        {
+            bail!(
+                "agent head changed while assembling execution manifest: expected \
+                 {expected_agent_event_id}, current {}",
+                record
+                    .latest_event_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
+        }
+        let matching_epoch = load_execution_epoch_by_manifest(
+            &self.harness.inner.storage,
+            &self.agent_dir(),
+            &manifest_digest,
+            &request.manifest,
+        )
+        .await?;
+        if let Some(stored_epoch) = matching_epoch {
+            let epoch = stored_epoch.epoch;
+            if record.active_execution_epoch_id == Some(epoch.id) {
+                return Ok(EnsureExecutionEpochResult {
+                    epoch,
+                    agent_event_id: record
+                        .latest_event_id
+                        .expect("agent with an execution epoch has an event head"),
+                    created: false,
+                });
+            }
+            let result = append_events_to_agent(
+                &self.harness.inner,
+                &self.agent_dir(),
+                self.record.id,
+                request.origin,
+                vec![AgentEventData::ExecutionEpochActivated {
+                    execution_epoch_id: epoch.id,
+                }],
+                &mut record,
+            )
+            .await?;
+            record.active_execution_epoch_id = Some(epoch.id);
+            self.store_record(&record).await?;
+            return Ok(EnsureExecutionEpochResult {
+                epoch,
+                agent_event_id: result.latest_event_id,
+                created: false,
+            });
+        }
+
+        let id = Uuid7::now();
+        let epoch = ExecutionEpochRecord {
+            id,
+            manifest_digest,
+            manifest: request.manifest,
+            created_at: id.timestamp().expect("uuid7 timestamp"),
+        };
+        let result = append_events_to_agent(
+            &self.harness.inner,
+            &self.agent_dir(),
+            self.record.id,
+            request.origin,
+            vec![AgentEventData::ExecutionEpochCreated {
+                epoch: epoch.clone(),
+            }],
+            &mut record,
+        )
+        .await?;
+        store_execution_epoch(
+            &self.harness.inner.storage,
+            &self.agent_dir(),
+            &StoredExecutionEpoch {
+                epoch: epoch.clone(),
+                first_activated_event_id: result.event_ids[0],
+            },
+        )
+        .await?;
+        record.active_execution_epoch_id = Some(epoch.id);
+        self.store_record(&record).await?;
+        Ok(EnsureExecutionEpochResult {
+            epoch,
+            agent_event_id: result.latest_event_id,
+            created: true,
+        })
+    }
+
     async fn list_conversations(
         &self,
         request: ListConversationsRequest,
@@ -1229,6 +1424,21 @@ impl AgentHandle for BasicAgentHandle {
             .storage
             .put_json(conversation_dir.join("record.json"), &record)
             .await?;
+        let mut agent_record = self.load_record().await?;
+        append_events_to_agent(
+            &self.harness.inner,
+            &self.agent_dir(),
+            self.record.id,
+            None,
+            vec![AgentEventData::ConversationCreated {
+                conversation_id: record.id,
+                slug: record.slug.clone(),
+                name: record.name.clone(),
+            }],
+            &mut agent_record,
+        )
+        .await?;
+        self.store_record(&agent_record).await?;
         Ok(Arc::new(BasicConversationHandle {
             harness: self.harness.clone(),
             agent_id: self.record.id,
@@ -1273,6 +1483,19 @@ impl AgentHandle for BasicAgentHandle {
             .storage
             .delete_prefix(conversation_dir)
             .await?;
+        let mut agent_record = self.load_record().await?;
+        append_events_to_agent(
+            &self.harness.inner,
+            &self.agent_dir(),
+            self.record.id,
+            None,
+            vec![AgentEventData::ConversationDeleted {
+                conversation_id: *id,
+            }],
+            &mut agent_record,
+        )
+        .await?;
+        self.store_record(&agent_record).await?;
         Ok(true)
     }
 
@@ -1286,12 +1509,25 @@ impl AgentHandle for BasicAgentHandle {
     async fn put_binding(&self, binding: Binding) -> Result<BindingId> {
         let _guard = self.harness.inner.write_lock.lock().await;
         let id = Uuid7::now();
-        let record = stored_binding(id, binding);
+        let binding = stored_binding(id, binding);
         self.harness
             .inner
             .storage
-            .put_json(self.bindings_dir().join(format!("{id}.json")), &record)
+            .put_json(self.bindings_dir().join(format!("{id}.json")), &binding)
             .await?;
+        let mut record = self.load_record().await?;
+        append_events_to_agent(
+            &self.harness.inner,
+            &self.agent_dir(),
+            self.record.id,
+            None,
+            vec![AgentEventData::BindingPut {
+                binding: binding.record,
+            }],
+            &mut record,
+        )
+        .await?;
+        self.store_record(&record).await?;
         Ok(id)
     }
 
@@ -1319,7 +1555,7 @@ impl AgentHandle for BasicAgentHandle {
     async fn put_secret(&self, request: PutSecretRequest) -> Result<SecretId> {
         let _guard = self.harness.inner.write_lock.lock().await;
         let id = Uuid7::now();
-        let record = StoredSecret {
+        let secret = StoredSecret {
             metadata: SecretMetadata {
                 id,
                 r#type: secret_type(&request.secret),
@@ -1335,8 +1571,21 @@ impl AgentHandle for BasicAgentHandle {
         self.harness
             .inner
             .storage
-            .put_json(self.secrets_dir().join(format!("{id}.json")), &record)
+            .put_json(self.secrets_dir().join(format!("{id}.json")), &secret)
             .await?;
+        let mut record = self.load_record().await?;
+        append_events_to_agent(
+            &self.harness.inner,
+            &self.agent_dir(),
+            self.record.id,
+            None,
+            vec![AgentEventData::SecretPut {
+                metadata: secret.metadata,
+            }],
+            &mut record,
+        )
+        .await?;
+        self.store_record(&record).await?;
         Ok(id)
     }
 
@@ -1361,7 +1610,24 @@ impl AgentHandle for BasicAgentHandle {
 
     async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion> {
         let _guard = self.harness.inner.write_lock.lock().await;
-        write_artifact_version(&self.harness.inner, &self.artifacts_dir(), request).await
+        let artifact =
+            write_artifact_version(&self.harness.inner, &self.artifacts_dir(), request).await?;
+        let mut record = self.load_record().await?;
+        append_events_to_agent(
+            &self.harness.inner,
+            &self.agent_dir(),
+            self.record.id,
+            None,
+            vec![AgentEventData::ArtifactWritten {
+                artifact_id: artifact.artifact_id,
+                path: artifact.path.clone(),
+                version: artifact.version,
+            }],
+            &mut record,
+        )
+        .await?;
+        self.store_record(&record).await?;
+        Ok(artifact)
     }
 
     async fn read_artifact(&self, request: ReadArtifactRequest) -> Result<Option<Artifact>> {
@@ -1407,6 +1673,10 @@ impl BasicAgentHandle {
         self.harness.agents_dir().join(self.record.id.to_string())
     }
 
+    fn events_dir(&self) -> PathBuf {
+        self.agent_dir().join("events")
+    }
+
     fn conversations_dir(&self) -> PathBuf {
         self.agent_dir().join("conversations")
     }
@@ -1421,6 +1691,22 @@ impl BasicAgentHandle {
 
     fn artifacts_dir(&self) -> PathBuf {
         self.agent_dir().join("artifacts")
+    }
+
+    async fn load_record(&self) -> Result<AgentRecord> {
+        self.harness
+            .inner
+            .storage
+            .get_json(self.agent_dir().join("record.json"))
+            .await
+    }
+
+    async fn store_record(&self, record: &AgentRecord) -> Result<()> {
+        self.harness
+            .inner
+            .storage
+            .put_json(self.agent_dir().join("record.json"), record)
+            .await
     }
 
     async fn list_conversation_records(
@@ -1502,7 +1788,9 @@ struct BasicScopedSandboxHandle<'a> {
 }
 
 enum BasicSandboxEventSink<'a> {
-    None,
+    Agent {
+        agent_id: AgentId,
+    },
     Conversation {
         conversation_id: ConversationId,
     },
@@ -1520,7 +1808,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             harness,
             owner_dir: harness.agents_dir().join(agent_id.to_string()),
             owner: SandboxOwner::Agent(agent_id),
-            event_sink: BasicSandboxEventSink::None,
+            event_sink: BasicSandboxEventSink::Agent { agent_id },
         }
     }
 
@@ -1871,7 +2159,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         request: &PreparedSandboxRequest,
     ) -> Result<Option<(SandboxId, StoredSandbox)>> {
         match self.event_sink {
-            BasicSandboxEventSink::None => {
+            BasicSandboxEventSink::Agent { .. } => {
                 find_matching_stored_sandbox(
                     &self.harness.inner.storage,
                     &self.sandboxes_dir(),
@@ -1954,9 +2242,14 @@ impl<'a> BasicScopedSandboxHandle<'a> {
 
     fn process_event_log(&self) -> Option<SandboxProcessEventLog> {
         match self.event_sink {
-            BasicSandboxEventSink::None | BasicSandboxEventSink::Turn { .. } => None,
+            BasicSandboxEventSink::Turn { .. } => None,
+            BasicSandboxEventSink::Agent { agent_id } => Some(SandboxProcessEventLog::Agent {
+                inner: Arc::clone(&self.harness.inner),
+                agent_id,
+                agent_dir: self.owner_dir.clone(),
+            }),
             BasicSandboxEventSink::Conversation { conversation_id } => {
-                Some(SandboxProcessEventLog {
+                Some(SandboxProcessEventLog::Conversation {
                     inner: Arc::clone(&self.harness.inner),
                     conversation_id,
                     conversation_dir: self.owner_dir.clone(),
@@ -1966,16 +2259,39 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn append_events(&self, data: Vec<EventData>) -> Result<()> {
-        if matches!(self.event_sink, BasicSandboxEventSink::None) {
-            return Ok(());
-        }
         let _guard = self.harness.inner.write_lock.lock().await;
         self.append_events_locked(data).await
     }
 
     async fn append_events_locked(&self, data: Vec<EventData>) -> Result<()> {
         match self.event_sink {
-            BasicSandboxEventSink::None => Ok(()),
+            BasicSandboxEventSink::Agent { agent_id } => {
+                let mut record = self
+                    .harness
+                    .inner
+                    .storage
+                    .get_json::<AgentRecord>(self.owner_dir.join("record.json"))
+                    .await?;
+                append_events_to_agent(
+                    &self.harness.inner,
+                    &self.owner_dir,
+                    agent_id,
+                    None,
+                    data.into_iter()
+                        .map(|event| AgentEventData::SandboxEvent {
+                            event: Box::new(event),
+                        })
+                        .collect(),
+                    &mut record,
+                )
+                .await?;
+                self.harness
+                    .inner
+                    .storage
+                    .put_json(self.owner_dir.join("record.json"), &record)
+                    .await?;
+                Ok(())
+            }
             BasicSandboxEventSink::Conversation { conversation_id } => {
                 let mut record = self
                     .harness
@@ -2072,21 +2388,72 @@ impl ConversationHandle for BasicConversationHandle {
         let _guard = self.harness.inner.write_lock.lock().await;
         let mut record = self.load_record().await?;
         let conversation_dir = self.conversation_dir();
+        let BeginTurnRequest {
+            session_id: requested_session_id,
+            input,
+            agent_event_id: requested_agent_event_id,
+            execution_epoch_id: requested_execution_epoch_id,
+        } = request;
+        let agent_record = self
+            .harness
+            .inner
+            .storage
+            .get_json::<AgentRecord>(self.agent_dir().join("record.json"))
+            .await?;
+        let agent_event_id = requested_agent_event_id.or(agent_record.latest_event_id);
+        if let Some(agent_event_id) = agent_event_id
+            && self
+                .harness
+                .inner
+                .storage
+                .get_json_if_exists::<AgentEvent>(
+                    self.agent_dir()
+                        .join("events")
+                        .join(format!("{agent_event_id}.json")),
+                )
+                .await?
+                .is_none()
+        {
+            bail!("agent event does not exist: {agent_event_id}");
+        }
+        let execution_epoch_id =
+            requested_execution_epoch_id.or(agent_record.active_execution_epoch_id);
+        if let Some(execution_epoch_id) = execution_epoch_id {
+            let stored_epoch = load_execution_epoch_by_id(
+                &self.harness.inner.storage,
+                &self.agent_dir(),
+                execution_epoch_id,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("execution epoch does not exist: {execution_epoch_id}"))?;
+            if let Some(agent_event_id) = agent_event_id
+                && stored_epoch.first_activated_event_id > agent_event_id
+            {
+                bail!(
+                    "execution epoch {execution_epoch_id} was activated after agent head {agent_event_id}"
+                );
+            }
+        }
 
-        let session_id = request.session_id.unwrap_or_else(Uuid7::now);
+        let session_id = requested_session_id.unwrap_or_else(Uuid7::now);
         let turn_record = TurnRecord {
             id: Uuid7::now(),
             session_id,
+            agent_event_id,
+            execution_epoch_id,
         };
         let mut events_to_append = Vec::new();
 
-        if request.session_id.is_none() {
+        if requested_session_id.is_none() {
             events_to_append.push(EventData::SessionStarted);
         }
-        events_to_append.push(EventData::TurnStarted);
-        if !request.input.is_empty() {
+        events_to_append.push(EventData::TurnStarted {
+            agent_event_id,
+            execution_epoch_id,
+        });
+        if !input.is_empty() {
             events_to_append.push(EventData::Messages {
-                messages: request.input,
+                messages: input,
                 response_id: None,
                 usage: None,
             });
@@ -2321,6 +2688,21 @@ impl ConversationHandle for BasicConversationHandle {
             .storage
             .put_json(conversation_dir.join("record.json"), &fork_record)
             .await?;
+        let mut agent_record = agent.load_record().await?;
+        append_events_to_agent(
+            &self.harness.inner,
+            &agent.agent_dir(),
+            self.agent_id,
+            None,
+            vec![AgentEventData::ConversationForked {
+                conversation_id: record.id,
+                source_conversation_id: self.record.id,
+                up_to_inclusive: request.up_to_inclusive,
+            }],
+            &mut agent_record,
+        )
+        .await?;
+        agent.store_record(&agent_record).await?;
         Ok(Arc::new(BasicConversationHandle {
             harness: self.harness.clone(),
             agent_id: self.agent_id,
@@ -2401,11 +2783,37 @@ impl ConversationHandle for BasicConversationHandle {
     async fn put_binding(&self, binding: Binding) -> Result<BindingId> {
         let _guard = self.harness.inner.write_lock.lock().await;
         let id = Uuid7::now();
-        let record = stored_binding(id, binding);
+        let binding = stored_binding(id, binding);
         self.harness
             .inner
             .storage
-            .put_json(self.bindings_dir().join(format!("{id}.json")), &record)
+            .put_json(self.bindings_dir().join(format!("{id}.json")), &binding)
+            .await?;
+        let mut agent_record = self
+            .harness
+            .inner
+            .storage
+            .get_json::<AgentRecord>(self.agent_dir().join("record.json"))
+            .await?;
+        append_events_to_agent(
+            &self.harness.inner,
+            &self.agent_dir(),
+            self.agent_id,
+            Some(crate::AgentEventOrigin {
+                conversation_id: self.record.id,
+                session_id: None,
+                turn_id: None,
+            }),
+            vec![AgentEventData::BindingPut {
+                binding: binding.record,
+            }],
+            &mut agent_record,
+        )
+        .await?;
+        self.harness
+            .inner
+            .storage
+            .put_json(self.agent_dir().join("record.json"), &agent_record)
             .await?;
         Ok(id)
     }
@@ -2450,7 +2858,7 @@ impl ConversationHandle for BasicConversationHandle {
     async fn put_secret(&self, request: PutSecretRequest) -> Result<SecretId> {
         let _guard = self.harness.inner.write_lock.lock().await;
         let id = Uuid7::now();
-        let record = StoredSecret {
+        let secret = StoredSecret {
             metadata: SecretMetadata {
                 id,
                 r#type: secret_type(&request.secret),
@@ -2466,7 +2874,33 @@ impl ConversationHandle for BasicConversationHandle {
         self.harness
             .inner
             .storage
-            .put_json(self.secrets_dir().join(format!("{id}.json")), &record)
+            .put_json(self.secrets_dir().join(format!("{id}.json")), &secret)
+            .await?;
+        let mut agent_record = self
+            .harness
+            .inner
+            .storage
+            .get_json::<AgentRecord>(self.agent_dir().join("record.json"))
+            .await?;
+        append_events_to_agent(
+            &self.harness.inner,
+            &self.agent_dir(),
+            self.agent_id,
+            Some(crate::AgentEventOrigin {
+                conversation_id: self.record.id,
+                session_id: None,
+                turn_id: None,
+            }),
+            vec![AgentEventData::SecretPut {
+                metadata: secret.metadata,
+            }],
+            &mut agent_record,
+        )
+        .await?;
+        self.harness
+            .inner
+            .storage
+            .put_json(self.agent_dir().join("record.json"), &agent_record)
             .await?;
         Ok(id)
     }
@@ -3180,6 +3614,12 @@ struct StoredArtifactMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredExecutionEpoch {
+    epoch: ExecutionEpochRecord,
+    first_activated_event_id: AgentEventId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredSandbox {
     id: SandboxId,
     #[serde(default)]
@@ -3382,10 +3822,17 @@ struct RunningSandboxProcess {
     notify: Notify,
 }
 
-struct SandboxProcessEventLog {
-    inner: Arc<BasicExoHarnessInner>,
-    conversation_id: ConversationId,
-    conversation_dir: PathBuf,
+enum SandboxProcessEventLog {
+    Agent {
+        inner: Arc<BasicExoHarnessInner>,
+        agent_id: AgentId,
+        agent_dir: PathBuf,
+    },
+    Conversation {
+        inner: Arc<BasicExoHarnessInner>,
+        conversation_id: ConversationId,
+        conversation_dir: PathBuf,
+    },
 }
 
 struct RunningSandboxProcessTasks {
@@ -3594,29 +4041,64 @@ async fn append_sandbox_process_data(
     let Some(event_log) = &process.event_log else {
         return Ok(());
     };
-    let _guard = event_log.inner.write_lock.lock().await;
-    let mut record = event_log
-        .inner
-        .storage
-        .get_json::<ConversationRecord>(event_log.conversation_dir.join("record.json"))
-        .await?;
-    append_events_to_conversation(
-        &event_log.inner,
-        &event_log.conversation_dir,
-        event_log.conversation_id,
-        None,
-        None,
-        record.latest_event_id,
-        data,
-        &mut record,
-    )
-    .await?;
-    event_log
-        .inner
-        .storage
-        .put_json(event_log.conversation_dir.join("record.json"), &record)
-        .await?;
-    Ok(())
+    match event_log {
+        SandboxProcessEventLog::Agent {
+            inner,
+            agent_id,
+            agent_dir,
+        } => {
+            let _guard = inner.write_lock.lock().await;
+            let mut record = inner
+                .storage
+                .get_json::<AgentRecord>(agent_dir.join("record.json"))
+                .await?;
+            append_events_to_agent(
+                inner,
+                agent_dir,
+                *agent_id,
+                None,
+                data.into_iter()
+                    .map(|event| AgentEventData::SandboxEvent {
+                        event: Box::new(event),
+                    })
+                    .collect(),
+                &mut record,
+            )
+            .await?;
+            inner
+                .storage
+                .put_json(agent_dir.join("record.json"), &record)
+                .await?;
+            Ok(())
+        }
+        SandboxProcessEventLog::Conversation {
+            inner,
+            conversation_id,
+            conversation_dir,
+        } => {
+            let _guard = inner.write_lock.lock().await;
+            let mut record = inner
+                .storage
+                .get_json::<ConversationRecord>(conversation_dir.join("record.json"))
+                .await?;
+            append_events_to_conversation(
+                inner,
+                conversation_dir,
+                *conversation_id,
+                None,
+                None,
+                record.latest_event_id,
+                data,
+                &mut record,
+            )
+            .await?;
+            inner
+                .storage
+                .put_json(conversation_dir.join("record.json"), &record)
+                .await?;
+            Ok(())
+        }
+    }
 }
 
 async fn sandbox_process_status(process: &Arc<RunningSandboxProcess>) -> SandboxProcessStatus {
@@ -3775,6 +4257,47 @@ async fn append_events_to_conversation(
     })
 }
 
+async fn append_events_to_agent(
+    inner: &BasicExoHarnessInner,
+    agent_dir: &Path,
+    agent_id: AgentId,
+    origin: Option<crate::AgentEventOrigin>,
+    data: Vec<AgentEventData>,
+    record: &mut AgentRecord,
+) -> Result<AddAgentEventsResult> {
+    if data.is_empty() {
+        bail!("cannot append zero agent events");
+    }
+    let mut event_ids = Vec::new();
+    let mut latest_event_id = None;
+    for data in data {
+        let id = Uuid7::now();
+        let event = AgentEvent {
+            id,
+            agent_id,
+            created_at: id.timestamp().expect("uuid7 timestamp"),
+            origin: origin.clone(),
+            data,
+        };
+        inner
+            .storage
+            .put_json(
+                agent_dir.join("events").join(format!("{}.json", event.id)),
+                &event,
+            )
+            .await?;
+        notify_agent_subscribers(inner, agent_id, event.clone());
+        latest_event_id = Some(event.id);
+        event_ids.push(event.id);
+    }
+    let latest_event_id = latest_event_id.expect("at least one agent event");
+    record.latest_event_id = Some(latest_event_id);
+    Ok(AddAgentEventsResult {
+        event_ids,
+        latest_event_id,
+    })
+}
+
 fn ensure_conversation_head(
     current_head: Option<EventId>,
     expected_head: Option<EventId>,
@@ -3843,6 +4366,17 @@ fn notify_subscribers(inner: &BasicExoHarnessInner, conversation_id: Conversatio
     entries.retain(|sender| sender.send(Ok(event.clone())).is_ok());
 }
 
+fn notify_agent_subscribers(inner: &BasicExoHarnessInner, agent_id: AgentId, event: AgentEvent) {
+    let mut subscribers = inner
+        .agent_subscribers
+        .lock()
+        .expect("agent subscribers poisoned");
+    let Some(entries) = subscribers.get_mut(&agent_id) else {
+        return;
+    };
+    entries.retain(|sender| sender.send(Ok(event.clone())).is_ok());
+}
+
 fn matches_bound(event_id: EventId, bound: &Bound<EventId>) -> bool {
     match bound {
         Bound::Unbounded => false,
@@ -3857,6 +4391,142 @@ async fn load_events(storage: &BasicObjectStore, events_dir: &Path) -> Result<Ve
         .await?;
     events.sort_by_key(|event| event.id);
     Ok(events)
+}
+
+async fn load_agent_events(
+    storage: &BasicObjectStore,
+    events_dir: &Path,
+) -> Result<Vec<AgentEvent>> {
+    let mut events = storage
+        .list_json_matching_suffix::<AgentEvent>(events_dir, ".json")
+        .await?;
+    events.sort_by_key(|event| event.id);
+    Ok(events)
+}
+
+async fn load_execution_epoch_by_manifest(
+    storage: &BasicObjectStore,
+    agent_dir: &Path,
+    manifest_digest: &str,
+    manifest: &Value,
+) -> Result<Option<StoredExecutionEpoch>> {
+    let digest_path = execution_epoch_digest_path(agent_dir, manifest_digest)?;
+    if let Some(epoch_id) = storage
+        .get_json_if_exists::<ExecutionEpochId>(&digest_path)
+        .await?
+    {
+        let stored = storage
+            .get_json_if_exists::<StoredExecutionEpoch>(execution_epoch_path(agent_dir, epoch_id))
+            .await?
+            .ok_or_else(|| {
+                anyhow!("execution epoch digest index references missing epoch: {manifest_digest}")
+            })?;
+        if stored.epoch.manifest_digest != manifest_digest || stored.epoch.manifest != *manifest {
+            bail!("execution epoch digest collision or corrupt index: {manifest_digest}");
+        }
+        return Ok(Some(stored));
+    }
+
+    let events = load_agent_events(storage, &agent_dir.join("events")).await?;
+    let matching_epoch = events.iter().rev().find_map(|event| match &event.data {
+        AgentEventData::ExecutionEpochCreated { epoch }
+            if epoch.manifest_digest == manifest_digest && epoch.manifest == *manifest =>
+        {
+            Some(epoch.clone())
+        }
+        _ => None,
+    });
+    let Some(epoch) = matching_epoch else {
+        return Ok(None);
+    };
+    let first_activated_event_id = events
+        .iter()
+        .find_map(|event| match &event.data {
+            AgentEventData::ExecutionEpochCreated {
+                epoch: activated_epoch,
+            } if activated_epoch.id == epoch.id => Some(event.id),
+            _ => None,
+        })
+        .expect("matching epoch has an activation event");
+    let stored = StoredExecutionEpoch {
+        epoch,
+        first_activated_event_id,
+    };
+    store_execution_epoch(storage, agent_dir, &stored).await?;
+    Ok(Some(stored))
+}
+
+async fn load_execution_epoch_by_id(
+    storage: &BasicObjectStore,
+    agent_dir: &Path,
+    epoch_id: ExecutionEpochId,
+) -> Result<Option<StoredExecutionEpoch>> {
+    if let Some(stored) = storage
+        .get_json_if_exists::<StoredExecutionEpoch>(execution_epoch_path(agent_dir, epoch_id))
+        .await?
+    {
+        return Ok(Some(stored));
+    }
+
+    let events = load_agent_events(storage, &agent_dir.join("events")).await?;
+    let mut epoch = None;
+    let mut first_activated_event_id = None;
+    for event in events {
+        let AgentEventData::ExecutionEpochCreated {
+            epoch: activated_epoch,
+        } = event.data
+        else {
+            continue;
+        };
+        if activated_epoch.id != epoch_id {
+            continue;
+        }
+        epoch.get_or_insert(activated_epoch);
+        first_activated_event_id.get_or_insert(event.id);
+    }
+    let (Some(epoch), Some(first_activated_event_id)) = (epoch, first_activated_event_id) else {
+        return Ok(None);
+    };
+    let stored = StoredExecutionEpoch {
+        epoch,
+        first_activated_event_id,
+    };
+    store_execution_epoch(storage, agent_dir, &stored).await?;
+    Ok(Some(stored))
+}
+
+async fn store_execution_epoch(
+    storage: &BasicObjectStore,
+    agent_dir: &Path,
+    stored: &StoredExecutionEpoch,
+) -> Result<()> {
+    storage
+        .put_json(execution_epoch_path(agent_dir, stored.epoch.id), stored)
+        .await?;
+    storage
+        .put_json(
+            execution_epoch_digest_path(agent_dir, &stored.epoch.manifest_digest)?,
+            &stored.epoch.id,
+        )
+        .await
+}
+
+fn execution_epoch_path(agent_dir: &Path, epoch_id: ExecutionEpochId) -> PathBuf {
+    agent_dir
+        .join("execution-epochs")
+        .join("by-id")
+        .join(format!("{epoch_id}.json"))
+}
+
+fn execution_epoch_digest_path(agent_dir: &Path, manifest_digest: &str) -> Result<PathBuf> {
+    let digest = manifest_digest
+        .strip_prefix("sha256:")
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow!("invalid execution epoch manifest digest: {manifest_digest}"))?;
+    Ok(agent_dir
+        .join("execution-epochs")
+        .join("by-digest")
+        .join(format!("{digest}.json")))
 }
 
 async fn load_artifact_versions(

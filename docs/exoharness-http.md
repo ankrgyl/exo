@@ -70,13 +70,29 @@ On exoharness errors:
 Trait objects do not cross HTTP. Stable resources are addressed by their durable ids:
 
 - `agent_id`
+- `agent_event_id`
 - `conversation_id`
 - `event_id`
+- `execution_epoch_id`
 - `artifact_id`
 - `binding_id`
 - `secret_id`
 
 Turns are addressed by durable ids. `conversation_begin_turn` returns the conversation identity plus the turn record. Subsequent `turn_add_events`, `turn_write_artifact`, and `turn_finish` requests include `agent_id`, `conversation_id`, `session_id`, and `turn_id`; the server reconstructs the turn from those ids.
+
+Agent timeline and execution-epoch operations use the same unary protocol:
+
+- `agent_get_events`
+- `agent_get_event`
+- `agent_add_events`
+- `agent_ensure_execution_epoch`
+
+The epoch request can include `expected_agent_event_id`; the server rejects a
+manifest assembled across a concurrent shared-agent mutation.
+
+`conversation_begin_turn` accepts optional `agent_event_id` and
+`execution_epoch_id` fields in its nested request. They pin the turn to a
+causally valid shared-agent head and immutable execution manifest.
 
 ## Streaming
 

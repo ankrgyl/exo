@@ -75,6 +75,15 @@ pub trait SandboxHandle: SnapshotHandle {
 pub trait AgentHandle: SandboxHandle {
     fn record(&self) -> &AgentRecord;
 
+    async fn get_events(&self, query: Option<AgentEventQuery>) -> Result<GetAgentEventsResult>;
+    async fn watch_events(&self, after_exclusive: Bound<AgentEventId>) -> Result<AgentEventStream>;
+    async fn get_event(&self, id: AgentEventId) -> Result<Option<AgentEvent>>;
+    async fn add_events(&self, request: AddAgentEventsRequest) -> Result<AddAgentEventsResult>;
+    async fn ensure_execution_epoch(
+        &self,
+        request: EnsureExecutionEpochRequest,
+    ) -> Result<EnsureExecutionEpochResult>;
+
     async fn list_conversations(
         &self,
         request: ListConversationsRequest,
@@ -147,6 +156,10 @@ pub struct AgentRecord {
     pub id: AgentId,
     pub slug: String,
     pub name: String,
+    #[serde(default)]
+    pub latest_event_id: Option<AgentEventId>,
+    #[serde(default)]
+    pub active_execution_epoch_id: Option<ExecutionEpochId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -185,12 +198,200 @@ pub struct ListConversationsResult<T> {
 pub struct TurnRecord {
     pub id: TurnId,
     pub session_id: SessionId,
+    #[serde(default)]
+    pub agent_event_id: Option<AgentEventId>,
+    #[serde(default)]
+    pub execution_epoch_id: Option<ExecutionEpochId>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BeginTurnRequest {
     pub session_id: Option<SessionId>,
     pub input: Vec<Message>,
+    /// Agent-state head observed by the executor preparing this turn. When
+    /// omitted, the exoharness captures the latest head atomically while
+    /// beginning the turn.
+    #[serde(default)]
+    pub agent_event_id: Option<AgentEventId>,
+    /// Execution epoch selected by the executor for this turn. When omitted,
+    /// the exoharness captures the agent's active epoch.
+    #[serde(default)]
+    pub execution_epoch_id: Option<ExecutionEpochId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentEventOrigin {
+    pub conversation_id: ConversationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentEventQuery {
+    pub cursor: Option<AgentEventId>,
+    pub direction: Option<EventQueryDirection>,
+    pub limit: Option<u32>,
+    pub types: Option<Vec<AgentEventKind>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AgentEventKind(Cow<'static, str>);
+
+impl AgentEventKind {
+    pub const AGENT_CREATED: AgentEventKind = AgentEventKind(Cow::Borrowed("agent_created"));
+    pub const CONVERSATION_CREATED: AgentEventKind =
+        AgentEventKind(Cow::Borrowed("conversation_created"));
+    pub const CONVERSATION_DELETED: AgentEventKind =
+        AgentEventKind(Cow::Borrowed("conversation_deleted"));
+    pub const CONVERSATION_FORKED: AgentEventKind =
+        AgentEventKind(Cow::Borrowed("conversation_forked"));
+    pub const ARTIFACT_WRITTEN: AgentEventKind = AgentEventKind(Cow::Borrowed("artifact_written"));
+    pub const BINDING_PUT: AgentEventKind = AgentEventKind(Cow::Borrowed("binding_put"));
+    pub const SECRET_PUT: AgentEventKind = AgentEventKind(Cow::Borrowed("secret_put"));
+    pub const SANDBOX_EVENT: AgentEventKind = AgentEventKind(Cow::Borrowed("sandbox_event"));
+    pub const EXECUTION_EPOCH_CREATED: AgentEventKind =
+        AgentEventKind(Cow::Borrowed("execution_epoch_created"));
+    pub const EXECUTION_EPOCH_ACTIVATED: AgentEventKind =
+        AgentEventKind(Cow::Borrowed("execution_epoch_activated"));
+
+    pub fn custom(name: impl Into<Cow<'static, str>>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentEvent {
+    pub id: AgentEventId,
+    pub agent_id: AgentId,
+    pub created_at: DateTimeUtc,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<AgentEventOrigin>,
+    pub data: AgentEventData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentEventData {
+    AgentCreated {
+        slug: String,
+        name: String,
+    },
+    ConversationCreated {
+        conversation_id: ConversationId,
+        slug: String,
+        name: String,
+    },
+    ConversationDeleted {
+        conversation_id: ConversationId,
+    },
+    ConversationForked {
+        conversation_id: ConversationId,
+        source_conversation_id: ConversationId,
+        up_to_inclusive: Option<EventId>,
+    },
+    ArtifactWritten {
+        artifact_id: ArtifactId,
+        path: String,
+        version: u64,
+    },
+    BindingPut {
+        binding: BindingRecord,
+    },
+    SecretPut {
+        metadata: SecretMetadata,
+    },
+    /// Agent-scoped sandbox lifecycle and process records reuse the existing
+    /// typed conversation event representation.
+    SandboxEvent {
+        event: Box<EventData>,
+    },
+    /// Creates an immutable epoch and makes it active. The manifest appears
+    /// only in this event; later activations refer to it by id.
+    ExecutionEpochCreated {
+        epoch: ExecutionEpochRecord,
+    },
+    ExecutionEpochActivated {
+        execution_epoch_id: ExecutionEpochId,
+    },
+    Custom {
+        event_type: String,
+        payload: Value,
+    },
+}
+
+impl AgentEventData {
+    pub fn kind(&self) -> AgentEventKind {
+        match self {
+            Self::AgentCreated { .. } => AgentEventKind::AGENT_CREATED,
+            Self::ConversationCreated { .. } => AgentEventKind::CONVERSATION_CREATED,
+            Self::ConversationDeleted { .. } => AgentEventKind::CONVERSATION_DELETED,
+            Self::ConversationForked { .. } => AgentEventKind::CONVERSATION_FORKED,
+            Self::ArtifactWritten { .. } => AgentEventKind::ARTIFACT_WRITTEN,
+            Self::BindingPut { .. } => AgentEventKind::BINDING_PUT,
+            Self::SecretPut { .. } => AgentEventKind::SECRET_PUT,
+            Self::SandboxEvent { .. } => AgentEventKind::SANDBOX_EVENT,
+            Self::ExecutionEpochCreated { .. } => AgentEventKind::EXECUTION_EPOCH_CREATED,
+            Self::ExecutionEpochActivated { .. } => AgentEventKind::EXECUTION_EPOCH_ACTIVATED,
+            Self::Custom { event_type, .. } => AgentEventKind::custom(event_type.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetAgentEventsResult {
+    pub events: Vec<AgentEvent>,
+    pub cursor: Option<AgentEventId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddAgentEventsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<AgentEventOrigin>,
+    pub data: Vec<AgentEventData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AddAgentEventsResult {
+    pub event_ids: Vec<AgentEventId>,
+    pub latest_event_id: AgentEventId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecutionEpochRecord {
+    pub id: ExecutionEpochId,
+    pub manifest_digest: String,
+    pub manifest: Value,
+    pub created_at: DateTimeUtc,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EnsureExecutionEpochRequest {
+    pub manifest: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<AgentEventOrigin>,
+    /// Agent head observed before the caller read the inputs represented by
+    /// `manifest`. When supplied, epoch selection fails if shared agent state
+    /// changed while the manifest was being assembled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_agent_event_id: Option<AgentEventId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EnsureExecutionEpochResult {
+    pub epoch: ExecutionEpochRecord,
+    /// Agent timeline head after ensuring the epoch. This is the head a
+    /// subsequent turn should pin.
+    pub agent_event_id: AgentEventId,
+    /// True only when a previously unseen manifest created a new immutable
+    /// epoch. Reactivating an older matching epoch returns false.
+    pub created: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -336,7 +537,12 @@ pub enum EventData {
     },
     SessionStarted,
     SessionEnded,
-    TurnStarted,
+    TurnStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_event_id: Option<AgentEventId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_epoch_id: Option<ExecutionEpochId>,
+    },
     TurnEnded,
     Messages {
         messages: Vec<Message>,
@@ -434,7 +640,7 @@ impl EventData {
             Self::ConversationForked { .. } => EventKind::CONVERSATION_FORKED,
             Self::SessionStarted => EventKind::SESSION_STARTED,
             Self::SessionEnded => EventKind::SESSION_ENDED,
-            Self::TurnStarted => EventKind::TURN_STARTED,
+            Self::TurnStarted { .. } => EventKind::TURN_STARTED,
             Self::TurnEnded => EventKind::TURN_ENDED,
             Self::Messages { .. } => EventKind::MESSAGES,
             Self::ToolRequested { .. } => EventKind::TOOL_REQUESTED,
@@ -934,6 +1140,8 @@ pub enum Secret {
 }
 
 pub type AgentId = Uuid7;
+pub type AgentEventId = Uuid7;
+pub type ExecutionEpochId = Uuid7;
 pub type ConversationId = Uuid7;
 pub type SessionId = Uuid7;
 pub type TurnId = Uuid7;
@@ -952,8 +1160,11 @@ pub type ToolArguments = Map<String, Value>;
 pub type BoxAsyncRead = Pin<Box<dyn AsyncRead + Send + Unpin>>;
 pub type BoxAsyncWrite = Pin<Box<dyn AsyncWrite + Send + Unpin>>;
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<Event>> + Send>>;
+pub type AgentEventStream = Pin<Box<dyn Stream<Item = Result<AgentEvent>> + Send>>;
 
 crate::impl_has_uuid7_id!(AgentRecord, id);
+crate::impl_has_uuid7_id!(AgentEvent, id);
+crate::impl_has_uuid7_id!(ExecutionEpochRecord, id);
 crate::impl_has_uuid7_id!(ConversationRecord, id);
 crate::impl_has_uuid7_id!(TurnRecord, id);
 crate::impl_has_uuid7_id!(Event, id);

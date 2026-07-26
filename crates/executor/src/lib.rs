@@ -49,15 +49,16 @@ pub use executor_types::{
     ToolRuntime, TypeScriptHarnessConfig, effective_sandbox_scope,
 };
 pub use exoharness::{
-    AgentHandle, BasicExoHarness, BasicExoHarnessConfig, Binding, BindingRecord,
-    ConversationHandle, DEFAULT_SANDBOX_IMAGE, DaytonaBackendSpec, E2bBackendSpec, EventData,
-    EventId, EventKind, EventQuery, EventQueryDirection, ExoHarness, ExoHarnessHttpServeOptions,
-    FileSystemMount, FileSystemMountMode, ForkConversationRequest, HTTP_EXOHARNESS_TRACING_TARGET,
-    HttpExoHarness, PutSecretRequest, SANDBOX_MAIN_MOUNT_DIR, SandboxBackendRegistration,
-    SandboxId, SandboxProvider, SandboxProviderConfig, Secret, SecretBackendChoice, SecretMetadata,
-    SessionId, SnapshotId, SpritesBackendSpec, StartSandboxRequest, ToolRequest, Uuid7,
-    VercelBackendSpec, default_aws_agentcore_image, default_daytona_image, default_docker_image,
-    default_e2b_template, default_vercel_image, serve_exoharness_http_listener,
+    AgentEventData, AgentEventId, AgentEventKind, AgentEventOrigin, AgentEventQuery, AgentHandle,
+    BasicExoHarness, BasicExoHarnessConfig, Binding, BindingRecord, ConversationHandle,
+    DEFAULT_SANDBOX_IMAGE, DaytonaBackendSpec, E2bBackendSpec, EventData, EventId, EventKind,
+    EventQuery, EventQueryDirection, ExoHarness, ExoHarnessHttpServeOptions, FileSystemMount,
+    FileSystemMountMode, ForkConversationRequest, HTTP_EXOHARNESS_TRACING_TARGET, HttpExoHarness,
+    PutSecretRequest, SANDBOX_MAIN_MOUNT_DIR, SandboxBackendRegistration, SandboxId,
+    SandboxProvider, SandboxProviderConfig, Secret, SecretBackendChoice, SecretMetadata, SessionId,
+    SnapshotId, SpritesBackendSpec, StartSandboxRequest, ToolRequest, Uuid7, VercelBackendSpec,
+    default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
+    default_vercel_image, serve_exoharness_http_listener,
     serve_exoharness_http_listener_with_options,
 };
 pub use harness_basic::BasicHarness;

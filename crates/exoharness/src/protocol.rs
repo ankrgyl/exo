@@ -1,15 +1,17 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AddEventsRequest, AddEventsResult, AgentId, AgentRecord, Artifact, ArtifactVersion,
+    AddAgentEventsRequest, AddAgentEventsResult, AddEventsRequest, AddEventsResult, AgentEvent,
+    AgentEventId, AgentEventQuery, AgentId, AgentRecord, Artifact, ArtifactVersion,
     BeginTurnRequest, Binding, BindingId, BindingRecord, CancelSandboxProcessRequest,
     CloseSandboxProcessInputRequest, ConversationId, ConversationRecord, CreateSandboxRequest,
-    Event, EventData, EventId, EventQuery, ForkConversationRequest, GetEventsResult,
-    GetSandboxProcessEventsResult, ListConversationsRequest, ListConversationsResult,
-    NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest, SandboxId,
-    SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId,
-    SecretMetadata, SessionId, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnId,
-    TurnRecord, WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    EnsureExecutionEpochRequest, EnsureExecutionEpochResult, Event, EventData, EventId, EventQuery,
+    ForkConversationRequest, GetAgentEventsResult, GetEventsResult, GetSandboxProcessEventsResult,
+    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
+    PutSecretRequest, ReadArtifactRequest, SandboxId, SandboxProcessEventQuery,
+    SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId, SecretMetadata, SessionId,
+    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnId, TurnRecord,
+    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,6 +124,22 @@ pub enum Request {
     AgentWriteArtifact {
         agent_id: AgentId,
         request: WriteArtifactRequest,
+    },
+    AgentGetEvents {
+        agent_id: AgentId,
+        query: Option<AgentEventQuery>,
+    },
+    AgentGetEvent {
+        agent_id: AgentId,
+        event_id: AgentEventId,
+    },
+    AgentAddEvents {
+        agent_id: AgentId,
+        request: AddAgentEventsRequest,
+    },
+    AgentEnsureExecutionEpoch {
+        agent_id: AgentId,
+        request: EnsureExecutionEpochRequest,
     },
     CreateSandbox {
         scope: SandboxScope,
@@ -303,6 +321,10 @@ impl Request {
             Self::AgentListArtifacts { .. } => "agent_list_artifacts",
             Self::AgentReadArtifact { .. } => "agent_read_artifact",
             Self::AgentWriteArtifact { .. } => "agent_write_artifact",
+            Self::AgentGetEvents { .. } => "agent_get_events",
+            Self::AgentGetEvent { .. } => "agent_get_event",
+            Self::AgentAddEvents { .. } => "agent_add_events",
+            Self::AgentEnsureExecutionEpoch { .. } => "agent_ensure_execution_epoch",
             Self::CreateSandbox { .. } => "create_sandbox",
             Self::SnapshotSandbox { .. } => "snapshot_sandbox",
             Self::StartSandbox { .. } => "start_sandbox",
@@ -359,6 +381,18 @@ pub enum Response {
     },
     Conversation {
         conversation: Option<ConversationHandleInfo>,
+    },
+    AgentEvents {
+        result: GetAgentEventsResult,
+    },
+    AgentEvent {
+        event: Option<AgentEvent>,
+    },
+    AddAgentEvents {
+        result: AddAgentEventsResult,
+    },
+    ExecutionEpoch {
+        result: EnsureExecutionEpochResult,
     },
     Events {
         result: GetEventsResult,
@@ -431,6 +465,10 @@ impl Response {
             Self::Bool { .. } => "bool",
             Self::Conversations { .. } => "conversations",
             Self::Conversation { .. } => "conversation",
+            Self::AgentEvents { .. } => "agent_events",
+            Self::AgentEvent { .. } => "agent_event",
+            Self::AddAgentEvents { .. } => "add_agent_events",
+            Self::ExecutionEpoch { .. } => "execution_epoch",
             Self::Events { .. } => "events",
             Self::Event { .. } => "event",
             Self::AddEvents { .. } => "add_events",

@@ -53,6 +53,7 @@ export default defineConfig({
             link: "/concepts/exoharness-and-executor",
           },
           { text: "Data Model", link: "/concepts/data-model" },
+          { text: "Causal Execution", link: "/concepts/causal-execution" },
           { text: "Time Travel", link: "/concepts/time-travel" },
           { text: "Sandboxes", link: "/concepts/sandboxes" },
           {

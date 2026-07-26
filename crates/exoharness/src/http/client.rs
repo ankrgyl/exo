@@ -17,18 +17,19 @@ use crate::protocol::{
     ClientMessage, ConversationHandleInfo, Request, Response, SandboxScope, ServerMessage,
 };
 use crate::{
-    AddEventsRequest, AddEventsResult, AgentHandle, AgentId, AgentRecord, Artifact,
+    AddAgentEventsRequest, AddAgentEventsResult, AddEventsRequest, AddEventsResult, AgentEvent,
+    AgentEventId, AgentEventQuery, AgentEventStream, AgentHandle, AgentId, AgentRecord, Artifact,
     ArtifactVersion, BeginTurnRequest, Binding, BindingId, BindingRecord,
     CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, ConversationHandle,
-    ConversationId, ConversationRecord, CreateSandboxRequest, Event, EventData, EventId,
-    EventQuery, EventStream, ExoHarness, ForkConversationRequest, GetEventsResult,
-    GetSandboxProcessEventsResult, ListConversationsRequest, ListConversationsResult,
-    NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest, Result,
-    RunInSandboxRequest, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery,
-    SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId,
-    SecretMetadata, SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
-    StartSandboxRequest, TurnHandle, TurnRecord, WaitSandboxProcessRequest, WriteArtifactRequest,
-    WriteSandboxProcessInputRequest,
+    ConversationId, ConversationRecord, CreateSandboxRequest, EnsureExecutionEpochRequest,
+    EnsureExecutionEpochResult, Event, EventData, EventId, EventQuery, EventStream, ExoHarness,
+    ForkConversationRequest, GetAgentEventsResult, GetEventsResult, GetSandboxProcessEventsResult,
+    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
+    PutSecretRequest, ReadArtifactRequest, Result, RunInSandboxRequest, SandboxHandle, SandboxId,
+    SandboxProcess, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessRecord,
+    SandboxProcessStatus, Secret, SecretId, SecretMetadata, SessionId, SnapshotHandle, SnapshotId,
+    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnRecord,
+    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 #[derive(Clone)]
@@ -408,6 +409,72 @@ async fn http_run_in_sandbox(
 impl AgentHandle for HttpAgentHandle {
     fn record(&self) -> &AgentRecord {
         &self.record
+    }
+
+    async fn get_events(&self, query: Option<AgentEventQuery>) -> Result<GetAgentEventsResult> {
+        match self
+            .harness
+            .request(Request::AgentGetEvents {
+                agent_id: self.record.id,
+                query,
+            })
+            .await?
+        {
+            Response::AgentEvents { result } => Ok(result),
+            response => unexpected_response(response, "agent_events"),
+        }
+    }
+
+    async fn watch_events(
+        &self,
+        _after_exclusive: Bound<AgentEventId>,
+    ) -> Result<AgentEventStream> {
+        unsupported("watch_events")
+    }
+
+    async fn get_event(&self, id: AgentEventId) -> Result<Option<AgentEvent>> {
+        match self
+            .harness
+            .request(Request::AgentGetEvent {
+                agent_id: self.record.id,
+                event_id: id,
+            })
+            .await?
+        {
+            Response::AgentEvent { event } => Ok(event),
+            response => unexpected_response(response, "agent_event"),
+        }
+    }
+
+    async fn add_events(&self, request: AddAgentEventsRequest) -> Result<AddAgentEventsResult> {
+        match self
+            .harness
+            .request(Request::AgentAddEvents {
+                agent_id: self.record.id,
+                request,
+            })
+            .await?
+        {
+            Response::AddAgentEvents { result } => Ok(result),
+            response => unexpected_response(response, "add_agent_events"),
+        }
+    }
+
+    async fn ensure_execution_epoch(
+        &self,
+        request: EnsureExecutionEpochRequest,
+    ) -> Result<EnsureExecutionEpochResult> {
+        match self
+            .harness
+            .request(Request::AgentEnsureExecutionEpoch {
+                agent_id: self.record.id,
+                request,
+            })
+            .await?
+        {
+            Response::ExecutionEpoch { result } => Ok(result),
+            response => unexpected_response(response, "execution_epoch"),
+        }
     }
 
     async fn list_conversations(

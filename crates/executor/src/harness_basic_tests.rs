@@ -7,9 +7,9 @@ use crate::{
 use anyhow::anyhow;
 use async_trait::async_trait;
 use exoharness::{
-    BasicExoHarness, Binding, EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness,
-    FileSystemMount, FileSystemMountMode, PutSecretRequest, Result, SandboxProvider, Secret,
-    ToolRequest, Uuid7,
+    AgentEventData, AgentEventKind, AgentEventQuery, BasicExoHarness, Binding, EventData,
+    EventKind, EventQuery, EventQueryDirection, ExoHarness, FileSystemMount, FileSystemMountMode,
+    PutSecretRequest, Result, SandboxProvider, Secret, ToolRequest, Uuid7,
 };
 use lingua::universal::{AssistantContent, UserContent};
 use lingua::{Message, UniversalStreamChunk, UniversalUsage};
@@ -146,7 +146,7 @@ async fn send_persists_messages_through_harness() {
         .await
         .expect("conversation should be created");
 
-    conversation
+    let result = conversation
         .send(SendRequest {
             input: vec![user_message("ping")],
             session_id: None,
@@ -176,6 +176,44 @@ async fn send_persists_messages_through_harness() {
         sandbox_events.is_empty(),
         "plain chat should not provision a sandbox"
     );
+
+    let epoch_events = agent
+        .exoharness_handle()
+        .get_events(Some(AgentEventQuery {
+            direction: Some(EventQueryDirection::Asc),
+            types: Some(vec![AgentEventKind::EXECUTION_EPOCH_CREATED]),
+            ..Default::default()
+        }))
+        .await
+        .expect("execution epoch events should load")
+        .events;
+    assert_eq!(epoch_events.len(), 1);
+    let AgentEventData::ExecutionEpochCreated { epoch } = &epoch_events[0].data else {
+        panic!("expected execution epoch creation");
+    };
+    assert_eq!(epoch.manifest["schema_version"], 1);
+    assert_eq!(epoch.manifest["executor"]["harness"], "basic");
+    assert_eq!(epoch.manifest["agent_config"]["model"], "gpt-5.4");
+    assert_eq!(epoch.manifest["visible_bindings"][0]["name"], "gpt-5.4");
+
+    let turn_started = conversation
+        .exoharness_handle()
+        .get_events(Some(EventQuery {
+            direction: Some(EventQueryDirection::Asc),
+            turn_id: Some(result.turn_id),
+            types: Some(vec![EventKind::TURN_STARTED]),
+            ..Default::default()
+        }))
+        .await
+        .expect("turn start should load")
+        .events;
+    assert!(matches!(
+        turn_started.first().expect("turn started").data,
+        EventData::TurnStarted {
+            agent_event_id: Some(agent_event_id),
+            execution_epoch_id: Some(execution_epoch_id),
+        } if agent_event_id == epoch_events[0].id && execution_epoch_id == epoch.id
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]

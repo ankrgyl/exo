@@ -30,7 +30,8 @@ The core API is intentionally small. Most operations are scoped to one of four
 handle types:
 
 - `ExoHarness`: root handle for global agents, bindings, and secrets.
-- `AgentHandle`: per-agent conversations, artifacts, bindings, and secrets.
+- `AgentHandle`: per-agent timeline, conversations, artifacts, bindings, and
+  secrets.
 - `ConversationHandle`: per-conversation event log, artifacts, sandboxes,
   bindings, and secrets.
 - `TurnHandle`: active-turn-only writes that must preserve turn consistency.
@@ -91,6 +92,11 @@ override them by name.
 An agent handle exposes conversations and agent-scoped resources:
 
 - `record() -> AgentRecord`
+- `get_events(AgentEventQuery) -> GetAgentEventsResult`
+- `watch_events(after_exclusive) -> AgentEventStream`
+- `get_event(agent_event_id) -> Option<AgentEvent>`
+- `add_events(AddAgentEventsRequest) -> AddAgentEventsResult`
+- `ensure_execution_epoch(EnsureExecutionEpochRequest) -> EnsureExecutionEpochResult`
 - `list_conversations() -> Vec<ConversationHandle>`
 - `get_conversation(id) -> Option<ConversationHandle>`
 - `new_conversation(NewConversationRequest) -> ConversationHandle`
@@ -100,7 +106,10 @@ An agent handle exposes conversations and agent-scoped resources:
 - `list_artifacts()`, `write_artifact()`, `read_artifact()`
 
 Agent-scoped artifacts are useful for configuration and data that should live
-with the agent instead of one conversation.
+with the agent instead of one conversation. Mutations append typed events to
+the agent timeline. Secret events contain metadata, never secret values.
+Epoch requests may include the agent head observed before manifest assembly;
+the backend rejects the request if that head changed before epoch selection.
 
 ### Conversation: `ConversationHandle`
 
@@ -149,9 +158,14 @@ which makes event ordering straightforward.
 
 Important records:
 
-- `AgentRecord`: `id`, `slug`, `name`.
+- `AgentRecord`: `id`, `slug`, `name`, `latest_event_id`,
+  `active_execution_epoch_id`.
 - `ConversationRecord`: `id`, `slug`, `name`, `latest_event_id`.
-- `TurnRecord`: `id`, `session_id`.
+- `TurnRecord`: `id`, `session_id`, `agent_event_id`, `execution_epoch_id`.
+- `AgentEvent`: `id`, `agent_id`, optional origin, `created_at`, and tagged
+  `data`.
+- `ExecutionEpochRecord`: `id`, manifest SHA-256 digest, immutable manifest,
+  and `created_at`.
 - `Event`: `id`, `conversation_id`, optional `session_id`, optional `turn_id`,
   `created_at`, and tagged `data`.
 - `ArtifactVersion`: `artifact_id`, `path`, `version`, `created_at`,
@@ -162,8 +176,14 @@ while the wire protocols preserve serde's snake_case tags and fields.
 
 ## Event Log API
 
-The event log is the durable source of truth for conversation history and
-runtime side effects. Events are append-only.
+The agent and conversation event logs are the durable source of truth for
+shared state, conversation history, and runtime side effects. Events are
+append-only.
+
+The agent timeline records agent/conversation lifecycle, agent artifacts,
+bindings, secret metadata, agent sandbox events, execution epoch creation and activation,
+and custom events. An optional origin links an agent event back to the
+conversation, session, and turn that caused it.
 
 Core event variants:
 
@@ -207,6 +227,21 @@ A session groups related turns. `begin_turn()` accepts an optional `session_id`.
 If none is provided, Exoharness creates a new session and appends
 `session_started` before `turn_started`. If input messages are included, they
 are appended as a `messages` event in the same turn.
+
+A turn's causal coordinates are its conversation position, `agent_event_id`,
+and `execution_epoch_id`. `begin_turn()` accepts optional explicit agent and
+epoch pins and rejects an epoch activated after the pinned agent head. When
+callers omit both, the basic backend captures the current agent head and active
+epoch while beginning the turn.
+
+Before `send()` or `send_stream()` begins a turn, the executor ensures a
+content-addressed execution epoch. Its manifest contains effective agent and
+conversation config, visible bindings, visible secret metadata, executor
+crate identity, and SHA-256 hashes for configured TypeScript harness/tool
+modules. Matching manifests reuse or reactivate an existing immutable epoch;
+previously unseen manifests append `execution_epoch_created` with the manifest.
+Reactivating a known epoch appends the compact, id-only
+`execution_epoch_activated`.
 
 The executor-level `send()` API starts a turn, executes the configured harness,
 and finishes the turn. External systems such as adapters and scheduler wakeups

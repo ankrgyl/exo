@@ -9,10 +9,11 @@ use tokio::time::timeout;
 use tracing::info;
 
 use crate::{
-    AddEventsRequest, BeginTurnRequest, Binding, EventData, EventKind, EventQuery,
-    EventQueryDirection, ExoHarness, ForkConversationRequest, ListConversationsRequest,
+    AddAgentEventsRequest, AddEventsRequest, AgentEventData, AgentEventKind, AgentEventOrigin,
+    AgentEventQuery, BeginTurnRequest, Binding, EnsureExecutionEpochRequest, EventData, EventKind,
+    EventQuery, EventQueryDirection, ExoHarness, ForkConversationRequest, ListConversationsRequest,
     ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest, NewConversationRequest,
-    SandboxCommand, SandboxRequest, Uuid7, WriteArtifactRequest,
+    PutSecretRequest, SandboxCommand, SandboxRequest, Secret, Uuid7, WriteArtifactRequest,
 };
 
 pub async fn supports_agent_and_conversation_crud(harness: Arc<dyn ExoHarness>) {
@@ -185,6 +186,7 @@ pub async fn begin_turn_tracks_events_through_finish(harness: Arc<dyn ExoHarness
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("ping")],
+            ..Default::default()
         })
         .await
         .expect("turn");
@@ -218,7 +220,7 @@ pub async fn begin_turn_tracks_events_through_finish(harness: Arc<dyn ExoHarness
     assert!(
         events
             .iter()
-            .any(|event| matches!(event.data, EventData::TurnStarted))
+            .any(|event| matches!(event.data, EventData::TurnStarted { .. }))
     );
     assert!(
         events
@@ -233,6 +235,278 @@ pub async fn begin_turn_tracks_events_through_finish(harness: Arc<dyn ExoHarness
             .any(|event| matches!(event.data, EventData::TurnEnded))
     );
     assert_eq!(events.last().expect("turn ended").id, latest_event_id);
+}
+
+pub async fn agent_timeline_pins_turns_to_execution_epochs(harness: Arc<dyn ExoHarness>) {
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: unique_slug("agent"),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    agent
+        .write_artifact(WriteArtifactRequest {
+            path: "config/executor.json".to_string(),
+            contents: br#"{"model":"test"}"#.to_vec(),
+        })
+        .await
+        .expect("agent artifact");
+    let secret_id = agent
+        .put_secret(PutSecretRequest {
+            name: "timeline-secret".to_string(),
+            secret: Secret::Key {
+                value: "must-not-appear-in-agent-events".to_string(),
+            },
+        })
+        .await
+        .expect("agent secret");
+    agent
+        .put_binding(Binding::Env {
+            name: "timeline-env".to_string(),
+            env_var: "TIMELINE_ENV".to_string(),
+            secret_id,
+        })
+        .await
+        .expect("agent binding");
+    let conversation_secret_id = conversation
+        .put_secret(PutSecretRequest {
+            name: "conversation-timeline-secret".to_string(),
+            secret: Secret::Key {
+                value: "conversation-secret-must-not-appear".to_string(),
+            },
+        })
+        .await
+        .expect("conversation secret");
+    conversation
+        .put_binding(Binding::Env {
+            name: "conversation-timeline-env".to_string(),
+            env_var: "CONVERSATION_TIMELINE_ENV".to_string(),
+            secret_id: conversation_secret_id,
+        })
+        .await
+        .expect("conversation binding");
+
+    let lifecycle = agent
+        .get_events(Some(AgentEventQuery {
+            direction: Some(EventQueryDirection::Asc),
+            ..Default::default()
+        }))
+        .await
+        .expect("agent lifecycle")
+        .events;
+    assert!(matches!(
+        lifecycle.first().expect("agent created").data,
+        AgentEventData::AgentCreated { .. }
+    ));
+    assert!(lifecycle.iter().any(|event| {
+        matches!(
+            event.data,
+            AgentEventData::ConversationCreated { conversation_id, .. }
+                if conversation_id == conversation.record().id
+        )
+    }));
+    assert!(
+        lifecycle
+            .iter()
+            .any(|event| { matches!(event.data, AgentEventData::SecretPut { .. }) })
+    );
+    assert!(
+        lifecycle
+            .iter()
+            .any(|event| { matches!(event.data, AgentEventData::BindingPut { .. }) })
+    );
+    assert!(lifecycle.iter().any(|event| {
+        matches!(
+            event.data,
+            AgentEventData::BindingPut { .. }
+                if event.origin.as_ref().is_some_and(|origin| {
+                    origin.conversation_id == conversation.record().id
+                })
+        )
+    }));
+    assert!(
+        !serde_json::to_string(&lifecycle)
+            .expect("serialize lifecycle")
+            .contains("must-not-appear-in-agent-events")
+    );
+    assert!(
+        !serde_json::to_string(&lifecycle)
+            .expect("serialize lifecycle")
+            .contains("conversation-secret-must-not-appear")
+    );
+    assert!(lifecycle.iter().any(|event| {
+        matches!(
+            event.data,
+            AgentEventData::ArtifactWritten { ref path, .. }
+            if path == "config/executor.json"
+        )
+    }));
+    let observed_agent_head = lifecycle.last().expect("agent event head").id;
+
+    let origin = AgentEventOrigin {
+        conversation_id: conversation.record().id,
+        session_id: None,
+        turn_id: None,
+    };
+    let first_epoch = agent
+        .ensure_execution_epoch(EnsureExecutionEpochRequest {
+            manifest: serde_json::json!({
+                "schema_version": 1,
+                "executor": {"version": "one"},
+            }),
+            origin: Some(origin.clone()),
+            expected_agent_event_id: Some(observed_agent_head),
+        })
+        .await
+        .expect("first execution epoch");
+    assert!(first_epoch.created);
+    assert_eq!(
+        first_epoch.epoch.manifest_digest.len(),
+        "sha256:".len() + 64
+    );
+
+    let custom = agent
+        .add_events(AddAgentEventsRequest {
+            origin: Some(origin.clone()),
+            data: vec![AgentEventData::Custom {
+                event_type: "deployment_observed".to_string(),
+                payload: serde_json::json!({"revision": "abc123"}),
+            }],
+        })
+        .await
+        .expect("custom agent event");
+    let stale_manifest_error = agent
+        .ensure_execution_epoch(EnsureExecutionEpochRequest {
+            manifest: first_epoch.epoch.manifest.clone(),
+            origin: Some(origin.clone()),
+            expected_agent_event_id: Some(first_epoch.agent_event_id),
+        })
+        .await
+        .expect_err("stale manifest snapshot must be rejected");
+    assert!(
+        stale_manifest_error
+            .to_string()
+            .contains("agent head changed while assembling execution manifest")
+    );
+    let reused_epoch = agent
+        .ensure_execution_epoch(EnsureExecutionEpochRequest {
+            manifest: first_epoch.epoch.manifest.clone(),
+            origin: Some(origin.clone()),
+            expected_agent_event_id: Some(custom.latest_event_id),
+        })
+        .await
+        .expect("reused execution epoch");
+    assert!(!reused_epoch.created);
+    assert_eq!(reused_epoch.epoch.id, first_epoch.epoch.id);
+    assert_eq!(reused_epoch.agent_event_id, custom.latest_event_id);
+
+    let turn = conversation
+        .begin_turn(BeginTurnRequest {
+            session_id: None,
+            input: vec![user_message("pin this execution")],
+            agent_event_id: Some(reused_epoch.agent_event_id),
+            execution_epoch_id: Some(reused_epoch.epoch.id),
+        })
+        .await
+        .expect("pinned turn");
+    assert_eq!(
+        turn.record().agent_event_id,
+        Some(reused_epoch.agent_event_id)
+    );
+    assert_eq!(
+        turn.record().execution_epoch_id,
+        Some(reused_epoch.epoch.id)
+    );
+    let started = conversation
+        .get_events(Some(EventQuery {
+            direction: Some(EventQueryDirection::Asc),
+            turn_id: Some(turn.record().id),
+            types: Some(vec![EventKind::TURN_STARTED]),
+            ..Default::default()
+        }))
+        .await
+        .expect("turn started event")
+        .events;
+    assert!(matches!(
+        started.first().expect("turn started").data,
+        EventData::TurnStarted {
+            agent_event_id: Some(agent_event_id),
+            execution_epoch_id: Some(execution_epoch_id),
+        } if agent_event_id == reused_epoch.agent_event_id
+            && execution_epoch_id == reused_epoch.epoch.id
+    ));
+
+    let second_epoch = agent
+        .ensure_execution_epoch(EnsureExecutionEpochRequest {
+            manifest: serde_json::json!({
+                "schema_version": 1,
+                "executor": {"version": "two"},
+            }),
+            origin: Some(origin),
+            expected_agent_event_id: Some(reused_epoch.agent_event_id),
+        })
+        .await
+        .expect("second execution epoch");
+    assert!(second_epoch.created);
+    assert_ne!(second_epoch.epoch.id, first_epoch.epoch.id);
+    let error = conversation
+        .begin_turn(BeginTurnRequest {
+            session_id: Some(turn.record().session_id),
+            input: Vec::new(),
+            agent_event_id: Some(reused_epoch.agent_event_id),
+            execution_epoch_id: Some(second_epoch.epoch.id),
+        })
+        .await
+        .err()
+        .expect("future epoch must be rejected");
+    assert!(error.to_string().contains("was activated after agent head"));
+
+    let reactivated_epoch = agent
+        .ensure_execution_epoch(EnsureExecutionEpochRequest {
+            manifest: first_epoch.epoch.manifest.clone(),
+            origin: Some(AgentEventOrigin {
+                conversation_id: conversation.record().id,
+                session_id: Some(turn.record().session_id),
+                turn_id: Some(turn.record().id),
+            }),
+            expected_agent_event_id: Some(second_epoch.agent_event_id),
+        })
+        .await
+        .expect("reactivated execution epoch");
+    assert!(!reactivated_epoch.created);
+    assert_eq!(reactivated_epoch.epoch.id, first_epoch.epoch.id);
+
+    let created_epoch_events = agent
+        .get_events(Some(AgentEventQuery {
+            direction: Some(EventQueryDirection::Asc),
+            types: Some(vec![AgentEventKind::EXECUTION_EPOCH_CREATED]),
+            ..Default::default()
+        }))
+        .await
+        .expect("epoch creation events")
+        .events;
+    assert_eq!(created_epoch_events.len(), 2);
+    let activated_epoch_events = agent
+        .get_events(Some(AgentEventQuery {
+            direction: Some(EventQueryDirection::Asc),
+            types: Some(vec![AgentEventKind::EXECUTION_EPOCH_ACTIVATED]),
+            ..Default::default()
+        }))
+        .await
+        .expect("epoch activation events")
+        .events;
+    assert_eq!(activated_epoch_events.len(), 1);
+    assert!(matches!(
+        activated_epoch_events[0].data,
+        AgentEventData::ExecutionEpochActivated {
+            execution_epoch_id,
+        } if execution_epoch_id == first_epoch.epoch.id
+    ));
 }
 
 pub async fn turn_events_continue_after_artifact_writes(harness: Arc<dyn ExoHarness>) {
@@ -252,6 +526,7 @@ pub async fn turn_events_continue_after_artifact_writes(harness: Arc<dyn ExoHarn
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("ping")],
+            ..Default::default()
         })
         .await
         .expect("turn");

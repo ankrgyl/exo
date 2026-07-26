@@ -92,6 +92,15 @@ async fn http_exoharness_begin_turn_tracks_events_through_finish() {
 }
 
 #[actix_web::test]
+async fn http_exoharness_agent_timeline_pins_turns_to_execution_epochs() {
+    let fixture = http_harness().await;
+    crate::contract_tests::agent_timeline_pins_turns_to_execution_epochs(Arc::clone(
+        &fixture.harness,
+    ))
+    .await;
+}
+
+#[actix_web::test]
 async fn http_exoharness_turn_events_continue_after_artifact_writes() {
     let fixture = http_harness().await;
     crate::contract_tests::turn_events_continue_after_artifact_writes(Arc::clone(&fixture.harness))
@@ -354,6 +363,7 @@ async fn http_exoharness_supports_turn_scoped_sandbox_snapshot_and_start() {
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: Vec::new(),
+            ..Default::default()
         })
         .await
         .expect("turn");

@@ -6,8 +6,14 @@ import {
   toolResultEvent,
   type AddEventsRequest,
   type AddEventsResult,
+  type AddAgentEventsRequest,
+  type AddAgentEventsResult,
   type Agent,
   type AgentConfig,
+  type AgentEvent,
+  type AgentEventData,
+  type AgentEventOrigin,
+  type AgentEventQuery,
   type AgentRecord,
   type Artifact,
   type ArtifactVersion,
@@ -21,10 +27,15 @@ import {
   type EventQuery,
   type ExoHarnessCurrent,
   type ExoHarness,
+  type EnsureExecutionEpochRequest,
+  type EnsureExecutionEpochResult,
+  type ExecutionEpochRecord,
   type FileSystemMount,
   type ForkConversationRequest,
+  type GetAgentEventsResult,
   type GetEventsResult,
   type JsonObject,
+  type JsonValue,
   type Message,
   type NewConversationRequest,
   type PendingToolCall,
@@ -94,6 +105,8 @@ interface RawAgentRecord {
   id: string;
   slug: string;
   name: string;
+  latest_event_id?: string | null;
+  active_execution_epoch_id?: string | null;
 }
 
 interface RawConversationRecord {
@@ -106,6 +119,8 @@ interface RawConversationRecord {
 interface RawTurnRecord {
   id: string;
   session_id: string;
+  agent_event_id?: string | null;
+  execution_epoch_id?: string | null;
 }
 
 interface RawArtifactVersion {
@@ -185,6 +200,43 @@ interface RawGetEventsResult {
 interface RawAddEventsResult {
   event_ids: string[];
   latest_event_id: string;
+}
+
+interface RawAgentEventOrigin {
+  conversation_id: string;
+  session_id?: string | null;
+  turn_id?: string | null;
+}
+
+interface RawAgentEvent {
+  id: string;
+  agent_id: string;
+  created_at: string;
+  origin?: RawAgentEventOrigin | null;
+  data: AgentEventData;
+}
+
+interface RawGetAgentEventsResult {
+  events: RawAgentEvent[];
+  cursor?: string | null;
+}
+
+interface RawAddAgentEventsResult {
+  event_ids: string[];
+  latest_event_id: string;
+}
+
+interface RawExecutionEpochRecord {
+  id: string;
+  manifest_digest: string;
+  manifest: JsonValue;
+  created_at: string;
+}
+
+interface RawEnsureExecutionEpochResult {
+  epoch: RawExecutionEpochRecord;
+  agent_event_id: string;
+  created: boolean;
 }
 
 interface RawEvent {
@@ -277,6 +329,34 @@ type RawExoRequest =
       type: "agent_write_artifact";
       agent_id: string;
       request: { path: string; contents: number[] };
+    }
+  | {
+      type: "agent_get_events";
+      agent_id: string;
+      query?: {
+        cursor?: string | null;
+        direction?: "asc" | "desc" | null;
+        limit?: number | null;
+        types?: string[] | null;
+      } | null;
+    }
+  | { type: "agent_get_event"; agent_id: string; event_id: string }
+  | {
+      type: "agent_add_events";
+      agent_id: string;
+      request: {
+        origin?: RawAgentEventOrigin | null;
+        data: AgentEventData[];
+      };
+    }
+  | {
+      type: "agent_ensure_execution_epoch";
+      agent_id: string;
+      request: {
+        manifest: JsonValue;
+        origin?: RawAgentEventOrigin | null;
+        expected_agent_event_id?: string | null;
+      };
     }
   | { type: "agent_list_bindings"; agent_id: string }
   | { type: "agent_get_binding"; agent_id: string; binding_id: string }
@@ -401,6 +481,10 @@ type RawExoResponse =
   | { type: "bool"; value: boolean }
   | { type: "conversations"; conversations: RawConversationHandleInfo[] }
   | { type: "conversation"; conversation: RawConversationHandleInfo | null }
+  | { type: "agent_events"; result: RawGetAgentEventsResult }
+  | { type: "agent_event"; event: RawAgentEvent | null }
+  | { type: "add_agent_events"; result: RawAddAgentEventsResult }
+  | { type: "execution_epoch"; result: RawEnsureExecutionEpochResult }
   | { type: "events"; result: RawGetEventsResult }
   | { type: "event"; event: RawEvent | null }
   | { type: "add_events"; result: RawAddEventsResult }
@@ -891,6 +975,8 @@ function toAgentRecord(raw: RawAgentRecord): AgentRecord {
     id: raw.id,
     slug: raw.slug,
     name: raw.name,
+    latestEventId: raw.latest_event_id ?? null,
+    activeExecutionEpochId: raw.active_execution_epoch_id ?? null,
   };
 }
 
@@ -907,6 +993,8 @@ function toTurnRecord(raw: RawTurnRecord): TurnRecord {
   return {
     id: raw.id,
     sessionId: raw.session_id,
+    agentEventId: raw.agent_event_id ?? null,
+    executionEpochId: raw.execution_epoch_id ?? null,
   };
 }
 
@@ -1026,6 +1114,116 @@ function toAddEventsResult(raw: RawAddEventsResult): AddEventsResult {
   };
 }
 
+function toAgentEventOrigin(raw: RawAgentEventOrigin): AgentEventOrigin {
+  return {
+    conversationId: raw.conversation_id,
+    sessionId: raw.session_id ?? null,
+    turnId: raw.turn_id ?? null,
+  };
+}
+
+function toRawAgentEventOrigin(origin: AgentEventOrigin): RawAgentEventOrigin {
+  return {
+    conversation_id: origin.conversationId,
+    session_id: origin.sessionId ?? null,
+    turn_id: origin.turnId ?? null,
+  };
+}
+
+function toAgentEvent(raw: RawAgentEvent): AgentEvent {
+  return {
+    id: raw.id,
+    agentId: raw.agent_id,
+    createdAt: raw.created_at,
+    origin: raw.origin ? toAgentEventOrigin(raw.origin) : null,
+    data: raw.data,
+  };
+}
+
+function toGetAgentEventsResult(
+  raw: RawGetAgentEventsResult,
+): GetAgentEventsResult {
+  return {
+    events: raw.events.map(toAgentEvent),
+    cursor: raw.cursor ?? null,
+  };
+}
+
+function toAddAgentEventsResult(
+  raw: RawAddAgentEventsResult,
+): AddAgentEventsResult {
+  return {
+    eventIds: raw.event_ids,
+    latestEventId: raw.latest_event_id,
+  };
+}
+
+function toExecutionEpochRecord(
+  raw: RawExecutionEpochRecord,
+): ExecutionEpochRecord {
+  return {
+    id: raw.id,
+    manifestDigest: raw.manifest_digest,
+    manifest: raw.manifest,
+    createdAt: raw.created_at,
+  };
+}
+
+function toEnsureExecutionEpochResult(
+  raw: RawEnsureExecutionEpochResult,
+): EnsureExecutionEpochResult {
+  return {
+    epoch: toExecutionEpochRecord(raw.epoch),
+    agentEventId: raw.agent_event_id,
+    created: raw.created,
+  };
+}
+
+type RawAgentEventQuery = {
+  cursor?: string | null;
+  direction?: "asc" | "desc" | null;
+  limit?: number | null;
+  types?: string[] | null;
+};
+
+function toRawAgentEventQuery(
+  query?: AgentEventQuery,
+): RawAgentEventQuery | null {
+  if (!query) {
+    return null;
+  }
+  return {
+    cursor: query.cursor ?? null,
+    direction: query.direction ?? null,
+    limit: query.limit ?? null,
+    types: query.types ?? null,
+  };
+}
+
+function toRawAddAgentEventsRequest(request: AddAgentEventsRequest): {
+  origin?: RawAgentEventOrigin | null;
+  data: AgentEventData[];
+} {
+  return {
+    origin: request.origin ? toRawAgentEventOrigin(request.origin) : null,
+    data: request.data,
+  };
+}
+
+function toRawEnsureExecutionEpochRequest(
+  request: EnsureExecutionEpochRequest,
+): {
+  manifest: JsonValue;
+  origin?: RawAgentEventOrigin | null;
+  expected_agent_event_id?: string | null;
+} {
+  return {
+    manifest: request.manifest,
+    origin: request.origin ? toRawAgentEventOrigin(request.origin) : null,
+    expected_agent_event_id: request.expectedAgentEventId ?? null,
+  };
+}
+
 type RawEventQuery = {
   cursor?: string | null;
   direction?: "asc" | "desc" | null;
@@ -1087,6 +1285,62 @@ function createAgent(client: ProtocolClient, raw: RawAgentRecord): Agent {
   const record = toAgentRecord(raw);
   const agent: Agent = {
     record,
+
+    async getEvents(query?: AgentEventQuery): Promise<GetAgentEventsResult> {
+      const payload = await client.requestExo({
+        type: "agent_get_events",
+        agent_id: record.id,
+        query: toRawAgentEventQuery(query),
+      });
+      if (payload.type !== "agent_events") {
+        throw new Error(`expected agent_events payload, got ${payload.type}`);
+      }
+      return toGetAgentEventsResult(payload.result);
+    },
+
+    async getEvent(id: string): Promise<AgentEvent | null> {
+      const payload = await client.requestExo({
+        type: "agent_get_event",
+        agent_id: record.id,
+        event_id: id,
+      });
+      if (payload.type !== "agent_event") {
+        throw new Error(`expected agent_event payload, got ${payload.type}`);
+      }
+      return payload.event ? toAgentEvent(payload.event) : null;
+    },
+
+    async addEvents(
+      request: AddAgentEventsRequest,
+    ): Promise<AddAgentEventsResult> {
+      const payload = await client.requestExo({
+        type: "agent_add_events",
+        agent_id: record.id,
+        request: toRawAddAgentEventsRequest(request),
+      });
+      if (payload.type !== "add_agent_events") {
+        throw new Error(
+          `expected add_agent_events payload, got ${payload.type}`,
+        );
+      }
+      return toAddAgentEventsResult(payload.result);
+    },
+
+    async ensureExecutionEpoch(
+      request: EnsureExecutionEpochRequest,
+    ): Promise<EnsureExecutionEpochResult> {
+      const payload = await client.requestExo({
+        type: "agent_ensure_execution_epoch",
+        agent_id: record.id,
+        request: toRawEnsureExecutionEpochRequest(request),
+      });
+      if (payload.type !== "execution_epoch") {
+        throw new Error(
+          `expected execution_epoch payload, got ${payload.type}`,
+        );
+      }
+      return toEnsureExecutionEpochResult(payload.result);
+    },
 
     async listConversations(): Promise<Conversation[]> {
       const payload = await client.requestExo({
