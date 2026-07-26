@@ -1008,18 +1008,49 @@ pub(crate) async fn read_active_checkpoint(
             types: Some(vec![EventKind::custom(COMPACTION_CHECKPOINT_EVENT)]),
         }))
         .await?;
-    let Some(event) = result.events.into_iter().next() else {
+    let Some(head) = result.events.into_iter().next() else {
+        // Never compacted. Nothing older to look for.
         return Ok(None);
     };
+    if let Some(decoded) = decode_checkpoint(head) {
+        return Ok(Some(decoded));
+    }
+
+    // The head exists and does not decode. Treating that as "no checkpoint" is
+    // only half right. Falling back to full history is safe for *this* prompt,
+    // but it also hides every older checkpoint from the repair path, which then
+    // rebuilds from the start of the log — the request a long conversation
+    // cannot make. An older valid checkpoint is exactly the ancestor the repair
+    // wants, so look past the broken head rather than stopping at it.
+    //
+    // Only reached on a malformed head, so the healthy path — and the
+    // never-compacted path, which is every conversation until the first cut —
+    // still costs exactly one bounded query per materialization.
+    let all = conversation
+        .get_events(Some(EventQuery {
+            cursor: None,
+            direction: Some(EventQueryDirection::Desc),
+            limit: None,
+            session_id: None,
+            turn_id: None,
+            types: Some(vec![EventKind::custom(COMPACTION_CHECKPOINT_EVENT)]),
+        }))
+        .await?;
+    Ok(all.events.into_iter().find_map(decode_checkpoint))
+}
+
+/// A checkpoint event decoded, or `None` when its payload does not parse.
+///
+/// Half-reading one would assemble a prompt with a hole, so a malformed payload
+/// is never partially honoured.
+fn decode_checkpoint(event: Event) -> Option<(EventId, CompactionCheckpoint)> {
     let event_id = event.id;
     let EventData::Custom { payload, .. } = event.data else {
-        return Ok(None);
+        return None;
     };
-    // A malformed checkpoint is treated as absent: falling back to full history
-    // is safe, whereas half-reading one would assemble a prompt with a hole.
-    Ok(serde_json::from_value(payload)
+    serde_json::from_value(payload)
         .ok()
-        .map(|checkpoint| (event_id, checkpoint)))
+        .map(|checkpoint| (event_id, checkpoint))
 }
 
 /// Id of the newest `TurnEnded` event, or `None` on a conversation with no

@@ -626,12 +626,45 @@ export async function readActiveCheckpoint(
 export async function readActiveCheckpointEvent(
   conversation: Conversation,
 ): Promise<{ eventId: string; checkpoint: CompactionCheckpoint } | null> {
-  const result = await conversation.getEvents({
+  const head = await conversation.getEvents({
     direction: "desc",
     limit: 1,
     types: [COMPACTION_CHECKPOINT_EVENT],
   });
-  const event = result.events[0];
+  // Never compacted: nothing older to look for.
+  if (head.events.length === 0) return null;
+  const decodedHead = decodeCheckpointEvent(head.events[0]);
+  if (decodedHead !== null) return decodedHead;
+
+  // The head exists and does not decode. Treating that as "no checkpoint" is
+  // only half right. Falling back to full history is safe for *this* prompt,
+  // but it also hides every older checkpoint from the repair path, which then
+  // rebuilds from the start of the log — the request a long conversation cannot
+  // make. An older valid checkpoint is exactly the ancestor the repair wants.
+  //
+  // Only reached on a malformed head, so the healthy path — and the
+  // never-compacted path, which is every conversation until the first cut —
+  // still costs exactly one bounded query per materialization.
+  const all = await conversation.getEvents({
+    direction: "desc",
+    types: [COMPACTION_CHECKPOINT_EVENT],
+  });
+  for (const event of all.events) {
+    const decoded = decodeCheckpointEvent(event);
+    if (decoded !== null) return decoded;
+  }
+  return null;
+}
+
+/**
+ * A checkpoint event decoded, or null when its payload does not parse.
+ *
+ * Half-reading one would assemble a prompt with a hole, so a malformed payload
+ * is never partially honoured.
+ */
+function decodeCheckpointEvent(
+  event: Event | undefined,
+): { eventId: string; checkpoint: CompactionCheckpoint } | null {
   if (!event) return null;
   const checkpoint = checkpointFromEvent(event.data);
   return checkpoint ? { eventId: event.id, checkpoint } : null;

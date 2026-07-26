@@ -3564,6 +3564,54 @@ async fn a_rescue_still_refuses_a_summary_that_would_grow_the_prompt() {
     );
 }
 
+/// A malformed newest checkpoint must not hide the valid ones behind it.
+///
+/// Stopping at the broken head is only half right: the prompt falls back to
+/// full history safely, but the repair path then rebuilds from the start of the
+/// log instead of chaining off the ancestor sitting right there — the request a
+/// long conversation cannot make.
+#[tokio::test]
+async fn a_malformed_checkpoint_head_does_not_hide_an_older_valid_one() {
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+    let turn = open_turn(conversation.as_ref()).await;
+    run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &CompactionConfig {
+            keep_recent_turns: 1,
+            ..CompactionConfig::default()
+        },
+        summarizer_models("summary-model"),
+        PromptPressure::housekeeping(),
+        &|_input| Box::pin(async { Ok("OLDER SUMMARY".to_string()) }),
+    )
+    .await;
+    turn.finish().await.expect("finish turn");
+    let valid = checkpoint_chain(conversation.as_ref()).await;
+    assert_eq!(valid.len(), 1, "one good checkpoint to find");
+
+    // A newer checkpoint event whose payload is missing required fields.
+    conversation
+        .add_events(AddEventsRequest {
+            session_id: None,
+            turn_id: None,
+            data: vec![EventData::Custom {
+                event_type: crate::compaction::COMPACTION_CHECKPOINT_EVENT.to_string(),
+                payload: json!({ "up_to_event_id": Uuid7::now() }),
+            }],
+        })
+        .await
+        .expect("seed a malformed checkpoint");
+
+    let active = crate::compaction::read_active_checkpoint(conversation.as_ref())
+        .await
+        .expect("read active checkpoint");
+    let (event_id, checkpoint) = active.expect("the older valid checkpoint should be found");
+    assert_eq!(event_id, valid[0].0);
+    assert_eq!(checkpoint.artifact_id, valid[0].1.artifact_id);
+}
+
 /// An empty summary artifact is a *missing* summary, not an empty one.
 ///
 /// A truncated write leaves zero bytes. Honouring that would cut the compacted

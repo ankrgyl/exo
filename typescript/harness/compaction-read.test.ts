@@ -5,6 +5,7 @@ import {
   PromptHistoryCache,
   materializeConversationMessages,
   materializePromptHistory,
+  readActiveCheckpointEvent,
   materializePromptMessages,
   readActiveCheckpoint,
   type ArtifactVersion,
@@ -415,6 +416,33 @@ describe("materializePromptHistory with a checkpoint", () => {
     );
     expect(rendered).toContain("ancient");
     expect(rendered).toContain("recent");
+  });
+
+  it("looks past a malformed checkpoint head to an older valid one", async () => {
+    // Stopping at the broken head is only half right: the prompt falls back to
+    // full history safely, but the repair path then rebuilds from the start of
+    // the log instead of chaining off the ancestor that is sitting right there.
+    const history = turn("ancient");
+    const stub = new StubConversation({
+      events: [
+        ...history,
+        checkpointEvent({
+          upToEventId: history.at(-1)!.id,
+          artifactId: artifactId(1),
+        }),
+        ...turn("middle"),
+        // A checkpoint event whose payload is missing required fields.
+        event("custom", {
+          event_type: COMPACTION_CHECKPOINT_EVENT,
+          payload: { up_to_event_id: eventId(1) },
+        }),
+        ...turn("recent"),
+      ],
+      artifacts: new Map([[artifactId(1), "OLDER SUMMARY"]]),
+    });
+
+    const active = await readActiveCheckpointEvent(stub as never);
+    expect(active?.checkpoint.artifactId).toBe(artifactId(1));
   });
 
   it("treats an empty summary artifact as missing", async () => {
