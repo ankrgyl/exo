@@ -30,11 +30,101 @@ use crate::render::{
     render_tool_result, render_transcript_lines,
 };
 use crate::tui::{
-    ReplCommand, ReplInput, chunk_text, cost_lines, parse_repl_input, render_external_event,
-    rewind_lines, shell_lines, snapshot_lines, snapshots_lines, teleport_lines,
+    chunk_text, cost_lines, render_external_event, rewind_lines, shell_lines, snapshot_lines,
+    snapshots_lines, teleport_lines,
 };
 
 const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
+
+// Slash-command registry for the TUI: names, aliases, arguments, and help all
+// live in this clap tree. `multicall` makes the first token the command name,
+// and clap's built-in `help` subcommand serves `/help`. The line-mode repl
+// keeps its own simpler handwritten parser.
+#[derive(Debug, clap::Parser)]
+#[command(name = "repl", multicall = true, about = "repl slash commands")]
+struct ReplCli {
+    #[command(subcommand)]
+    command: ReplCommand,
+}
+
+#[derive(Debug, PartialEq, clap::Subcommand)]
+enum ReplCommand {
+    /// Exit the repl
+    #[command(alias = "exit")]
+    Quit,
+    /// Reprint the conversation transcript
+    History,
+    /// Summarize token usage and dollar cost
+    #[command(alias = "usage")]
+    Cost,
+    /// Show or set how much tool detail is printed
+    Verbosity {
+        #[arg(value_enum)]
+        level: Option<Verbosity>,
+    },
+    /// Run a command in the conversation's sandbox
+    #[command(alias = "sandbox")]
+    Shell {
+        /// Shell source, passed to the sandbox verbatim
+        command: String,
+    },
+    /// Snapshot a sandbox in this conversation (defaults to the latest one)
+    Snapshot { sandbox_id: Option<String> },
+    /// List snapshots taken in this conversation
+    Snapshots,
+    /// Restore the sandbox to a previous snapshot
+    Rewind { snapshot_id: String },
+    /// Move the live sandbox to another provider (e.g. daytona: snapshot + restore there)
+    Teleport { provider: String },
+}
+
+/// What a line of repl input means.
+#[derive(Debug, PartialEq)]
+enum ReplInput {
+    Empty,
+    /// Plain chat text for the model.
+    Chat(String),
+    Command(ReplCommand),
+}
+
+fn parse_repl_input(line: &str) -> Result<ReplInput, clap::Error> {
+    use clap::{CommandFactory, Parser};
+
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(ReplInput::Empty);
+    }
+    let Some(stripped) = trimmed.strip_prefix('/') else {
+        return Ok(ReplInput::Chat(trimmed.to_string()));
+    };
+    // `//text` escapes to the chat message `/text`.
+    if stripped.starts_with('/') {
+        return Ok(ReplInput::Chat(stripped.to_string()));
+    }
+    // A lone `/` shows the command list.
+    if stripped.is_empty() {
+        return Err(ReplCli::try_parse_from(["help"])
+            .expect_err("the help subcommand always short-circuits into an error"));
+    }
+
+    let (head, rest) = match stripped.split_once(char::is_whitespace) {
+        Some((head, rest)) => (head, rest.trim()),
+        None => (stripped, ""),
+    };
+    // Shell source must reach the sandbox verbatim: shlex-splitting and
+    // rejoining would change quoting, expansion, pipes, and redirections.
+    let argv: Vec<String> = if matches!(head, "shell" | "sandbox") && !rest.is_empty() {
+        vec![head.to_string(), rest.to_string()]
+    } else {
+        shlex::split(stripped).ok_or_else(|| {
+            ReplCli::command().error(
+                clap::error::ErrorKind::InvalidValue,
+                "unbalanced quotes in command input",
+            )
+        })?
+    };
+    Ok(ReplInput::Command(ReplCli::try_parse_from(argv)?.command))
+}
 
 /// The input box grows with wrapped content up to this many text rows, then
 /// scrolls vertically.
@@ -666,5 +756,104 @@ fn status_style(status: &str) -> Style {
         Style::new().green()
     } else {
         Style::new().red()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReplCommand, ReplInput, parse_repl_input};
+    use crate::render::Verbosity;
+
+    #[test]
+    fn parses_blank_and_chat_input() {
+        assert_eq!(parse_repl_input("   ").unwrap(), ReplInput::Empty);
+        assert_eq!(
+            parse_repl_input(" hello there ").unwrap(),
+            ReplInput::Chat("hello there".to_string())
+        );
+    }
+
+    #[test]
+    fn double_slash_escapes_to_slash_prefixed_chat() {
+        assert_eq!(
+            parse_repl_input("//quit is a command").unwrap(),
+            ReplInput::Chat("/quit is a command".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_commands_and_aliases() {
+        assert_eq!(
+            parse_repl_input("/quit").unwrap(),
+            ReplInput::Command(ReplCommand::Quit)
+        );
+        assert_eq!(
+            parse_repl_input("/exit").unwrap(),
+            ReplInput::Command(ReplCommand::Quit)
+        );
+        assert_eq!(
+            parse_repl_input("/usage").unwrap(),
+            ReplInput::Command(ReplCommand::Cost)
+        );
+        assert_eq!(
+            parse_repl_input("/verbosity full").unwrap(),
+            ReplInput::Command(ReplCommand::Verbosity {
+                level: Some(Verbosity::Full)
+            })
+        );
+        assert_eq!(
+            parse_repl_input("/snapshot abc").unwrap(),
+            ReplInput::Command(ReplCommand::Snapshot {
+                sandbox_id: Some("abc".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn shell_source_is_preserved_verbatim() {
+        let input = r#"/shell echo "a  b" | grep 'a' > /tmp/out"#;
+        assert_eq!(
+            parse_repl_input(input).unwrap(),
+            ReplInput::Command(ReplCommand::Shell {
+                command: r#"echo "a  b" | grep 'a' > /tmp/out"#.to_string()
+            })
+        );
+        assert_eq!(
+            parse_repl_input("/sandbox ls -la").unwrap(),
+            ReplInput::Command(ReplCommand::Shell {
+                command: "ls -la".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn shell_without_source_is_a_usage_error() {
+        let error = parse_repl_input("/shell").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn unknown_commands_error_instead_of_reaching_the_model() {
+        let error = parse_repl_input("/snapshoot abc").unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+        assert!(error.to_string().contains("snapshot"), "suggests the fix");
+    }
+
+    #[test]
+    fn extra_arguments_are_clap_errors() {
+        assert!(parse_repl_input("/snapshot one two").is_err());
+        assert!(parse_repl_input("/rewind").is_err());
+    }
+
+    #[test]
+    fn help_is_generated_from_the_command_tree() {
+        let error = parse_repl_input("/help").unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let rendered = error.to_string();
+        assert!(rendered.contains("snapshot"));
+        assert!(rendered.contains("teleport"));
     }
 }

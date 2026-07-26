@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::{CommandFactory, Parser};
 use executor::{
     ConversationHandle, EventData, EventId, EventKind, EventQuery, EventQueryDirection,
     ExecutionStreamEvent, HarnessAgent, HarnessConversation, SandboxId, SandboxProvider,
@@ -30,99 +29,6 @@ use crate::run_sandbox_shell_command;
 const DEFAULT_SHELL_PROGRAM: &str = "/bin/bash";
 const REMOTE_HISTORY_BASE: usize = 1_000_000;
 const REMOTE_HISTORY_PAGE_SIZE: u32 = 32;
-
-// Slash-command registry: names, aliases, arguments, and help all live in
-// this clap tree. `multicall` makes the first token the command name, and
-// clap's built-in `help` subcommand serves `/help`.
-#[derive(Debug, clap::Parser)]
-#[command(name = "repl", multicall = true, about = "repl slash commands")]
-pub(crate) struct ReplCli {
-    #[command(subcommand)]
-    command: ReplCommand,
-}
-
-#[derive(Debug, PartialEq, clap::Subcommand)]
-pub(crate) enum ReplCommand {
-    /// Exit the repl
-    #[command(alias = "exit")]
-    Quit,
-    /// Reprint the conversation transcript
-    History,
-    /// Summarize token usage and dollar cost
-    #[command(alias = "usage")]
-    Cost,
-    /// Show or set how much tool detail is printed
-    Verbosity {
-        #[arg(value_enum)]
-        level: Option<Verbosity>,
-    },
-    /// Run a command in the conversation's sandbox
-    #[command(alias = "sandbox")]
-    Shell {
-        /// Shell source, passed to the sandbox verbatim
-        command: String,
-    },
-    /// Snapshot a sandbox in this conversation (defaults to the latest one)
-    Snapshot { sandbox_id: Option<String> },
-    /// List snapshots taken in this conversation
-    Snapshots,
-    /// Restore the sandbox to a previous snapshot
-    Rewind { snapshot_id: String },
-    /// Move the live sandbox to another provider (e.g. daytona: snapshot + restore there)
-    Teleport { provider: String },
-}
-
-/// What a line of repl input means.
-#[derive(Debug, PartialEq)]
-pub(crate) enum ReplInput {
-    Empty,
-    /// Plain chat text for the model.
-    Chat(String),
-    Command(ReplCommand),
-}
-
-/// Whether the repl keeps reading input after a command.
-enum ReplFlow {
-    Continue,
-    Quit,
-}
-
-pub(crate) fn parse_repl_input(line: &str) -> Result<ReplInput, clap::Error> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return Ok(ReplInput::Empty);
-    }
-    let Some(stripped) = trimmed.strip_prefix('/') else {
-        return Ok(ReplInput::Chat(trimmed.to_string()));
-    };
-    // `//text` escapes to the chat message `/text`.
-    if stripped.starts_with('/') {
-        return Ok(ReplInput::Chat(stripped.to_string()));
-    }
-    // A lone `/` shows the command list.
-    if stripped.is_empty() {
-        return Err(ReplCli::try_parse_from(["help"])
-            .expect_err("the help subcommand always short-circuits into an error"));
-    }
-
-    let (head, rest) = match stripped.split_once(char::is_whitespace) {
-        Some((head, rest)) => (head, rest.trim()),
-        None => (stripped, ""),
-    };
-    // Shell source must reach the sandbox verbatim: shlex-splitting and
-    // rejoining would change quoting, expansion, pipes, and redirections.
-    let argv: Vec<String> = if matches!(head, "shell" | "sandbox") && !rest.is_empty() {
-        vec![head.to_string(), rest.to_string()]
-    } else {
-        shlex::split(stripped).ok_or_else(|| {
-            ReplCli::command().error(
-                clap::error::ErrorKind::InvalidValue,
-                "unbalanced quotes in command input",
-            )
-        })?
-    };
-    Ok(ReplInput::Command(ReplCli::try_parse_from(argv)?.command))
-}
 
 pub async fn run_chat_repl(
     agent: Arc<dyn HarnessAgent>,
@@ -485,25 +391,121 @@ impl ChatRepl {
             let _ = event_printer.await;
 
             match readline_result {
-                Ok(line) => match parse_repl_input(&line) {
-                    Ok(ReplInput::Empty) => continue,
-                    Ok(ReplInput::Chat(text)) => {
-                        self.editor.add_history_entry(line.as_str())?;
-                        self.send(&text).await?;
+                Ok(line) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
                     }
-                    Ok(ReplInput::Command(command)) => {
-                        if matches!(command, ReplCommand::Shell { .. }) {
+                    match trimmed {
+                        "/quit" | "/exit" => break,
+                        "/history" => self.print_transcript().await?,
+                        "/cost" | "/usage" => {
+                            print_lines(cost_lines(self.conversation.as_ref()).await);
+                        }
+                        "/help" => print_help(),
+                        "/verbosity" => {
+                            println!("verbosity: {}", self.verbosity);
+                            println!("usage: /verbosity <minimal|compact|full>");
+                        }
+                        other if other.starts_with("/verbosity ") => {
+                            let arg = other
+                                .strip_prefix("/verbosity ")
+                                .expect("prefix checked")
+                                .trim();
+                            match arg.parse::<Verbosity>() {
+                                Ok(verbosity) => {
+                                    self.verbosity = verbosity;
+                                    println!("verbosity set to {verbosity}");
+                                }
+                                Err(error) => println!("{error}"),
+                            }
+                        }
+                        "/shell" | "/sandbox" => {
+                            println!("usage: /shell <command>");
+                            println!("alias: /sandbox <command>");
+                        }
+                        other
+                            if other
+                                .strip_prefix("/shell ")
+                                .or_else(|| other.strip_prefix("/sandbox "))
+                                .is_some() =>
+                        {
+                            let command = other
+                                .strip_prefix("/shell ")
+                                .or_else(|| other.strip_prefix("/sandbox "))
+                                .expect("shell prefix should exist")
+                                .trim();
+                            if command.is_empty() {
+                                println!("usage: /shell <command>");
+                                println!("alias: /sandbox <command>");
+                            } else {
+                                self.editor.add_history_entry(line.as_str())?;
+                                self.run_shell(command).await?;
+                            }
+                        }
+                        "/snapshot" => {
+                            print_lines(snapshot_lines(self.conversation.as_ref(), None).await);
+                        }
+                        other if other.starts_with("/snapshot ") => {
+                            let arg = other
+                                .strip_prefix("/snapshot ")
+                                .expect("prefix checked")
+                                .trim();
+                            if arg.is_empty() {
+                                println!("usage: /snapshot [<sandbox-id>]");
+                            } else if arg.contains(char::is_whitespace) {
+                                println!("/snapshot takes at most one sandbox id; got: {arg:?}");
+                            } else {
+                                print_lines(
+                                    snapshot_lines(
+                                        self.conversation.as_ref(),
+                                        Some(arg.to_string()),
+                                    )
+                                    .await,
+                                );
+                            }
+                        }
+                        "/snapshots" => {
+                            print_lines(snapshots_lines(self.conversation.as_ref()).await);
+                        }
+                        "/teleport" => {
+                            println!("usage: /teleport <provider> (e.g. /teleport daytona)");
+                        }
+                        other if other.starts_with("/teleport ") => {
+                            let arg = other
+                                .strip_prefix("/teleport ")
+                                .expect("prefix checked")
+                                .trim();
+                            if arg.is_empty() || arg.contains(char::is_whitespace) {
+                                println!("usage: /teleport <provider> (e.g. /teleport daytona)");
+                            } else {
+                                match self.teleport_sandbox(arg).await {
+                                    Ok((sandbox_id, provider)) => {
+                                        println!("sandbox {sandbox_id} teleported to {provider}");
+                                    }
+                                    Err(error) => println!("teleport failed: {error:#}"),
+                                }
+                            }
+                        }
+                        other if other.starts_with("/rewind ") => {
+                            let arg = other
+                                .strip_prefix("/rewind ")
+                                .expect("prefix checked")
+                                .trim();
+                            if arg.is_empty() {
+                                println!("usage: /rewind <snapshot-id>");
+                            } else if arg.contains(char::is_whitespace) {
+                                println!("/rewind takes exactly one snapshot id; got: {arg:?}");
+                            } else {
+                                print_lines(rewind_lines(self.conversation.as_ref(), arg).await);
+                            }
+                        }
+                        _ => {
                             self.editor.add_history_entry(line.as_str())?;
-                        }
-                        match self.execute_command(command).await? {
-                            ReplFlow::Continue => {}
-                            ReplFlow::Quit => break,
+                            self.send(trimmed).await?;
                         }
                     }
-                    Err(error) => {
-                        let _ = error.print();
-                    }
-                },
+                }
                 Err(ReadlineError::Interrupted) => {
                     println!();
                     continue;
@@ -523,32 +525,36 @@ impl ChatRepl {
         Ok(())
     }
 
-    async fn execute_command(&mut self, command: ReplCommand) -> Result<ReplFlow> {
-        let conversation = self.conversation.as_ref();
-        match command {
-            ReplCommand::Quit => return Ok(ReplFlow::Quit),
-            ReplCommand::History => self.print_transcript().await?,
-            ReplCommand::Cost => print_lines(cost_lines(conversation).await),
-            ReplCommand::Verbosity { level } => match level {
-                Some(verbosity) => {
-                    self.verbosity = verbosity;
-                    println!("verbosity set to {verbosity}");
-                }
-                None => println!("verbosity: {}", self.verbosity),
-            },
-            ReplCommand::Shell { command } => self.run_shell(&command).await?,
-            ReplCommand::Snapshot { sandbox_id } => {
-                print_lines(snapshot_lines(conversation, sandbox_id).await);
-            }
-            ReplCommand::Snapshots => print_lines(snapshots_lines(conversation).await),
-            ReplCommand::Rewind { snapshot_id } => {
-                print_lines(rewind_lines(conversation, &snapshot_id).await);
-            }
-            ReplCommand::Teleport { provider } => {
-                print_lines(teleport_lines(conversation, &provider).await);
-            }
-        }
-        Ok(ReplFlow::Continue)
+    /// Teleport the conversation's live sandbox to another provider: snapshot
+    /// it where it runs now, then restore that snapshot under the target
+    /// provider. Prints progress between the slow steps, which is why the
+    /// line-mode repl doesn't use the TUI's silent `teleport_lines`.
+    async fn teleport_sandbox(&self, provider_str: &str) -> Result<(SandboxId, SandboxProvider)> {
+        let provider = provider_str
+            .parse::<SandboxProvider>()
+            .map_err(|error| anyhow::anyhow!("invalid provider `{provider_str}`: {error}"))?;
+        let sandbox_id = latest_sandbox_id(self.conversation.as_ref())
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no sandbox has been created in this conversation yet")
+            })?;
+        println!("snapshotting sandbox {sandbox_id}...");
+        let snapshot_id = self
+            .conversation
+            .exoharness_handle()
+            .snapshot_sandbox(sandbox_id.clone())
+            .await?;
+        println!("snapshot {snapshot_id} captured; restoring on {provider}...");
+        self.conversation
+            .exoharness_handle()
+            .start_sandbox(StartSandboxRequest {
+                id: sandbox_id.clone(),
+                snapshot_id,
+                idle_seconds: None,
+                provider: Some(provider),
+            })
+            .await?;
+        Ok((sandbox_id, provider))
     }
 
     async fn send(&mut self, input: &str) -> Result<()> {
@@ -818,6 +824,21 @@ fn print_lines(lines: Vec<String>) {
     for line in lines {
         println!("{line}");
     }
+}
+
+fn print_help() {
+    println!("repl commands:");
+    println!("  /quit | /exit        exit the repl");
+    println!("  /history             reprint the conversation transcript");
+    println!("  /verbosity <level>   set tool output detail: minimal, compact, or full");
+    println!("  /cost | /usage       summarize token usage and dollar cost");
+    println!("  /snapshot [<id>]     snapshot a sandbox in this conversation");
+    println!("                       (defaults to the latest one if no id is given)");
+    println!("  /snapshots           list snapshots taken in this conversation");
+    println!("  /rewind <id>         restore the sandbox to a previous snapshot");
+    println!("  /teleport <provider> move the live sandbox to another provider");
+    println!("                       (e.g. /teleport daytona: snapshot + restore there)");
+    println!("  /help                show this message");
 }
 
 /// `/cost` output: summarize token usage and dollar cost for the conversation
@@ -1166,106 +1187,10 @@ async fn sandbox_id_for_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ReplCommand, ReplInput, Verbosity, parse_repl_input, render_external_event,
-        render_user_content_for_history,
-    };
+    use super::{Verbosity, render_external_event, render_user_content_for_history};
     use executor::EventData;
     use lingua::Message;
     use lingua::universal::UserContent;
-
-    #[test]
-    fn parses_blank_and_chat_input() {
-        assert_eq!(parse_repl_input("   ").unwrap(), ReplInput::Empty);
-        assert_eq!(
-            parse_repl_input(" hello there ").unwrap(),
-            ReplInput::Chat("hello there".to_string())
-        );
-    }
-
-    #[test]
-    fn double_slash_escapes_to_slash_prefixed_chat() {
-        assert_eq!(
-            parse_repl_input("//quit is a command").unwrap(),
-            ReplInput::Chat("/quit is a command".to_string())
-        );
-    }
-
-    #[test]
-    fn parses_commands_and_aliases() {
-        assert_eq!(
-            parse_repl_input("/quit").unwrap(),
-            ReplInput::Command(ReplCommand::Quit)
-        );
-        assert_eq!(
-            parse_repl_input("/exit").unwrap(),
-            ReplInput::Command(ReplCommand::Quit)
-        );
-        assert_eq!(
-            parse_repl_input("/usage").unwrap(),
-            ReplInput::Command(ReplCommand::Cost)
-        );
-        assert_eq!(
-            parse_repl_input("/verbosity full").unwrap(),
-            ReplInput::Command(ReplCommand::Verbosity {
-                level: Some(Verbosity::Full)
-            })
-        );
-        assert_eq!(
-            parse_repl_input("/snapshot abc").unwrap(),
-            ReplInput::Command(ReplCommand::Snapshot {
-                sandbox_id: Some("abc".to_string())
-            })
-        );
-    }
-
-    #[test]
-    fn shell_source_is_preserved_verbatim() {
-        let input = r#"/shell echo "a  b" | grep 'a' > /tmp/out"#;
-        assert_eq!(
-            parse_repl_input(input).unwrap(),
-            ReplInput::Command(ReplCommand::Shell {
-                command: r#"echo "a  b" | grep 'a' > /tmp/out"#.to_string()
-            })
-        );
-        assert_eq!(
-            parse_repl_input("/sandbox ls -la").unwrap(),
-            ReplInput::Command(ReplCommand::Shell {
-                command: "ls -la".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn shell_without_source_is_a_usage_error() {
-        let error = parse_repl_input("/shell").unwrap_err();
-        assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
-    }
-
-    #[test]
-    fn unknown_commands_error_instead_of_reaching_the_model() {
-        let error = parse_repl_input("/snapshoot abc").unwrap_err();
-        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
-        assert!(error.to_string().contains("snapshot"), "suggests the fix");
-    }
-
-    #[test]
-    fn extra_arguments_are_clap_errors() {
-        assert!(parse_repl_input("/snapshot one two").is_err());
-        assert!(parse_repl_input("/rewind").is_err());
-    }
-
-    #[test]
-    fn help_is_generated_from_the_command_tree() {
-        let error = parse_repl_input("/help").unwrap_err();
-        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
-        let rendered = error.to_string();
-        assert!(rendered.contains("snapshot"));
-        assert!(rendered.contains("teleport"));
-    }
 
     #[test]
     fn renders_scheduled_task_wakeup_user_messages() {
