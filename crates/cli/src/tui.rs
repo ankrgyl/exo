@@ -741,6 +741,12 @@ impl ChatRepl {
                     *self.watch_after.lock().expect("chat event watch poisoned") =
                         Some(result.latest_event_id);
                 }
+                ExecutionStreamEvent::Cancelled(result) => {
+                    self.session_id = Some(result.session_id);
+                    *self.watch_after.lock().expect("chat event watch poisoned") =
+                        Some(result.latest_event_id);
+                    println!("[cancelled]");
+                }
             }
         }
 

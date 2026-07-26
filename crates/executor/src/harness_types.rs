@@ -9,8 +9,8 @@ use lingua::Message;
 
 use crate::{
     AgentConfig, AgentHarnessKind, BraintrustTracingConfig, ConversationConfig,
-    ConversationModelConfig, ExecutionStreamHandle, SandboxScope, SendRequest, SendResult,
-    TypeScriptHarnessConfig,
+    ConversationModelConfig, ExecutionCancellation, ExecutionStreamHandle, SandboxScope,
+    SendRequest, SendResult, TypeScriptHarnessConfig,
 };
 
 #[async_trait]
@@ -56,6 +56,11 @@ pub trait HarnessConversation: Send + Sync {
     async fn close_session(&self, session_id: SessionId) -> Result<()>;
     async fn send(&self, request: SendRequest) -> Result<SendResult>;
     async fn send_stream(&self, request: SendRequest) -> Result<ExecutionStreamHandle>;
+    async fn send_stream_with_cancellation(
+        &self,
+        request: SendRequest,
+        cancellation: ExecutionCancellation,
+    ) -> Result<ExecutionStreamHandle>;
 }
 
 #[derive(Debug, Clone)]

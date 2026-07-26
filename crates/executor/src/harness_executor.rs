@@ -18,8 +18,8 @@ use crate::shared::{
     spawn_prepared_turn_stream,
 };
 use crate::{
-    AgentConfig, ConversationConfig, ConversationModelConfig, ExecutionStreamEvent,
-    ExecutionStreamHandle, SendRequest, SendResult,
+    AgentConfig, ConversationConfig, ConversationModelConfig, ExecutionCancellation,
+    ExecutionStreamEvent, ExecutionStreamHandle, SendRequest, SendResult,
 };
 
 #[derive(Clone, Copy)]
@@ -207,11 +207,12 @@ where
         .await
     }
 
-    async fn send_stream(
+    async fn send_stream_with_cancellation(
         &self,
         agent: Arc<dyn AgentHandle>,
         conversation: Arc<dyn ConversationHandle>,
         request: SendRequest,
+        cancellation: ExecutionCancellation,
     ) -> Result<ExecutionStreamHandle> {
         let (mut agent_config, conversation_config, model_override) = tokio::try_join!(
             self.get_agent_config(agent.as_ref()),
@@ -246,6 +247,7 @@ where
             conversation,
             turn,
             trace_agent_config,
+            cancellation,
             move |turn_trace, event_tx| {
                 Box::pin(async move {
                     executor

@@ -1,3 +1,4 @@
+mod acp;
 mod adapters;
 mod env;
 #[cfg(test)]
@@ -374,6 +375,8 @@ impl From<SandboxScopeArg> for SandboxScope {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Serve one existing conversation over ACP on stdio.
+    Acp { agent: String, conversation: String },
     /// Manage agents and their executor configuration.
     Agent {
         #[command(subcommand)]
@@ -847,6 +850,14 @@ async fn main() -> Result<()> {
     .await?;
 
     match cli.command {
+        Commands::Acp {
+            agent,
+            conversation,
+        } => {
+            let conversation =
+                must_get_conversation(harness.as_ref(), &agent, &conversation).await?;
+            acp::serve(conversation).await?;
+        }
         Commands::Adapters { command } => {
             adapters::handle_adapter_command(&cli.root, Arc::clone(&harness), command).await?;
         }
@@ -2108,6 +2119,7 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
             },
         },
         Commands::Repl { agent, .. } => Some(agent.as_deref().unwrap_or(DEFAULT_REPL_SLUG)),
+        Commands::Acp { agent, .. } => Some(agent.as_str()),
         Commands::Secret { .. }
         | Commands::Model { .. }
         | Commands::Provider { .. }

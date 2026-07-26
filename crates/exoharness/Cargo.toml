@@ -20,7 +20,7 @@ basic-backend = [
   "dep:tracing",
   "dep:url",
 ]
-apple-keychain = ["dep:keyring", "dep:keyring-core"]
+apple-keychain = ["dep:keyring"]
 aws-agentcore = [
   "basic-backend",
   "dep:aws-config",
@@ -41,8 +41,7 @@ base64 = { version = "0.22.1", optional = true }
 bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
-keyring = { version = "4.0.0-rc.3", optional = true }
-keyring-core = { version = "0.7.2", optional = true }
+keyring = { version = "4.1.5", optional = true }
 lingua.workspace = true
 object_store = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }

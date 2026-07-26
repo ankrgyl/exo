@@ -6,13 +6,17 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Error;
 use exoharness::{
-    AgentHandle, AgentId, ConversationHandle, ConversationId, EventId, Result, TurnHandle,
+    AgentHandle, AgentId, ConversationHandle, ConversationId, EventData, EventId, Result,
+    TurnHandle,
 };
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::execution_tracing::{ExecutionTracer, TurnExecutionTrace};
-use crate::{AgentConfig, ExecutionStreamEvent, ExecutionStreamHandle, SendResult};
+use crate::{
+    AgentConfig, ExecutionCancellation, ExecutionStreamEvent, ExecutionStreamHandle, SendResult,
+};
 
 pub(crate) type TurnFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
@@ -88,6 +92,7 @@ pub(crate) fn spawn_prepared_turn_stream<Run>(
     conversation: Arc<dyn ConversationHandle>,
     turn: Arc<dyn TurnHandle>,
     agent_config: AgentConfig,
+    cancellation: ExecutionCancellation,
     run: Run,
 ) -> ExecutionStreamHandle
 where
@@ -100,6 +105,7 @@ where
 {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
+    let task_cancellation = cancellation.clone();
     tokio::spawn(async move {
         let session_id = turn.record().session_id;
         let turn_id = turn.record().id;
@@ -114,13 +120,31 @@ where
                 true,
             )
             .await;
-        let send_result = finalize_turn(turn.as_ref(), run(turn_trace.as_deref(), &event_tx).await)
-            .await
-            .map(|latest_event_id| SendResult {
-                session_id,
-                turn_id,
-                latest_event_id,
-            });
+        let (send_result, was_cancelled) = tokio::select! {
+            result = run(turn_trace.as_deref(), &event_tx) => (
+                finalize_turn(turn.as_ref(), result).await.map(|latest_event_id| SendResult {
+                    session_id,
+                    turn_id,
+                    latest_event_id,
+                }),
+                false,
+            ),
+            () = task_cancellation.cancelled() => {
+                let result = async {
+                    turn.add_events(vec![EventData::Custom {
+                        event_type: "turn_cancelled".to_string(),
+                        payload: json!({ "source": "execution_stream" }),
+                    }]).await?;
+                    let latest_event_id = turn.finish().await?;
+                    Ok(SendResult {
+                        session_id,
+                        turn_id,
+                        latest_event_id,
+                    })
+                }.await;
+                (result, true)
+            },
+        };
 
         if let Some(turn_trace) = turn_trace {
             match &send_result {
@@ -136,11 +160,16 @@ where
         if let Err(error) = &send_result {
             try_send_stream_error(&event_tx, error);
         } else if let Ok(result) = &send_result {
-            try_send_stream_event(&event_tx, ExecutionStreamEvent::Completed(result.clone()));
+            let event = if was_cancelled {
+                ExecutionStreamEvent::Cancelled(result.clone())
+            } else {
+                ExecutionStreamEvent::Completed(result.clone())
+            };
+            try_send_stream_event(&event_tx, event);
         }
     });
 
-    ExecutionStreamHandle::new(UnboundedReceiverStream::new(event_rx))
+    ExecutionStreamHandle::with_cancellation(UnboundedReceiverStream::new(event_rx), cancellation)
 }
 
 async fn finish_turn_trace(
