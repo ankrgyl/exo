@@ -828,7 +828,13 @@ async function readCheckpointSummary(
       artifactId: checkpoint.artifactId,
       version: checkpoint.artifactVersion,
     });
-    if (text === null) return { text: null, conclusive: true };
+    // An empty artifact is a *missing* summary, not an empty one. A truncated
+    // write leaves zero bytes, and honouring that would cut the compacted
+    // prefix out of the prompt and put nothing in its place — exactly what the
+    // writer's empty-summary guard refuses to do, undone on the read side.
+    if (text === null || text.trim() === "") {
+      return { text: null, conclusive: true };
+    }
     memoizeSummary(key, text);
     return { text };
   } catch {

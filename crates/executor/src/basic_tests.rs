@@ -746,6 +746,15 @@ impl FakeExoHarness {
             .pop();
     }
 
+    /// Replace the newest artifact's contents with nothing, as a truncated
+    /// write would — distinct from the artifact vanishing entirely.
+    fn truncate_newest_artifact(&self) {
+        let mut state = self.state.lock().expect("fake harness poisoned");
+        if let Some(newest) = state.artifacts.last_mut() {
+            newest.1 = Vec::new();
+        }
+    }
+
     /// Keep only the first artifact ever written, dropping every later one —
     /// the case where the readable ancestor is far back in the chain.
     fn retain_oldest_artifact(&self) {
@@ -3552,6 +3561,49 @@ async fn a_rescue_still_refuses_a_summary_that_would_grow_the_prompt() {
     assert!(
         checkpoint_events(conversation.as_ref()).await.is_empty(),
         "and nothing should have been published"
+    );
+}
+
+/// An empty summary artifact is a *missing* summary, not an empty one.
+///
+/// A truncated write leaves zero bytes. Honouring that would cut the compacted
+/// prefix out of the prompt and put nothing in its place — exactly what the
+/// writer's empty-summary guard refuses to do, undone on the read side, and
+/// every later compaction would chain off the hole.
+#[tokio::test]
+async fn an_empty_summary_artifact_replays_the_full_history() {
+    let (harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+    let turn = open_turn(conversation.as_ref()).await;
+    run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &CompactionConfig {
+            keep_recent_turns: 1,
+            ..CompactionConfig::default()
+        },
+        summarizer_models("summary-model"),
+        PromptPressure::housekeeping(),
+        &|_input| Box::pin(async { Ok("A SUMMARY".to_string()) }),
+    )
+    .await;
+    turn.finish().await.expect("finish turn");
+
+    harness.truncate_newest_artifact();
+
+    let executor = test_executor();
+    let messages = executor
+        .materialize_prompt_history(conversation.as_ref(), &[])
+        .await
+        .expect("materialize");
+    let text = prompt_text(&messages);
+    assert!(
+        text.contains("ancient"),
+        "the prefix has to come back verbatim: {text}"
+    );
+    assert!(
+        !text.contains("<conversation_summary>"),
+        "and no empty summary should stand in for it"
     );
 }
 

@@ -417,6 +417,28 @@ describe("materializePromptHistory with a checkpoint", () => {
     expect(rendered).toContain("recent");
   });
 
+  it("treats an empty summary artifact as missing", async () => {
+    // A truncated write leaves zero bytes. Honouring that would cut the
+    // compacted prefix out of the prompt and put nothing in its place — what
+    // the writer's empty-summary guard refuses to do, undone on the read side.
+    const history = turn("ancient");
+    const stub = new StubConversation({
+      events: [
+        ...history,
+        checkpointEvent({
+          upToEventId: history.at(-1)!.id,
+          artifactId: artifactId(1),
+        }),
+        ...turn("recent"),
+      ],
+      artifacts: new Map([[artifactId(1), "   "]]),
+    });
+
+    const text = JSON.stringify(await materializePromptHistory(stub as never));
+    expect(text).toContain("ancient");
+    expect(text).not.toContain("<conversation_summary>");
+  });
+
   it("does not serve one conversation's summary to another", async () => {
     // Forking copies artifact ids and versions. Once the fork and its source
     // have each compacted again, both hold the same `artifactId@version`

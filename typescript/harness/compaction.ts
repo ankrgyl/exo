@@ -1552,10 +1552,13 @@ async function readSummaryOrFallBack(
   checkpoint: CompactionCheckpoint,
 ): Promise<string | null> {
   try {
-    return await conversation.readArtifactText({
+    const text = await conversation.readArtifactText({
       artifactId: checkpoint.artifactId,
       version: checkpoint.artifactVersion,
     });
+    // Empty is missing, not empty: a truncated write leaves zero bytes, and
+    // chaining off that would carry the hole forward into every later summary.
+    return text === null || text.trim() === "" ? null : text;
   } catch {
     return null;
   }

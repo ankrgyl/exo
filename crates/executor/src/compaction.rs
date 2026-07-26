@@ -1165,7 +1165,15 @@ pub(crate) async fn read_summary(
             version: Some(checkpoint.artifact_version),
         })
         .await?;
-    Ok(artifact.and_then(|artifact| String::from_utf8(artifact.contents).ok()))
+    Ok(artifact
+        .and_then(|artifact| String::from_utf8(artifact.contents).ok())
+        // An empty artifact is a *missing* summary, not an empty one. A
+        // truncated write leaves zero bytes, and honouring that would cut the
+        // compacted prefix out of the prompt and put nothing in its place —
+        // exactly what the writer's empty-summary guard refuses to do, undone
+        // on the read side. Reporting it as absent runs the full-history
+        // fallback and lets the next compaction rebuild.
+        .filter(|summary| !summary.trim().is_empty()))
 }
 
 /// How a summary is presented to the model.
