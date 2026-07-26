@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -7,7 +8,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+    EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use executor::{
     EventId, EventQuery, EventQueryDirection, ExecutionStreamEvent, HarnessAgent,
@@ -290,6 +291,13 @@ struct TuiApp {
     /// Whether the terminal reports mouse events to us (wheel scrolling).
     /// Toggled off to let the terminal's native text selection work.
     mouse_captured: bool,
+    /// Screen-cell selection anchors (start, head) while drag-selecting.
+    selection: Option<(Position, Position)>,
+    /// Transcript area inside its borders, from the last draw; selection is
+    /// clamped to it so copies never include border bars or box padding.
+    transcript_inner: Rect,
+    /// A finished drag is waiting to be copied from the rendered buffer.
+    copy_pending: bool,
     spinner_frame: usize,
     session_id: Option<SessionId>,
     watch_after: Arc<Mutex<Option<EventId>>>,
@@ -321,6 +329,9 @@ impl TuiApp {
             scrollback: 0,
             busy: Arc::new(AtomicBool::new(false)),
             mouse_captured: true,
+            selection: None,
+            transcript_inner: Rect::ZERO,
+            copy_pending: false,
             spinner_frame: 0,
             session_id: None,
             watch_after,
@@ -346,6 +357,15 @@ impl TuiApp {
                     Some(Ok(event)) => {
                         if self.handle_terminal_event(event, &tx).await? {
                             break Ok(());
+                        }
+                        if self.copy_pending {
+                            self.copy_pending = false;
+                            // After a draw the current buffer is the cleared
+                            // next frame; render once more and read the
+                            // completed frame's cells instead.
+                            let completed = terminal.draw(|frame| self.draw(frame))?;
+                            let buffer = completed.buffer.clone();
+                            self.copy_selection(&buffer);
                         }
                     }
                     Some(Err(error)) => break Err(error.into()),
@@ -387,9 +407,28 @@ impl TuiApp {
         tx: &mpsc::UnboundedSender<AppEvent>,
     ) -> Result<bool> {
         if let Event::Mouse(mouse) = event {
+            let position = Position::new(mouse.column, mouse.row);
             match mouse.kind {
                 MouseEventKind::ScrollUp => self.scrollback = self.scrollback.saturating_add(3),
                 MouseEventKind::ScrollDown => self.scrollback = self.scrollback.saturating_sub(3),
+                // Drag-select: the terminal won't select natively while it
+                // reports the mouse to us, so we track the region ourselves
+                // and copy it from the rendered buffer on release.
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.selection = Some((position, position));
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some((_, head)) = self.selection.as_mut() {
+                        *head = position;
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if self.selection.is_some_and(|(start, head)| start != head) {
+                        self.copy_pending = true;
+                    } else {
+                        self.selection = None;
+                    }
+                }
                 _ => {}
             }
             return Ok(false);
@@ -406,7 +445,16 @@ impl TuiApp {
             return Ok(false);
         }
         match (key.modifiers, key.code) {
-            (KeyModifiers::CONTROL, KeyCode::Char('c') | KeyCode::Char('d')) => return Ok(true),
+            // Ctrl+C clears a non-empty input first (like the line repl's
+            // interrupt) and only exits when there is nothing to clear.
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
+                if self.input.is_empty() {
+                    return Ok(true);
+                }
+                self.input.clear();
+                self.history_pos = None;
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('d')) => return Ok(true),
             (KeyModifiers::CONTROL, KeyCode::Char('u')) => self.input.clear(),
             // Release the mouse so the terminal's native text selection works,
             // at the cost of wheel scrolling; toggle back when done.
@@ -697,17 +745,16 @@ impl TuiApp {
 
     fn push_user_line(&mut self, text: &str) {
         // Ratatui lines cannot hold newlines; multi-line messages become one
-        // transcript line each, with the prefix only on the first.
+        // transcript line each, with the prefix only on the first. The whole
+        // message, prefix included, is bold so user turns stand out.
         for (index, piece) in text.split('\n').enumerate() {
-            let mut spans = Vec::new();
-            if index == 0 {
-                spans.push(Span::styled(
-                    format!("{} user: ", compact_timestamp()),
-                    Style::new().dim(),
-                ));
-            }
-            spans.push(Span::styled(piece.to_string(), Style::new().bold()));
-            self.transcript.push(Line::from(spans));
+            let line = if index == 0 {
+                format!("{} user: {piece}", compact_timestamp())
+            } else {
+                piece.to_string()
+            };
+            self.transcript
+                .push(Line::styled(line, Style::new().bold()));
         }
         self.scrollback = 0;
     }
@@ -719,6 +766,36 @@ impl TuiApp {
 
     fn is_busy(&self) -> bool {
         self.busy.load(Ordering::Relaxed)
+    }
+
+    /// Pull the drag-selected cells out of the last rendered frame (row-major,
+    /// like terminal-native selection) and push them to the system clipboard
+    /// via OSC 52, which works through tmux and ssh in most terminals.
+    fn copy_selection(&mut self, buffer: &Buffer) {
+        let Some((anchor, head)) = self.selection else {
+            return;
+        };
+        let mut lines = Vec::new();
+        for (row, from, to) in selection_rows(anchor, head, self.transcript_inner) {
+            let mut text = String::new();
+            for column in from..=to {
+                if let Some(cell) = buffer.cell(Position::new(column, row)) {
+                    text.push_str(cell.symbol());
+                }
+            }
+            lines.push(text.trim_end().to_string());
+        }
+        let text = lines.join("\n");
+        // Send regardless (harmless if swallowed), but report honestly when a
+        // known hop is configured to drop it.
+        let mut stdout = std::io::stdout();
+        let _ = write!(stdout, "\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+        let _ = stdout.flush();
+        match clipboard_block_reason() {
+            Some(reason) => self.push_notice(&reason),
+            None => self.push_notice(&format!("copied {} characters", text.chars().count())),
+        }
+        self.selection = None;
     }
 
     fn history_step(&mut self, direction: isize) {
@@ -804,7 +881,7 @@ impl TuiApp {
         .areas(frame.area());
 
         let title = format!(
-            " {} · {} ",
+            " ⧓ {} · {} ",
             self.agent.record().slug,
             self.conversation.record().slug
         );
@@ -812,6 +889,7 @@ impl TuiApp {
         // block's border rows, which would over-scroll by two.
         let transcript =
             Paragraph::new(Text::from(self.transcript.clone())).wrap(Wrap { trim: false });
+        self.transcript_inner = Block::new().borders(Borders::ALL).inner(transcript_area);
         let inner_width = transcript_area.width.saturating_sub(2);
         let inner_height = transcript_area.height.saturating_sub(2);
         let total = transcript.line_count(inner_width) as u16;
@@ -851,9 +929,9 @@ impl TuiApp {
             "idle".to_string()
         };
         let mouse = if self.mouse_captured {
-            "Ctrl+T to select text"
+            "drag to copy text"
         } else {
-            "mouse released: select text freely, Ctrl+T to restore scrolling"
+            "mouse released: native selection, Ctrl+T to restore scrolling"
         };
         let status = Line::from(format!(
             " {state} · verbosity {} · {mouse} · Ctrl+C quit",
@@ -861,7 +939,99 @@ impl TuiApp {
         ))
         .style(Style::new().dim());
         frame.render_widget(Paragraph::new(status), status_area);
+
+        // Reverse-video the drag selection so it reads like terminal-native
+        // selection while the mouse is captured.
+        if let Some((anchor, head)) = self.selection {
+            let inner = self.transcript_inner;
+            let buffer = frame.buffer_mut();
+            for (row, from, to) in selection_rows(anchor, head, inner) {
+                buffer.set_style(
+                    Rect::new(from, row, to - from + 1, 1),
+                    Style::new().reversed(),
+                );
+            }
+        }
     }
+}
+
+/// Detectable reasons an OSC 52 clipboard write will never arrive: tmux
+/// swallows application clipboard escapes unless `set-clipboard` is `on`.
+/// Checked per copy so fixing the setting takes effect immediately.
+fn clipboard_block_reason() -> Option<String> {
+    std::env::var_os("TMUX")?;
+    let output = std::process::Command::new("tmux")
+        .args(["show", "-gv", "set-clipboard"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (value != "on").then(|| {
+        format!(
+            "copy blocked: tmux set-clipboard is `{value}`; run `tmux set -g set-clipboard on`, \
+             or hold Shift/Alt while dragging to select natively"
+        )
+    })
+}
+
+/// Row-major ordering for the two selection anchors.
+fn order_selection(a: Position, b: Position) -> (Position, Position) {
+    if (a.y, a.x) <= (b.y, b.x) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// The per-row column spans of a selection, clamped to the transcript's
+/// inner area so border bars and box padding never highlight or copy.
+fn selection_rows(anchor: Position, head: Position, inner: Rect) -> Vec<(u16, u16, u16)> {
+    let (start, end) = order_selection(anchor, head);
+    if inner.width == 0 || inner.height == 0 {
+        return Vec::new();
+    }
+    let (min_x, max_x) = (inner.left(), inner.right().saturating_sub(1));
+    let mut rows = Vec::new();
+    for row in start.y.max(inner.top())..=end.y.min(inner.bottom().saturating_sub(1)) {
+        let from = if row == start.y {
+            start.x.max(min_x)
+        } else {
+            min_x
+        };
+        let to = if row == end.y {
+            end.x.min(max_x)
+        } else {
+            max_x
+        };
+        if from <= to {
+            rows.push((row, from, to));
+        }
+    }
+    rows
+}
+
+/// Minimal base64 for OSC 52 payloads; not worth a dependency.
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let bits = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(ALPHABET[(bits >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(bits >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(bits >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[bits as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// Basic styling for pre-rendered transcript strings, keyed off the line
@@ -886,11 +1056,44 @@ fn transcript_line_style(line: &str) -> Style {
 /// applied to every line after splitting on embedded newlines — so
 /// continuation lines keep the message's look.
 fn styled_message_lines(rendered: &str) -> Vec<Line<'static>> {
+    if let Some(lines) = styled_speaker_lines(rendered) {
+        return lines;
+    }
     let style = transcript_line_style(rendered);
     rendered
         .split('\n')
         .map(|line| Line::styled(line.to_string(), style))
         .collect()
+}
+
+/// Match the live rendering for agent messages: dim `[ts] agent: ` prefix,
+/// plain text, continuation lines without a prefix. User messages fall
+/// through to the whole-line bold style instead.
+fn styled_speaker_lines(rendered: &str) -> Option<Vec<Line<'static>>> {
+    const TIMESTAMP_LEN: usize = "[HH:MM:SS]".len();
+    let anchored = rendered.len() > TIMESTAMP_LEN
+        && rendered.as_bytes()[0] == b'['
+        && rendered.as_bytes()[TIMESTAMP_LEN - 1] == b']';
+    if !anchored {
+        return None;
+    }
+    let rest = &rendered[TIMESTAMP_LEN..];
+    let agent_marker = format!(" {ASSISTANT_LABEL}: ");
+    if !rest.starts_with(&agent_marker) {
+        return None;
+    }
+    let (marker_len, text_style) = (agent_marker.len(), Style::new());
+    let (prefix, text) = rendered.split_at(TIMESTAMP_LEN + marker_len);
+    let mut lines = Vec::new();
+    for (index, piece) in text.split('\n').enumerate() {
+        let mut spans = Vec::new();
+        if index == 0 {
+            spans.push(Span::styled(prefix.to_string(), Style::new().dim()));
+        }
+        spans.push(Span::styled(piece.to_string(), text_style));
+        lines.push(Line::from(spans));
+    }
+    Some(lines)
 }
 
 fn status_style(status: &str) -> Style {
