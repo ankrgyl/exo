@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use executor::{
     EventId, EventQuery, EventQueryDirection, ExecutionStreamEvent, HarnessAgent,
@@ -42,15 +42,19 @@ const MAX_INPUT_ROWS: u16 = 8;
 
 /// Wrap input at exact character boundaries so the cursor position stays a
 /// simple row/column computation (word-wrap would make it unpredictable).
-/// The cursor sits at the end, so a line that exactly fills the width rolls
-/// over to a fresh empty line.
+/// Embedded newlines (pasted or Alt+Enter) are hard breaks. The cursor sits
+/// at the end, so a line that exactly fills the width rolls over to a fresh
+/// empty line.
 fn wrap_input_chars(input: &str, width: usize) -> Vec<String> {
     let mut lines = vec![String::new()];
     let mut column = 0;
     for ch in input.chars() {
-        if column == width {
+        if ch == '\n' || column == width {
             lines.push(String::new());
             column = 0;
+            if ch == '\n' {
+                continue;
+            }
         }
         lines.last_mut().expect("lines never empty").push(ch);
         column += 1;
@@ -80,11 +84,17 @@ pub async fn run_chat_tui(
     let terminal = ratatui::init();
     // Capture the mouse so wheel motion reaches us as scroll events; without
     // this the terminal fakes arrow keys, which would page the input history.
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // Bracketed paste keeps pasted newlines literal instead of sending the
+    // message once per line.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
     let result = TuiApp::new(agent, conversation, verbosity)
         .run(terminal)
         .await;
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     ratatui::restore();
     result
 }
@@ -204,6 +214,11 @@ impl TuiApp {
             }
             return Ok(false);
         }
+        if let Event::Paste(text) = event {
+            // Terminals report pasted line breaks as `\r`.
+            self.input.push_str(&text.replace('\r', "\n"));
+            return Ok(false);
+        }
         let Event::Key(key) = event else {
             return Ok(false);
         };
@@ -213,6 +228,7 @@ impl TuiApp {
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c') | KeyCode::Char('d')) => return Ok(true),
             (KeyModifiers::CONTROL, KeyCode::Char('u')) => self.input.clear(),
+            (KeyModifiers::ALT, KeyCode::Enter) => self.input.push('\n'),
             (_, KeyCode::Enter) => return self.submit_input(tx).await,
             (_, KeyCode::Backspace) => {
                 self.input.pop();

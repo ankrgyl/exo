@@ -38,7 +38,7 @@ reqwest = { version = "0.12.23", default-features = false, features = [
   "rustls-tls",
   "stream",
 ] }
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = { version = "0.28", features = ["bracketed-paste", "event-stream"] }
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
