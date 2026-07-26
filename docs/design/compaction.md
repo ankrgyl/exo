@@ -191,9 +191,15 @@ CJK by roughly half and can still under-charge the densest Hangul. The accurate
 provider count remains the real mechanism; this only has to be right enough to
 keep a prompt away from the wall.
 
-Both share a once-per-turn latch. No new `turn_ended` appears mid-turn, so the
-cut point cannot change within a turn; a second attempt would re-scan the log and
-re-run the summarizer for the same answer.
+Both share a latch, because a second attempt within a turn re-scans the log and
+can re-run the summarizer — real money on a long tool loop. But the latch records
+_why_ re-attempting would be pointless rather than asserting it. The obvious
+version — "no new `turn_ended` appears mid-turn, so the cut point cannot change"
+— is the unserialized-turns premise being violated again: other turns finish
+while this one loops. One early "not enough completed turns to cut" would then
+suppress every later check while the prompt kept growing. So the latch stores the
+newest turn boundary at the last attempt; a new one means the answer may have
+changed, the same one means it cannot have.
 
 ### RLM does not compact, on purpose
 
@@ -211,11 +217,18 @@ exists for: precise access to a large external context without spending the
 window on it. `AgentConfig::compaction` documents itself as basic-executor-only,
 and `rlm_does_not_compact_its_out_of_band_transcript` pins the behaviour.
 
-For the same reason `materialize_conversation_messages` — used by RLM and by
-`HarnessConversation::messages()` — deliberately returns the **full** log and
-ignores checkpoints. It is not a prompt builder. Making it checkpoint-aware would
+For the same reason `materialize_conversation_messages` (Rust) and
+`materializeConversationMessages` (TypeScript) — used by RLM and by the "what is
+in this conversation" accessors — deliberately return the **full** log and ignore
+checkpoints. They are not prompt builders. Making them checkpoint-aware would
 also quietly break the "history stays queryable" guarantee that justifies never
 mutating the log.
+
+The two purposes have to be separate _functions_, not a flag: TypeScript's
+`materializeConversationMessages` originally served both the RLM context and two
+genuine prompt paths, so it applied the checkpoint and the RLM harness silently
+received a summary instead of its exact history. `materializePromptHistory` is
+now the checkpoint-aware one, and the split matches Rust's.
 
 ## Summaries
 

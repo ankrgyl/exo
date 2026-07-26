@@ -508,24 +508,42 @@ export function resolveSummarizerModel(
 }
 
 /**
- * At-most-once-per-turn gate around `shouldCompact`.
+ * Gate around `shouldCompact` that stops a turn re-attempting compaction for no
+ * reason.
  *
- * Compaction can only cut at a `turn_ended` boundary, and no new one appears
- * while a turn is in flight — so within a turn the cut point cannot change. A
- * second attempt would re-scan the log and re-run the summarizer to reach the
- * same answer. Without this, a turn that crosses the threshold and then fails
- * (or skips) compaction retries on every subsequent round, which on a long tool
- * loop is a real and silent cost.
+ * The point of a gate here is cost: a second attempt re-scans the log and can
+ * re-run the summarizer, which is real money on a long tool loop. The original
+ * version latched permanently on the first attempt, justified by "no new
+ * `turn_ended` appears while a turn is in flight" — which is the premise turns
+ * being unserialized makes false. Other turns finish while this one loops, and
+ * an attempt that skipped because there were not yet enough completed turns to
+ * cut would then suppress every later check in the turn, while the prompt kept
+ * growing toward the limit.
+ *
+ * So the gate records *why* re-attempting would be pointless rather than
+ * asserting it: the newest turn boundary at the last attempt. A new one means
+ * the cut point may have moved and it is worth another look; the same one means
+ * it cannot have.
  */
 export class CompactionGate {
-  private attempted = false;
+  private attemptedAt: string | null | undefined = undefined;
 
-  shouldAttempt(args: ShouldCompactArgs): boolean {
-    return !this.attempted && shouldCompact(args);
+  shouldAttempt(
+    args: ShouldCompactArgs,
+    /** Id of the newest `turn_ended` event, from `readLatestTurnEnded`. */
+    latestTurnEnded: string | null,
+  ): boolean {
+    if (
+      this.attemptedAt !== undefined &&
+      this.attemptedAt === latestTurnEnded
+    ) {
+      return false;
+    }
+    return shouldCompact(args);
   }
 
-  markAttempted(): void {
-    this.attempted = true;
+  markAttempted(latestTurnEnded: string | null): void {
+    this.attemptedAt = latestTurnEnded;
   }
 }
 

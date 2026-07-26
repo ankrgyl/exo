@@ -14,10 +14,10 @@ use lingua::universal::{ToolContentPart, ToolResultContentPart};
 use serde_json::json;
 
 use crate::compaction::{
-    CompactionOutcome, PromptSize, SummarizeInput, previous_summary_message, prompt_size,
-    read_active_checkpoint, read_summary_or_fall_back, record_summarizer_usage,
-    resolve_summarizer_model, run_compaction, should_compact, summarizer_instruction,
-    summarizer_max_output_tokens, summary_message, tool_definition_size,
+    CompactionLatch, CompactionOutcome, PromptSize, SummarizeInput, previous_summary_message,
+    prompt_size, read_active_checkpoint, read_latest_turn_ended, read_summary_or_fall_back,
+    record_summarizer_usage, resolve_summarizer_model, run_compaction, should_compact,
+    summarizer_instruction, summarizer_max_output_tokens, summary_message, tool_definition_size,
 };
 use crate::execution_tracing::TurnExecutionTrace;
 use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor};
@@ -257,7 +257,7 @@ where
         turn: &dyn TurnHandle,
         agent_config: &AgentConfig,
         trigger: CompactionTrigger<'_>,
-        attempted: &mut bool,
+        latch: &mut CompactionLatch,
     ) -> bool {
         let CompactionTrigger {
             model,
@@ -267,13 +267,6 @@ where
             round,
             turn_trace,
         } = trigger;
-        // At most one attempt per turn: compaction can only cut at a
-        // `turn_ended` boundary, and none appears while a turn is in flight, so
-        // a second attempt re-scans the log and re-runs the summarizer to reach
-        // the same answer. On a long tool loop that is a real, silent cost.
-        if *attempted {
-            return false;
-        }
         let config = agent_config.compaction.clone().unwrap_or_default();
         if !should_compact(
             &config,
@@ -283,7 +276,26 @@ where
         ) {
             return false;
         }
-        *attempted = true;
+
+        // Re-attempting within a turn costs a log scan and possibly a
+        // summarizer call, so it needs a reason. The reason is a turn boundary
+        // that was not there last time: cuts land only on `TurnEnded`, so while
+        // the newest one is unchanged a re-scan reaches the same answer. Turns
+        // are not serialized, so other turns do finish while this one loops —
+        // which is exactly the case a plain once-per-turn flag got wrong,
+        // suppressing every later check after one early "not enough completed
+        // turns to cut".
+        let latest_turn_ended = match read_latest_turn_ended(conversation).await {
+            Ok(latest) => latest,
+            Err(error) => {
+                tracing::warn!(%error, "compaction: could not read the latest turn boundary");
+                return false;
+            }
+        };
+        if latch.is_settled(latest_turn_ended) {
+            return false;
+        }
+        latch.mark_attempted(latest_turn_ended);
 
         // `summary_model` overrides the model id within the agent's existing
         // binding, so a cheaper model from the same provider costs no extra
@@ -442,7 +454,7 @@ where
         stream_mode: ExecutorStreamMode<'_>,
         turn_trace: Option<&dyn TurnExecutionTrace>,
     ) -> Result<()> {
-        let mut compaction_attempted = false;
+        let mut compaction_latch = CompactionLatch::default();
         for round in 0u32.. {
             if agent_config
                 .max_tool_round_trips
@@ -487,7 +499,7 @@ where
                         round: round as usize,
                         turn_trace,
                     },
-                    &mut compaction_attempted,
+                    &mut compaction_latch,
                 )
                 .await
             {
@@ -540,7 +552,7 @@ where
                     round: round as usize,
                     turn_trace,
                 },
-                &mut compaction_attempted,
+                &mut compaction_latch,
             )
             .await;
 

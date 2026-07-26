@@ -638,6 +638,53 @@ export async function readActiveCheckpointEvent(
 }
 
 /**
+ * The **whole** conversation as messages, checkpoint or not.
+ *
+ * Not a prompt builder — `materializePromptHistory` is. The distinction matters
+ * because compaction is only ever worth doing for text that occupies the model's
+ * input window, and this function's callers are the ones where it does not:
+ *
+ * - The RLM harness loads it into the JS REPL's out-of-band `context`, which
+ *   never enters the model input (the root prompt carries only a short
+ *   preview), so summarizing it would trade away precision for no saving in the
+ *   window it is not occupying.
+ * - Anything answering "what is in this conversation", where the whole point of
+ *   never mutating the log is that the answer stays complete.
+ *
+ * Mirrors `materialize_conversation_messages` in the Rust executor, which draws
+ * the same line for the same reasons.
+ */
+/**
+ * Id of the newest `turn_ended` event, or null on a conversation with no
+ * completed turn.
+ *
+ * This is the whole of what a cut point depends on: compaction only ever cuts at
+ * a turn boundary, so while no new one appears, re-scanning can only reach the
+ * same answer. One bounded `desc limit 1` query, the same shape as
+ * `readActiveCheckpointEvent`.
+ */
+export async function readLatestTurnEnded(
+  conversation: Conversation,
+): Promise<string | null> {
+  const result = await conversation.getEvents({
+    direction: "desc",
+    limit: 1,
+    types: ["turn_ended"],
+  });
+  return result.events[0]?.id ?? null;
+}
+
+export async function materializeConversationMessages(
+  conversation: Conversation,
+): Promise<Message[]> {
+  const result = await conversation.getEvents({
+    direction: "asc",
+    types: [...HISTORY_EVENT_TYPES],
+  });
+  return materializeEventsToMessages(result.events);
+}
+
+/**
  * Prompt history for a conversation.
  *
  * With no checkpoint this replays the whole log, exactly as it always has. With
@@ -645,7 +692,7 @@ export async function readActiveCheckpointEvent(
  * checkpoint are scanned. The raw log is never touched, so anything the summary
  * loses is still recoverable through `getEvents`.
  */
-export async function materializeConversationMessages(
+export async function materializePromptHistory(
   conversation: Conversation,
 ): Promise<Message[]> {
   const checkpoint = await readActiveCheckpoint(conversation);
@@ -815,10 +862,7 @@ export async function materializePromptMessages(
   conversation: Conversation,
   instructions: Message[],
 ): Promise<Message[]> {
-  return [
-    ...instructions,
-    ...(await materializeConversationMessages(conversation)),
-  ];
+  return [...instructions, ...(await materializePromptHistory(conversation))];
 }
 
 export function messagesToHistoryMessages(

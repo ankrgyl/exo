@@ -726,6 +726,61 @@ pub(crate) async fn read_active_checkpoint(
         .map(|checkpoint| (event_id, checkpoint)))
 }
 
+/// Id of the newest `TurnEnded` event, or `None` on a conversation with no
+/// completed turn.
+///
+/// This is the whole of what a cut point depends on: `select_cut_point` only
+/// ever cuts at a turn boundary, so while no new one appears, re-scanning can
+/// only reach the same answer. One bounded `desc limit 1` query, the same shape
+/// as `read_active_checkpoint`.
+pub(crate) async fn read_latest_turn_ended(
+    conversation: &dyn ConversationHandle,
+) -> Result<Option<EventId>> {
+    let result = conversation
+        .get_events(Some(EventQuery {
+            cursor: None,
+            direction: Some(EventQueryDirection::Desc),
+            limit: Some(1),
+            session_id: None,
+            turn_id: None,
+            types: Some(vec![EventKind::TURN_ENDED]),
+        }))
+        .await?;
+    Ok(result.events.first().map(|event| event.id))
+}
+
+/// Tracks whether compaction is worth re-attempting within a turn.
+///
+/// The point of a latch here is cost: a second attempt re-scans the log and can
+/// re-run the summarizer, which is real money on a long tool loop. The original
+/// version latched permanently on the first attempt, justified by "no new
+/// `turn_ended` appears while a turn is in flight" — which is the premise turns
+/// being unserialized makes false. Other turns finish while this one loops, and
+/// an attempt that skipped because there were not yet enough completed turns to
+/// cut would then suppress every later check in the turn, while the prompt kept
+/// growing toward the limit.
+///
+/// So the latch records *why* re-attempting would be pointless rather than
+/// asserting it: the newest turn boundary at the last attempt. A new one means
+/// the cut point may have moved and it is worth another look; the same one means
+/// it cannot have.
+#[derive(Debug, Default)]
+pub(crate) struct CompactionLatch {
+    attempted_at: Option<Option<EventId>>,
+}
+
+impl CompactionLatch {
+    /// True when nothing that could change the cut point has happened since the
+    /// last attempt in this turn.
+    pub(crate) fn is_settled(&self, latest_turn_ended: Option<EventId>) -> bool {
+        self.attempted_at == Some(latest_turn_ended)
+    }
+
+    pub(crate) fn mark_attempted(&mut self, latest_turn_ended: Option<EventId>) {
+        self.attempted_at = Some(latest_turn_ended);
+    }
+}
+
 /// Summary text for a checkpoint, or `None` if it cannot be had — whether the
 /// artifact is missing or the store refused to hand it over.
 ///
@@ -1466,6 +1521,37 @@ mod tests {
         assert_eq!(total.ascii_bytes, 3);
         assert_eq!(total.other_bytes, 3);
         assert_eq!(total.bytes(), 6);
+    }
+
+    #[test]
+    fn the_latch_reopens_when_a_concurrent_turn_finishes() {
+        let boundary = Uuid7::now();
+        let mut latch = CompactionLatch::default();
+
+        // Nothing attempted yet: never settled, whatever the log looks like.
+        assert!(!latch.is_settled(Some(boundary)));
+        assert!(!latch.is_settled(None));
+
+        latch.mark_attempted(Some(boundary));
+        // Same boundary: a re-scan can only reach the same answer, and
+        // re-summarizing for it is real money on a long tool loop.
+        assert!(latch.is_settled(Some(boundary)));
+
+        // Turns are not serialized, so other turns complete while this one
+        // loops. An attempt that skipped for want of completed turns must not
+        // suppress every later check — that is how a growing tool loop reaches
+        // the provider limit with compaction enabled and idle.
+        assert!(!latch.is_settled(Some(Uuid7::now())));
+    }
+
+    #[test]
+    fn the_latch_treats_the_first_boundary_as_a_change() {
+        // A conversation with no completed turn reports `None`; the first
+        // `TurnEnded` to land is exactly what makes a cut possible at all.
+        let mut latch = CompactionLatch::default();
+        latch.mark_attempted(None);
+        assert!(latch.is_settled(None));
+        assert!(!latch.is_settled(Some(Uuid7::now())));
     }
 
     #[test]

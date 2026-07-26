@@ -4,6 +4,7 @@ import { COMPACTION_CHECKPOINT_EVENT, checkpointToPayload } from "./compaction";
 import {
   PromptHistoryCache,
   materializeConversationMessages,
+  materializePromptHistory,
   materializePromptMessages,
   readActiveCheckpoint,
   type ArtifactVersion,
@@ -170,18 +171,47 @@ function texts(messages: Message[]): string[] {
 
 // --- tests -------------------------------------------------------------------
 
-describe("materializeConversationMessages without a checkpoint", () => {
+describe("materializeConversationMessages", () => {
+  it("returns the whole log even when a checkpoint exists", async () => {
+    // Not a prompt builder. Its callers are the ones where compaction buys
+    // nothing: the RLM harness loads this into the JS REPL's out-of-band
+    // `context`, which never enters the model's input window, and anything
+    // answering "what is in this conversation" needs the complete answer.
+    // Handing those a summary trades precision away for no saving at all.
+    const older = turn("ancient");
+    const stub = new StubConversation({
+      events: [
+        ...older,
+        checkpointEvent({
+          upToEventId: older.at(-1)!.id,
+          artifactId: artifactId(1),
+        }),
+        ...turn("recent"),
+      ],
+      artifacts: new Map([[artifactId(1), "SUMMARY OF EARLIER"]]),
+    });
+
+    const rendered = texts(
+      await materializeConversationMessages(asConversation(stub)),
+    );
+    expect(rendered).toContain("ancient");
+    expect(rendered).toContain("recent");
+    expect(rendered.join("\n")).not.toContain("SUMMARY OF EARLIER");
+    // Nor should it have gone looking for the artifact.
+    expect(stub.artifactReads).toEqual([]);
+  });
+});
+
+describe("materializePromptHistory without a checkpoint", () => {
   it("returns the full history, exactly as before", async () => {
     const events = [...turn("one"), ...turn("two")];
     const stub = new StubConversation({ events });
-    const messages = await materializeConversationMessages(
-      asConversation(stub),
-    );
+    const messages = await materializePromptHistory(asConversation(stub));
     expect(texts(messages)).toEqual(["one", "two"]);
   });
 });
 
-describe("materializeConversationMessages with a checkpoint", () => {
+describe("materializePromptHistory with a checkpoint", () => {
   it("replaces compacted history with the summary and keeps the tail", async () => {
     const older = [...turn("ancient"), ...turn("old")];
     const cut = older.at(-1)!;
@@ -195,9 +225,7 @@ describe("materializeConversationMessages with a checkpoint", () => {
       artifacts: new Map([[artifactId(1), "SUMMARY: the user likes tea"]]),
     });
 
-    const messages = await materializeConversationMessages(
-      asConversation(stub),
-    );
+    const messages = await materializePromptHistory(asConversation(stub));
     const rendered = texts(messages);
 
     expect(
@@ -220,7 +248,7 @@ describe("materializeConversationMessages with a checkpoint", () => {
     });
 
     const rendered = texts(
-      await materializeConversationMessages(asConversation(stub)),
+      await materializePromptHistory(asConversation(stub)),
     );
     const summaryIndex = rendered.findIndex((t) => t.includes("SUMMARY"));
     const tailIndex = rendered.indexOf("recent");
@@ -239,7 +267,7 @@ describe("materializeConversationMessages with a checkpoint", () => {
       artifacts: new Map([[artifactId(1), "SUMMARY"]]),
     });
 
-    await materializeConversationMessages(asConversation(stub));
+    await materializePromptHistory(asConversation(stub));
 
     // The history scan must carry the checkpoint's cursor. Without it the
     // prompt would shrink but the read would still be O(whole log).
@@ -264,7 +292,7 @@ describe("materializeConversationMessages with a checkpoint", () => {
     });
 
     // listArtifacts() throws in the stub; reaching it is the failure.
-    await materializeConversationMessages(asConversation(stub));
+    await materializePromptHistory(asConversation(stub));
     expect(stub.artifactReads).toEqual([artifactId(7)]);
   });
 
@@ -285,7 +313,7 @@ describe("materializeConversationMessages with a checkpoint", () => {
     });
 
     const rendered = texts(
-      await materializeConversationMessages(asConversation(stub)),
+      await materializePromptHistory(asConversation(stub)),
     );
     expect(rendered).toContain("ancient");
     expect(rendered).toContain("recent");
@@ -312,7 +340,7 @@ describe("materializeConversationMessages with a checkpoint", () => {
     stub.failArtifactReads = true;
 
     const rendered = texts(
-      await materializeConversationMessages(asConversation(stub)),
+      await materializePromptHistory(asConversation(stub)),
     );
     expect(rendered).toContain("ancient");
     expect(rendered).toContain("recent");
@@ -345,7 +373,7 @@ describe("materializeConversationMessages with a checkpoint", () => {
     });
 
     const rendered = texts(
-      await materializeConversationMessages(asConversation(stub)),
+      await materializePromptHistory(asConversation(stub)),
     );
     expect(rendered.some((t) => t.includes("NEW SUMMARY"))).toBe(true);
     expect(rendered.some((t) => t.includes("OLD SUMMARY"))).toBe(false);
@@ -401,7 +429,7 @@ describe("PromptHistoryCache", () => {
     const cachedMessages = await cached.materialize(
       asConversation(new StubConversation({ events })),
     );
-    const direct = await materializeConversationMessages(
+    const direct = await materializePromptHistory(
       asConversation(new StubConversation({ events })),
     );
     expect(cachedMessages).toEqual(direct);

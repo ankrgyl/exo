@@ -15,7 +15,7 @@ import {
   appendCustomEvent,
   assistantTextMessage,
   defineHarness,
-  materializeConversationMessages,
+  materializePromptHistory,
   messageText,
   messagesEvent,
   messagesToTranscript,
@@ -418,7 +418,9 @@ async function materializeClaudePromptMessages(
   context: TurnContext,
   systemPrompt: string | null,
 ): Promise<Message[]> {
-  const messages = await materializeConversationMessages(
+  // The prompt path, so the checkpoint applies — unlike the RLM harness, this
+  // history goes straight into the model's input window.
+  const messages = await materializePromptHistory(
     context.exoharness.current.conversation,
   );
   const promptMessages = messages.filter(

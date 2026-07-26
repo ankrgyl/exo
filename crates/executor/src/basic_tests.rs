@@ -28,7 +28,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::compaction::{
     COMPACTION_CHECKPOINT_EVENT, COMPACTION_FAILED_EVENT, CompactionCheckpoint, CompactionConfig,
-    CompactionOutcome, PromptSize, SummarizeInput, prompt_size, run_compaction,
+    CompactionLatch, CompactionOutcome, PromptSize, SummarizeInput, prompt_size, run_compaction,
 };
 use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor};
 use crate::*;
@@ -1984,7 +1984,7 @@ async fn the_summarizer_call_carries_model_credentials() {
                 round: 0,
                 turn_trace: None,
             },
-            &mut false,
+            &mut CompactionLatch::default(),
         )
         .await;
 
@@ -2051,7 +2051,7 @@ async fn summarizer_usage_names_the_model_even_when_the_provider_does_not() {
                 round: 0,
                 turn_trace: None,
             },
-            &mut false,
+            &mut CompactionLatch::default(),
         )
         .await;
     turn.finish().await.expect("finish turn");
@@ -2087,7 +2087,7 @@ async fn compaction_is_attempted_at_most_once_per_turn() {
         ..default_agent_config()
     };
 
-    let mut attempted = false;
+    let mut latch = CompactionLatch::default();
     for _ in 0..5 {
         executor
             .maybe_compact(
@@ -2106,7 +2106,7 @@ async fn compaction_is_attempted_at_most_once_per_turn() {
                     round: 0,
                     turn_trace: None,
                 },
-                &mut attempted,
+                &mut latch,
             )
             .await;
     }
@@ -2633,7 +2633,7 @@ async fn summarizer_usage_is_recorded_without_entering_the_prompt() {
     let executor = BasicExecutor::new(model, Arc::new(FakeToolRuntime::default()));
 
     let turn = open_turn(conversation.as_ref()).await;
-    let mut attempted = false;
+    let mut latch = CompactionLatch::default();
     executor
         .maybe_compact(
             conversation.as_ref(),
@@ -2656,7 +2656,7 @@ async fn summarizer_usage_is_recorded_without_entering_the_prompt() {
                 round: 0,
                 turn_trace: None,
             },
-            &mut attempted,
+            &mut latch,
         )
         .await;
     turn.finish().await.expect("finish turn");

@@ -855,24 +855,50 @@ describe("CompactionGate", () => {
     maxInputTokens: 100_000,
     materializedChars: 0,
   };
+  const boundary = eventId(1);
 
   it("allows the first attempt when the threshold is crossed", () => {
-    expect(new CompactionGate().shouldAttempt(args)).toBe(true);
+    expect(new CompactionGate().shouldAttempt(args, boundary)).toBe(true);
   });
 
-  it("allows nothing once an attempt has been made", () => {
-    // Within one turn no new turn_ended event appears, so the cut point cannot
-    // change: a second attempt would re-scan and re-summarize for the same
-    // answer. Retrying every round of a long tool loop is real money.
+  it("allows nothing more while the newest turn boundary is unchanged", () => {
+    // A second attempt against the same boundary re-scans and re-summarizes for
+    // the same answer. Retrying every round of a long tool loop is real money.
     const gate = new CompactionGate();
-    expect(gate.shouldAttempt(args)).toBe(true);
-    gate.markAttempted();
-    expect(gate.shouldAttempt(args)).toBe(false);
-    expect(gate.shouldAttempt(args)).toBe(false);
+    expect(gate.shouldAttempt(args, boundary)).toBe(true);
+    gate.markAttempted(boundary);
+    expect(gate.shouldAttempt(args, boundary)).toBe(false);
+    expect(gate.shouldAttempt(args, boundary)).toBe(false);
+  });
+
+  it("allows another attempt once a concurrent turn finishes", () => {
+    // Turns are not serialized, so other turns complete while this one loops.
+    // An attempt that skipped for want of completed turns must not suppress
+    // every later check — that is how a growing tool loop reaches the provider
+    // limit with compaction enabled and idle.
+    const gate = new CompactionGate();
+    expect(gate.shouldAttempt(args, boundary)).toBe(true);
+    gate.markAttempted(boundary);
+    expect(gate.shouldAttempt(args, boundary)).toBe(false);
+
+    const newerBoundary = eventId(2);
+    expect(gate.shouldAttempt(args, newerBoundary)).toBe(true);
+  });
+
+  it("treats the first boundary appearing as a change worth re-checking", () => {
+    // A conversation with no completed turn yet reports null; the first
+    // `turn_ended` to land is exactly what makes a cut possible.
+    const gate = new CompactionGate();
+    expect(gate.shouldAttempt(args, null)).toBe(true);
+    gate.markAttempted(null);
+    expect(gate.shouldAttempt(args, null)).toBe(false);
+    expect(gate.shouldAttempt(args, boundary)).toBe(true);
   });
 
   it("still respects the threshold before the first attempt", () => {
     const gate = new CompactionGate();
-    expect(gate.shouldAttempt({ ...args, promptTokens: 10_000 })).toBe(false);
+    expect(
+      gate.shouldAttempt({ ...args, promptTokens: 10_000 }, boundary),
+    ).toBe(false);
   });
 });
