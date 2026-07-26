@@ -30,6 +30,30 @@ Finding the active checkpoint is one bounded query
 the checkpoint carries the artifact id so reading the summary is a direct fetch
 rather than a `listArtifacts` scan.
 
+### The wire format is a custom-event envelope
+
+A checkpoint travels as `{type: "custom", event_type: "exo.compaction.v1",
+payload: {...}}`. That envelope is not cosmetic: `Custom` is the only extensible
+variant of Rust's `EventData` enum, which is `#[serde(tag = "type")]`, so a
+flattened `{type: "exo.compaction.v1", ...}` is rejected as an unknown variant.
+Querying by `event_type` works because a custom event's kind _is_ its
+`event_type` (`EventData::kind()`).
+
+TypeScript cannot catch a mistake here at compile time — its `EventData` is
+`{type: string} & Record<string, unknown>` — and each runtime's own tests will
+happily agree with whatever shape that runtime writes. So the format is pinned
+by a golden fixture that _both_ test suites parse:
+[`tests/fixtures/compaction-checkpoint.json`](../../tests/fixtures/compaction-checkpoint.json).
+
+Two payload fields store event ids, and both are cursors rather than data:
+`up_to_event_id` (the cut boundary) and `previous_checkpoint_id` (the previous
+checkpoint _event's_ id, which makes the chain traversable — storing the previous
+cut boundary there would name an ordinary `turn_ended` event). Because forking
+renumbers every event it copies, `EventData::remap_event_ids` rewrites both while
+the fork is being written; otherwise a forked checkpoint points into the source
+conversation, and since the regenerated ids all sort _after_ the stale cursor,
+the fork replays its entire history _and_ prepends the summary.
+
 ## Where cuts are allowed
 
 **Cuts land only on `turn_ended` boundaries.** This is the load-bearing
@@ -55,21 +79,52 @@ Mutating the cut point to land mid-round makes it fail.
 
 ## When compaction triggers
 
-The provider already tells us how large the prompt was: `prompt_tokens` on the
-response usage, which the harness records on every `messages` event. Compare it
-against the model's `max_input_tokens`, which is already present in the LiteLLM
-data the cost table downloads:
+The provider already tells us how large the prompt was, so no client-side
+tokenizer is needed. Compare occupancy against the model's `max_input_tokens`,
+which is already present in the LiteLLM data the cost table downloads:
 
 ```
-prompt_tokens > thresholdRatio * max_input_tokens   → compact
+inputOccupancy > thresholdRatio * max_input_tokens   → compact
 ```
 
-No client-side tokenizer, and the number reflects what the provider actually
-counted. When either value is unavailable — the price table is fetched over the
-network and is explicitly best-effort — a character budget stands in.
+**Occupancy is not `prompt_tokens`.** For Anthropic-family providers that number
+counts only the _fresh_ slice; cache reads and cache writes are reported
+separately and billed additively — the same asymmetry `computeCostUsd` already
+handles via `isAdditive()`. A 195k-token prompt that is 185k cache hits reports
+`prompt_tokens ≈ 5000`, so a threshold check against the fresh slice alone would
+sit at 2.5% of a 200k window and never fire — on precisely the workload
+compaction exists for. `inputOccupancy` reuses `isAdditive()` to add the cache
+fields back for those providers, and trusts `prompt_tokens` for the inclusive
+ones (where adding them would double-count).
 
-Compaction runs _between rounds_, not at turn start, so a single runaway turn
-can bring its own prompt back under the limit.
+When either value is unavailable — the price table is fetched over the network
+and is explicitly best-effort — a character budget stands in.
+
+### Two triggers, and why both are needed
+
+**After each round**, from the provider's own counts. This is the accurate one,
+and it runs between rounds rather than at turn start so a single runaway turn can
+bring its own prompt back under the limit.
+
+**Before each request**, from a character estimate of the assembled prompt. This
+one exists because the post-response trigger cannot fire on the case that matters
+most: a prompt already past the hard limit is _rejected_, and that error leaves
+the turn before any compaction runs. The next turn replays the same oversized
+history and fails identically — an absorbing state that no retry escapes. The
+character estimate is deliberately pessimistic (3 chars/token) because the two
+errors are asymmetric: compacting slightly early costs one summarizer call, while
+failing to fire costs the conversation.
+
+Both share a once-per-turn latch. No new `turn_ended` appears mid-turn, so the
+cut point cannot change within a turn; a second attempt would re-scan the log and
+re-run the summarizer for the same answer.
+
+### RLM
+
+The RLM executor materializes the whole conversation once and bakes it into a
+single root prompt, then loops over tool rounds without re-reading the log. There
+is no between-rounds moment where a smaller prompt would help, so it compacts in
+one place only: before that context is captured.
 
 ## Summaries
 
@@ -101,6 +156,18 @@ and put nothing in its place, which is strictly worse than a large prompt. A
 checkpoint whose artifact has vanished falls back to full history for the same
 reason.
 
+That fallback is also why an unreadable summary **stops the chain**. Compacting
+from a broken checkpoint's boundary would summarize only the tail and then write
+a perfectly readable checkpoint over it — disarming the fallback and dropping
+everything before the break from the prompt for good. Instead, compaction
+rebuilds from the start of the log: one larger summarizer call, nothing lost.
+
+The summarizer is a real, billable call, so its usage is recorded — on a
+`messages` event, which is where this repo's cost aggregation looks. The message
+list is empty on purpose: history materialization folds these events into the
+prompt, so carrying the summarizer's reply there would inject it back into the
+context compaction just shrank.
+
 ## Caching
 
 `BasicExecutor` keeps an incremental history cache, and the TypeScript turn loop
@@ -112,6 +179,15 @@ O(rounds × events).
 cache holds; a stale cache would keep serving pre-compaction history from memory,
 the prompt would never shrink, and nothing would error. Both implementations have
 a test for this, and stubbing out the invalidation makes it fail.
+
+Invalidation alone is not sufficient, because turns on one conversation are not
+serialized. A turn that read a pre-checkpoint entry and then blocked in
+`getEvents` would, on resuming, write its stale snapshot back _over_ the
+invalidation — and that entry carries its own cursor and `summary: None`, so
+every later prompt keeps replaying the compacted prefix indefinitely. The Rust
+cache therefore carries a generation counter, bumped on every invalidation and
+re-checked before publishing: a read that started in an older generation drops
+its result instead of republishing it.
 
 The TypeScript cache holds raw _events_ and re-folds them each round rather than
 caching derived messages. The fold is cheap and the fetch is what hurts, and it

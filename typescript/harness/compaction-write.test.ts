@@ -55,7 +55,13 @@ class StubTarget {
     let events = [...this.events];
     if (query?.types) {
       const types = new Set(query.types);
-      events = events.filter((e) => types.has(e.data.type));
+      // A custom event is queryable by its `event_type`, not by the literal
+      // "custom" — mirroring `EventData::kind()` in the Rust harness.
+      events = events.filter((e) =>
+        types.has(
+          e.data.type === "custom" ? String(e.data.event_type) : e.data.type,
+        ),
+      );
     }
     if (query?.direction === "desc") {
       events.reverse();
@@ -129,8 +135,21 @@ function args(stub: StubTarget, overrides: Record<string, unknown> = {}) {
   } as Parameters<typeof runCompaction>[0];
 }
 
+/**
+ * Checkpoints as they were actually appended. Matching on the custom-event
+ * envelope rather than a flattened `type` is the point: a writer that emits
+ * `{type: "exo.compaction.v1", ...}` is rejected by the Rust harness, so a
+ * helper that accepted that shape would hide the failure it exists to catch.
+ */
 function checkpointEvents(stub: StubTarget): EventData[] {
-  return stub.appended.filter((d) => d.type === COMPACTION_CHECKPOINT_EVENT);
+  return stub.appended.filter(
+    (d) => d.type === "custom" && d.event_type === COMPACTION_CHECKPOINT_EVENT,
+  );
+}
+
+/** The decoded payload of a checkpoint event. */
+function checkpointPayload(data: EventData): Record<string, unknown> {
+  return data.payload as Record<string, unknown>;
 }
 
 // --- tests -------------------------------------------------------------------
@@ -146,10 +165,11 @@ describe("runCompaction", () => {
 
     const checkpoints = checkpointEvents(stub);
     expect(checkpoints).toHaveLength(1);
-    expect(checkpoints[0].artifact_id).toBe("art-1");
-    expect(checkpoints[0].artifact_path).toBe(stub.written[0].path);
-    expect(checkpoints[0].model).toBe("test-model");
-    expect(checkpoints[0].prompt_tokens_before).toBe(123);
+    const payload = checkpointPayload(checkpoints[0]);
+    expect(payload.artifact_id).toBe("art-1");
+    expect(payload.artifact_path).toBe(stub.written[0].path);
+    expect(payload.model).toBe("test-model");
+    expect(payload.prompt_tokens_before).toBe(123);
   });
 
   it("does nothing when the conversation is too short to cut safely", async () => {
@@ -181,10 +201,11 @@ describe("runCompaction", () => {
     // would silently lose everything before the first checkpoint.
     expect(seen[0]).toBe("SUMMARY OF EVERYTHING");
     const checkpoints = checkpointEvents(stub);
-    expect(checkpoints[0].previous_checkpoint_id).not.toBeNull();
+    const payload = checkpointPayload(checkpoints[0]);
+    expect(payload.previous_checkpoint_id).not.toBeNull();
     // The count is what the agent is shown to judge how much history it is
     // missing, so it has to cover the whole chain, not just this pass.
-    expect(Number(checkpoints[0].compacted_event_count)).toBeGreaterThan(4);
+    expect(Number(payload.compacted_event_count)).toBeGreaterThan(4);
   });
 
   it("caps an oversized summary rather than trusting the model", async () => {
@@ -212,10 +233,12 @@ describe("runCompaction", () => {
     expect(checkpointEvents(stub)).toHaveLength(0);
     // The failure is recorded so the agent can see why its prompt is still big.
     const failures = stub.appended.filter(
-      (d) => d.type === COMPACTION_FAILED_EVENT,
+      (d) => d.type === "custom" && d.event_type === COMPACTION_FAILED_EVENT,
     );
     expect(failures).toHaveLength(1);
-    expect(String(failures[0].error)).toContain("model unavailable");
+    expect(String(checkpointPayload(failures[0]).error)).toContain(
+      "model unavailable",
+    );
   });
 
   it("never fails the turn when the artifact write throws", async () => {

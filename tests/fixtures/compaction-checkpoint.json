@@ -1,0 +1,15 @@
+{
+  "type": "custom",
+  "event_type": "exo.compaction.v1",
+  "payload": {
+    "up_to_event_id": "01920000-0000-7000-8000-000000000001",
+    "artifact_id": "01920000-0000-7000-8000-0000000000a1",
+    "artifact_path": "compaction/01920000-0000-7000-8000-00000000000c/summary.md",
+    "artifact_version": 3,
+    "previous_checkpoint_id": "01920000-0000-7000-8000-000000000002",
+    "compacted_event_count": 412,
+    "summary_chars": 6120,
+    "prompt_tokens_before": 148000,
+    "model": "claude-sonnet-4-5"
+  }
+}

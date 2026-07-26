@@ -7,8 +7,9 @@ import {
 } from "./compaction";
 
 // Compaction is part of the harness's public surface: executors trigger it and
-// agent tools inspect it. `compaction.ts` imports only types from here, so the
-// cycle is erased at compile time.
+// agent tools inspect it. The two modules import from each other; the cycle is
+// fine because every cross-module use is a hoisted function or a type, never a
+// value read at module-evaluation time.
 export * from "./compaction";
 
 export type JsonPrimitive = string | number | boolean | null;
@@ -612,13 +613,28 @@ export const HISTORY_EVENT_TYPES = [
 export async function readActiveCheckpoint(
   conversation: Conversation,
 ): Promise<CompactionCheckpoint | null> {
+  return (await readActiveCheckpointEvent(conversation))?.checkpoint ?? null;
+}
+
+/**
+ * The newest checkpoint together with the id of the event carrying it.
+ *
+ * The event id matters because `previousCheckpointId` has to record it to make
+ * the chain traversable — the payload itself only knows its cut boundary, which
+ * is an ordinary `turn_ended` event.
+ */
+export async function readActiveCheckpointEvent(
+  conversation: Conversation,
+): Promise<{ eventId: string; checkpoint: CompactionCheckpoint } | null> {
   const result = await conversation.getEvents({
     direction: "desc",
     limit: 1,
     types: [COMPACTION_CHECKPOINT_EVENT],
   });
   const event = result.events[0];
-  return event ? checkpointFromEvent(event.data) : null;
+  if (!event) return null;
+  const checkpoint = checkpointFromEvent(event.data);
+  return checkpoint ? { eventId: event.id, checkpoint } : null;
 }
 
 /**

@@ -45,7 +45,7 @@ class StubConversation {
     let events = [...this.events];
     if (query?.types) {
       const types = new Set(query.types);
-      events = events.filter((event) => types.has(event.data.type));
+      events = events.filter((event) => types.has(eventKind(event)));
     }
     if (query?.direction === "desc") {
       events.reverse();
@@ -81,6 +81,18 @@ function asConversation(stub: StubConversation): Conversation {
   return stub as unknown as Conversation;
 }
 
+/**
+ * The kind an event is queryable by. A custom event's kind is its `event_type`,
+ * not the literal `"custom"` — mirroring `EventData::kind()` in
+ * `crates/exoharness/src/types.rs`. Filtering on `data.type` instead would make
+ * the stub disagree with the real harness and let a broken read path pass.
+ */
+function eventKind(event: Event): string {
+  return event.data.type === "custom"
+    ? String(event.data.event_type)
+    : event.data.type;
+}
+
 // --- event builders ----------------------------------------------------------
 
 let nextId = 0;
@@ -106,8 +118,12 @@ function checkpointEvent(args: {
   upToEventId: string;
   artifactId: string;
 }): Event {
-  return event(COMPACTION_CHECKPOINT_EVENT, {
-    ...checkpointToPayload({
+  // The real custom-event envelope: `{type: "custom", event_type, payload}`.
+  // Building a flattened event here would make these tests agree with a writer
+  // that the Rust harness rejects.
+  return event("custom", {
+    event_type: COMPACTION_CHECKPOINT_EVENT,
+    payload: checkpointToPayload({
       upToEventId: args.upToEventId,
       artifactId: args.artifactId,
       artifactPath: "compaction/conv-1/1.md",
@@ -207,7 +223,7 @@ describe("materializeConversationMessages with a checkpoint", () => {
     const historyQuery = stub.queries.find((q) =>
       q.types?.includes("messages"),
     );
-    expect(historyQuery?.cursor).toBe(checkpoint.data.up_to_event_id);
+    expect(historyQuery?.cursor).toBe(older.at(-1)!.id);
   });
 
   it("resolves the summary by artifact id, not by listing artifacts", async () => {

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use anyhow::anyhow;
 use exoharness::{
     ConversationHandle, Event, EventData, EventId, EventKind, EventQuery, EventQueryDirection,
-    ReadArtifactRequest, Result, TurnHandle, WriteArtifactRequest,
+    ReadArtifactRequest, Result, TurnHandle, UsageRecord, WriteArtifactRequest,
 };
 use futures::future::BoxFuture;
 use lingua::Message;
@@ -24,7 +24,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::basic::extend_message_history;
 
-pub(crate) const COMPACTION_CHECKPOINT_EVENT: &str = "exo.compaction.v1";
+// Re-exported from exoharness, which owns it because forking has to remap the
+// event ids this payload stores as cursors.
+pub(crate) use exoharness::COMPACTION_CHECKPOINT_EVENT;
+
 pub(crate) const COMPACTION_FAILED_EVENT: &str = "exo.compaction.failed.v1";
 
 /// Marker appended when compaction runs, pointing at the summary artifact.
@@ -175,6 +178,57 @@ pub(crate) fn should_compact(
     materialized_chars > config.fallback_char_budget
 }
 
+/// Characters per token assumed when estimating a prompt's size without a
+/// tokenizer.
+///
+/// Deliberately low. English averages nearer four, but agent prompts are dense
+/// with JSON and code, and the two errors are not symmetric: over-estimating
+/// compacts a little earlier than strictly necessary, while under-estimating
+/// lets a prompt reach the provider's hard limit — and that failure is
+/// self-perpetuating, because the rejection happens before anything can shrink
+/// the history that caused it.
+const ESTIMATED_CHARS_PER_TOKEN: u64 = 3;
+
+/// Record what a summarizer call cost, without putting its text in the prompt.
+///
+/// Compaction makes a real, billable model call. Discarding its usage makes a
+/// conversation's spend totals understate reality by exactly the cost of keeping
+/// itself compact — and repeated compactions compound that.
+///
+/// The usage rides on a `Messages` event because that is where this repo's cost
+/// aggregation looks (the TUI and the `list_conversation_events` tool both sum
+/// `usage.cost_usd` over `messages` events). The message list is deliberately
+/// empty: history materialization folds these events into the prompt, so
+/// carrying the summarizer's own reply here would inject it into the very
+/// context compaction just shrank.
+pub(crate) async fn record_summarizer_usage(
+    turn: &dyn TurnHandle,
+    usage: Option<Box<UsageRecord>>,
+) {
+    let Some(usage) = usage else {
+        return;
+    };
+    if let Err(error) = turn
+        .add_events(vec![EventData::Messages {
+            messages: Vec::new(),
+            response_id: None,
+            usage: Some(usage),
+        }])
+        .await
+    {
+        // Accounting is not worth failing a turn over.
+        tracing::warn!(%error, "could not record summarizer usage");
+    }
+}
+
+/// Rough token count for a prompt of `chars` characters.
+///
+/// Only for the pre-request trigger, which has no provider-reported count to
+/// work from. Once a response comes back, its usage is exact and preferred.
+pub(crate) fn estimated_tokens_from_chars(chars: u64) -> u64 {
+    chars.div_ceil(ESTIMATED_CHARS_PER_TOKEN)
+}
+
 /// Enforce the summary ceiling. Chained compaction feeds each summary back into
 /// the next one, so without a hard cap the summary itself grows without bound —
 /// the classic way this design rots. Truncation is deliberately blunt: the model
@@ -264,17 +318,37 @@ async fn compact(
     prompt_tokens_before: Option<u64>,
     summarize: &Summarizer<'_>,
 ) -> Result<CompactionOutcome> {
-    let previous = read_active_checkpoint(conversation).await?;
-    let previous_summary = match &previous {
-        Some(previous) => read_summary(conversation, previous).await?,
+    let existing = read_active_checkpoint(conversation).await?;
+    let previous_summary = match &existing {
+        Some((_, checkpoint)) => read_summary(conversation, checkpoint).await?,
         None => None,
+    };
+
+    // A checkpoint whose summary artifact cannot be read must not be chained
+    // off. Scanning from its boundary would summarize only the tail, and the new
+    // checkpoint would be perfectly readable — which disarms the read path's
+    // safety net, where a missing artifact currently falls back to replaying the
+    // full log. Everything before the broken checkpoint would then be gone from
+    // the prompt for good. Rebuilding from the start of the log costs one larger
+    // summarizer call and loses nothing.
+    let previous = match (&existing, &previous_summary) {
+        (Some(_), None) => {
+            tracing::warn!(
+                conversation_id = %conversation.record().id,
+                "compaction: previous summary is unreadable; rebuilding from the start of the log"
+            );
+            None
+        }
+        _ => existing,
     };
 
     // Only look at events after the last checkpoint: everything before it is
     // already represented by `previous_summary`.
     let scan = conversation
         .get_events(Some(EventQuery {
-            cursor: previous.as_ref().map(|previous| previous.up_to_event_id),
+            cursor: previous
+                .as_ref()
+                .map(|(_, checkpoint)| checkpoint.up_to_event_id),
             direction: Some(EventQueryDirection::Asc),
             limit: None,
             session_id: None,
@@ -354,9 +428,12 @@ async fn compact(
         // would understate it on every compaction after the first.
         compacted_event_count: previous
             .as_ref()
-            .map_or(0, |previous| previous.compacted_event_count)
+            .map_or(0, |(_, checkpoint)| checkpoint.compacted_event_count)
             + cut.compacted_event_count,
-        previous_checkpoint_id: previous.map(|previous| previous.up_to_event_id),
+        // The previous *checkpoint event's* own id, not its cut boundary. The
+        // boundary names an ordinary `turn_ended` event, so storing it here
+        // makes the chain untraversable from the second compaction onward.
+        previous_checkpoint_id: previous.map(|(event_id, _)| event_id),
         summary_chars: summary.chars().count() as u64,
         prompt_tokens_before,
         model: model.to_string(),
@@ -371,11 +448,16 @@ async fn compact(
     })
 }
 
-/// The newest checkpoint, or `None` if this conversation was never compacted.
-/// One bounded `desc` query rather than a scan of the whole log.
+/// The newest checkpoint and the id of the event carrying it, or `None` if this
+/// conversation was never compacted. One bounded `desc` query rather than a scan
+/// of the whole log.
+///
+/// The event id is returned alongside because `previous_checkpoint_id` has to
+/// record it to make the chain traversable; the payload itself only knows its
+/// cut boundary, which is an ordinary `turn_ended` event.
 pub(crate) async fn read_active_checkpoint(
     conversation: &dyn ConversationHandle,
-) -> Result<Option<CompactionCheckpoint>> {
+) -> Result<Option<(EventId, CompactionCheckpoint)>> {
     let result = conversation
         .get_events(Some(EventQuery {
             cursor: None,
@@ -389,12 +471,15 @@ pub(crate) async fn read_active_checkpoint(
     let Some(event) = result.events.into_iter().next() else {
         return Ok(None);
     };
+    let event_id = event.id;
     let EventData::Custom { payload, .. } = event.data else {
         return Ok(None);
     };
     // A malformed checkpoint is treated as absent: falling back to full history
     // is safe, whereas half-reading one would assemble a prompt with a hole.
-    Ok(serde_json::from_value(payload).ok())
+    Ok(serde_json::from_value(payload)
+        .ok()
+        .map(|checkpoint| (event_id, checkpoint)))
 }
 
 /// Summary text for a checkpoint, or `None` if the artifact has gone missing.
@@ -488,6 +573,51 @@ mod tests {
     use crate::harness_helpers::user_message;
     use exoharness::{ToolRequest, Uuid7};
     use serde_json::{Map, json};
+
+    /// The same bytes the TypeScript suite decodes. Both runtimes must agree on
+    /// this envelope; see `tests/fixtures/README.md` for why it is a file rather
+    /// than a literal in either language's tests.
+    const CHECKPOINT_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compaction-checkpoint.json"
+    ));
+
+    #[test]
+    fn shared_fixture_decodes_through_the_custom_event_envelope() {
+        // Deserializing as `EventData` is the half that matters: a flattened
+        // `{"type": "exo.compaction.v1", ...}` is an unknown enum variant and
+        // fails here, which is exactly how the TypeScript writer's checkpoints
+        // were being rejected after their summary artifact had been written.
+        let data: EventData =
+            serde_json::from_str(CHECKPOINT_FIXTURE).expect("fixture is a valid EventData");
+        let EventData::Custom {
+            event_type,
+            payload,
+        } = data
+        else {
+            panic!("fixture must decode as a custom event");
+        };
+        assert_eq!(event_type, COMPACTION_CHECKPOINT_EVENT);
+
+        let checkpoint: CompactionCheckpoint =
+            serde_json::from_value(payload).expect("payload is a valid checkpoint");
+        assert_eq!(
+            checkpoint.up_to_event_id.to_string(),
+            "01920000-0000-7000-8000-000000000001"
+        );
+        assert_eq!(checkpoint.artifact_version, 3);
+        assert_eq!(checkpoint.compacted_event_count, 412);
+        assert_eq!(checkpoint.summary_chars, 6120);
+        assert_eq!(checkpoint.prompt_tokens_before, Some(148_000));
+        assert_eq!(checkpoint.model, "claude-sonnet-4-5");
+        assert_eq!(
+            checkpoint
+                .previous_checkpoint_id
+                .expect("fixture chains to a previous checkpoint")
+                .to_string(),
+            "01920000-0000-7000-8000-000000000002"
+        );
+    }
 
     fn event(data: EventData) -> Event {
         Event {

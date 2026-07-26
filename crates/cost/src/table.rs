@@ -92,6 +92,31 @@ impl PricingTable {
             .filter(|limit| *limit > 0)
     }
 
+    /// Total tokens occupying the model's input window for one call — the number
+    /// to compare against `max_input_tokens`.
+    ///
+    /// This is *not* always `prompt_tokens`. For Anthropic-family providers that
+    /// number counts only the fresh slice, with cache reads and cache writes
+    /// reported separately and billed additively (the same asymmetry
+    /// `compute_cost_usd` handles). Comparing the fresh slice alone against the
+    /// context limit understates occupancy by exactly the cached prefix — which
+    /// on a long, well-cached conversation is nearly the whole window, so a
+    /// threshold check would never fire on the workload that needs it most.
+    ///
+    /// `None` when the model is unknown or reported no prompt tokens; callers
+    /// fall back to their own budget in that case.
+    pub fn input_occupancy(&self, model: &str, tokens: TokenCounts) -> Option<u64> {
+        let entry = self.lookup(model)?;
+        let prompt = tokens.prompt?.max(0) as u64;
+        if !is_additive(entry.litellm_provider.as_deref()) {
+            // Already inclusive of cache reads.
+            return Some(prompt);
+        }
+        let cached = tokens.prompt_cached.unwrap_or(0).max(0) as u64;
+        let created = tokens.prompt_cache_creation.unwrap_or(0).max(0) as u64;
+        Some(prompt + cached + created)
+    }
+
     /// USD cost for one call, or `None` if the model is unknown or unpriced.
     pub fn compute_cost_usd(&self, model: &str, tokens: TokenCounts) -> Option<f64> {
         let entry = self.lookup(model)?;
@@ -168,6 +193,48 @@ mod tests {
             prompt_cached: Some(cached),
             prompt_cache_creation: Some(created),
         }
+    }
+
+    #[test]
+    fn input_occupancy_adds_cached_tokens_for_additive_providers() {
+        // A window that is nearly all cache hits: 5k fresh over a 185k cached
+        // prefix. Anthropic reports the 5k as `prompt_tokens`, so counting that
+        // alone would put a 195k-token prompt at 2.5% of a 200k window and
+        // compaction would never fire.
+        let occupancy = table()
+            .input_occupancy("claude-sonnet-4-6", counts(5_000, 100, 185_000, 5_000))
+            .expect("priced model");
+        assert_eq!(occupancy, 195_000);
+
+        let limit = table().max_input_tokens("claude-sonnet-4-6").unwrap();
+        assert!(occupancy as f64 > 0.7 * limit as f64);
+    }
+
+    #[test]
+    fn input_occupancy_trusts_prompt_tokens_for_inclusive_providers() {
+        // OpenAI's `prompt_tokens` already includes cache reads; adding them
+        // again would double-count the cached prefix and compact too eagerly.
+        assert_eq!(
+            table()
+                .input_occupancy("gpt-4o-mini", counts(50_000, 100, 40_000, 0))
+                .expect("priced model"),
+            50_000
+        );
+    }
+
+    #[test]
+    fn input_occupancy_resolves_dated_revisions_and_unknown_models() {
+        assert_eq!(
+            table()
+                .input_occupancy("claude-sonnet-4-6-20251022", counts(10, 0, 90, 0))
+                .expect("prefix match"),
+            100
+        );
+        assert!(
+            table()
+                .input_occupancy("some-unlisted-model", counts(10, 0, 0, 0))
+                .is_none()
+        );
     }
 
     #[test]

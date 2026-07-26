@@ -257,36 +257,87 @@ describe("checkpoint events", () => {
       promptTokensBefore: 150_000,
       model: "gpt-5.6-terra",
     };
-    const parsed = checkpointFromEvent({
-      type: COMPACTION_CHECKPOINT_EVENT,
-      ...toPayload(checkpoint),
-    });
+    const parsed = checkpointFromEvent(checkpointEvent(toPayload(checkpoint)));
     expect(parsed).toEqual(checkpoint);
   });
 
   it("rejects a malformed payload rather than half-reading it", () => {
+    expect(checkpointFromEvent(checkpointEvent({}))).toBeNull();
     expect(
-      checkpointFromEvent({ type: COMPACTION_CHECKPOINT_EVENT }),
-    ).toBeNull();
-    expect(
-      checkpointFromEvent({
-        type: COMPACTION_CHECKPOINT_EVENT,
-        up_to_event_id: 42,
-      }),
+      checkpointFromEvent(checkpointEvent({ up_to_event_id: 42 })),
     ).toBeNull();
     expect(checkpointFromEvent({ type: "something_else" })).toBeNull();
     // An id-less checkpoint cannot resolve its summary; refuse it rather than
     // silently assemble a prompt with the compacted history missing.
     expect(
+      checkpointFromEvent(
+        checkpointEvent({
+          up_to_event_id: "evt-1",
+          artifact_path: "compaction/1.md",
+          artifact_version: 1,
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  // The envelope, not the payload, is where the two runtimes previously
+  // disagreed: TypeScript wrote a flattened `{type: "exo.compaction.v1", ...}`
+  // that Rust's `EventData` enum rejects outright. These two cases pin the
+  // shape from the outside so neither side can drift again.
+  it("ignores a flattened checkpoint that is not a custom-event envelope", () => {
+    expect(
       checkpointFromEvent({
         type: COMPACTION_CHECKPOINT_EVENT,
-        up_to_event_id: "evt-1",
-        artifact_path: "compaction/1.md",
-        artifact_version: 1,
+        ...toPayload({
+          upToEventId: "evt-1",
+          artifactId: "art-1",
+          artifactPath: "compaction/1.md",
+          artifactVersion: 1,
+          previousCheckpointId: null,
+          compactedEventCount: 1,
+          summaryChars: 1,
+          promptTokensBefore: null,
+          model: "m",
+        }),
       }),
     ).toBeNull();
   });
+
+  it("decodes the shared cross-runtime fixture", async () => {
+    // Same bytes the Rust suite deserializes; see tests/fixtures/README.md.
+    const { readFile } = await import("node:fs/promises");
+    const { fileURLToPath } = await import("node:url");
+    const path = fileURLToPath(
+      new URL(
+        "../../tests/fixtures/compaction-checkpoint.json",
+        import.meta.url,
+      ),
+    );
+    const fixture = JSON.parse(await readFile(path, "utf8"));
+
+    expect(checkpointFromEvent(fixture)).toEqual({
+      upToEventId: "01920000-0000-7000-8000-000000000001",
+      artifactId: "01920000-0000-7000-8000-0000000000a1",
+      artifactPath:
+        "compaction/01920000-0000-7000-8000-00000000000c/summary.md",
+      artifactVersion: 3,
+      previousCheckpointId: "01920000-0000-7000-8000-000000000002",
+      compactedEventCount: 412,
+      summaryChars: 6120,
+      promptTokensBefore: 148000,
+      model: "claude-sonnet-4-5",
+    });
+  });
 });
+
+/** A checkpoint event in the real custom-event envelope. */
+function checkpointEvent(payload: Record<string, unknown>) {
+  return {
+    type: "custom",
+    event_type: COMPACTION_CHECKPOINT_EVENT,
+    payload,
+  };
+}
 
 function toPayload(checkpoint: CompactionCheckpoint): Record<string, unknown> {
   return {

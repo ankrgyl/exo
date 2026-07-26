@@ -28,8 +28,10 @@ function event(type: string, extra: Record<string, unknown> = {}): Event {
 }
 
 function checkpointEvent(): Event {
-  return event(COMPACTION_CHECKPOINT_EVENT, {
-    ...checkpointToPayload({
+  // The real custom-event envelope; see tests/fixtures/README.md.
+  return event("custom", {
+    event_type: COMPACTION_CHECKPOINT_EVENT,
+    payload: checkpointToPayload({
       upToEventId: "evt-000001",
       artifactId: "art-1",
       artifactPath: "compaction/conv-1/summary.md",
@@ -54,7 +56,13 @@ function makeContext(options: {
       let events = [...options.events];
       if (query?.types) {
         const types = new Set(query.types);
-        events = events.filter((e) => types.has(e.data.type));
+        // Custom events are queryable by `event_type`, mirroring the Rust
+        // harness's `EventData::kind()`.
+        events = events.filter((e) =>
+          types.has(
+            e.data.type === "custom" ? String(e.data.event_type) : e.data.type,
+          ),
+        );
       }
       if (query?.direction === "desc") events.reverse();
       if (query?.limit != null) events = events.slice(0, query.limit);

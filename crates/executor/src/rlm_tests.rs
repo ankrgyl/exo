@@ -658,3 +658,103 @@ async fn register_test_model(exoharness: &dyn ExoHarness) {
         .await
         .expect("test model should register");
 }
+
+/// RLM must compact, not just read checkpoints someone else wrote.
+///
+/// Its shape differs from the basic executor's: the whole conversation is
+/// materialized once and baked into a single root prompt, so there is no
+/// between-rounds moment where a smaller prompt would help. The only useful
+/// place to compact is before that context is captured. Without it an RLM
+/// conversation grows unbounded while its config reports compaction as enabled.
+#[tokio::test(flavor = "current_thread")]
+async fn rlm_compacts_its_own_history_before_building_the_root_prompt() {
+    let tempdir = TempDir::new().expect("tempdir should exist");
+    let exoharness = Arc::new(
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
+            .await
+            .expect("basic exoharness should initialize"),
+    ) as Arc<dyn ExoHarness>;
+
+    // Every call answers immediately: the root prompts finish their turn, and
+    // the compaction pass takes whichever one it draws as its summary text.
+    let model = Arc::new(FakeModelClient::new(
+        (0..8)
+            .map(|_| ModelResponse {
+                provider_cost_usd: None,
+                response_id: Some(Uuid7::now()),
+                messages: vec![assistant_message("FINAL(ok)")],
+                tool_calls: Vec::new(),
+                usage: None,
+                model: None,
+                ttft: None,
+                duration: None,
+            })
+            .collect(),
+    ));
+    let harness = RlmHarness::new(exoharness, model);
+    register_test_model(harness.exoharness_handle().as_ref()).await;
+
+    let agent = harness
+        .create_agent(CreateAgentRequest {
+            slug: "demo".to_string(),
+            name: Some("Demo".to_string()),
+            harness: crate::AgentHarnessKind::Rlm,
+            typescript: None,
+            enable_agent_tool_creation: true,
+            sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
+            sandbox_scope: None,
+            enable_networking: false,
+            model: "gpt-5.4".to_string(),
+            max_output_tokens: Some(512),
+            max_tool_round_trips: None,
+            compaction: Some(crate::compaction::CompactionConfig {
+                enabled: true,
+                keep_recent_turns: 1,
+                // The fake model has no known input limit, so drive the trigger
+                // through the character-budget fallback.
+                fallback_char_budget: 2_000,
+                // Must stay well under the compactable span, or compaction
+                // correctly declines to "shrink" a prefix into something bigger.
+                max_summary_chars: 500,
+                ..crate::compaction::CompactionConfig::default()
+            }),
+
+            braintrust: None,
+        })
+        .await
+        .expect("agent should be created");
+    let conversation = agent
+        .create_conversation(CreateConversationRequest::default())
+        .await
+        .expect("conversation should be created");
+
+    // Three turns, each large enough that the transcript clears the budget.
+    for index in 0..3 {
+        conversation
+            .send(SendRequest {
+                input: vec![user_message(&format!(
+                    "question {index} {}",
+                    "y".repeat(3_000)
+                ))],
+                session_id: None,
+            })
+            .await
+            .expect("send should succeed");
+    }
+
+    let events = conversation
+        .exoharness_handle()
+        .get_events(None)
+        .await
+        .expect("events should load")
+        .events;
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.data,
+            EventData::Custom { event_type, .. }
+                if event_type == crate::compaction::COMPACTION_CHECKPOINT_EVENT
+        )),
+        "RLM should have written a compaction checkpoint"
+    );
+}

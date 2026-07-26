@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -13,8 +14,9 @@ use lingua::universal::{ToolContentPart, ToolResultContentPart};
 use serde_json::json;
 
 use crate::compaction::{
-    CompactionOutcome, SummarizeInput, prompt_chars, read_active_checkpoint, read_summary,
-    run_compaction, should_compact, summarizer_instruction, summary_message,
+    CompactionOutcome, SummarizeInput, estimated_tokens_from_chars, prompt_chars,
+    read_active_checkpoint, read_summary, record_summarizer_usage, run_compaction, should_compact,
+    summarizer_instruction, summary_message,
 };
 use crate::execution_tracing::TurnExecutionTrace;
 use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor};
@@ -31,6 +33,9 @@ pub struct BasicExecutor<M, T> {
     model: Arc<M>,
     tools: Arc<T>,
     history_cache: Arc<RwLock<HashMap<ConversationId, HistoryCacheEntry>>>,
+    /// Bumped on every cache invalidation. A materialization that started before
+    /// an invalidation must not write its now-stale snapshot back afterwards.
+    cache_generation: Arc<AtomicU64>,
     pricing: Arc<PricingTable>,
 }
 
@@ -45,6 +50,7 @@ impl<M, T> BasicExecutor<M, T> {
             model,
             tools,
             history_cache: Arc::new(RwLock::new(HashMap::new())),
+            cache_generation: Arc::new(AtomicU64::new(0)),
             pricing,
         }
     }
@@ -56,10 +62,11 @@ impl<M, T> BasicExecutor<M, T> {
     /// skipping this would keep serving pre-compaction history from memory: the
     /// prompt would never shrink and nothing would error.
     pub(crate) fn invalidate_history_cache(&self, conversation_id: ConversationId) {
-        self.history_cache
-            .write()
-            .expect(HISTORY_CACHE_NAME)
-            .remove(&conversation_id);
+        let mut cache = self.history_cache.write().expect(HISTORY_CACHE_NAME);
+        cache.remove(&conversation_id);
+        // Bump while still holding the write lock, so no reader can observe the
+        // removal without also observing the new generation.
+        self.cache_generation.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -69,6 +76,7 @@ impl<M, T> Clone for BasicExecutor<M, T> {
             model: Arc::clone(&self.model),
             tools: Arc::clone(&self.tools),
             history_cache: Arc::clone(&self.history_cache),
+            cache_generation: Arc::clone(&self.cache_generation),
             pricing: Arc::clone(&self.pricing),
         }
     }
@@ -96,6 +104,13 @@ where
         instructions: &[Message],
     ) -> Result<Vec<Message>> {
         let conversation_id = conversation.record().id;
+        // Sampled with the read, and re-checked before the write below. Turns on
+        // one conversation are not serialized, so without this a turn that read
+        // a pre-checkpoint entry, then blocked in `get_events` while another turn
+        // compacted and invalidated, would write its stale full-history snapshot
+        // back over the invalidation — and every later prompt would keep
+        // replaying the compacted prefix, silently and indefinitely.
+        let generation = self.cache_generation.load(Ordering::Acquire);
         let cached_entry = {
             let cache = self.history_cache.read().expect(HISTORY_CACHE_NAME);
             cache.get(&conversation_id).cloned()
@@ -110,12 +125,14 @@ where
                 // A checkpoint whose artifact has vanished is worse than none:
                 // it would cut history out with nothing standing in for it.
                 // Fall back to the full replay instead.
-                Some(checkpoint) => read_summary(conversation, &checkpoint)
-                    .await?
-                    .map(|summary| CachedSummary {
-                        text: summary,
-                        up_to_event_id: checkpoint.up_to_event_id,
-                    }),
+                Some((_, checkpoint)) => {
+                    read_summary(conversation, &checkpoint)
+                        .await?
+                        .map(|summary| CachedSummary {
+                            text: summary,
+                            up_to_event_id: checkpoint.up_to_event_id,
+                        })
+                }
                 None => None,
             },
         };
@@ -149,18 +166,23 @@ where
         extend_message_history(&mut event_messages, &mut tool_call_names, &result.events);
         let cursor = result.cursor.or(cursor);
 
-        self.history_cache
-            .write()
-            .expect(HISTORY_CACHE_NAME)
-            .insert(
-                conversation_id,
-                HistoryCacheEntry {
-                    cursor,
-                    messages: event_messages.clone(),
-                    tool_call_names,
-                    summary: summary.clone(),
-                },
-            );
+        {
+            let mut cache = self.history_cache.write().expect(HISTORY_CACHE_NAME);
+            // Only publish if nothing invalidated the cache while this read was
+            // in flight. Dropping the entry costs one rebuild; keeping a stale
+            // one costs correctness.
+            if self.cache_generation.load(Ordering::Acquire) == generation {
+                cache.insert(
+                    conversation_id,
+                    HistoryCacheEntry {
+                        cursor,
+                        messages: event_messages.clone(),
+                        tool_call_names,
+                        summary: summary.clone(),
+                    },
+                );
+            }
+        }
 
         if let Some(summary) = summary {
             event_messages.insert(0, summary_message(&summary.text));
@@ -185,17 +207,17 @@ where
         prompt_tokens: Option<u64>,
         prompt_chars: u64,
         attempted: &mut bool,
-    ) {
+    ) -> bool {
         // At most one attempt per turn: compaction can only cut at a
         // `turn_ended` boundary, and none appears while a turn is in flight, so
         // a second attempt re-scans the log and re-runs the summarizer to reach
         // the same answer. On a long tool loop that is a real, silent cost.
         if *attempted {
-            return;
+            return false;
         }
         let config = agent_config.compaction.clone().unwrap_or_default();
         if !should_compact(&config, prompt_tokens, max_input_tokens, prompt_chars) {
-            return;
+            return false;
         }
         *attempted = true;
 
@@ -213,7 +235,13 @@ where
             &summary_model,
             prompt_tokens,
             &|input| {
-                Box::pin(self.summarize(input, conversation, &agent_config.model, &summary_model))
+                Box::pin(self.summarize(
+                    input,
+                    conversation,
+                    turn,
+                    &agent_config.model,
+                    &summary_model,
+                ))
             },
         )
         .await;
@@ -229,15 +257,18 @@ where
                 );
                 // The cache holds exactly the prefix that was just replaced.
                 self.invalidate_history_cache(conversation_id);
+                true
             }
             // The prompt crossed the threshold but nothing was compacted, so it
             // will cross again next round. Both cases are worth seeing in logs:
             // they are why a conversation's context stops shrinking.
             CompactionOutcome::Skipped { reason } => {
                 tracing::debug!(%conversation_id, %reason, "compaction skipped");
+                false
             }
             CompactionOutcome::Failed { error } => {
                 tracing::warn!(%conversation_id, %error, "compaction failed");
+                false
             }
         }
     }
@@ -253,6 +284,7 @@ where
         &self,
         input: SummarizeInput,
         conversation: &dyn ConversationHandle,
+        turn: &dyn TurnHandle,
         binding: &str,
         model: &str,
     ) -> Result<String> {
@@ -272,7 +304,9 @@ where
                 max_output_tokens: None,
             })
             .await?;
-        Ok(assistant_messages_text(&response.messages))
+        let text = assistant_messages_text(&response.messages);
+        record_summarizer_usage(turn, build_usage_record(&response, &self.pricing)).await;
+        Ok(text)
     }
 
     async fn run_turn_loop(
@@ -297,26 +331,65 @@ where
             let messages = self
                 .materialize_prompt_history(conversation, &agent_config.instructions)
                 .await?;
-            let request =
+            let mut request =
                 build_model_request(conversation, agent_config, conversation_config, messages)
                     .await?;
             let model = request.model.clone();
-            // Only the fallback trigger needs a character count, so skip
-            // serializing the whole prompt when the price table knows this
-            // model's input limit.
             let max_input_tokens = self.pricing.max_input_tokens(&model);
-            let prompt_chars = match max_input_tokens {
-                Some(_) => 0,
-                None => prompt_chars(&request.messages),
-            };
+            let prompt_chars = prompt_chars(&request.messages);
+
+            // Compact *before* sending when the prompt already looks too large.
+            //
+            // The post-response trigger below is more accurate — it uses the
+            // provider's own counts — but it only ever runs after a successful
+            // call. A prompt that is already past the model's hard limit is
+            // rejected outright, and that error propagates out of the turn
+            // before anything can shrink the history responsible for it. Every
+            // later turn then replays the same oversized log and fails the same
+            // way, with no path back. This check is what makes that state
+            // recoverable; the character estimate is deliberately pessimistic
+            // because failing to fire here is far more costly than firing early.
+            if self
+                .maybe_compact(
+                    conversation,
+                    turn.as_ref(),
+                    agent_config,
+                    &model,
+                    max_input_tokens,
+                    Some(estimated_tokens_from_chars(prompt_chars)),
+                    prompt_chars,
+                    &mut compaction_attempted,
+                )
+                .await
+            {
+                // The checkpoint just written replaces the prefix this prompt
+                // was built from, so rebuild it before sending.
+                let messages = self
+                    .materialize_prompt_history(conversation, &agent_config.instructions)
+                    .await?;
+                request =
+                    build_model_request(conversation, agent_config, conversation_config, messages)
+                        .await?;
+            }
+
             let response = self
                 .complete_model_round(request, round as usize, stream_mode, turn_trace)
                 .await?;
-            let prompt_tokens = response
-                .usage
-                .as_ref()
-                .and_then(|usage| usage.prompt_tokens)
-                .and_then(|tokens| u64::try_from(tokens).ok());
+            // Occupancy, not `prompt_tokens`: on Anthropic-family providers the
+            // latter counts only the fresh slice, so a heavily cached prompt
+            // that fills the window reports a tiny number and would never trip
+            // the threshold.
+            let prompt_tokens = response.usage.as_ref().and_then(|usage| {
+                self.pricing.input_occupancy(
+                    &model,
+                    TokenCounts {
+                        prompt: usage.prompt_tokens,
+                        completion: usage.completion_tokens,
+                        prompt_cached: usage.prompt_cached_tokens,
+                        prompt_cache_creation: usage.prompt_cache_creation_tokens,
+                    },
+                )
+            });
 
             let events = interpret_model_response(response, &self.pricing);
             turn.add_events(events.clone()).await?;
@@ -324,6 +397,8 @@ where
             // Compact between rounds using the token count the provider just
             // reported, so a single runaway turn can bring its own prompt back
             // under the limit rather than failing every turn from here on.
+            // Whether it fired does not matter here: the next round rebuilds the
+            // prompt from scratch and will pick up any checkpoint written.
             self.maybe_compact(
                 conversation,
                 turn.as_ref(),
@@ -686,7 +761,7 @@ fn interpret_model_response(response: ModelResponse, pricing: &PricingTable) -> 
     events
 }
 
-fn build_usage_record(
+pub(crate) fn build_usage_record(
     response: &ModelResponse,
     pricing: &PricingTable,
 ) -> Option<Box<UsageRecord>> {

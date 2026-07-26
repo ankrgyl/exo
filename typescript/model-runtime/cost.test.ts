@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { computeCostUsd, lookup, maxInputTokens, parseTable } from "./cost";
+import {
+  computeCostUsd,
+  inputOccupancy,
+  lookup,
+  maxInputTokens,
+  parseTable,
+} from "./cost";
 
 const FIXTURE = `{
   "sample_spec": { "comment": "ignored" },
@@ -35,6 +41,40 @@ describe("cost", () => {
     );
     expect(lookup(table, "gpt-4o")).toBeUndefined();
     expect(lookup(table, "gpt-4-0613")).toBeDefined();
+  });
+
+  it("counts cached tokens toward input occupancy for additive providers", () => {
+    // A window that is nearly all cache hits: 5k fresh over a 185k cached
+    // prefix. Anthropic reports the 5k as `prompt_tokens`, so counting that
+    // alone would put a 190k-token prompt at 2.5% of a 200k window and
+    // compaction would never fire.
+    const occupancy = inputOccupancy(table, "claude-sonnet-4-6", {
+      prompt: 5_000,
+      completion: 100,
+      cached: 185_000,
+    });
+    expect(occupancy).toBe(190_000);
+    expect(occupancy!).toBeGreaterThan(
+      0.7 * maxInputTokens(table, "claude-sonnet-4-6")!,
+    );
+  });
+
+  it("trusts prompt tokens for inclusive providers", () => {
+    // OpenAI's prompt count already includes cache reads; adding them again
+    // would double-count the cached prefix and compact too eagerly.
+    expect(
+      inputOccupancy(table, "gpt-4o-mini", {
+        prompt: 50_000,
+        completion: 100,
+        cached: 40_000,
+      }),
+    ).toBe(50_000);
+  });
+
+  it("has no input occupancy for an unknown model", () => {
+    expect(
+      inputOccupancy(table, "some-unlisted-model", { prompt: 10 }),
+    ).toBeNull();
   });
 
   it("bills Anthropic additively (prompt excludes cached)", () => {

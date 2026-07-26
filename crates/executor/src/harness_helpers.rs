@@ -87,7 +87,7 @@ pub(crate) async fn materialize_conversation_messages(
     // A checkpoint whose artifact has vanished falls back to full history:
     // a large prompt beats one with a hole where the summary should be.
     let summary = match read_active_checkpoint(conversation).await? {
-        Some(checkpoint) => read_summary(conversation, &checkpoint)
+        Some((_, checkpoint)) => read_summary(conversation, &checkpoint)
             .await?
             .map(|text| (text, checkpoint.up_to_event_id)),
         None => None,

@@ -26,7 +26,12 @@ import {
   type ResponsesRuntimeLike,
   type TraceParent,
 } from "@exo/model-runtime/responses";
-import { ensureTable, getTable, maxInputTokens } from "@exo/model-runtime/cost";
+import {
+  ensureTable,
+  getTable,
+  inputOccupancy,
+  maxInputTokens,
+} from "@exo/model-runtime/cost";
 
 import { resolveLlmBinding } from "./shared";
 
@@ -167,11 +172,22 @@ async function runResponsesTurnLoop(
     // Compact between rounds, using the token count the provider just reported.
     // Doing it here rather than at turn start means a single runaway turn can
     // still bring its own prompt back under the limit.
-    const modelInputLimit = maxInputTokens(getTable() ?? new Map(), model);
+    const table = getTable() ?? new Map();
+    const modelInputLimit = maxInputTokens(table, model);
+    // Occupancy, not `input_tokens`: on Anthropic-family providers the latter
+    // counts only the fresh slice, so a heavily cached prompt that fills the
+    // window reports a tiny number and would never trip the threshold.
+    const occupancy = response.usage
+      ? inputOccupancy(table, model, {
+          prompt: response.usage.input_tokens,
+          completion: response.usage.output_tokens,
+          cached: response.usage.input_tokens_details?.cached_tokens,
+        })
+      : null;
     if (
       compaction.shouldAttempt({
         policy,
-        promptTokens: response.usage?.input_tokens ?? null,
+        promptTokens: occupancy,
         maxInputTokens: modelInputLimit,
         // Only the fallback trigger reads this, so skip walking the whole
         // prompt when the price table knows the model's limit.
@@ -184,7 +200,7 @@ async function runResponsesTurnLoop(
         turn: context.exoharness.current.turn,
         policy,
         model: policy.summaryModel ?? model,
-        promptTokensBefore: response.usage?.input_tokens ?? null,
+        promptTokensBefore: occupancy,
         summarize: (input) =>
           summarizeWithModel(runtime, policy, model, turnParent, round, input),
       });

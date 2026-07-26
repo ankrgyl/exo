@@ -20,9 +20,10 @@ import type {
   Turn,
 } from "./index";
 import {
+  appendCustomEvent,
   HISTORY_EVENT_TYPES,
   materializeEventsToMessages,
-  readActiveCheckpoint,
+  readActiveCheckpointEvent,
 } from "./index";
 
 export const COMPACTION_CHECKPOINT_EVENT = "exo.compaction.v1";
@@ -225,19 +226,43 @@ export function checkpointToPayload(
 }
 
 /**
+ * Payload of a custom event of the given type, or null if `data` is some other
+ * event.
+ *
+ * Custom events travel as `{ type: "custom", event_type, payload }` — that
+ * envelope is the only extensible `EventData` variant the Rust harness accepts
+ * (`crates/exoharness/src/types.rs`), and the variant tag is what makes an event
+ * queryable by `event_type`. Reading `data.type` for the event name instead
+ * would miss every event the Rust executor writes.
+ */
+function customEventPayload(
+  data: EventData,
+  eventType: string,
+): Record<string, unknown> | null {
+  if (data.type !== "custom" || data.event_type !== eventType) {
+    return null;
+  }
+  const payload = data.payload;
+  return typeof payload === "object" && payload !== null
+    ? (payload as Record<string, unknown>)
+    : null;
+}
+
+/**
  * Decode a checkpoint event, or null if it is not one / is malformed. A partial
  * read would silently drop history, so every required field is validated.
  */
 export function checkpointFromEvent(
   data: EventData,
 ): CompactionCheckpoint | null {
-  if (data.type !== COMPACTION_CHECKPOINT_EVENT) {
+  const payload = customEventPayload(data, COMPACTION_CHECKPOINT_EVENT);
+  if (payload === null) {
     return null;
   }
-  const upToEventId = data.up_to_event_id;
-  const artifactId = data.artifact_id;
-  const artifactPath = data.artifact_path;
-  const artifactVersion = data.artifact_version;
+  const upToEventId = payload.up_to_event_id;
+  const artifactId = payload.artifact_id;
+  const artifactPath = payload.artifact_path;
+  const artifactVersion = payload.artifact_version;
   if (
     typeof upToEventId !== "string" ||
     typeof artifactId !== "string" ||
@@ -252,16 +277,16 @@ export function checkpointFromEvent(
     artifactPath,
     artifactVersion,
     previousCheckpointId:
-      typeof data.previous_checkpoint_id === "string"
-        ? data.previous_checkpoint_id
+      typeof payload.previous_checkpoint_id === "string"
+        ? payload.previous_checkpoint_id
         : null,
-    compactedEventCount: numberOr(data.compacted_event_count, 0),
-    summaryChars: numberOr(data.summary_chars, 0),
+    compactedEventCount: numberOr(payload.compacted_event_count, 0),
+    summaryChars: numberOr(payload.summary_chars, 0),
     promptTokensBefore:
-      typeof data.prompt_tokens_before === "number"
-        ? data.prompt_tokens_before
+      typeof payload.prompt_tokens_before === "number"
+        ? payload.prompt_tokens_before
         : null,
-    model: typeof data.model === "string" ? data.model : "",
+    model: typeof payload.model === "string" ? payload.model : "",
   };
 }
 
@@ -380,19 +405,28 @@ export async function runCompaction(
 async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
   const { conversation, turn, policy, model, promptTokensBefore } = args;
 
-  const previous = await readActiveCheckpoint(conversation);
-  const previousSummary = previous
+  const existing = await readActiveCheckpointEvent(conversation);
+  const previousSummary = existing
     ? await conversation.readArtifactText({
-        artifactId: previous.artifactId,
-        version: previous.artifactVersion,
+        artifactId: existing.checkpoint.artifactId,
+        version: existing.checkpoint.artifactVersion,
       })
     : null;
+
+  // A checkpoint whose summary artifact cannot be read must not be chained off.
+  // Scanning from its boundary would summarize only the tail, and the new
+  // checkpoint would be perfectly readable — which disarms the read path's
+  // safety net, where a missing artifact falls back to replaying the full log.
+  // Everything before the broken checkpoint would then be gone from the prompt
+  // for good. Rebuilding from the start costs one larger call and loses nothing.
+  const previous =
+    existing !== null && previousSummary === null ? null : existing;
 
   // Only look at events after the last checkpoint: everything before it is
   // already represented by `previousSummary`.
   const scan = await conversation.getEvents({
     direction: "asc",
-    cursor: previous?.upToEventId ?? null,
+    cursor: previous?.checkpoint.upToEventId ?? null,
     types: [...HISTORY_EVENT_TYPES, "turn_ended"],
   });
   const cut = selectCutPoint(scan.events, policy.keepRecentTurns);
@@ -442,22 +476,24 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
     artifactId: written.artifactId,
     artifactPath: written.path,
     artifactVersion: written.version,
-    previousCheckpointId: previous?.upToEventId ?? null,
+    // The previous *checkpoint event's* own id, not its cut boundary. The
+    // boundary names an ordinary `turn_ended` event, so storing it here makes
+    // the chain untraversable from the second compaction onward.
+    previousCheckpointId: previous?.eventId ?? null,
     // Cumulative across the chain. This is the number the agent is shown to
     // judge how much history it is missing, so counting only this pass would
     // understate it on every compaction after the first.
     compactedEventCount:
-      (previous?.compactedEventCount ?? 0) + cut.compactedEventCount,
+      (previous?.checkpoint.compactedEventCount ?? 0) + cut.compactedEventCount,
     summaryChars: summary.length,
     promptTokensBefore,
     model,
   };
-  await turn.addEvents([
-    {
-      type: COMPACTION_CHECKPOINT_EVENT,
-      ...checkpointToPayload(checkpoint),
-    },
-  ]);
+  await appendCustomEvent(
+    turn,
+    COMPACTION_CHECKPOINT_EVENT,
+    checkpointToPayload(checkpoint),
+  );
   return { status: "compacted", checkpoint };
 }
 
@@ -478,7 +514,7 @@ function summaryArtifactPath(conversation: Conversation): string {
 
 async function recordFailure(turn: Turn, error: string): Promise<void> {
   try {
-    await turn.addEvents([{ type: COMPACTION_FAILED_EVENT, error }]);
+    await appendCustomEvent(turn, COMPACTION_FAILED_EVENT, { error });
   } catch {
     // Recording the failure is best-effort; it must not mask the original
     // problem or take the turn down with it.
