@@ -6,6 +6,32 @@ export type DiscordAttachmentLike = {
   name?: string | null;
 };
 
+const DISCORD_CONTENT_LIMIT = 2_000;
+
+export function splitDiscordContent(
+  text: string,
+  limit = DISCORD_CONTENT_LIMIT,
+): string[] {
+  if (text.length <= limit) {
+    return [text];
+  }
+
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > limit) {
+    const window = remaining.slice(0, limit);
+    const newline = window.lastIndexOf("\n");
+    const space = window.lastIndexOf(" ");
+    const splitAt = newline > 0 ? newline + 1 : space > 0 ? space + 1 : limit;
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt);
+  }
+  if (remaining.length > 0) {
+    chunks.push(remaining);
+  }
+  return chunks;
+}
+
 export function attachmentKindForContentType(
   contentType: string | null | undefined,
 ): AdapterAttachment["kind"] {

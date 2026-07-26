@@ -16,7 +16,7 @@ fi
 EXO_BIN="${EXO_BIN:-$ROOT_DIR/target/debug/exo}"
 SCHEDULER_BIN="${EXO_SCHEDULER_BIN:-$ROOT_DIR/target/debug/exo-scheduler-runner}"
 ENV_FILE="${EXO_ENV_FILE:-$ROOT_DIR/.env}"
-MODEL="${EXO_MODEL:-gpt-5.4}"
+MODEL="${EXO_MODEL:-gpt-5.6-terra}"
 AGENT="${EXO_AGENT:-exo-agent}"
 AGENT_NAME="${EXO_AGENT_NAME:-Exo Agent}"
 CONVERSATION="${EXO_CONVERSATION:-dev}"
@@ -98,7 +98,7 @@ Subcommands:
                    image) without starting anything
 
 Options:
-  --model <model>              Model binding name (default: gpt-5.4)
+  --model <model>              Model binding name (default: gpt-5.6-terra)
   --upstream-model <model>     Upstream model id for register-model (default: --model)
   --secret-name <name>         Secret name for register-model (e.g. openai)
   --secret-env <env-var>       Environment variable holding the API key for register-model
@@ -588,6 +588,8 @@ setup_agent() {
   fi
   ensure_agent
   ensure_conversation
+  ensure_self_repo_mount
+  ensure_agent_cli_mount
 }
 
 agent_exists() {
@@ -616,6 +618,8 @@ ensure_agent() {
     if [[ -n "$SANDBOX_PROVIDER" ]]; then
       args+=(--sandbox-provider "$SANDBOX_PROVIDER")
     fi
+    # The exo agent shares one sandbox across all of its conversations.
+    args+=(--sandbox-scope "${SANDBOX_SCOPE:-agent}")
   fi
   exo "${args[@]}"
 }
@@ -667,7 +671,9 @@ ensure_self_repo_mount() {
     die "Exo self map is missing: examples/exo/SELF.md"
   fi
 
-  exo conversation mount add "$AGENT" "$CONVERSATION" "$ROOT_DIR" "$SELF_REPO_MOUNT_PATH" --rw >/dev/null
+  # Agent-level mounts apply to the shared agent sandbox for every
+  # conversation, so adapter conversations see the repo too.
+  exo agent mount add "$AGENT" "$ROOT_DIR" "$SELF_REPO_MOUNT_PATH" --rw >/dev/null
 }
 
 ensure_agent_cli_mount() {
@@ -684,7 +690,7 @@ ensure_agent_cli_mount() {
     die "agent-cli mount path must be absolute: $AGENT_CLI_MOUNT_PATH"
   fi
 
-  exo conversation mount add "$AGENT" "$CONVERSATION" "$AGENT_CLI_MOUNT_ROOT" "$AGENT_CLI_MOUNT_PATH" --rw >/dev/null
+  exo agent mount add "$AGENT" "$AGENT_CLI_MOUNT_ROOT" "$AGENT_CLI_MOUNT_PATH" --rw >/dev/null
 }
 
 list_agents_and_conversations() {

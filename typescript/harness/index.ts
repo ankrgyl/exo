@@ -33,13 +33,19 @@ export interface AgentConfig {
     toolModulePaths: string[];
   } | null;
   enableAgentToolCreation: boolean;
-  sandboxImage?: string | null;
-  sandboxProvider: "daytona" | "apple_container" | "docker" | "local_process";
-  enableNetworking: boolean;
+  sandbox: AgentSandboxConfig;
   model: string;
   maxOutputTokens?: number | null;
   maxToolRoundTrips?: number | null;
   braintrust?: unknown;
+}
+
+export interface AgentSandboxConfig {
+  image?: string | null;
+  provider: "daytona" | "apple_container" | "docker" | "local_process";
+  mounts: FileSystemMount[];
+  enableNetworking: boolean;
+  scope: "agent" | "conversation";
 }
 
 export type Binding =

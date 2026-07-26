@@ -126,6 +126,30 @@ pub(crate) async fn conversation_sandboxes(
     Ok(sandboxes)
 }
 
+// The agent-scoped sandbox is shared by every conversation, so its spec must
+// not depend on which conversation asks for it: it is derived from the agent
+// config alone.
+pub(crate) fn agent_sandbox_spec(agent_config: &AgentConfig) -> ConversationSandboxSpec {
+    ConversationSandboxSpec {
+        provider: agent_config.sandbox.provider,
+        image: agent_config
+            .sandbox
+            .image
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SANDBOX_IMAGE.to_string()),
+        default_workdir: agent_config
+            .sandbox
+            .mounts
+            .first()
+            .map(|mount| mount.mount_path.clone())
+            .unwrap_or_else(|| "/".to_string()),
+        file_system_mounts: normalize_mounts(&agent_config.sandbox.mounts),
+        durable_file_systems: Vec::new(),
+        enable_networking: agent_config.sandbox.enable_networking,
+        idle_seconds: 300,
+    }
+}
+
 pub(crate) fn conversation_sandbox_spec(
     agent_config: &AgentConfig,
     config: &ConversationConfig,
@@ -149,7 +173,7 @@ pub(crate) fn conversation_sandbox_spec(
             .unwrap_or_else(|| "/".to_string()),
         file_system_mounts: normalize_mounts(&config.mounts),
         durable_file_systems: config.durable_file_systems.clone(),
-        enable_networking: agent_config.enable_networking,
+        enable_networking: agent_config.sandbox.enable_networking,
         idle_seconds: 300,
     }
 }

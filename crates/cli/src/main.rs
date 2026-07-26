@@ -6,19 +6,20 @@ mod env_tests;
 mod mount_tests;
 #[cfg(test)]
 mod naming_tests;
+mod render;
 #[cfg(test)]
 mod repl_tests;
 #[cfg(test)]
 mod secret_tests;
 mod tui;
+mod tui_app;
 
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -37,13 +38,12 @@ use executor::{
     default_vercel_image, effective_sandbox_scope, load_agent_config, send_conversation_wakeup,
     serve_exoharness_http_listener_with_options,
 };
-use lingua::Message;
-use lingua::universal::{AssistantContent, AssistantContentPart, ToolContentPart, UserContent};
 use serde::Deserialize;
 use tabwriter::TabWriter;
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::env::CliEnvironment;
+use crate::render::{Verbosity, print_message};
 use tui::run_chat_repl;
 
 #[derive(Debug, Parser)]
@@ -410,6 +410,12 @@ enum Commands {
         /// Conversation slug to use or create (default: a fresh generated slug).
         #[arg(long)]
         conversation: Option<String>,
+        /// How much tool detail to print: minimal, compact, or full.
+        #[arg(long, value_enum, default_value_t = Verbosity::default())]
+        verbosity: Verbosity,
+        /// Use the legacy line-mode repl instead of the full-screen TUI.
+        #[arg(long)]
+        legacy_tui: bool,
     },
     Adapters {
         #[command(subcommand)]
@@ -440,6 +446,8 @@ enum AgentCommands {
         sandbox_image: Option<String>,
         #[arg(long, value_enum)]
         sandbox_provider: Option<SandboxProviderArg>,
+        #[arg(long, value_enum)]
+        sandbox_scope: Option<SandboxScopeArg>,
         #[arg(long, value_enum)]
         networking: Option<EnabledDisabled>,
         #[arg(long)]
@@ -476,6 +484,8 @@ enum AgentCommands {
         #[arg(long, value_enum)]
         sandbox_provider: Option<SandboxProviderArg>,
         #[arg(long, value_enum)]
+        sandbox_scope: Option<SandboxScopeArg>,
+        #[arg(long, value_enum)]
         networking: Option<EnabledDisabled>,
         #[arg(long)]
         model: Option<String>,
@@ -496,11 +506,35 @@ enum AgentCommands {
         #[arg(long)]
         braintrust_project_id: Option<String>,
     },
+    Mount {
+        #[command(subcommand)]
+        command: AgentMountCommands,
+    },
     Show {
         agent: String,
     },
     Delete {
         agent: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentMountCommands {
+    List {
+        agent: String,
+    },
+    Add {
+        agent: String,
+        host_path: PathBuf,
+        mount_path: Option<String>,
+        #[arg(long)]
+        rw: bool,
+        #[arg(long)]
+        internal: bool,
+    },
+    Remove {
+        agent: String,
+        mount_path: String,
     },
 }
 
@@ -826,6 +860,8 @@ async fn main() -> Result<()> {
             model,
             agent,
             conversation,
+            verbosity,
+            legacy_tui,
         } => {
             let agent_slug =
                 agent.unwrap_or_else(|| default_repl_agent_slug(harness_selection.as_ref()));
@@ -873,6 +909,7 @@ async fn main() -> Result<()> {
                                 .and_then(HarnessSelection::default_sandbox_image)
                                 .map(str::to_string),
                             sandbox_provider: default_sandbox_provider,
+                            sandbox_scope: None,
                             enable_networking: harness_selection
                                 .as_ref()
                                 .is_some_and(HarnessSelection::default_enable_networking),
@@ -898,7 +935,14 @@ async fn main() -> Result<()> {
                 }
             };
 
-            run_chat_repl(Arc::clone(&agent), conversation).await?;
+            // Non-interactive stdin/stdout (pipes, CI) can't host the
+            // full-screen TUI; fall back to line mode automatically.
+            let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+            if legacy_tui || !interactive {
+                run_chat_repl(Arc::clone(&agent), conversation, verbosity).await?;
+            } else {
+                tui_app::run_chat_tui(Arc::clone(&agent), conversation, verbosity).await?;
+            }
         }
         Commands::Agent { command } => match command {
             AgentCommands::List => {
@@ -919,6 +963,7 @@ async fn main() -> Result<()> {
                 tool_creation,
                 sandbox_image,
                 sandbox_provider,
+                sandbox_scope,
                 networking,
                 model,
                 max_output_tokens,
@@ -968,6 +1013,7 @@ async fn main() -> Result<()> {
                         sandbox_provider: sandbox_provider
                             .map(SandboxProvider::from)
                             .unwrap_or(default_sandbox_provider),
+                        sandbox_scope: sandbox_scope.map(SandboxScope::from),
                         enable_networking,
                         model,
                         max_output_tokens,
@@ -996,6 +1042,7 @@ async fn main() -> Result<()> {
                 sandbox_image,
                 clear_sandbox_image,
                 sandbox_provider,
+                sandbox_scope,
                 networking,
                 model,
                 max_output_tokens,
@@ -1123,28 +1170,36 @@ async fn main() -> Result<()> {
                     }
                 }
                 if clear_sandbox_image {
-                    config.sandbox_image = None;
+                    config.sandbox.image = None;
                     changed = true;
                 } else if let Some(sandbox_image) = sandbox_image {
                     if sandbox_image.trim().is_empty() {
                         bail!("sandbox image must not be empty");
                     }
-                    config.sandbox_image = Some(sandbox_image);
+                    config.sandbox.image = Some(sandbox_image);
                     changed = true;
                 }
 
                 if let Some(sandbox_provider) = sandbox_provider {
                     let sandbox_provider = SandboxProvider::from(sandbox_provider);
-                    if config.sandbox_provider != sandbox_provider {
-                        config.sandbox_provider = sandbox_provider;
+                    if config.sandbox.provider != sandbox_provider {
+                        config.sandbox.provider = sandbox_provider;
+                        changed = true;
+                    }
+                }
+
+                if let Some(sandbox_scope) = sandbox_scope {
+                    let sandbox_scope = SandboxScope::from(sandbox_scope);
+                    if config.sandbox.scope != sandbox_scope {
+                        config.sandbox.scope = sandbox_scope;
                         changed = true;
                     }
                 }
 
                 if let Some(networking) = networking {
                     let enable_networking = networking.enabled();
-                    if config.enable_networking != enable_networking {
-                        config.enable_networking = enable_networking;
+                    if config.sandbox.enable_networking != enable_networking {
+                        config.sandbox.enable_networking = enable_networking;
                         changed = true;
                     }
                 }
@@ -1213,6 +1268,80 @@ async fn main() -> Result<()> {
                 agent.put_config(config).await?;
                 println!("updated agent {}", agent.record().slug);
             }
+            AgentCommands::Mount { command } => match command {
+                AgentMountCommands::List { agent } => {
+                    let agent = must_get_agent(harness.as_ref(), &agent).await?;
+                    let config = agent.config().await?;
+                    print_mounts(&config.sandbox.mounts);
+                }
+                AgentMountCommands::Add {
+                    agent,
+                    host_path,
+                    mount_path,
+                    rw,
+                    internal,
+                } => {
+                    let agent = must_get_agent(harness.as_ref(), &agent).await?;
+                    let canonical_host_path = canonicalize_directory(&host_path)?;
+
+                    let mut config = agent.config().await?;
+                    let mount_path = match mount_path {
+                        Some(mount_path) => {
+                            validate_mount_path(&mount_path)?;
+                            mount_path
+                        }
+                        None => default_mount_path(&canonical_host_path, &config.sandbox.mounts),
+                    };
+                    let new_mount = FileSystemMount {
+                        host_path: canonical_host_path.display().to_string(),
+                        mount_path: mount_path.clone(),
+                        mode: if rw {
+                            FileSystemMountMode::ReadWrite
+                        } else {
+                            FileSystemMountMode::ReadOnly
+                        },
+                        internal: Some(internal),
+                    };
+
+                    if let Some(existing) = config
+                        .sandbox
+                        .mounts
+                        .iter_mut()
+                        .find(|mount| mount.mount_path == mount_path)
+                    {
+                        *existing = new_mount;
+                    } else {
+                        config.sandbox.mounts.push(new_mount);
+                    }
+
+                    agent.put_config(config).await?;
+                    println!(
+                        "mounted {} -> {} ({}) for agent {}",
+                        canonical_host_path.display(),
+                        mount_path,
+                        if rw { "rw" } else { "ro" },
+                        agent.record().slug
+                    );
+                }
+                AgentMountCommands::Remove { agent, mount_path } => {
+                    let agent = must_get_agent(harness.as_ref(), &agent).await?;
+                    let mut config = agent.config().await?;
+                    let before = config.sandbox.mounts.len();
+                    config
+                        .sandbox
+                        .mounts
+                        .retain(|mount| mount.mount_path != mount_path);
+                    if config.sandbox.mounts.len() == before {
+                        bail!("mount not found: {mount_path}");
+                    }
+                    agent.put_config(config).await?;
+                    println!(
+                        "removed mount {} from agent {}",
+                        mount_path,
+                        agent.record().slug
+                    );
+                }
+            },
             AgentCommands::Show { agent } => {
                 let agent = must_get_agent(harness.as_ref(), &agent).await?;
                 let config = agent.config().await?;
@@ -1247,13 +1376,22 @@ async fn main() -> Result<()> {
                 );
                 println!(
                     "sandbox_image: {}",
-                    config.sandbox_image.as_deref().unwrap_or("default")
+                    config.sandbox.image.as_deref().unwrap_or("default")
                 );
                 println!(
                     "sandbox_provider: {}",
-                    format_sandbox_provider(config.sandbox_provider)
+                    format_sandbox_provider(config.sandbox.provider)
                 );
-                println!("enable_networking: {}", config.enable_networking);
+                println!(
+                    "sandbox_scope: {}",
+                    match config.sandbox.scope {
+                        executor::SandboxScope::Agent => "agent",
+                        executor::SandboxScope::Conversation => "conversation",
+                    }
+                );
+                println!("enable_networking: {}", config.sandbox.enable_networking);
+                println!("sandbox_mounts:");
+                print_mounts(&config.sandbox.mounts);
                 println!("model: {}", config.model);
                 println!(
                     "max_output_tokens: {}",
@@ -1340,7 +1478,7 @@ async fn main() -> Result<()> {
                     conversation.record().id
                 );
                 if repl {
-                    run_chat_repl(Arc::clone(&agent), conversation).await?;
+                    run_chat_repl(Arc::clone(&agent), conversation, Verbosity::default()).await?;
                 } else {
                     println!(
                         "start chatting with it via `{}`",
@@ -1381,7 +1519,7 @@ async fn main() -> Result<()> {
                         .ok_or_else(|| {
                             anyhow!("forked conversation not found: {}", forked.record().slug)
                         })?;
-                    run_chat_repl(agent, conversation).await?;
+                    run_chat_repl(agent, conversation, Verbosity::default()).await?;
                 } else {
                     println!(
                         "start chatting with it via `{}`",
@@ -1705,7 +1843,7 @@ async fn main() -> Result<()> {
                 send_conversation_wakeup(conversation.as_ref(), prompt).await?;
                 let messages = conversation.messages().await?;
                 for message in &messages[previous_messages.len()..] {
-                    print_message(message);
+                    print_message(message, Verbosity::Full);
                 }
             }
             ConversationCommands::Delete {
@@ -1959,6 +2097,11 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
             AgentCommands::Update { agent, .. }
             | AgentCommands::Show { agent }
             | AgentCommands::Delete { agent } => Some(agent.as_str()),
+            AgentCommands::Mount { command } => match command {
+                AgentMountCommands::List { agent }
+                | AgentMountCommands::Add { agent, .. }
+                | AgentMountCommands::Remove { agent, .. } => Some(agent.as_str()),
+            },
             AgentCommands::List | AgentCommands::Create { .. } => None,
         },
         Commands::Conversation { command } => match command {
@@ -2625,81 +2768,6 @@ async fn run_sandbox_shell_command(
     Ok(serde_json::from_value(result)?)
 }
 
-pub(crate) fn print_message(message: &Message) {
-    let timestamp = compact_timestamp();
-    match message {
-        Message::User { content } => {
-            println!("{timestamp} user: {}", render_user_content(content));
-        }
-        Message::Assistant { content, .. } => {
-            println!(
-                "{timestamp} assistant: {}",
-                render_assistant_content(content)
-            );
-        }
-        Message::Tool { content } => {
-            for part in content {
-                let ToolContentPart::ToolResult(result) = part;
-                println!("{timestamp} tool {}: {}", result.tool_name, result.output);
-            }
-        }
-        Message::System { content } => {
-            println!("{timestamp} system: {}", render_user_content(content));
-        }
-        Message::Developer { content } => {
-            println!("{timestamp} developer: {}", render_user_content(content));
-        }
-    }
-}
-
-pub(crate) fn compact_timestamp() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() % 86_400)
-        .unwrap_or(0);
-    let hours = seconds / 3_600;
-    let minutes = (seconds % 3_600) / 60;
-    let seconds = seconds % 60;
-    format!("[{hours:02}:{minutes:02}:{seconds:02}]")
-}
-
-fn render_user_content(content: &UserContent) -> String {
-    match content {
-        UserContent::String(text) => text.clone(),
-        UserContent::Array(parts) => parts
-            .iter()
-            .map(|part| match part {
-                lingua::universal::UserContentPart::Text(text) => text.text.clone(),
-                _ => "[non-text user content]".to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-    }
-}
-
-pub(crate) fn render_assistant_content(content: &AssistantContent) -> String {
-    match content {
-        AssistantContent::String(text) => text.clone(),
-        AssistantContent::Array(parts) => parts
-            .iter()
-            .map(|part| match part {
-                AssistantContentPart::Text(text) => text.text.clone(),
-                AssistantContentPart::Reasoning { text, .. } => format!("[reasoning] {text}"),
-                AssistantContentPart::ToolCall {
-                    tool_name,
-                    arguments,
-                    ..
-                } => format!("[tool_call {tool_name}] {arguments}"),
-                AssistantContentPart::ToolResult {
-                    tool_name, output, ..
-                } => format!("[tool_result {tool_name}] {output}"),
-                AssistantContentPart::File { .. } => "[file]".to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-    }
-}
-
 fn repl_command(agent_slug: &str, conversation_slug: &str) -> String {
     format!("exo repl --agent {agent_slug} --conversation {conversation_slug}")
 }
@@ -2827,6 +2895,8 @@ mod create_tests {
                 model: None,
                 agent: None,
                 conversation: None,
+                verbosity: crate::render::Verbosity::Compact,
+                legacy_tui: false,
             }
         ));
     }

@@ -1049,7 +1049,7 @@ async function requireCodexSandboxNetworking(
     "codex_networking_required",
     {
       metadata: turnMetadata(context),
-      agent_enable_networking: context.agentConfig.enableNetworking,
+      agent_enable_networking: context.agentConfig.sandbox.enableNetworking,
       reason:
         "Codex runs its model stream inside the exoharness sandbox, so the agent sandbox must have networking enabled.",
     },
@@ -1065,7 +1065,7 @@ function codexSandboxNetworkingError(context: TurnContext): string {
 }
 
 function codexEffectiveNetworking(context: TurnContext): boolean {
-  return context.agentConfig.enableNetworking;
+  return context.agentConfig.sandbox.enableNetworking;
 }
 
 function codexSandboxCommand(context: TurnContext): string[] {
@@ -1127,17 +1127,17 @@ function codexAppServerCwd(context: TurnContext): string {
 
 function codexEffectiveSandboxProvider(
   context: TurnContext,
-): TurnContext["agentConfig"]["sandboxProvider"] {
+): TurnContext["agentConfig"]["sandbox"]["provider"] {
   return (
     context.conversationConfig.sandboxProvider ??
-    context.agentConfig.sandboxProvider
+    context.agentConfig.sandbox.provider
   );
 }
 
 function codexEffectiveSandboxImage(context: TurnContext): string | null {
   return (
     context.conversationConfig.sandboxImage ??
-    context.agentConfig.sandboxImage ??
+    context.agentConfig.sandbox.image ??
     null
   );
 }

@@ -43,7 +43,7 @@ pub use adapter::{AdapterRunOptions, run_adapters_watch};
 pub use braintrust::{BraintrustProject, BraintrustRuntimeConfig, BraintrustTracingConfig};
 pub use conversation_wakeup::send_conversation_wakeup;
 pub use executor_types::{
-    AgentConfig, AgentHarnessKind, ConversationConfig, ConversationModelConfig,
+    AgentConfig, AgentHarnessKind, AgentSandboxConfig, ConversationConfig, ConversationModelConfig,
     ExecutionStreamEvent, ExecutionStreamHandle, ModelClient, ModelRequest, ModelResponse,
     ModelResponseStream, PendingToolCall, SandboxScope, SendRequest, SendResult, ToolDefinition,
     ToolRuntime, TypeScriptHarnessConfig, effective_sandbox_scope,

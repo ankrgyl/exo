@@ -9,7 +9,7 @@ use lingua::Message;
 
 use crate::{
     AgentConfig, AgentHarnessKind, BraintrustTracingConfig, ConversationConfig,
-    ConversationModelConfig, ExecutionStreamHandle, SendRequest, SendResult,
+    ConversationModelConfig, ExecutionStreamHandle, SandboxScope, SendRequest, SendResult,
     TypeScriptHarnessConfig,
 };
 
@@ -67,6 +67,7 @@ pub struct CreateAgentRequest {
     pub enable_agent_tool_creation: bool,
     pub sandbox_image: Option<String>,
     pub sandbox_provider: SandboxProvider,
+    pub sandbox_scope: Option<SandboxScope>,
     pub enable_networking: bool,
     pub model: String,
     pub max_output_tokens: Option<i64>,

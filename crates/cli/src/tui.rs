@@ -1,6 +1,6 @@
 use std::borrow::Cow;
-use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::collections::{BTreeMap, HashMap};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,14 +16,15 @@ use lingua::{Message, UniversalStreamChunk};
 use rustyline::error::ReadlineError;
 use rustyline::history::{History, MemHistory, SearchDirection, SearchResult};
 use rustyline::{Cmd, Config, Editor, ExternalPrinter, KeyCode, KeyEvent, Modifiers};
-use serde_json::{Map, Value};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
-use crate::{
-    compact_timestamp, print_message, render_assistant_content, run_sandbox_shell_command,
+use crate::render::{
+    ASSISTANT_LABEL, Verbosity, compact_result_status, compact_timestamp, print_transcript,
+    render_assistant_content, render_tool_call, render_tool_result,
 };
+use crate::run_sandbox_shell_command;
 
 const DEFAULT_SHELL_PROGRAM: &str = "/bin/bash";
 const REMOTE_HISTORY_BASE: usize = 1_000_000;
@@ -32,8 +33,9 @@ const REMOTE_HISTORY_PAGE_SIZE: u32 = 32;
 pub async fn run_chat_repl(
     agent: Arc<dyn HarnessAgent>,
     conversation: Arc<dyn HarnessConversation>,
+    verbosity: Verbosity,
 ) -> Result<()> {
-    let mut repl = ChatRepl::new(agent, conversation)?;
+    let mut repl = ChatRepl::new(agent, conversation, verbosity)?;
     repl.print_transcript().await?;
     repl.run().await
 }
@@ -351,12 +353,14 @@ struct ChatRepl {
     editor: Editor<(), ChatHistory>,
     session_id: Option<SessionId>,
     watch_after: Arc<Mutex<Option<EventId>>>,
+    verbosity: Verbosity,
 }
 
 impl ChatRepl {
     fn new(
         agent: Arc<dyn HarnessAgent>,
         conversation: Arc<dyn HarnessConversation>,
+        verbosity: Verbosity,
     ) -> Result<Self> {
         let latest_event_id = conversation.record().latest_event_id;
         let history = ChatHistory::new(conversation.exoharness_handle(), latest_event_id);
@@ -368,97 +372,13 @@ impl ChatRepl {
             editor,
             session_id: None,
             watch_after: Arc::new(Mutex::new(latest_event_id)),
+            verbosity,
         })
     }
 
     async fn print_transcript(&self) -> Result<()> {
-        for message in self.conversation.messages().await? {
-            print_message(&message);
-        }
-        Ok(())
-    }
-
-    /// Summarize token usage and dollar cost for this conversation from the
-    /// `usage` records on its `messages` events. Paginates so it covers the
-    /// whole conversation, not just one page.
-    async fn print_cost(&self) -> Result<()> {
-        let handle = self.conversation.exoharness_handle();
-        let mut cursor: Option<EventId> = None;
-        let mut per_model: BTreeMap<String, ModelCost> = BTreeMap::new();
-        let mut unpriced = 0usize;
-        loop {
-            let result = handle
-                .get_events(Some(EventQuery {
-                    cursor,
-                    direction: Some(EventQueryDirection::Desc),
-                    limit: Some(REMOTE_HISTORY_PAGE_SIZE),
-                    session_id: None,
-                    turn_id: None,
-                    types: Some(vec![EventKind::MESSAGES]),
-                }))
-                .await?;
-            for event in &result.events {
-                if let EventData::Messages {
-                    usage: Some(usage), ..
-                } = &event.data
-                {
-                    let entry = per_model.entry(usage.model.clone()).or_default();
-                    entry.calls += 1;
-                    entry.prompt += usage.prompt_tokens.unwrap_or(0);
-                    entry.cached += usage.prompt_cached_tokens.unwrap_or(0);
-                    entry.completion += usage.completion_tokens.unwrap_or(0);
-                    match usage.cost_usd {
-                        Some(cost) => entry.cost += cost,
-                        None => unpriced += 1,
-                    }
-                }
-            }
-            match result.cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
-
-        if per_model.is_empty() {
-            println!("no recorded model usage in this conversation yet");
-            return Ok(());
-        }
-
-        let mut total = ModelCost::default();
-        println!(
-            "{:<28} {:>6} {:>10} {:>10} {:>10} {:>12}",
-            "MODEL", "CALLS", "PROMPT", "CACHED", "OUT", "COST"
-        );
-        for (model, c) in &per_model {
-            println!(
-                "{:<28} {:>6} {:>10} {:>10} {:>10} {:>12}",
-                truncate(model, 28),
-                c.calls,
-                c.prompt,
-                c.cached,
-                c.completion,
-                fmt_usd(c.cost),
-            );
-            total.calls += c.calls;
-            total.prompt += c.prompt;
-            total.cached += c.cached;
-            total.completion += c.completion;
-            total.cost += c.cost;
-        }
-        println!(
-            "{:<28} {:>6} {:>10} {:>10} {:>10} {:>12}",
-            "TOTAL",
-            total.calls,
-            total.prompt,
-            total.cached,
-            total.completion,
-            fmt_usd(total.cost),
-        );
-        if unpriced > 0 {
-            println!(
-                "note: {unpriced} call(s) had no price (model not in the price table); cost excludes them"
-            );
-        }
+        let messages = self.conversation.messages().await?;
+        print_transcript(&messages, self.verbosity);
         Ok(())
     }
 
@@ -467,8 +387,10 @@ impl ChatRepl {
             let prompt = format!("{}> ", self.conversation.record().slug);
             let event_printer = self.spawn_event_printer()?;
             let readline_result = self.editor.readline(&prompt);
-            event_printer.abort();
-            let _ = event_printer.await;
+            if let Some(event_printer) = event_printer {
+                event_printer.abort();
+                let _ = event_printer.await;
+            }
 
             match readline_result {
                 Ok(line) => {
@@ -480,11 +402,26 @@ impl ChatRepl {
                         "/quit" | "/exit" => break,
                         "/history" => self.print_transcript().await?,
                         "/cost" | "/usage" => {
-                            if let Err(error) = self.print_cost().await {
-                                println!("cost summary failed: {error:#}");
-                            }
+                            print_lines(cost_lines(self.conversation.as_ref()).await);
                         }
                         "/help" => print_help(),
+                        "/verbosity" => {
+                            println!("verbosity: {}", self.verbosity);
+                            println!("usage: /verbosity <minimal|compact|full>");
+                        }
+                        other if other.starts_with("/verbosity ") => {
+                            let arg = other
+                                .strip_prefix("/verbosity ")
+                                .expect("prefix checked")
+                                .trim();
+                            match arg.parse::<Verbosity>() {
+                                Ok(verbosity) => {
+                                    self.verbosity = verbosity;
+                                    println!("verbosity set to {verbosity}");
+                                }
+                                Err(error) => println!("{error}"),
+                            }
+                        }
                         "/shell" | "/sandbox" => {
                             println!("usage: /shell <command>");
                             println!("alias: /sandbox <command>");
@@ -508,10 +445,9 @@ impl ChatRepl {
                                 self.run_shell(command).await?;
                             }
                         }
-                        "/snapshot" => match self.snapshot_sandbox(None).await {
-                            Ok(snapshot_id) => println!("snapshot {snapshot_id}"),
-                            Err(error) => println!("snapshot failed: {error:#}"),
-                        },
+                        "/snapshot" => {
+                            print_lines(snapshot_lines(self.conversation.as_ref(), None).await);
+                        }
                         other if other.starts_with("/snapshot ") => {
                             let arg = other
                                 .strip_prefix("/snapshot ")
@@ -522,30 +458,18 @@ impl ChatRepl {
                             } else if arg.contains(char::is_whitespace) {
                                 println!("/snapshot takes at most one sandbox id; got: {arg:?}");
                             } else {
-                                match self.snapshot_sandbox(Some(arg.to_string())).await {
-                                    Ok(snapshot_id) => println!("snapshot {snapshot_id}"),
-                                    Err(error) => println!("snapshot failed: {error:#}"),
-                                }
+                                print_lines(
+                                    snapshot_lines(
+                                        self.conversation.as_ref(),
+                                        Some(arg.to_string()),
+                                    )
+                                    .await,
+                                );
                             }
                         }
-                        "/snapshots" => match self.list_snapshots().await {
-                            Ok(snapshots) if snapshots.is_empty() => {
-                                println!("no snapshots yet for this conversation");
-                            }
-                            Ok(snapshots) => {
-                                println!("SNAPSHOT\tTAKEN\tSANDBOX");
-                                for (snapshot_id, sandbox_id) in snapshots {
-                                    // Snapshot ids are uuid7, so creation time
-                                    // is embedded in the id itself.
-                                    let taken = snapshot_id
-                                        .timestamp()
-                                        .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                                        .unwrap_or_else(|| "-".to_string());
-                                    println!("{snapshot_id}\t{taken}\t{sandbox_id}");
-                                }
-                            }
-                            Err(error) => println!("listing snapshots failed: {error:#}"),
-                        },
+                        "/snapshots" => {
+                            print_lines(snapshots_lines(self.conversation.as_ref()).await);
+                        }
                         "/teleport" => {
                             println!("usage: /teleport <provider> (e.g. /teleport daytona)");
                         }
@@ -575,15 +499,15 @@ impl ChatRepl {
                             } else if arg.contains(char::is_whitespace) {
                                 println!("/rewind takes exactly one snapshot id; got: {arg:?}");
                             } else {
-                                match self.rewind_to_snapshot(arg).await {
-                                    Ok(()) => println!("rewound to snapshot {arg}"),
-                                    Err(error) => println!("rewind failed: {error:#}"),
-                                }
+                                print_lines(rewind_lines(self.conversation.as_ref(), arg).await);
                             }
                         }
                         _ => {
                             self.editor.add_history_entry(line.as_str())?;
-                            self.send(trimmed).await?;
+                            if let Err(error) = self.send(trimmed).await {
+                                println!();
+                                println!("turn failed: {error:#}");
+                            }
                         }
                     }
                 }
@@ -606,31 +530,10 @@ impl ChatRepl {
         Ok(())
     }
 
-    async fn snapshot_sandbox(&self, explicit_id: Option<SandboxId>) -> Result<SnapshotId> {
-        let sandbox_id = match explicit_id {
-            Some(id) => id,
-            None => latest_sandbox_id(self.conversation.as_ref())
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("no sandbox has been created in this conversation yet")
-                })?,
-        };
-        let id = self
-            .conversation
-            .exoharness_handle()
-            .snapshot_sandbox(sandbox_id)
-            .await?;
-        Ok(id)
-    }
-
-    async fn list_snapshots(&self) -> Result<Vec<(SnapshotId, SandboxId)>> {
-        list_snapshots(self.conversation.as_ref()).await
-    }
-
     /// Teleport the conversation's live sandbox to another provider: snapshot
     /// it where it runs now, then restore that snapshot under the target
-    /// provider. The sandbox id is stable across the move; only the backend
-    /// (and the machine actually running the container) changes.
+    /// provider. Prints progress between the slow steps, which is why the
+    /// line-mode repl doesn't use the TUI's silent `teleport_lines`.
     async fn teleport_sandbox(&self, provider_str: &str) -> Result<(SandboxId, SandboxProvider)> {
         let provider = provider_str
             .parse::<SandboxProvider>()
@@ -659,30 +562,6 @@ impl ChatRepl {
         Ok((sandbox_id, provider))
     }
 
-    /// Restore the conversation's sandbox to a previously-taken snapshot.
-    /// Stops the current container, decodes the snapshot payload, and starts
-    /// a fresh container from that state.
-    async fn rewind_to_snapshot(&self, snapshot_id_str: &str) -> Result<()> {
-        let snapshot_id = snapshot_id_str
-            .parse::<SnapshotId>()
-            .map_err(|error| anyhow::anyhow!("invalid snapshot id `{snapshot_id_str}`: {error}"))?;
-        let sandbox_id = sandbox_id_for_snapshot(self.conversation.as_ref(), snapshot_id)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!("snapshot {snapshot_id} not found in this conversation")
-            })?;
-        self.conversation
-            .exoharness_handle()
-            .start_sandbox(StartSandboxRequest {
-                id: sandbox_id,
-                snapshot_id,
-                idle_seconds: None,
-                provider: None,
-            })
-            .await?;
-        Ok(())
-    }
-
     async fn send(&mut self, input: &str) -> Result<()> {
         let mut stream = self
             .conversation
@@ -696,19 +575,30 @@ impl ChatRepl {
         let mut stdout = io::stdout();
         let mut printed_assistant = false;
         let mut streamed_text = String::new();
+        // Tool names by call id, so results (which only carry the id) can be
+        // labeled in compact mode.
+        let mut pending_tool_calls: HashMap<String, String> = HashMap::new();
+        // Compact call line left open (no newline) so the matching result can
+        // acknowledge receipt on the same line.
+        let mut open_call: Option<String> = None;
 
         while let Some(event) = stream.next().await {
             match event? {
                 ExecutionStreamEvent::FirstChunk { ttft } => {
-                    print_ttft(ttft);
+                    if self.verbosity == Verbosity::Full {
+                        print_ttft(ttft);
+                    }
                 }
                 ExecutionStreamEvent::Chunk(chunk) => {
                     let text = chunk_text(&chunk);
                     if text.is_empty() {
                         continue;
                     }
+                    if open_call.take().is_some() {
+                        println!();
+                    }
                     if !printed_assistant {
-                        print!("{} assistant: ", compact_timestamp());
+                        print!("{} {ASSISTANT_LABEL}: ", compact_timestamp());
                         stdout.flush()?;
                         printed_assistant = true;
                     }
@@ -717,19 +607,50 @@ impl ChatRepl {
                     streamed_text.push_str(&text);
                 }
                 ExecutionStreamEvent::ToolCall {
+                    tool_call_id,
                     tool_name,
                     arguments,
-                    ..
                 } => {
-                    if printed_assistant && !streamed_text.ends_with('\n') {
+                    if open_call.take().is_some() {
                         println!();
                     }
-                    println!("{}", render_tool_call(&tool_name, &arguments));
-                    printed_assistant = false;
-                    streamed_text.clear();
+                    if printed_assistant && !streamed_text.ends_with('\n') {
+                        println!();
+                        printed_assistant = false;
+                        streamed_text.clear();
+                    }
+                    if let Some(rendered) = render_tool_call(&tool_name, &arguments, self.verbosity)
+                    {
+                        if self.verbosity == Verbosity::Compact {
+                            print!("{rendered}");
+                            stdout.flush()?;
+                            open_call = Some(tool_call_id.clone());
+                        } else {
+                            println!("{rendered}");
+                        }
+                        printed_assistant = false;
+                        streamed_text.clear();
+                    }
+                    pending_tool_calls.insert(tool_call_id, tool_name);
                 }
-                ExecutionStreamEvent::ToolResult { result, .. } => {
-                    println!("{}", render_tool_result(&result));
+                ExecutionStreamEvent::ToolResult {
+                    tool_call_id,
+                    result,
+                } => {
+                    let tool_name = pending_tool_calls
+                        .remove(&tool_call_id)
+                        .unwrap_or_else(|| "tool".to_string());
+                    if open_call.as_deref() == Some(tool_call_id.as_str()) {
+                        open_call = None;
+                        println!(" {}", compact_result_status(&result));
+                    } else if let Some(rendered) =
+                        render_tool_result(&tool_name, &result, self.verbosity)
+                    {
+                        if open_call.take().is_some() {
+                            println!();
+                        }
+                        println!("{rendered}");
+                    }
                 }
                 ExecutionStreamEvent::Completed(result) => {
                     self.session_id = Some(result.session_id);
@@ -738,26 +659,33 @@ impl ChatRepl {
                 }
             }
         }
+        if open_call.is_some() {
+            println!();
+        }
 
         if printed_assistant {
             println!();
         } else if let Some(last_message) = self.conversation.messages().await?.last().cloned()
             && let Message::Assistant { content, .. } = last_message
         {
-            let rendered = render_assistant_content(&content);
+            let rendered = render_assistant_content(&content, self.verbosity);
             if !rendered.is_empty() {
-                println!("{} assistant: {}", compact_timestamp(), rendered);
+                println!("{} {ASSISTANT_LABEL}: {}", compact_timestamp(), rendered);
             }
         }
         println!();
         Ok(())
     }
 
-    fn spawn_event_printer(&mut self) -> Result<JoinHandle<()>> {
+    fn spawn_event_printer(&mut self) -> Result<Option<JoinHandle<()>>> {
+        if !io::stdin().is_terminal() {
+            return Ok(None);
+        }
         let conversation = self.conversation.exoharness_handle();
         let watch_after = Arc::clone(&self.watch_after);
+        let verbosity = self.verbosity;
         let mut printer = self.editor.create_external_printer()?;
-        Ok(tokio::spawn(async move {
+        Ok(Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
                 interval.tick().await;
@@ -777,7 +705,7 @@ impl ChatRepl {
                         for event in result.events {
                             *watch_after.lock().expect("chat event watch poisoned") =
                                 Some(event.id);
-                            for rendered in render_external_event(&event.data) {
+                            for rendered in render_external_event(&event.data, verbosity) {
                                 let _ = printer.print(format!("{rendered}\n"));
                             }
                         }
@@ -788,16 +716,11 @@ impl ChatRepl {
                     }
                 }
             }
-        }))
+        })))
     }
 
     async fn run_shell(&self, command: &str) -> Result<()> {
-        let mut config = self.conversation.config().await?;
-        if config.shell_program.is_none() {
-            config.shell_program = Some(DEFAULT_SHELL_PROGRAM.to_string());
-            self.conversation.put_config(config).await?;
-        }
-        let output = run_sandbox_shell_command(
+        let output = shell_output(
             self.agent.as_ref(),
             self.conversation.as_ref(),
             command.to_string(),
@@ -812,7 +735,7 @@ impl ChatRepl {
     }
 }
 
-fn chunk_text(chunk: &UniversalStreamChunk) -> String {
+pub(crate) fn chunk_text(chunk: &UniversalStreamChunk) -> String {
     let mut text = String::new();
     for choice in &chunk.choices {
         if let Some(delta) = choice.delta_view()
@@ -833,59 +756,7 @@ fn print_ttft(ttft: Duration) {
     }
 }
 
-fn render_tool_call(tool_name: &str, arguments: &Map<String, Value>) -> String {
-    let mut lines = vec![format!("tool call {tool_name}")];
-    append_object_fields(&mut lines, arguments, "  ");
-    lines.join("\n")
-}
-
-fn render_tool_result(result: &Value) -> String {
-    let mut lines = vec!["tool result".to_string()];
-    match result {
-        Value::Object(object) => append_object_fields(&mut lines, object, "  "),
-        other => lines.push(format!("  {}", render_value_inline(other))),
-    }
-    lines.join("\n")
-}
-
-fn append_object_fields(lines: &mut Vec<String>, object: &Map<String, Value>, indent: &str) {
-    if object.is_empty() {
-        lines.push(format!("{indent}{{}}"));
-        return;
-    }
-
-    for (key, value) in object {
-        append_field(lines, key, value, indent);
-    }
-}
-
-fn append_field(lines: &mut Vec<String>, key: &str, value: &Value, indent: &str) {
-    match value {
-        Value::String(text) if text.contains('\n') => {
-            lines.push(format!("{indent}{key}:"));
-            for line in text.lines() {
-                lines.push(format!("{indent}  {line}"));
-            }
-            if text.ends_with('\n') {
-                lines.push(format!("{indent}  "));
-            }
-        }
-        Value::Object(object) => {
-            lines.push(format!("{indent}{key}:"));
-            append_object_fields(lines, object, &format!("{indent}  "));
-        }
-        other => lines.push(format!("{indent}{key}: {}", render_value_inline(other))),
-    }
-}
-
-fn render_value_inline(value: &Value) -> String {
-    match value {
-        Value::String(text) => format!("{text:?}"),
-        other => serde_json::to_string(other).unwrap_or_else(|_| "<unrenderable>".to_string()),
-    }
-}
-
-fn render_external_event(data: &EventData) -> Vec<String> {
+pub(crate) fn render_external_event(data: &EventData, verbosity: Verbosity) -> Vec<String> {
     let EventData::Messages { messages, .. } = data else {
         return Vec::new();
     };
@@ -895,9 +766,9 @@ fn render_external_event(data: &EventData) -> Vec<String> {
             Message::User { content } => render_external_user_content(content)
                 .map(|rendered| format!("{} user: {rendered}", compact_timestamp())),
             Message::Assistant { content, .. } => {
-                let rendered = render_assistant_content(content);
+                let rendered = render_assistant_content(content, verbosity);
                 (!rendered.is_empty())
-                    .then(|| format!("{} assistant: {rendered}", compact_timestamp()))
+                    .then(|| format!("{} {ASSISTANT_LABEL}: {rendered}", compact_timestamp()))
             }
             _ => None,
         })
@@ -957,10 +828,17 @@ fn truncate(value: &str, max: usize) -> String {
     }
 }
 
+fn print_lines(lines: Vec<String>) {
+    for line in lines {
+        println!("{line}");
+    }
+}
+
 fn print_help() {
     println!("repl commands:");
     println!("  /quit | /exit        exit the repl");
     println!("  /history             reprint the conversation transcript");
+    println!("  /verbosity <level>   set tool output detail: minimal, compact, or full");
     println!("  /cost | /usage       summarize token usage and dollar cost");
     println!("  /snapshot [<id>]     snapshot a sandbox in this conversation");
     println!("                       (defaults to the latest one if no id is given)");
@@ -969,6 +847,266 @@ fn print_help() {
     println!("  /teleport <provider> move the live sandbox to another provider");
     println!("                       (e.g. /teleport daytona: snapshot + restore there)");
     println!("  /help                show this message");
+}
+
+/// `/cost` output: summarize token usage and dollar cost for the conversation
+/// from the `usage` records on its `messages` events. Paginates so it covers
+/// the whole conversation, not just one page.
+pub(crate) async fn cost_lines(conversation: &dyn HarnessConversation) -> Vec<String> {
+    match cost_summary(conversation).await {
+        Ok(lines) => lines,
+        Err(error) => vec![format!("cost summary failed: {error:#}")],
+    }
+}
+
+async fn cost_summary(conversation: &dyn HarnessConversation) -> Result<Vec<String>> {
+    let handle = conversation.exoharness_handle();
+    let mut cursor: Option<EventId> = None;
+    let mut per_model: BTreeMap<String, ModelCost> = BTreeMap::new();
+    let mut unpriced = 0usize;
+    loop {
+        let result = handle
+            .get_events(Some(EventQuery {
+                cursor,
+                direction: Some(EventQueryDirection::Desc),
+                limit: Some(REMOTE_HISTORY_PAGE_SIZE),
+                session_id: None,
+                turn_id: None,
+                types: Some(vec![EventKind::MESSAGES]),
+            }))
+            .await?;
+        for event in &result.events {
+            if let EventData::Messages {
+                usage: Some(usage), ..
+            } = &event.data
+            {
+                let entry = per_model.entry(usage.model.clone()).or_default();
+                entry.calls += 1;
+                entry.prompt += usage.prompt_tokens.unwrap_or(0);
+                entry.cached += usage.prompt_cached_tokens.unwrap_or(0);
+                entry.completion += usage.completion_tokens.unwrap_or(0);
+                match usage.cost_usd {
+                    Some(cost) => entry.cost += cost,
+                    None => unpriced += 1,
+                }
+            }
+        }
+        match result.cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    if per_model.is_empty() {
+        return Ok(vec![
+            "no recorded model usage in this conversation yet".to_string(),
+        ]);
+    }
+
+    let mut lines = Vec::new();
+    let mut total = ModelCost::default();
+    lines.push(format!(
+        "{:<28} {:>6} {:>10} {:>10} {:>10} {:>12}",
+        "MODEL", "CALLS", "PROMPT", "CACHED", "OUT", "COST"
+    ));
+    for (model, c) in &per_model {
+        lines.push(format!(
+            "{:<28} {:>6} {:>10} {:>10} {:>10} {:>12}",
+            truncate(model, 28),
+            c.calls,
+            c.prompt,
+            c.cached,
+            c.completion,
+            fmt_usd(c.cost),
+        ));
+        total.calls += c.calls;
+        total.prompt += c.prompt;
+        total.cached += c.cached;
+        total.completion += c.completion;
+        total.cost += c.cost;
+    }
+    lines.push(format!(
+        "{:<28} {:>6} {:>10} {:>10} {:>10} {:>12}",
+        "TOTAL",
+        total.calls,
+        total.prompt,
+        total.cached,
+        total.completion,
+        fmt_usd(total.cost),
+    ));
+    if unpriced > 0 {
+        lines.push(format!(
+            "note: {unpriced} call(s) had no price (model not in the price table); cost excludes them"
+        ));
+    }
+    Ok(lines)
+}
+
+/// `/snapshot` output: snapshot the given sandbox, or the conversation's
+/// latest one when no id is given.
+pub(crate) async fn snapshot_lines(
+    conversation: &dyn HarnessConversation,
+    explicit_id: Option<SandboxId>,
+) -> Vec<String> {
+    match snapshot_sandbox(conversation, explicit_id).await {
+        Ok(snapshot_id) => vec![format!("snapshot {snapshot_id}")],
+        Err(error) => vec![format!("snapshot failed: {error:#}")],
+    }
+}
+
+async fn snapshot_sandbox(
+    conversation: &dyn HarnessConversation,
+    explicit_id: Option<SandboxId>,
+) -> Result<SnapshotId> {
+    let sandbox_id = match explicit_id {
+        Some(id) => id,
+        None => latest_sandbox_id(conversation).await?.ok_or_else(|| {
+            anyhow::anyhow!("no sandbox has been created in this conversation yet")
+        })?,
+    };
+    let id = conversation
+        .exoharness_handle()
+        .snapshot_sandbox(sandbox_id)
+        .await?;
+    Ok(id)
+}
+
+/// `/snapshots` output: every snapshot taken in the conversation.
+pub(crate) async fn snapshots_lines(conversation: &dyn HarnessConversation) -> Vec<String> {
+    match list_snapshots(conversation).await {
+        Ok(snapshots) if snapshots.is_empty() => {
+            vec!["no snapshots yet for this conversation".to_string()]
+        }
+        Ok(snapshots) => {
+            let mut lines = vec!["SNAPSHOT\tTAKEN\tSANDBOX".to_string()];
+            for (snapshot_id, sandbox_id) in snapshots {
+                // Snapshot ids are uuid7, so creation time is embedded in the
+                // id itself.
+                let taken = snapshot_id
+                    .timestamp()
+                    .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                lines.push(format!("{snapshot_id}\t{taken}\t{sandbox_id}"));
+            }
+            lines
+        }
+        Err(error) => vec![format!("listing snapshots failed: {error:#}")],
+    }
+}
+
+/// `/rewind` output: restore the conversation's sandbox to a previous
+/// snapshot. Stops the current container, decodes the snapshot payload, and
+/// starts a fresh container from that state.
+pub(crate) async fn rewind_lines(
+    conversation: &dyn HarnessConversation,
+    snapshot_id: &str,
+) -> Vec<String> {
+    match rewind_to_snapshot(conversation, snapshot_id).await {
+        Ok(()) => vec![format!("rewound to snapshot {snapshot_id}")],
+        Err(error) => vec![format!("rewind failed: {error:#}")],
+    }
+}
+
+async fn rewind_to_snapshot(
+    conversation: &dyn HarnessConversation,
+    snapshot_id_str: &str,
+) -> Result<()> {
+    let snapshot_id = snapshot_id_str
+        .parse::<SnapshotId>()
+        .map_err(|error| anyhow::anyhow!("invalid snapshot id `{snapshot_id_str}`: {error}"))?;
+    let sandbox_id = sandbox_id_for_snapshot(conversation, snapshot_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("snapshot {snapshot_id} not found in this conversation"))?;
+    conversation
+        .exoharness_handle()
+        .start_sandbox(StartSandboxRequest {
+            id: sandbox_id,
+            snapshot_id,
+            idle_seconds: None,
+            provider: None,
+        })
+        .await?;
+    Ok(())
+}
+
+/// `/teleport` output: move the conversation's live sandbox to another
+/// provider by snapshotting it where it runs now, then restoring that
+/// snapshot under the target provider. The sandbox id is stable across the
+/// move; only the backend (and the machine actually running the container)
+/// changes.
+pub(crate) async fn teleport_lines(
+    conversation: &dyn HarnessConversation,
+    provider: &str,
+) -> Vec<String> {
+    match teleport_sandbox(conversation, provider).await {
+        Ok((sandbox_id, provider)) => {
+            vec![format!("sandbox {sandbox_id} teleported to {provider}")]
+        }
+        Err(error) => vec![format!("teleport failed: {error:#}")],
+    }
+}
+
+async fn teleport_sandbox(
+    conversation: &dyn HarnessConversation,
+    provider_str: &str,
+) -> Result<(SandboxId, SandboxProvider)> {
+    let provider = provider_str
+        .parse::<SandboxProvider>()
+        .map_err(|error| anyhow::anyhow!("invalid provider `{provider_str}`: {error}"))?;
+    let sandbox_id = latest_sandbox_id(conversation)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no sandbox has been created in this conversation yet"))?;
+    let snapshot_id = conversation
+        .exoharness_handle()
+        .snapshot_sandbox(sandbox_id.clone())
+        .await?;
+    conversation
+        .exoharness_handle()
+        .start_sandbox(StartSandboxRequest {
+            id: sandbox_id.clone(),
+            snapshot_id,
+            idle_seconds: None,
+            provider: Some(provider),
+        })
+        .await?;
+    Ok((sandbox_id, provider))
+}
+
+/// `/shell` output as display lines. The line-mode repl streams raw bytes to
+/// stdout/stderr instead; this is for UIs that own the screen.
+pub(crate) async fn shell_lines(
+    agent: &dyn HarnessAgent,
+    conversation: &dyn HarnessConversation,
+    command: String,
+) -> Vec<String> {
+    match shell_output(agent, conversation, command).await {
+        Ok(output) => {
+            let mut lines: Vec<String> = output
+                .stdout
+                .lines()
+                .chain(output.stderr.lines())
+                .map(str::to_string)
+                .collect();
+            if output.exit_code != 0 {
+                lines.push(format!("[exit {}]", output.exit_code));
+            }
+            lines
+        }
+        Err(error) => vec![format!("shell failed: {error:#}")],
+    }
+}
+
+async fn shell_output(
+    agent: &dyn HarnessAgent,
+    conversation: &dyn HarnessConversation,
+    command: String,
+) -> Result<crate::SandboxShellOutput> {
+    let mut config = conversation.config().await?;
+    if config.shell_program.is_none() {
+        config.shell_program = Some(DEFAULT_SHELL_PROGRAM.to_string());
+        conversation.put_config(config).await?;
+    }
+    run_sandbox_shell_command(agent, conversation, command).await
 }
 
 /// Walk the conversation's event log to find the latest `SandboxCreated`
@@ -1057,59 +1195,25 @@ async fn sandbox_id_for_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        render_external_event, render_tool_call, render_tool_result,
-        render_user_content_for_history,
-    };
+    use super::{Verbosity, render_external_event, render_user_content_for_history};
     use executor::EventData;
     use lingua::Message;
     use lingua::universal::UserContent;
-    use serde_json::{Map, Value};
-
-    #[test]
-    fn renders_multiline_tool_call_arguments_as_indented_block() {
-        let arguments = Map::from_iter([(
-            "code".to_string(),
-            Value::String("const x = 1;\nconst y = 2;".to_string()),
-        )]);
-
-        let rendered = render_tool_call("repl_execute", &arguments);
-
-        assert_eq!(
-            rendered,
-            "tool call repl_execute\n  code:\n    const x = 1;\n    const y = 2;"
-        );
-    }
-
-    #[test]
-    fn renders_multiline_tool_result_fields_as_indented_block() {
-        let result = Value::Object(Map::from_iter([
-            ("error".to_string(), Value::Null),
-            (
-                "stdout".to_string(),
-                Value::String("line 1\nline 2".to_string()),
-            ),
-        ]));
-
-        let rendered = render_tool_result(&result);
-
-        assert_eq!(
-            rendered,
-            "tool result\n  error: null\n  stdout:\n    line 1\n    line 2"
-        );
-    }
 
     #[test]
     fn renders_scheduled_task_wakeup_user_messages() {
-        let rendered = render_external_event(&EventData::Messages {
-            messages: vec![Message::User {
-                content: UserContent::String(
-                    "Scheduled task `joke` completed.\n\nstdout preview:\nhello".to_string(),
-                ),
-            }],
-            response_id: None,
-            usage: None,
-        });
+        let rendered = render_external_event(
+            &EventData::Messages {
+                messages: vec![Message::User {
+                    content: UserContent::String(
+                        "Scheduled task `joke` completed.\n\nstdout preview:\nhello".to_string(),
+                    ),
+                }],
+                response_id: None,
+                usage: None,
+            },
+            Verbosity::Compact,
+        );
 
         assert_eq!(rendered.len(), 1);
         assert!(rendered[0].contains("user: Scheduled task `joke` completed."));

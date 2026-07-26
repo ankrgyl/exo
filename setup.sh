@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_URL="${EXO_REPO_URL:-https://github.com/exoharness/exo.git}"
 REPO_REF="${EXO_REPO_REF:-main}"
 INSTALL_DIR="${EXO_INSTALL_DIR:-$PWD}"
-MODEL_NAME="${EXO_MODEL:-gpt-5.4}"
+MODEL_NAME="${EXO_MODEL:-gpt-5.6-terra}"
 UPSTREAM_MODEL="${EXO_UPSTREAM_MODEL:-}"
 MODEL_PROVIDER="${EXO_MODEL_PROVIDER:-}"
 AGENT_NAME="${EXO_AGENT_NAME:-Exo}"

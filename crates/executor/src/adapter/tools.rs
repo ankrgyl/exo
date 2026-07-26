@@ -966,7 +966,7 @@ async fn read_sandbox_file(
 ) -> Result<Vec<u8>> {
     match effective_sandbox_scope(agent_config, config) {
         SandboxScope::Agent => {
-            let sandbox = ensure_agent_sandbox(agent, agent_config, config).await?;
+            let sandbox = ensure_agent_sandbox(agent, agent_config).await?;
             read_agent_sandbox_file_bytes(agent, sandbox.sandbox_id, sandbox_path).await
         }
         SandboxScope::Conversation => {
@@ -1714,9 +1714,13 @@ mod tests {
             harness: AgentHarnessKind::Exo,
             typescript: None,
             enable_agent_tool_creation: true,
-            sandbox_image: None,
-            sandbox_provider: SandboxProvider::Docker,
-            enable_networking: false,
+            sandbox: crate::AgentSandboxConfig {
+                image: None,
+                provider: SandboxProvider::Docker,
+                mounts: Vec::new(),
+                enable_networking: false,
+                scope: crate::SandboxScope::Agent,
+            },
             model: "test-model".to_string(),
             max_output_tokens: None,
             max_tool_round_trips: None,

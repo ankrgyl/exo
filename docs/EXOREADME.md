@@ -50,7 +50,7 @@ Because the exoharness substrate doesn't depend on the executor, an agent built 
 - **Evolve safely** to change its own policy processes, with access to inspect its own history and artifacts while the exoharness isolates secrets and compute resources to maintain safety.
 
 For the architectural model and terminology, see
-[spec/exoharness.md](./spec/exoharness.md).
+[docs/spec.md](./spec.md).
 
 ## Status
 

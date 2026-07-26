@@ -22,6 +22,7 @@ any change — successful or not — can be inspected, rewound, or forked from.
 - [**Getting Started**](/getting-started/) — One setup script to a running agent you can chat with from your browser.
 - [**Concepts**](/concepts/) — The architecture: exoharness, executors, events, sandboxes, and time travel.
 - [**Tutorials**](/tutorials/) — Build your own harness with custom tools and context.
+- [**Discord**](https://discord.gg/8x23hdBJU6) — Join the community for help and discussion.
 ## How it stays safe
 
 Exo splits an agent into two halves:

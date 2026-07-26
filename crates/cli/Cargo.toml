@@ -17,11 +17,14 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 cost = { path = "../cost" }
+crossterm.workspace = true
 executor = { path = "../executor" }
 lingua.workspace = true
+ratatui.workspace = true
 rustyline = "15.0.0"
 serde.workspace = true
 serde_json.workspace = true
+shlex.workspace = true
 tabwriter.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true

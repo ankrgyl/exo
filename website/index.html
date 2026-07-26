@@ -3,11 +3,11 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>exo</title>
+    <title>exoharness</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta
       name="description"
-      content="exo is a minimal system for building agents. It separates trusted state, resources, and security from agent-specific logic."
+      content="exoharness is a minimal architecture for building agents. It separates trusted state, resources, and security from agent-specific logic."
     />
 
     <style>
@@ -728,8 +728,8 @@
         font: inherit;
       }
 
-      .footer {
-        margin-top: 42px;
+      .linkbar {
+        margin-bottom: 18px;
         color: var(--muted);
       }
 
@@ -807,12 +807,39 @@
             height="36"
             style="vertical-align: -7px; margin-right: 10px"
           />
-          <span class="md"># </span>exo
+          <span class="md"># </span>exoharness
         </h1>
+        <nav class="linkbar" aria-label="Project links">
+          <span class="md">[</span
+          ><a href="https://github.com/exoharness/exo">github</a
+          ><span class="md">]</span>
+          <span class="md">(</span>https://github.com/exoharness/exo<span
+            class="md"
+            >)</span
+          >
+          <span class="md"> - [</span
+          ><a href="https://github.com/exoharness/exo/blob/main/docs/spec.md"
+            >spec</a
+          ><span class="md">]</span>
+          <span class="md">(</span>./docs/spec.md<span class="md">)</span>
+          <span class="md"> - [</span><a href="/docs">docs</a
+          ><span class="md">]</span> <span class="md">(</span>./docs<span
+            class="md"
+            >)</span
+          >
+          <span class="md"> - [</span
+          ><a href="https://discord.gg/8x23hdBJU6">discord</a
+          ><span class="md">]</span>
+          <span class="md">(</span>https://discord.gg/8x23hdBJU6<span class="md"
+            >)</span
+          >
+          <span class="md"> - </span>mit
+        </nav>
         <p class="lede">
-          exo is a minimal system for building agents. It separates trusted
-          infrastructure for state, resources, and security from agent-specific
-          logic that can evolve, stop, resume, and rewind across runs.
+          exoharness is a minimal architecture for building agents. It separates
+          trusted infrastructure for state, resources, and security from
+          agent-specific logic that can evolve, stop, resume, and rewind across
+          runs.
         </p>
         <p class="quote">
           <span class="md">&gt;</span>
@@ -1092,9 +1119,8 @@
         </p>
         <p>
           For the exact model and terminology, read
-          <a
-            href="https://github.com/exoharness/exo/blob/main/spec/exoharness.md"
-            >spec/exoharness.md</a
+          <a href="https://github.com/exoharness/exo/blob/main/docs/spec.md"
+            >docs/spec.md</a
           >.
         </p>
       </section>
@@ -1174,27 +1200,16 @@
         </p>
       </section>
 
-      <footer class="footer">
-        <span class="md">[</span
-        ><a href="https://github.com/exoharness/exo">github</a
-        ><span class="md">]</span>
-        <span class="md">(</span>https://github.com/exoharness/exo<span
-          class="md"
-          >)</span
-        >
-        <span class="md"> - [</span
-        ><a
-          href="https://github.com/exoharness/exo/blob/main/spec/exoharness.md"
-          >spec</a
-        ><span class="md">]</span>
-        <span class="md">(</span>./spec/exoharness.md<span class="md">)</span>
-        <span class="md"> - [</span><a href="/docs">docs</a
-        ><span class="md">]</span> <span class="md">(</span>./docs<span
-          class="md"
-          >)</span
-        >
-        <span class="md"> - </span>mit
-      </footer>
+      <section aria-labelledby="vs-exo">
+        <h2 id="vs-exo"><span class="md">## </span>exoharness vs exo</h2>
+        <p>
+          exoharness is the substrate; exo is a fully recursively self-improving
+          agent built on top of the exoharness. Because the exoharness owns the
+          durable state — the event log, secrets, artifacts, and sandboxes — exo
+          can rewrite its own executor, tools, and prompts across runs without
+          risking its history or identity.
+        </p>
+      </section>
     </main>
     <script>
       const profiles = {

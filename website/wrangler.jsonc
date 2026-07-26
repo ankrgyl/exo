@@ -2,9 +2,6 @@
   "name": "exo",
   "main": "src/worker.js",
   "compatibility_date": "2026-05-24",
-  "build": {
-    "command": "pnpm --dir .. website:build",
-  },
   "assets": {
     "binding": "ASSETS",
     "directory": "dist",

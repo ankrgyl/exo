@@ -21,6 +21,7 @@ import {
 import {
   createResilienceHandlers,
   inboundAttachments,
+  splitDiscordContent,
   startConnectionWatchdog,
 } from "./discord";
 import type { DiscordVoice as DiscordVoiceInstance } from "./voice";
@@ -177,10 +178,14 @@ try {
           attachmentCount: command.attachments.length,
         },
       });
-      await sendDiscordMessage(target, {
-        content: command.text,
-        files: await discordAttachmentFiles(command.attachments),
-      });
+      const files = await discordAttachmentFiles(command.attachments);
+      const contentChunks = splitDiscordContent(command.text);
+      for (const [index, content] of contentChunks.entries()) {
+        await sendDiscordMessage(target, {
+          content,
+          files: index === 0 ? files : [],
+        });
+      }
       // If this target has an active voice session, also speak the reply. The
       // text send above doubles as the inspectable transcript of the voice turn.
       if (voice) {

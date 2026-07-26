@@ -126,9 +126,13 @@ where
             harness: request.harness,
             typescript: request.typescript,
             enable_agent_tool_creation: request.enable_agent_tool_creation,
-            sandbox_image: request.sandbox_image,
-            sandbox_provider: request.sandbox_provider,
-            enable_networking: request.enable_networking,
+            sandbox: crate::AgentSandboxConfig {
+                image: request.sandbox_image,
+                provider: request.sandbox_provider,
+                mounts: Vec::new(),
+                enable_networking: request.enable_networking,
+                scope: request.sandbox_scope.unwrap_or_default(),
+            },
             model: request.model,
             max_output_tokens: request.max_output_tokens,
             max_tool_round_trips: request.max_tool_round_trips,
@@ -237,11 +241,11 @@ where
             .await?;
         let default_conversation_config = ConversationConfig::default();
         let conversation_config = ConversationConfig {
-            sandbox_image: request.sandbox_image.or(agent_config.sandbox_image),
+            sandbox_image: request.sandbox_image.or(agent_config.sandbox.image),
             sandbox_provider: Some(
                 request
                     .sandbox_provider
-                    .unwrap_or(agent_config.sandbox_provider),
+                    .unwrap_or(agent_config.sandbox.provider),
             ),
             shell_program: request
                 .shell_program

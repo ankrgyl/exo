@@ -49,9 +49,13 @@ interface RawAgentConfig {
     tool_module_paths?: string[];
   } | null;
   enable_agent_tool_creation?: boolean;
-  sandbox_image?: string | null;
-  sandbox_provider: "daytona" | "apple_container" | "docker" | "local_process";
-  enable_networking: boolean;
+  sandbox: {
+    image?: string | null;
+    provider: "daytona" | "apple_container" | "docker" | "local_process";
+    mounts?: RawConversationConfig["mounts"] | null;
+    enable_networking: boolean;
+    scope: "agent" | "conversation";
+  };
   model: string;
   max_output_tokens?: number | null;
   max_tool_round_trips?: number | null;
@@ -833,9 +837,13 @@ function toAgentConfig(raw: RawAgentConfig): AgentConfig {
         }
       : null,
     enableAgentToolCreation: raw.enable_agent_tool_creation ?? true,
-    sandboxImage: raw.sandbox_image ?? null,
-    sandboxProvider: raw.sandbox_provider,
-    enableNetworking: raw.enable_networking,
+    sandbox: {
+      image: raw.sandbox.image ?? null,
+      provider: raw.sandbox.provider,
+      mounts: (raw.sandbox.mounts ?? []).map(toFileSystemMount),
+      enableNetworking: raw.sandbox.enable_networking,
+      scope: raw.sandbox.scope,
+    },
     model: raw.model,
     maxOutputTokens: raw.max_output_tokens ?? null,
     maxToolRoundTrips: raw.max_tool_round_trips ?? null,

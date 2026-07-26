@@ -290,7 +290,7 @@ async fn resolve_task_sandbox(
 ) -> Result<ResolvedTaskSandbox> {
     match task.sandbox_mode {
         ScheduledTaskSandboxMode::Agent => {
-            let sandbox = ensure_agent_sandbox(agent, agent_config, conversation_config).await?;
+            let sandbox = ensure_agent_sandbox(agent, agent_config).await?;
             Ok(ResolvedTaskSandbox::Agent {
                 sandbox_id: sandbox.sandbox_id,
             })

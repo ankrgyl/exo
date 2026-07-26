@@ -6,6 +6,7 @@ import {
   describeCloseCode,
   errorMessage,
   inboundAttachments,
+  splitDiscordContent,
   startConnectionWatchdog,
 } from "./discord";
 
@@ -230,5 +231,36 @@ describe("startConnectionWatchdog", () => {
     expect(exit).not.toHaveBeenCalled();
     expect(emit).not.toHaveBeenCalled();
     stop();
+  });
+});
+
+describe("splitDiscordContent", () => {
+  it("keeps short messages intact", () => {
+    expect(splitDiscordContent("hello")).toEqual(["hello"]);
+  });
+
+  it("splits long messages at newline boundaries when possible", () => {
+    const chunks = splitDiscordContent(
+      `${"a".repeat(1_500)}\n${"b".repeat(1_000)}`,
+    );
+    expect(chunks).toHaveLength(2);
+    expect(chunks.join("")).toBe(`${"a".repeat(1_500)}\n${"b".repeat(1_000)}`);
+    expect(chunks.every((chunk) => chunk.length <= 2_000)).toBe(true);
+  });
+
+  it("hard-splits an unbroken string without losing content", () => {
+    const input = "x".repeat(4_501);
+    const chunks = splitDiscordContent(input);
+    expect(chunks.map((chunk) => chunk.length)).toEqual([2_000, 2_000, 501]);
+    expect(chunks.join("")).toBe(input);
+  });
+});
+
+describe("splitDiscordContent boundary handling", () => {
+  it("never emits a chunk over the configured limit", () => {
+    const input = `${"a".repeat(2_000)}\nnext`;
+    const chunks = splitDiscordContent(input);
+    expect(chunks.every((chunk) => chunk.length <= 2_000)).toBe(true);
+    expect(chunks.join("")).toBe(input);
   });
 });

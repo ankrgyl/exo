@@ -26,15 +26,28 @@ pub struct AgentConfig {
     pub typescript: Option<TypeScriptHarnessConfig>,
     #[serde(default = "default_enable_agent_tool_creation")]
     pub enable_agent_tool_creation: bool,
-    #[serde(default)]
-    pub sandbox_image: Option<String>,
-    pub sandbox_provider: SandboxProvider,
-    #[serde(default)]
-    pub enable_networking: bool,
+    pub sandbox: AgentSandboxConfig,
     pub model: String,
     pub max_output_tokens: Option<i64>,
     pub max_tool_round_trips: Option<u32>,
     pub braintrust: Option<BraintrustTracingConfig>,
+}
+
+/// Agent-level defaults for conversation sandboxes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSandboxConfig {
+    /// Default scope for conversation that don't specify a `sandbox_scope`.
+    #[serde(default)]
+    pub scope: SandboxScope,
+    #[serde(default)]
+    pub image: Option<String>,
+    pub provider: SandboxProvider,
+    /// Mounts for the agent-scoped sandbox. These apply to every conversation
+    /// that uses the shared agent sandbox.
+    #[serde(default)]
+    pub mounts: Vec<FileSystemMount>,
+    #[serde(default)]
+    pub enable_networking: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -74,10 +87,11 @@ pub struct ConversationConfig {
     pub sandbox_scope: Option<SandboxScope>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxScope {
     Agent,
+    #[default]
     Conversation,
 }
 
@@ -119,22 +133,19 @@ pub fn effective_sandbox_scope(
 ) -> SandboxScope {
     conversation_config
         .sandbox_scope
-        .unwrap_or(match agent_config.harness {
-            AgentHarnessKind::Exo => SandboxScope::Agent,
-            _ => SandboxScope::Conversation,
-        })
+        .unwrap_or(agent_config.sandbox.scope)
 }
 
 impl ConversationConfig {
     pub fn effective_sandbox_image<'a>(&'a self, agent_config: &'a AgentConfig) -> Option<&'a str> {
         self.sandbox_image
             .as_deref()
-            .or(agent_config.sandbox_image.as_deref())
+            .or(agent_config.sandbox.image.as_deref())
     }
 
     pub fn effective_sandbox_provider(&self, agent_config: &AgentConfig) -> SandboxProvider {
         self.sandbox_provider
-            .unwrap_or(agent_config.sandbox_provider)
+            .unwrap_or(agent_config.sandbox.provider)
     }
 }
 

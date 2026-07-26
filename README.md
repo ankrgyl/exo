@@ -12,6 +12,8 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg?logo=rust)](Cargo.toml)
 [![TypeScript](https://img.shields.io/badge/typescript-5.x-3178c6.svg?logo=typescript&logoColor=white)](tsconfig.json)
 
+[Documentation](https://exoharness.ai/docs) · [Examples](examples/) · [Discord](https://discord.gg/8x23hdBJU6)
+
 </div>
 
 Exo is a systems approach to recursive self improvement. In short, it's a
@@ -69,6 +71,10 @@ automatically via [mise](https://mise.jdx.dev)._
 
 It'll build Exo (may take a few minutes), then ask for the API key and your name
 and your agent's name, and give you the command to start Exo (./exo.sh).
+
+<div align="center">
+<img height="300" alt="exo-img" src="https://github.com/user-attachments/assets/b8fafe1c-7814-4681-b6f6-bed6859c7835" />
+</div>
 
 ## Basic Agent Interaction
 
@@ -181,6 +187,28 @@ There are a number of prompt files that Exo uses during runtime. You can edit th
 
 After changing prompt files, ask Exo to rebuild/restart itself for them to go in
 use.
+
+## Ongoing Work
+
+Exo is still in the early stages of development, with many areas of active
+work. We welcome participation ranging from core development to feedback from
+users. Current areas of focus include:
+
+- **Autonomous self-maintenance:** Exo should periodically inspect its context,
+  memories, tools, scheduled tasks, and running processes; identify stale or
+  conflicting state; propose or perform safe cleanup; and record what changed.
+  Success means a long-running agent becomes more organized over time rather
+  than accumulating context and tool rot.
+- **Recoverable, portable execution:** Schedulers, adapters, and other
+  long-running work should persist enough state to resume after process,
+  machine, or network failure. Work should be movable between compatible
+  machines without losing canonical history or duplicating side effects.
+- **High-level multi-agent orchestration:** Cloning and lineage are useful
+  primitives, but agents also need policies for when to clone, how to divide
+  work, how children report results, how conflicting conclusions are resolved,
+  and when a lineage should stop. The goal is a family of agents that produces
+  better results than one agent without creating unbounded cost or coordination
+  overhead.
 
 ## License
 
