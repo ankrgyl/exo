@@ -7,6 +7,7 @@ mod braintrust;
 #[cfg(test)]
 mod braintrust_tests;
 mod compaction;
+pub use compaction::CompactionConfig;
 mod conversation_events;
 mod conversation_sandbox;
 mod conversation_wakeup;

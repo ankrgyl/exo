@@ -1724,6 +1724,8 @@ mod tests {
             model: "test-model".to_string(),
             max_output_tokens: None,
             max_tool_round_trips: None,
+            compaction: None,
+
             braintrust: None,
         }
     }

@@ -25,6 +25,10 @@ use serde_json::{Map, Value, json};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+use crate::compaction::{
+    COMPACTION_CHECKPOINT_EVENT, COMPACTION_FAILED_EVENT, CompactionConfig, CompactionOutcome,
+    SummarizeInput, run_compaction,
+};
 use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor};
 use crate::*;
 
@@ -616,6 +620,7 @@ struct FakeExoHarness {
 struct FakeState {
     agent: AgentRecord,
     conversation: FakeConversationState,
+    artifacts: Vec<(ArtifactVersion, Vec<u8>)>,
 }
 
 struct FakeConversationState {
@@ -632,6 +637,7 @@ impl FakeExoHarness {
                     slug: "agent".to_string(),
                     name: "Agent".to_string(),
                 },
+                artifacts: Vec::new(),
                 conversation: FakeConversationState {
                     record: ConversationRecord {
                         id: conversation_id,
@@ -1024,16 +1030,49 @@ impl ConversationHandle for FakeConversationHandle {
         Err(anyhow!("not implemented"))
     }
 
-    async fn write_artifact(&self, _request: WriteArtifactRequest) -> Result<ArtifactVersion> {
-        Err(anyhow!("not implemented"))
+    async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion> {
+        let mut state = self.state.lock().expect("state poisoned");
+        let existing = state
+            .artifacts
+            .iter()
+            .filter(|(version, _)| version.path == request.path)
+            .map(|(version, _)| version.clone())
+            .max_by_key(|version| version.version);
+        let version = ArtifactVersion {
+            artifact_id: existing
+                .as_ref()
+                .map(|version| version.artifact_id)
+                .unwrap_or_else(Uuid7::now),
+            path: request.path,
+            version: existing.map(|version| version.version + 1).unwrap_or(1),
+            created_at: Uuid7::now().timestamp().expect("uuid7 timestamp"),
+            size_bytes: request.contents.len() as u64,
+        };
+        state.artifacts.push((version.clone(), request.contents));
+        Ok(version)
     }
 
-    async fn read_artifact(&self, _request: ReadArtifactRequest) -> Result<Option<Artifact>> {
-        Ok(None)
+    async fn read_artifact(&self, request: ReadArtifactRequest) -> Result<Option<Artifact>> {
+        let state = self.state.lock().expect("state poisoned");
+        let found = state
+            .artifacts
+            .iter()
+            .filter(|(version, _)| version.artifact_id == request.artifact_id)
+            .filter(|(version, _)| request.version.is_none_or(|want| want == version.version))
+            .max_by_key(|(version, _)| version.version);
+        Ok(found.map(|(version, contents)| Artifact {
+            version: version.clone(),
+            contents: contents.clone(),
+        }))
     }
 
     async fn list_artifacts(&self) -> Result<Vec<ArtifactVersion>> {
-        Ok(Vec::new())
+        let state = self.state.lock().expect("state poisoned");
+        Ok(state
+            .artifacts
+            .iter()
+            .map(|(version, _)| version.clone())
+            .collect())
     }
 
     async fn list_bindings(&self) -> Result<Vec<BindingRecord>> {
@@ -1298,6 +1337,365 @@ fn default_agent_config() -> AgentConfig {
         model: "test-model".to_string(),
         max_output_tokens: None,
         max_tool_round_trips: Some(4),
+        compaction: None,
         braintrust: None,
     }
+}
+
+// --- compaction ---------------------------------------------------------------
+
+/// A fake harness plus its single conversation, which is all the compaction
+/// tests need.
+async fn compaction_fixture() -> (Arc<FakeExoHarness>, Arc<dyn ConversationHandle>) {
+    let agent_id = Uuid7::now();
+    let conversation_id = Uuid7::now();
+    let exoharness = Arc::new(FakeExoHarness::new(agent_id, conversation_id));
+    let agent = exoharness
+        .get_agent(&agent_id)
+        .await
+        .expect("get agent")
+        .expect("agent exists");
+    let conversation = agent
+        .get_conversation(&conversation_id)
+        .await
+        .expect("get conversation")
+        .expect("conversation exists");
+    (exoharness, conversation)
+}
+
+async fn open_turn(conversation: &dyn ConversationHandle) -> Arc<dyn TurnHandle> {
+    conversation
+        .begin_turn(BeginTurnRequest {
+            session_id: None,
+            input: Vec::new(),
+        })
+        .await
+        .expect("begin turn")
+}
+
+fn test_executor() -> BasicExecutor<FakeModelClient, FakeToolRuntime> {
+    BasicExecutor::new(
+        Arc::new(FakeModelClient::new(Vec::new())),
+        Arc::new(FakeToolRuntime::default()),
+    )
+}
+
+/// Text of every message in the prompt, for asserting what survived a cut.
+fn prompt_text(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .map(|message| match message {
+            Message::User { content } | Message::System { content } => format!("{content:?}"),
+            Message::Assistant { content, .. } => format!("{content:?}"),
+            other => format!("{other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn seed_completed_turns(conversation: &dyn ConversationHandle, labels: &[&str]) {
+    for label in labels {
+        conversation
+            .add_events(AddEventsRequest {
+                session_id: None,
+                turn_id: None,
+                data: vec![
+                    EventData::Messages {
+                        messages: vec![Message::User {
+                            content: UserContent::String((*label).to_string()),
+                        }],
+                        response_id: None,
+                        usage: None,
+                    },
+                    EventData::TurnEnded,
+                ],
+            })
+            .await
+            .expect("seed turn");
+    }
+}
+
+#[tokio::test]
+async fn prompt_history_is_unchanged_without_a_checkpoint() {
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["alpha", "beta"]).await;
+
+    let executor = test_executor();
+    let messages = executor
+        .materialize_prompt_history(conversation.as_ref(), &[])
+        .await
+        .expect("materialize");
+
+    let text = prompt_text(&messages);
+    assert!(text.contains("alpha"), "{text}");
+    assert!(text.contains("beta"), "{text}");
+}
+
+#[tokio::test]
+async fn prompt_history_replaces_compacted_span_with_the_summary() {
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+
+    let turn = open_turn(conversation.as_ref()).await;
+    let outcome = run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &CompactionConfig {
+            keep_recent_turns: 1,
+            ..CompactionConfig::default()
+        },
+        "summary-model",
+        Some(1_000),
+        &|_input| Box::pin(async { Ok("SUMMARY OF EARLIER".to_string()) }),
+    )
+    .await;
+    assert!(
+        matches!(outcome, CompactionOutcome::Compacted { .. }),
+        "{outcome:?}"
+    );
+
+    let executor = test_executor();
+    let messages = executor
+        .materialize_prompt_history(conversation.as_ref(), &[])
+        .await
+        .expect("materialize");
+
+    let text = prompt_text(&messages);
+    assert!(text.contains("SUMMARY OF EARLIER"), "{text}");
+    assert!(text.contains("recent"), "{text}");
+    assert!(!text.contains("ancient"), "{text}");
+    assert!(!text.contains("old"), "{text}");
+}
+
+#[tokio::test]
+async fn compaction_invalidates_the_history_cache() {
+    // The cache holds exactly the prefix compaction replaces. Without explicit
+    // invalidation the executor would keep serving the pre-compaction history
+    // from memory: the prompt would never shrink and nothing would error.
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+
+    let executor = test_executor();
+    // Prime the cache with the full pre-compaction history.
+    let before = executor
+        .materialize_prompt_history(conversation.as_ref(), &[])
+        .await
+        .expect("materialize");
+    assert!(prompt_text(&before).contains("ancient"));
+
+    let turn = open_turn(conversation.as_ref()).await;
+    let outcome = run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &CompactionConfig {
+            keep_recent_turns: 1,
+            ..CompactionConfig::default()
+        },
+        "summary-model",
+        None,
+        &|_input| Box::pin(async { Ok("SUMMARY".to_string()) }),
+    )
+    .await;
+    let CompactionOutcome::Compacted { .. } = outcome else {
+        panic!("expected compaction, got {outcome:?}");
+    };
+    executor.invalidate_history_cache(conversation.record().id);
+
+    let after = executor
+        .materialize_prompt_history(conversation.as_ref(), &[])
+        .await
+        .expect("materialize");
+    let text = prompt_text(&after);
+    assert!(text.contains("SUMMARY"), "{text}");
+    assert!(!text.contains("ancient"), "{text}");
+}
+
+#[tokio::test]
+async fn compaction_skips_a_conversation_too_short_to_cut() {
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["only"]).await;
+
+    let turn = open_turn(conversation.as_ref()).await;
+    let outcome = run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &CompactionConfig::default(),
+        "summary-model",
+        None,
+        &|_input| Box::pin(async { Ok("SUMMARY".to_string()) }),
+    )
+    .await;
+    assert!(
+        matches!(outcome, CompactionOutcome::Skipped { .. }),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_summarizer_does_not_fail_the_turn() {
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+
+    let turn = open_turn(conversation.as_ref()).await;
+    let outcome = run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &CompactionConfig {
+            keep_recent_turns: 1,
+            ..CompactionConfig::default()
+        },
+        "summary-model",
+        None,
+        &|_input| Box::pin(async { Err(anyhow!("model unavailable")) }),
+    )
+    .await;
+    assert!(
+        matches!(outcome, CompactionOutcome::Failed { .. }),
+        "{outcome:?}"
+    );
+
+    // History is untouched, and the failure is on the record so the agent can
+    // see why its prompt never shrank.
+    let events = conversation.get_events(None).await.expect("events").events;
+    assert!(events.iter().any(|event| matches!(
+        &event.data,
+        EventData::Custom { event_type, .. } if event_type == COMPACTION_FAILED_EVENT
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        &event.data,
+        EventData::Custom { event_type, .. } if event_type == COMPACTION_CHECKPOINT_EVENT
+    )));
+}
+
+#[tokio::test]
+async fn chained_compaction_merges_the_previous_summary() {
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["one", "two", "three"]).await;
+    let config = CompactionConfig {
+        keep_recent_turns: 1,
+        ..CompactionConfig::default()
+    };
+
+    let turn = open_turn(conversation.as_ref()).await;
+    run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &config,
+        "summary-model",
+        None,
+        &|_input| Box::pin(async { Ok("FIRST SUMMARY".to_string()) }),
+    )
+    .await;
+
+    seed_completed_turns(conversation.as_ref(), &["four", "five"]).await;
+    let seen = Arc::new(Mutex::new(None));
+    let captured = Arc::clone(&seen);
+    let turn = open_turn(conversation.as_ref()).await;
+    run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &config,
+        "summary-model",
+        None,
+        &move |input: SummarizeInput| {
+            *captured.lock().expect("seen poisoned") = input.previous_summary.clone();
+            Box::pin(async { Ok("MERGED".to_string()) })
+        },
+    )
+    .await;
+
+    // Dropping the prior summary would silently lose everything before the
+    // first checkpoint.
+    assert_eq!(
+        seen.lock().expect("seen poisoned").as_deref(),
+        Some("FIRST SUMMARY")
+    );
+}
+
+#[tokio::test]
+async fn an_empty_summary_is_refused() {
+    // Checkpointing an empty summary drops real history and puts nothing in
+    // its place — strictly worse than leaving the prompt large.
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+
+    let turn = open_turn(conversation.as_ref()).await;
+    let outcome = run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &CompactionConfig {
+            keep_recent_turns: 1,
+            ..CompactionConfig::default()
+        },
+        "summary-model",
+        None,
+        &|_input| Box::pin(async { Ok("   ".to_string()) }),
+    )
+    .await;
+    assert!(
+        matches!(outcome, CompactionOutcome::Failed { .. }),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn compacted_history_is_not_re_summarized() {
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["one", "two", "three"]).await;
+
+    let seen = Arc::new(Mutex::new(String::new()));
+    let captured = Arc::clone(&seen);
+    let turn = open_turn(conversation.as_ref()).await;
+    run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &CompactionConfig {
+            keep_recent_turns: 1,
+            ..CompactionConfig::default()
+        },
+        "summary-model",
+        None,
+        &move |input: SummarizeInput| {
+            *captured.lock().expect("seen poisoned") = prompt_text(&input.messages);
+            Box::pin(async { Ok("SUMMARY".to_string()) })
+        },
+    )
+    .await;
+
+    let summarized = seen.lock().expect("seen poisoned").clone();
+    assert!(summarized.contains("one"), "{summarized}");
+    assert!(summarized.contains("two"), "{summarized}");
+    // `three` is the kept turn; folding it in would duplicate it in the prompt.
+    assert!(!summarized.contains("three"), "{summarized}");
+}
+
+#[tokio::test]
+async fn shared_materialize_helper_honors_a_checkpoint() {
+    // The RLM executor builds its context through this helper rather than
+    // through BasicExecutor's cache, so it needs the same checkpoint awareness
+    // or RLM conversations keep growing unbounded.
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+
+    let turn = open_turn(conversation.as_ref()).await;
+    run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &CompactionConfig {
+            keep_recent_turns: 1,
+            ..CompactionConfig::default()
+        },
+        "summary-model",
+        None,
+        &|_input| Box::pin(async { Ok("SUMMARY OF EARLIER".to_string()) }),
+    )
+    .await;
+
+    let messages = crate::harness_helpers::materialize_conversation_messages(conversation.as_ref())
+        .await
+        .expect("materialize");
+    let text = prompt_text(&messages);
+    assert!(text.contains("SUMMARY OF EARLIER"), "{text}");
+    assert!(text.contains("recent"), "{text}");
+    assert!(!text.contains("ancient"), "{text}");
 }

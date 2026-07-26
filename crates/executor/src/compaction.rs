@@ -11,8 +11,18 @@
 //! the checkpoint payload. It mirrors `typescript/harness/compaction.ts` so both
 //! executors agree on the on-disk format and can read each other's checkpoints.
 
-use exoharness::{Event, EventData, EventId};
+use std::collections::HashMap;
+
+use anyhow::anyhow;
+use exoharness::{
+    ConversationHandle, Event, EventData, EventId, EventKind, EventQuery, EventQueryDirection,
+    ReadArtifactRequest, Result, TurnHandle, WriteArtifactRequest,
+};
+use futures::future::BoxFuture;
+use lingua::Message;
 use serde::{Deserialize, Serialize};
+
+use crate::basic::extend_message_history;
 
 pub(crate) const COMPACTION_CHECKPOINT_EVENT: &str = "exo.compaction.v1";
 pub(crate) const COMPACTION_FAILED_EVENT: &str = "exo.compaction.failed.v1";
@@ -25,6 +35,8 @@ pub(crate) const COMPACTION_FAILED_EVENT: &str = "exo.compaction.failed.v1";
 pub(crate) struct CompactionCheckpoint {
     /// Inclusive: retained history is everything strictly after this id.
     pub up_to_event_id: EventId,
+    /// Read directly by id; the alternative is a list_artifacts scan per round.
+    pub artifact_id: exoharness::ArtifactId,
     pub artifact_path: String,
     pub artifact_version: u64,
     /// Previous checkpoint in the chain, for auditing.
@@ -174,6 +186,277 @@ pub(crate) fn cap_summary(summary: &str, max_chars: u32) -> String {
     let head_chars = max_chars.saturating_sub(MARKER.chars().count());
     let head: String = trimmed.chars().take(head_chars).collect();
     format!("{head}{MARKER}").chars().take(max_chars).collect()
+}
+
+// --- running a compaction ----------------------------------------------------
+
+/// Input handed to the summarizer.
+#[derive(Debug, Clone)]
+pub(crate) struct SummarizeInput {
+    /// Messages being folded into the summary — the compacted span only.
+    pub messages: Vec<Message>,
+    /// Summary from the previous checkpoint, to be merged rather than replaced.
+    pub previous_summary: Option<String>,
+    pub max_chars: u32,
+}
+
+/// Produces the summary text. Taken as a callback rather than called directly
+/// so the orchestration below is testable without a model, and so callers can
+/// point it at a cheaper model than the one running the conversation.
+pub(crate) type Summarizer<'a> =
+    dyn Fn(SummarizeInput) -> BoxFuture<'a, Result<String>> + Send + Sync + 'a;
+
+#[derive(Debug)]
+pub(crate) enum CompactionOutcome {
+    Compacted {
+        checkpoint: Box<CompactionCheckpoint>,
+    },
+    Skipped {
+        reason: String,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+/// Fold a conversation's older history into a summary checkpoint.
+///
+/// Nothing here is allowed to fail the caller's turn. Compaction is a
+/// housekeeping step; if the summarizer is down or the artifact store rejects a
+/// write, the right outcome is an oversized prompt (today's behaviour) rather
+/// than a dead conversation. Failures are recorded as an event so the agent can
+/// see why its context never shrank.
+pub(crate) async fn run_compaction(
+    conversation: &dyn ConversationHandle,
+    turn: &dyn TurnHandle,
+    config: &CompactionConfig,
+    model: &str,
+    prompt_tokens_before: Option<u64>,
+    summarize: &Summarizer<'_>,
+) -> CompactionOutcome {
+    match compact(
+        conversation,
+        turn,
+        config,
+        model,
+        prompt_tokens_before,
+        summarize,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let error = error.to_string();
+            record_failure(turn, &error).await;
+            CompactionOutcome::Failed { error }
+        }
+    }
+}
+
+async fn compact(
+    conversation: &dyn ConversationHandle,
+    turn: &dyn TurnHandle,
+    config: &CompactionConfig,
+    model: &str,
+    prompt_tokens_before: Option<u64>,
+    summarize: &Summarizer<'_>,
+) -> Result<CompactionOutcome> {
+    let previous = read_active_checkpoint(conversation).await?;
+    let previous_summary = match &previous {
+        Some(previous) => read_summary(conversation, previous).await?,
+        None => None,
+    };
+
+    // Only look at events after the last checkpoint: everything before it is
+    // already represented by `previous_summary`.
+    let scan = conversation
+        .get_events(Some(EventQuery {
+            cursor: previous.as_ref().map(|previous| previous.up_to_event_id),
+            direction: Some(EventQueryDirection::Asc),
+            limit: None,
+            session_id: None,
+            turn_id: None,
+            types: Some(vec![
+                EventKind::MESSAGES,
+                EventKind::TOOL_REQUESTED,
+                EventKind::TOOL_RESULT,
+                EventKind::TURN_ENDED,
+            ]),
+        }))
+        .await?;
+
+    let Some(cut) = select_cut_point(&scan.events, config.keep_recent_turns) else {
+        return Ok(CompactionOutcome::Skipped {
+            reason: "not enough completed turns to cut".to_string(),
+        });
+    };
+
+    let cut_index = scan
+        .events
+        .iter()
+        .position(|event| event.id == cut.up_to_event_id)
+        .ok_or_else(|| anyhow!("cut point is not in the scanned events"))?;
+    let mut messages = Vec::new();
+    let mut tool_call_names = HashMap::new();
+    extend_message_history(
+        &mut messages,
+        &mut tool_call_names,
+        &scan.events[..=cut_index],
+    );
+
+    let summarized = summarize(SummarizeInput {
+        messages,
+        previous_summary,
+        max_chars: config.max_summary_chars,
+    })
+    .await?;
+
+    let summary = cap_summary(&summarized, config.max_summary_chars);
+    if summary.is_empty() {
+        // Checkpointing an empty summary would drop real history and put
+        // nothing in its place — strictly worse than an oversized prompt.
+        let error = "summarizer returned an empty summary".to_string();
+        record_failure(turn, &error).await;
+        return Ok(CompactionOutcome::Failed { error });
+    }
+
+    let written = conversation
+        .write_artifact(WriteArtifactRequest {
+            path: summary_artifact_path(conversation),
+            contents: summary.clone().into_bytes(),
+        })
+        .await?;
+
+    let checkpoint = CompactionCheckpoint {
+        up_to_event_id: cut.up_to_event_id,
+        artifact_id: written.artifact_id,
+        artifact_path: written.path,
+        artifact_version: written.version,
+        previous_checkpoint_id: previous.map(|previous| previous.up_to_event_id),
+        compacted_event_count: cut.compacted_event_count,
+        summary_chars: summary.chars().count() as u64,
+        prompt_tokens_before,
+        model: model.to_string(),
+    };
+    turn.add_events(vec![EventData::Custom {
+        event_type: COMPACTION_CHECKPOINT_EVENT.to_string(),
+        payload: serde_json::to_value(&checkpoint)?,
+    }])
+    .await?;
+    Ok(CompactionOutcome::Compacted {
+        checkpoint: Box::new(checkpoint),
+    })
+}
+
+/// The newest checkpoint, or `None` if this conversation was never compacted.
+/// One bounded `desc` query rather than a scan of the whole log.
+pub(crate) async fn read_active_checkpoint(
+    conversation: &dyn ConversationHandle,
+) -> Result<Option<CompactionCheckpoint>> {
+    let result = conversation
+        .get_events(Some(EventQuery {
+            cursor: None,
+            direction: Some(EventQueryDirection::Desc),
+            limit: Some(1),
+            session_id: None,
+            turn_id: None,
+            types: Some(vec![EventKind::custom(COMPACTION_CHECKPOINT_EVENT)]),
+        }))
+        .await?;
+    let Some(event) = result.events.into_iter().next() else {
+        return Ok(None);
+    };
+    let EventData::Custom { payload, .. } = event.data else {
+        return Ok(None);
+    };
+    // A malformed checkpoint is treated as absent: falling back to full history
+    // is safe, whereas half-reading one would assemble a prompt with a hole.
+    Ok(serde_json::from_value(payload).ok())
+}
+
+/// Summary text for a checkpoint, or `None` if the artifact has gone missing.
+pub(crate) async fn read_summary(
+    conversation: &dyn ConversationHandle,
+    checkpoint: &CompactionCheckpoint,
+) -> Result<Option<String>> {
+    let artifact = conversation
+        .read_artifact(ReadArtifactRequest {
+            artifact_id: checkpoint.artifact_id,
+            version: Some(checkpoint.artifact_version),
+        })
+        .await?;
+    Ok(artifact.and_then(|artifact| String::from_utf8(artifact.contents).ok()))
+}
+
+/// How a summary is presented to the model. A system message so it reads as
+/// context the harness supplied, not as something the user said.
+pub(crate) fn summary_message(summary: &str) -> Message {
+    crate::harness_helpers::system_message(&format!(
+        "Summary of earlier conversation history that has been compacted out of this prompt. \
+Treat it as an accurate record of what happened before. The full raw history is still \
+available through the conversation event log if you need detail this summary omits.\n\n{summary}"
+    ))
+}
+
+fn summary_artifact_path(conversation: &dyn ConversationHandle) -> String {
+    format!("compaction/{}/summary.md", conversation.record().id)
+}
+
+async fn record_failure(turn: &dyn TurnHandle, error: &str) {
+    let payload = serde_json::json!({ "error": error });
+    if let Err(error) = turn
+        .add_events(vec![EventData::Custom {
+            event_type: COMPACTION_FAILED_EVENT.to_string(),
+            payload,
+        }])
+        .await
+    {
+        // Best-effort: recording the failure must not mask the original problem
+        // or take the turn down with it.
+        tracing::warn!(%error, "failed to record compaction failure event");
+    }
+}
+
+/// Prompt instruction for the summarizer.
+///
+/// Ordered by what is most expensive to lose. Specifics (paths, ids, error
+/// text) go first among the "preserve" rules because they are exactly what a
+/// summary tends to drop and what is hardest to recover afterwards.
+pub(crate) fn summarizer_instruction(input: &SummarizeInput) -> String {
+    let merge = match &input.previous_summary {
+        None => String::new(),
+        Some(previous) => format!(
+            "\n\nA summary of even earlier history is provided first. Merge it with the new \
+material into a single summary covering both — do not simply append, and do not drop facts \
+from the earlier summary.\n\n<earlier_summary>\n{previous}\n</earlier_summary>"
+        ),
+    };
+    format!(
+        "You are compacting the earlier portion of an agent conversation so it can be dropped \
+from the prompt while remaining usable.\n\n\
+Write a dense factual summary of what happened. Prioritise, in order:\n\
+1. Decisions made and conclusions reached, with the reasoning that led to them.\n\
+2. Durable facts about the user, the task, and the environment.\n\
+3. Work completed, files or resources changed, and commands that mattered.\n\
+4. Open threads: what was in progress, what failed, what was agreed for later.\n\n\
+Rules:\n\
+- Write in the third person about what \"the user\" and \"the agent\" did.\n\
+- Preserve specifics: names, paths, ids, numbers, error messages. Those are what a summary \
+usually loses and what is most expensive to lose.\n\
+- Do not speculate or add anything not present in the material.\n\
+- Do not address the reader or describe the summary itself. Output only the summary.\
+{merge}\n\nKeep the summary under {} characters.",
+        input.max_chars
+    )
+}
+
+/// Character size of a prompt, for the fallback trigger when the price table
+/// has no input limit for the model.
+pub(crate) fn prompt_chars(messages: &[Message]) -> u64 {
+    messages
+        .iter()
+        .map(|message| serde_json::to_string(message).map(|s| s.len()).unwrap_or(0) as u64)
+        .sum()
 }
 
 #[cfg(test)]
@@ -422,6 +705,7 @@ mod tests {
     fn checkpoint_round_trips_through_json() {
         let checkpoint = CompactionCheckpoint {
             up_to_event_id: Uuid7::now(),
+            artifact_id: Uuid7::now(),
             artifact_path: "compaction/conv-1/1.md".to_string(),
             artifact_version: 1,
             previous_checkpoint_id: None,
@@ -433,6 +717,7 @@ mod tests {
         let encoded = serde_json::to_value(&checkpoint).expect("serialize");
         // The wire shape must match the TypeScript harness exactly.
         assert!(encoded.get("up_to_event_id").is_some());
+        assert!(encoded.get("artifact_id").is_some());
         assert!(encoded.get("artifact_path").is_some());
         let decoded: CompactionCheckpoint = serde_json::from_value(encoded).expect("deserialize");
         assert_eq!(decoded, checkpoint);

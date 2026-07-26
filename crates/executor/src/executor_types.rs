@@ -16,6 +16,7 @@ use tokio::sync::OwnedMutexGuard;
 use tokio_stream::{Stream, wrappers::UnboundedReceiverStream};
 
 use crate::braintrust::BraintrustTracingConfig;
+use crate::compaction::CompactionConfig;
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct AgentConfig {
@@ -30,6 +31,11 @@ pub struct AgentConfig {
     pub model: String,
     pub max_output_tokens: Option<i64>,
     pub max_tool_round_trips: Option<u32>,
+    /// Conversation compaction policy. `None` uses the defaults, which are on:
+    /// an uncompacted long-running conversation eventually exceeds the model's
+    /// input limit and then fails permanently.
+    #[serde(default)]
+    pub compaction: Option<CompactionConfig>,
     pub braintrust: Option<BraintrustTracingConfig>,
 }
 

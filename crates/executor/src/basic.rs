@@ -12,9 +12,15 @@ use lingua::Message;
 use lingua::universal::{ToolContentPart, ToolResultContentPart};
 use serde_json::json;
 
+use crate::compaction::{
+    CompactionOutcome, SummarizeInput, prompt_chars, read_active_checkpoint, read_summary,
+    run_compaction, should_compact, summarizer_instruction, summary_message,
+};
 use crate::execution_tracing::TurnExecutionTrace;
 use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor};
-use crate::harness_helpers::{resolve_model_binding, to_lingua_value};
+use crate::harness_helpers::{
+    assistant_messages_text, resolve_model_binding, system_message, to_lingua_value,
+};
 use crate::shared::{HISTORY_CACHE_NAME, try_send_stream_event};
 use crate::{
     AgentConfig, ConversationConfig, ExecutionStreamEvent, ModelClient, ModelRequest,
@@ -41,6 +47,19 @@ impl<M, T> BasicExecutor<M, T> {
             history_cache: Arc::new(RwLock::new(HashMap::new())),
             pricing,
         }
+    }
+}
+
+impl<M, T> BasicExecutor<M, T> {
+    /// Drop a conversation's cached history so the next materialization rebuilds
+    /// from the log. Compaction replaces exactly the prefix this cache holds, so
+    /// skipping this would keep serving pre-compaction history from memory: the
+    /// prompt would never shrink and nothing would error.
+    pub(crate) fn invalidate_history_cache(&self, conversation_id: ConversationId) {
+        self.history_cache
+            .write()
+            .expect(HISTORY_CACHE_NAME)
+            .remove(&conversation_id);
     }
 }
 
@@ -71,7 +90,7 @@ where
     M: ModelClient + 'static,
     T: ToolRuntime + 'static,
 {
-    async fn materialize_prompt_history(
+    pub(crate) async fn materialize_prompt_history(
         &self,
         conversation: &dyn ConversationHandle,
         instructions: &[Message],
@@ -82,9 +101,33 @@ where
             cache.get(&conversation_id).cloned()
         };
 
+        // On a cold cache, start from the newest checkpoint rather than the top
+        // of the log: everything before it is represented by the summary. A
+        // warm cache already spans the checkpoint, so it keeps its own cursor.
+        let summary = match &cached_entry {
+            Some(entry) => entry.summary.clone(),
+            None => match read_active_checkpoint(conversation).await? {
+                // A checkpoint whose artifact has vanished is worse than none:
+                // it would cut history out with nothing standing in for it.
+                // Fall back to the full replay instead.
+                Some(checkpoint) => read_summary(conversation, &checkpoint)
+                    .await?
+                    .map(|summary| CachedSummary {
+                        text: summary,
+                        up_to_event_id: checkpoint.up_to_event_id,
+                    }),
+                None => None,
+            },
+        };
+
+        let cursor = match &cached_entry {
+            Some(entry) => entry.cursor,
+            None => summary.as_ref().map(|summary| summary.up_to_event_id),
+        };
+
         let result = conversation
             .get_events(Some(EventQuery {
-                cursor: cached_entry.as_ref().and_then(|entry| entry.cursor),
+                cursor,
                 direction: Some(EventQueryDirection::Asc),
                 limit: None,
                 session_id: None,
@@ -104,9 +147,7 @@ where
             .as_ref()
             .map_or_else(HashMap::new, |entry| entry.tool_call_names.clone());
         extend_message_history(&mut event_messages, &mut tool_call_names, &result.events);
-        let cursor = result
-            .cursor
-            .or_else(|| cached_entry.and_then(|entry| entry.cursor));
+        let cursor = result.cursor.or(cursor);
 
         self.history_cache
             .write()
@@ -117,12 +158,98 @@ where
                     cursor,
                     messages: event_messages.clone(),
                     tool_call_names,
+                    summary: summary.clone(),
                 },
             );
+
+        if let Some(summary) = summary {
+            event_messages.insert(0, summary_message(&summary.text));
+        }
 
         let mut messages = instructions.to_vec();
         messages.extend(event_messages);
         Ok(messages)
+    }
+
+    /// Compact if the prompt has grown past the configured share of the model's
+    /// input limit. Deliberately infallible: compaction is housekeeping, and a
+    /// summarizer outage should leave an oversized prompt rather than kill the
+    /// turn. `run_compaction` records its own failure events.
+    async fn maybe_compact(
+        &self,
+        conversation: &dyn ConversationHandle,
+        turn: &dyn TurnHandle,
+        agent_config: &AgentConfig,
+        model: &str,
+        prompt_tokens: Option<u64>,
+        prompt_chars: u64,
+    ) {
+        let config = agent_config.compaction.clone().unwrap_or_default();
+        if !should_compact(
+            &config,
+            prompt_tokens,
+            self.pricing.max_input_tokens(model),
+            prompt_chars,
+        ) {
+            return;
+        }
+
+        let summary_model = config
+            .summary_model
+            .clone()
+            .unwrap_or_else(|| model.to_string());
+        let outcome = run_compaction(
+            conversation,
+            turn,
+            &config,
+            &summary_model,
+            prompt_tokens,
+            &|input| Box::pin(self.summarize(input, &summary_model)),
+        )
+        .await;
+
+        let conversation_id = conversation.record().id;
+        match outcome {
+            CompactionOutcome::Compacted { checkpoint } => {
+                tracing::info!(
+                    %conversation_id,
+                    compacted_events = checkpoint.compacted_event_count,
+                    summary_chars = checkpoint.summary_chars,
+                    "compacted conversation history"
+                );
+                // The cache holds exactly the prefix that was just replaced.
+                self.invalidate_history_cache(conversation_id);
+            }
+            // The prompt crossed the threshold but nothing was compacted, so it
+            // will cross again next round. Both cases are worth seeing in logs:
+            // they are why a conversation's context stops shrinking.
+            CompactionOutcome::Skipped { reason } => {
+                tracing::debug!(%conversation_id, %reason, "compaction skipped");
+            }
+            CompactionOutcome::Failed { error } => {
+                tracing::warn!(%conversation_id, %error, "compaction failed");
+            }
+        }
+    }
+
+    /// Summarize a compacted span with a model call carrying no tools.
+    async fn summarize(&self, input: SummarizeInput, model: &str) -> Result<String> {
+        let mut messages = vec![system_message(&summarizer_instruction(&input))];
+        messages.extend(input.messages);
+
+        let response = self
+            .model
+            .complete(ModelRequest {
+                model: model.to_string(),
+                api_key: None,
+                base_url: None,
+                messages,
+                // No tools: the summarizer reads, it does not act.
+                tools: Vec::new(),
+                max_output_tokens: None,
+            })
+            .await?;
+        Ok(assistant_messages_text(&response.messages))
     }
 
     async fn run_turn_loop(
@@ -146,15 +273,35 @@ where
             let messages = self
                 .materialize_prompt_history(conversation, &agent_config.instructions)
                 .await?;
+            let prompt_chars = prompt_chars(&messages);
             let request =
                 build_model_request(conversation, agent_config, conversation_config, messages)
                     .await?;
+            let model = request.model.clone();
             let response = self
                 .complete_model_round(request, round as usize, stream_mode, turn_trace)
                 .await?;
+            let prompt_tokens = response
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.prompt_tokens)
+                .and_then(|tokens| u64::try_from(tokens).ok());
 
             let events = interpret_model_response(response, &self.pricing);
             turn.add_events(events.clone()).await?;
+
+            // Compact between rounds using the token count the provider just
+            // reported, so a single runaway turn can bring its own prompt back
+            // under the limit rather than failing every turn from here on.
+            self.maybe_compact(
+                conversation,
+                turn.as_ref(),
+                agent_config,
+                &model,
+                prompt_tokens,
+                prompt_chars,
+            )
+            .await;
 
             let tool_requests = collect_tool_requests(&events);
             if tool_requests.is_empty() {
@@ -408,7 +555,7 @@ where
     }
 }
 
-fn extend_message_history(
+pub(crate) fn extend_message_history(
     history: &mut Vec<Message>,
     tool_call_names: &mut HashMap<ToolCallId, String>,
     events: &[exoharness::Event],
@@ -637,4 +784,14 @@ struct HistoryCacheEntry {
     cursor: Option<EventId>,
     messages: Vec<Message>,
     tool_call_names: HashMap<ToolCallId, String>,
+    /// Summary standing in for the compacted prefix, if the conversation has
+    /// been compacted. Cached alongside the messages so a warm cache does not
+    /// re-read the checkpoint artifact on every round.
+    summary: Option<CachedSummary>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSummary {
+    text: String,
+    up_to_event_id: EventId,
 }
