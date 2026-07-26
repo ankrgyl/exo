@@ -15,7 +15,7 @@ instructions for anything missing:
 - **Rust** (via [rustup](https://rustup.rs/))
 - **Docker** — running, for the agent's sandbox
 
-You'll also need an **OpenAI API key**.
+You'll also need an API key from **OpenAI**, **OpenRouter**, or **Venice**.
 
 ## Run the setup script
 
@@ -24,12 +24,26 @@ curl -fsSL https://raw.githubusercontent.com/exoharness/exo/main/setup.sh -o set
 bash setup.sh
 ```
 
+For a non-interactive provider selection, set the provider, model, and API key
+in the environment:
+
+```bash
+EXO_MODEL_PROVIDER=venice \
+EXO_UPSTREAM_MODEL=zai-org-glm-5 \
+VENICE_API_KEY=vapi_... \
+bash setup.sh
+```
+
+Venice uses its OpenAI-compatible Chat Completions endpoint at
+`https://api.venice.ai/api/v1`.
+
 The script installs Exo into the current directory and walks you through
 everything:
 
 1. Clones the repository and builds the `exo` CLI.
-2. Asks for your OpenAI API key (stored in a `.env` file with `600`
-   permissions, then registered in exo's secret store).
+2. Asks you to choose OpenAI, OpenRouter, or Venice and enter its API key
+   (stored in a `.env` file with `600` permissions, then registered in exo's
+   secret store).
 3. Asks for your name and your agent's name, and writes a local profile at
    `.exo/exo-profile.md` (git-ignored — machine-specific instructions
    live here).

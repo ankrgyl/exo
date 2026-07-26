@@ -57,8 +57,8 @@ Exo was designed to be incredibly simple to use. With just a few commands you
 should have a fully functional agent who can do standard agent tasks (computer
 use, research, coding etc.) but can also extend itself as needed.
 
-To use Exo as an agent, you'll need an OpenAI or OpenRouter API key. If you
-have that, simply do the following:
+To use Exo as an agent, you'll need an OpenAI, OpenRouter, or Venice API key.
+If you have that, simply do the following:
 
 ```
 curl -fsSL https://raw.githubusercontent.com/exoharness/exo/main/setup.sh -o setup.sh

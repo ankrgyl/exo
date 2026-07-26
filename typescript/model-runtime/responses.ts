@@ -289,11 +289,17 @@ export function runtimeFromModelBinding(
   binding: ResponsesModelBinding,
 ): ResponsesRuntimeLike {
   const model = binding.model ?? "";
+  // Venice supports model ids from multiple vendors, including ids beginning
+  // with `claude`, so its explicit endpoint must take precedence over
+  // model-name-based native provider detection.
+  if (isVeniceBinding(binding)) {
+    return ChatCompletionsRuntime.fromModelBinding(agentConfig, binding);
+  }
   if (isAnthropicModel(model)) {
     return AnthropicRuntime.fromModelBinding(agentConfig, binding);
   }
   // OpenRouter is OpenAI-compatible but Chat Completions only (no Responses
-  // API), so force the chat path regardless of how the model name looks.
+  // API), so force the chat path regardless of the model name.
   if (isOpenRouterBinding(binding)) {
     return ChatCompletionsRuntime.fromModelBinding(agentConfig, binding);
   }
@@ -313,6 +319,14 @@ export function isAnthropicModel(model: string): boolean {
 // model name isn't a reliable signal), mirroring the Rust runtime.
 export function isOpenRouterBinding(binding: ResponsesModelBinding): boolean {
   return (binding.baseUrl ?? "").includes("openrouter.ai");
+}
+
+export function isVeniceBinding(binding: ResponsesModelBinding): boolean {
+  try {
+    return new URL(binding.baseUrl ?? "").hostname === "api.venice.ai";
+  } catch {
+    return false;
+  }
 }
 
 export function modelRequiresResponsesApi(model: string): boolean {

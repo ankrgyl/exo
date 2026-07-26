@@ -141,13 +141,57 @@ fn resolve_runtime_config(
     request: &ModelRequest,
     env: &HashMap<String, String>,
 ) -> Result<ResolvedRuntimeConfig> {
-    if is_anthropic_model(&request.model) {
+    // Venice proxies models from multiple vendors, including model ids that
+    // begin with `claude`, so its explicit endpoint takes precedence over
+    // model-name-based native provider detection.
+    if is_venice_request(request) {
+        resolve_venice_config(request, env)
+    } else if is_anthropic_model(&request.model) {
         resolve_anthropic_config(request, env)
     } else if is_openrouter_request(request) {
         resolve_openrouter_config(request, env)
     } else {
         resolve_openai_config(request, env)
     }
+}
+
+/// Venice exposes the OpenAI Chat Completions API at its own endpoint. Select
+/// it by exact hostname so model names do not affect routing and lookalike
+/// hosts cannot trigger provider-specific behavior.
+fn is_venice_request(request: &ModelRequest) -> bool {
+    request
+        .base_url
+        .as_deref()
+        .is_some_and(|raw| Url::parse(raw).is_ok_and(|url| url.host_str() == Some("api.venice.ai")))
+}
+
+fn resolve_venice_config(
+    request: &ModelRequest,
+    env: &HashMap<String, String>,
+) -> Result<ResolvedRuntimeConfig> {
+    let key = request
+        .api_key
+        .clone()
+        .or_else(|| optional_env(env, "VENICE_API_KEY"))
+        .ok_or_else(|| anyhow::anyhow!("model request is missing an API key"))?;
+    let endpoint = request
+        .base_url
+        .clone()
+        .map(|raw| Url::parse(&raw))
+        .transpose()?;
+    Ok(ResolvedRuntimeConfig {
+        provider_alias: "venice".to_string(),
+        provider_kind: "openai".to_string(),
+        format: ProviderFormat::ChatCompletions,
+        endpoint,
+        endpoint_template: None,
+        metadata: HashMap::new(),
+        auth: AuthConfig::ApiKey {
+            key,
+            header: Some("authorization".to_string()),
+            prefix: Some("Bearer".to_string()),
+        },
+    })
 }
 
 /// OpenRouter is an OpenAI-compatible aggregator selected by its base URL (it
@@ -467,6 +511,59 @@ mod tests {
                 if header.as_deref() == Some("authorization")
                     && prefix.as_deref() == Some("Bearer")
         ));
+    }
+
+    #[test]
+    fn venice_bindings_use_openai_chat_completions() {
+        let mut request = model_request();
+        request.model = "claude-opus-4-8".to_string();
+        request.api_key = Some("vapi_request".to_string());
+        request.base_url = Some("https://api.venice.ai/api/v1".to_string());
+
+        let config = resolve_runtime_config(&request, &HashMap::new()).unwrap();
+
+        assert_eq!(config.provider_alias, "venice");
+        assert_eq!(config.provider_kind, "openai");
+        assert_eq!(config.format, ProviderFormat::ChatCompletions);
+        assert!(matches!(
+            config.auth,
+            AuthConfig::ApiKey {
+                ref key,
+                ref header,
+                ref prefix,
+            } if key == "vapi_request"
+                && header.as_deref() == Some("authorization")
+                && prefix.as_deref() == Some("Bearer")
+        ));
+    }
+
+    #[test]
+    fn venice_bindings_fall_back_to_venice_api_key() {
+        let mut request = model_request();
+        request.api_key = None;
+        request.base_url = Some("https://api.venice.ai/api/v1".to_string());
+        let env = HashMap::from([("VENICE_API_KEY".to_string(), "vapi_env".to_string())]);
+
+        let config = resolve_runtime_config(&request, &env).unwrap();
+
+        assert!(matches!(
+            config.auth,
+            AuthConfig::ApiKey { ref key, .. } if key == "vapi_env"
+        ));
+    }
+
+    #[test]
+    fn venice_detection_rejects_invalid_and_lookalike_urls() {
+        let mut request = model_request();
+        request.api_key = Some("sk-test".to_string());
+        request.base_url = Some("https://api.venice.ai.example.com/api/v1".to_string());
+
+        let config = resolve_runtime_config(&request, &HashMap::new()).unwrap();
+        assert_eq!(config.provider_alias, "openai");
+        assert_eq!(config.format, ProviderFormat::Responses);
+
+        request.base_url = Some("not a URL".to_string());
+        assert!(resolve_runtime_config(&request, &HashMap::new()).is_err());
     }
 
     #[test]
