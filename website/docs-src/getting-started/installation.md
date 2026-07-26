@@ -30,7 +30,7 @@ in the environment:
 ```bash
 EXO_MODEL_PROVIDER=venice \
 EXO_UPSTREAM_MODEL=zai-org-glm-5 \
-VENICE_API_KEY=vapi_... \
+VENICE_API_KEY=... \
 bash setup.sh
 ```
 
