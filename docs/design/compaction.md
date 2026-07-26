@@ -156,12 +156,25 @@ agent's own view of its history, so it is made inspectable:
 A prompt block appears only once a checkpoint exists, stating how many events
 were folded away so the agent can judge what it is missing rather than guess.
 
+Compaction also does nothing when the compactable span is already smaller than
+`maxSummaryChars`. A prompt can cross the threshold because of the turns being
+_kept_ — one enormous tool result, say — and replacing a smaller prefix with a
+summary that could be larger would grow the prompt, not shrink it.
+
+Each turn attempts compaction at most once. Cuts land only on `turn_ended`
+boundaries and none appears mid-turn, so the answer provably cannot change
+within a turn; retrying every round would re-scan the log and re-run the
+summarizer for the same result.
+
 ## Known limits
 
 - Compaction bounds the _prompt_, not the _read_.
   `crates/exoharness/src/storage.rs` still loads every event file from disk
   before filtering, so a cursor query remains O(N) at the storage layer.
   Indexing the event log is the complementary fix.
+- A conversation whose _retained_ turns alone exceed the input limit cannot be
+  rescued by compaction: there is nothing safe left to cut. Lowering
+  `keepRecentTurns` helps; cutting mid-turn would corrupt tool rounds.
 - Summaries are flat, not hierarchical. If a flat summary proves lossy in
   practice, tiered summaries are the next step.
 - Summary _quality_ is not covered by the test suite — the deterministic tests

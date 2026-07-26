@@ -402,8 +402,23 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
 
   const cutIndex = scan.events.findIndex((e) => e.id === cut.upToEventId);
   const compactedEvents = scan.events.slice(0, cutIndex + 1);
+  const compactedMessages = materializeEventsToMessages(compactedEvents);
+
+  // A prompt can cross the threshold because of the turns being *kept* — one
+  // huge tool result, say. Replacing a smaller prefix with a summary that could
+  // be larger grows the prompt instead of shrinking it, and spends a model call
+  // to do so. Nothing to reclaim means nothing to do.
+  const spanChars = messagesChars(compactedMessages);
+  const previousChars = previousSummary?.length ?? 0;
+  if (spanChars + previousChars <= policy.maxSummaryChars) {
+    return {
+      status: "skipped",
+      reason: "compactable history is already smaller than the summary cap",
+    };
+  }
+
   const summarized = await args.summarize({
-    messages: materializeEventsToMessages(compactedEvents),
+    messages: compactedMessages,
     previousSummary,
     maxChars: policy.maxSummaryChars,
   });
@@ -444,6 +459,17 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
     },
   ]);
   return { status: "compacted", checkpoint };
+}
+
+function messagesChars(messages: Message[]): number {
+  let total = 0;
+  for (const message of messages) {
+    total +=
+      typeof message.content === "string"
+        ? message.content.length
+        : JSON.stringify(message.content).length;
+  }
+  return total;
 }
 
 function summaryArtifactPath(conversation: Conversation): string {

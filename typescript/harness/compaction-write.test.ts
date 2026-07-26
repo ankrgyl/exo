@@ -24,9 +24,16 @@ function event(type: string, extra: Record<string, unknown> = {}): Event {
   };
 }
 
+// Turns carry realistic bulk: compaction deliberately does nothing when the
+// compactable span is already smaller than the summary cap, so a fixture of
+// single-character turns would exercise only that skip path.
+const TURN_PADDING = "x".repeat(4_000);
+
 function turn(text: string): Event[] {
   return [
-    event("messages", { messages: [{ role: "user", content: text }] }),
+    event("messages", {
+      messages: [{ role: "user", content: `${text} ${TURN_PADDING}` }],
+    }),
     event("turn_ended"),
   ];
 }
@@ -231,13 +238,34 @@ describe("runCompaction", () => {
     expect(checkpointEvents(stub)).toHaveLength(0);
   });
 
+  it("skips when the compactable span is smaller than the summary cap", async () => {
+    // A prompt can cross the threshold because of the *retained* turns — one
+    // huge tool result, say. Summarizing a tiny prefix into an 8k-character
+    // summary would grow the prompt, not shrink it, and cost a model call to do
+    // it. Nothing to reclaim means nothing to do.
+    const stub = target([...turn("a"), ...turn("b"), ...turn("c")]);
+    let called = false;
+    const result = await runCompaction(
+      args(stub, {
+        policy: { ...policy, maxSummaryChars: 1_000_000 },
+        summarize: (async () => {
+          called = true;
+          return "SUMMARY";
+        }) satisfies SummarizeFn,
+      }),
+    );
+    expect(result.status).toBe("skipped");
+    expect(called).toBe(false);
+    expect(stub.written).toHaveLength(0);
+  });
+
   it("summarizes only the events being compacted", async () => {
     const stub = target([...turn("a"), ...turn("b"), ...turn("c")]);
     let received: string[] = [];
     await runCompaction(
       args(stub, {
         summarize: (async (input) => {
-          received = input.messages.map((m) => String(m.content));
+          received = input.messages.map((m) => String(m.content).split(" ")[0]);
           return "SUMMARY";
         }) satisfies SummarizeFn,
       }),

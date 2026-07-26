@@ -1393,8 +1393,14 @@ fn prompt_text(messages: &[Message]) -> String {
         .join("\n")
 }
 
+/// Turns carry realistic bulk: compaction deliberately does nothing when the
+/// compactable span is already smaller than the summary cap, so a fixture of
+/// single-word turns would exercise only that skip path.
+const TURN_PADDING_CHARS: usize = 4_000;
+
 async fn seed_completed_turns(conversation: &dyn ConversationHandle, labels: &[&str]) {
     for label in labels {
+        let body = format!("{label} {}", "x".repeat(TURN_PADDING_CHARS));
         conversation
             .add_events(AddEventsRequest {
                 session_id: None,
@@ -1402,7 +1408,7 @@ async fn seed_completed_turns(conversation: &dyn ConversationHandle, labels: &[&
                 data: vec![
                     EventData::Messages {
                         messages: vec![Message::User {
-                            content: UserContent::String((*label).to_string()),
+                            content: UserContent::String(body.clone()),
                         }],
                         response_id: None,
                         usage: None,
@@ -1796,5 +1802,178 @@ async fn compaction_is_attempted_at_most_once_per_turn() {
         model.observed_requests().len(),
         1,
         "summarizer should be called once per turn, not once per round"
+    );
+}
+
+/// End-to-end through the real turn loop: several turns run, the prompt crosses
+/// the threshold, compaction fires, and the next turn's prompt is materially
+/// smaller while still carrying the summary. Unit tests cover each piece; this
+/// covers the wiring between them, which is where a working feature quietly
+/// becomes a no-op.
+#[tokio::test(flavor = "current_thread")]
+async fn a_full_turn_loop_compacts_and_shrinks_the_next_prompt() {
+    let agent_id = Uuid7::now();
+    let conversation_id = Uuid7::now();
+    let exoharness = Arc::new(FakeExoHarness::new(agent_id, conversation_id));
+    let agent = exoharness
+        .get_agent(&agent_id)
+        .await
+        .expect("get agent")
+        .expect("agent exists");
+    let conversation = agent
+        .get_conversation(&conversation_id)
+        .await
+        .expect("get conversation")
+        .expect("conversation exists");
+
+    // One assistant reply per turn, plus one summary reply for the compaction
+    // that fires on the final turn.
+    let replies = (0..6)
+        .map(|index| ModelResponse {
+            provider_cost_usd: None,
+            response_id: None,
+            messages: vec![assistant_message(&format!(
+                "reply {index} {}",
+                "x".repeat(4_000)
+            ))],
+            tool_calls: vec![],
+            usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
+        })
+        .collect::<Vec<_>>();
+    let model = Arc::new(FakeModelClient::new(replies));
+    let executor = BasicExecutor::new(Arc::clone(&model), Arc::new(FakeToolRuntime::default()));
+
+    let config = AgentConfig {
+        compaction: Some(CompactionConfig {
+            keep_recent_turns: 1,
+            // The fake model has no known input limit, so drive the trigger
+            // through the character-budget fallback.
+            fallback_char_budget: 0,
+            enabled: false,
+            ..CompactionConfig::default()
+        }),
+        ..default_agent_config()
+    };
+    let enabled = AgentConfig {
+        compaction: config
+            .compaction
+            .clone()
+            .map(|compaction| CompactionConfig {
+                enabled: true,
+                ..compaction
+            }),
+        ..config.clone()
+    };
+
+    // Three turns with compaction off, to build history worth compacting.
+    for index in 0..3 {
+        run_one_turn(
+            &executor,
+            agent.as_ref(),
+            conversation.as_ref(),
+            &config,
+            index,
+        )
+        .await;
+    }
+
+    let before = executor
+        .materialize_prompt_history(conversation.as_ref(), &[])
+        .await
+        .expect("materialize");
+
+    // A fourth turn with compaction on.
+    run_one_turn(
+        &executor,
+        agent.as_ref(),
+        conversation.as_ref(),
+        &enabled,
+        3,
+    )
+    .await;
+
+    let events = conversation.get_events(None).await.expect("events").events;
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.data,
+            EventData::Custom { event_type, .. } if event_type == COMPACTION_CHECKPOINT_EVENT
+        )),
+        "the turn loop should have written a checkpoint"
+    );
+
+    let after = executor
+        .materialize_prompt_history(conversation.as_ref(), &[])
+        .await
+        .expect("materialize");
+    assert!(
+        after.len() < before.len(),
+        "prompt should shrink: {} messages before, {} after",
+        before.len(),
+        after.len()
+    );
+    let text = prompt_text(&after);
+    assert!(
+        text.contains("Summary of earlier conversation history"),
+        "the summary must stand in for what was removed: {text}"
+    );
+}
+
+async fn run_one_turn(
+    executor: &BasicExecutor<FakeModelClient, FakeToolRuntime>,
+    agent: &dyn AgentHandle,
+    conversation: &dyn ConversationHandle,
+    config: &AgentConfig,
+    index: usize,
+) {
+    let turn = conversation
+        .begin_turn(BeginTurnRequest {
+            session_id: None,
+            input: vec![user_message(&format!("ask {index} {}", "x".repeat(4_000)))],
+        })
+        .await
+        .expect("begin turn");
+    HarnessExecutor::execute_turn(
+        executor,
+        agent,
+        conversation,
+        Arc::clone(&turn),
+        config,
+        &ConversationConfig::default(),
+        &(),
+        ExecutorStreamMode::Disabled,
+        None,
+    )
+    .await
+    .expect("execute turn");
+    turn.finish().await.expect("finish turn");
+}
+
+#[tokio::test]
+async fn compaction_skips_when_there_is_nothing_to_reclaim() {
+    // Mirrors the TypeScript guard: if the compactable span is already smaller
+    // than the summary cap, summarizing it can only grow the prompt.
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["one", "two", "three"]).await;
+
+    let turn = open_turn(conversation.as_ref()).await;
+    let outcome = run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &CompactionConfig {
+            keep_recent_turns: 1,
+            max_summary_chars: u32::MAX,
+            ..CompactionConfig::default()
+        },
+        "summary-model",
+        None,
+        &|_input| Box::pin(async { panic!("summarizer must not be called") }),
+    )
+    .await;
+    assert!(
+        matches!(outcome, CompactionOutcome::Skipped { .. }),
+        "{outcome:?}"
     );
 }

@@ -307,6 +307,20 @@ async fn compact(
         &scan.events[..=cut_index],
     );
 
+    // A prompt can cross the threshold because of the turns being *kept* — one
+    // huge tool result, say. Replacing a smaller prefix with a summary that
+    // could be larger grows the prompt instead of shrinking it, and spends a
+    // model call to do so. Nothing to reclaim means nothing to do.
+    let span_chars = prompt_chars(&messages)
+        + previous_summary
+            .as_ref()
+            .map_or(0, |summary| summary.chars().count() as u64);
+    if span_chars <= config.max_summary_chars as u64 {
+        return Ok(CompactionOutcome::Skipped {
+            reason: "compactable history is already smaller than the summary cap".to_string(),
+        });
+    }
+
     let summarized = summarize(SummarizeInput {
         messages,
         previous_summary,
