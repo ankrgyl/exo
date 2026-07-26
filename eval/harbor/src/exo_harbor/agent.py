@@ -12,8 +12,8 @@ from harbor.models.agent.context import AgentContext
 
 from exo_harbor import __version__
 from exo_harbor.docker import resolve_main_container
-from exo_harbor.exo import Adapter, ExoClient
-from exo_harbor.protocol import TaskStarted, send_task_started
+from exo_harbor.exo import ExoClient
+from exo_harbor.protocol import TaskStarted, probe, send_task_started
 
 
 class ExoAgent(BaseAgent):
@@ -29,6 +29,7 @@ class ExoAgent(BaseAgent):
         exo_model: str | None = None,
         conversation_mode: Literal["per_task", "shared"] = "per_task",
         conversation: str = "harbor",
+        setup_conversation: str = "harbor-setup",
         adapter_start_timeout_sec: float | str = 30,
         task_timeout_sec: float | str = 3600,
         **kwargs,
@@ -52,10 +53,12 @@ class ExoAgent(BaseAgent):
         self._model = model
         self._conversation_mode = conversation_mode
         self._shared_conversation = _slug(conversation)
+        self._setup_conversation = _slug(setup_conversation)
         self._adapter_start_timeout_sec = float(adapter_start_timeout_sec)
         self._task_timeout_sec = float(task_timeout_sec)
         self._conversation_slug: str | None = None
-        self._adapter: Adapter | None = None
+        self._conversation_id: str | None = None
+        self._socket_path = self._exo.root / "harbor.sock"
         self._sandbox_id: str | None = None
 
     @staticmethod
@@ -72,7 +75,6 @@ class ExoAgent(BaseAgent):
             if self._conversation_mode == "shared"
             else _slug(f"harbor-{trial_id}")
         )
-        socket_path = self._exo.root / "harbor" / f"{conversation}.sock"
         self._exo.root.mkdir(parents=True, exist_ok=True)
         lock = FileLock(self._exo.root / "harbor-setup.lock")
         await asyncio.to_thread(lock.acquire)
@@ -80,18 +82,30 @@ class ExoAgent(BaseAgent):
             if not await self._exo.exists("agent", "show", self._agent_slug):
                 await self._exo.create_agent(self._agent_slug, self._model)
             if not await self._exo.exists(
+                "conversation", "show", self._agent_slug, self._setup_conversation
+            ):
+                await self._exo.create_conversation(
+                    self._agent_slug, self._setup_conversation
+                )
+            if not await probe(self._socket_path):
+                await self._exo.ensure_harbor_adapter(
+                    self._agent_slug,
+                    self._setup_conversation,
+                    self._socket_path,
+                )
+                await self._exo.ensure_runner(
+                    self._socket_path, self._adapter_start_timeout_sec
+                )
+            if not await self._exo.exists(
                 "conversation", "show", self._agent_slug, conversation
             ):
                 await self._exo.create_conversation(self._agent_slug, conversation)
-            adapter = await self._exo.ensure_adapter(
-                self._agent_slug, conversation, socket_path
+            conversation_id = await self._exo.conversation_id(
+                self._agent_slug, conversation
             )
         finally:
             await asyncio.to_thread(lock.release)
 
-        await self._exo.ensure_runner(
-            adapter.socket_path, self._adapter_start_timeout_sec
-        )
         container = await resolve_main_container(environment.session_id)
         sandbox_id = await self._exo.attach(
             self._agent_slug,
@@ -100,7 +114,7 @@ class ExoAgent(BaseAgent):
             default_workdir=container.workdir,
         )
         self._conversation_slug = conversation
-        self._adapter = adapter
+        self._conversation_id = conversation_id
         self._sandbox_id = sandbox_id
 
     async def run(
@@ -109,30 +123,33 @@ class ExoAgent(BaseAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        if not self._conversation_slug or not self._adapter or not self._sandbox_id:
+        if (
+            not self._conversation_slug
+            or not self._conversation_id
+            or not self._sandbox_id
+        ):
             raise RuntimeError("ExoAgent.setup() must complete before run()")
         trial_id = self._trial_id(environment)
         request = TaskStarted(
             trial_id=trial_id,
             task_name=environment.environment_name,
             instruction=instruction,
-            conversation_id=self._adapter.conversation_id,
+            conversation_id=self._conversation_id,
             sandbox_id=self._sandbox_id,
         )
         exo_metadata: dict[str, object] = {
             "trial_id": trial_id,
             "agent": self._agent_slug,
             "conversation": self._conversation_slug,
-            "conversation_id": self._adapter.conversation_id,
-            "adapter_id": self._adapter.adapter_id,
-            "socket_path": str(self._adapter.socket_path),
+            "conversation_id": self._conversation_id,
+            "socket_path": str(self._socket_path),
             "sandbox_id": self._sandbox_id,
             "conversation_mode": self._conversation_mode,
         }
         context.metadata = {**(context.metadata or {}), "exo": exo_metadata}
         try:
             completed = await send_task_started(
-                self._adapter.socket_path,
+                self._socket_path,
                 request,
                 timeout_sec=self._task_timeout_sec,
             )

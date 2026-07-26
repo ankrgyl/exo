@@ -42,7 +42,7 @@ function createAdapterTool(): ToolInstance {
     definition: {
       name: "create_adapter",
       description:
-        "Create and enable a long-running adapter for this conversation. Use source 'built_in' with config type 'irc' or 'agent-cli'. Use source 'library' with config type 'exochat', 'whatsapp', 'signal', 'discord', or 'slack' for shipped library adapters.",
+        "Create and enable a long-running adapter for this conversation. Use source 'built_in' with config type 'irc' or 'agent-cli'. Use source 'library' with config type 'exochat', 'whatsapp', 'signal', 'discord', 'slack', or 'harbor' for shipped library adapters.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -519,6 +519,19 @@ function adapterConfigSchema(): ToolDefinition["parameters"] {
         type: "object",
         additionalProperties: false,
         properties: {
+          type: { type: "string", enum: ["harbor"] },
+          socketPath: {
+            type: "string",
+            description:
+              "Absolute host unix socket path where Harbor sends task and verification events.",
+          },
+        },
+        required: ["type", "socketPath"],
+      },
+      {
+        type: "object",
+        additionalProperties: false,
+        properties: {
           type: { type: "string", enum: ["agent-cli"] },
           socketPath: {
             type: ["string", "null"],
@@ -560,7 +573,8 @@ function validateAdapterSource(source: string, type: string): void {
       type === "whatsapp" ||
       type === "signal" ||
       type === "discord" ||
-      type === "slack") &&
+      type === "slack" ||
+      type === "harbor") &&
     source !== "library"
   ) {
     throw new Error(`${type} adapters must use source 'library'`);

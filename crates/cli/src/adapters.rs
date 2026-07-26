@@ -6,26 +6,11 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use clap::Subcommand;
-use executor::{
-    AdapterConfig, AdapterRunOptions, AdapterSource, AdapterStore, Harness, NewAdapter,
-    run_adapters_watch,
-};
+use executor::{AdapterRunOptions, AdapterStore, Harness, run_adapters_watch};
 use tabwriter::TabWriter;
 
 #[derive(Debug, Subcommand)]
 pub enum AdapterCommands {
-    EnsureHarbor {
-        agent: String,
-        conversation: String,
-        #[arg(long, default_value = "harbor")]
-        name: String,
-        #[arg(long)]
-        socket_path: Option<PathBuf>,
-        #[arg(long, default_value = "examples/exo/adapters/harbor/worker.ts")]
-        worker_path: PathBuf,
-        #[arg(long, default_value = "node_modules/.bin/tsx")]
-        tsx_path: PathBuf,
-    },
     List {
         #[arg(long)]
         include_disabled: bool,
@@ -55,87 +40,6 @@ pub async fn handle_adapter_command(
 ) -> Result<()> {
     let store = AdapterStore::new(root.join("adapters"));
     match command {
-        AdapterCommands::EnsureHarbor {
-            agent,
-            conversation,
-            name,
-            socket_path,
-            worker_path,
-            tsx_path,
-        } => {
-            let agent = harness
-                .get_agent(&agent)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("agent not found"))?;
-            let conversation = agent
-                .get_conversation(&conversation)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("conversation not found"))?;
-            let worker_path = worker_path.canonicalize().map_err(|error| {
-                anyhow::anyhow!(
-                    "failed to resolve Harbor adapter worker {}: {error}",
-                    worker_path.display()
-                )
-            })?;
-            let tsx_path = tsx_path.canonicalize().map_err(|error| {
-                anyhow::anyhow!(
-                    "failed to resolve tsx executable {}: {error}",
-                    tsx_path.display()
-                )
-            })?;
-            let socket_path =
-                std::path::absolute(socket_path.unwrap_or_else(|| root.join("harbor.sock")))?;
-            let state_dir = std::path::absolute(
-                root.join("adapters")
-                    .join("harbor-state")
-                    .join(conversation.record().id.to_string()),
-            )?;
-            let config = harbor_adapter_config(&tsx_path, &worker_path, &socket_path, &state_dir);
-            let existing = store
-                .list_adapters_for_conversation(
-                    &agent.record().id.to_string(),
-                    &conversation.record().id.to_string(),
-                    true,
-                )
-                .await?
-                .into_iter()
-                .find(|adapter| adapter.name == name);
-            let adapter = match existing {
-                Some(adapter) if !adapter.enabled => {
-                    bail!(
-                        "Harbor adapter {} exists but is disabled; delete it before recreating",
-                        adapter.id
-                    )
-                }
-                Some(adapter) if adapter.config != config => {
-                    bail!(
-                        "Harbor adapter {} exists with different configuration",
-                        adapter.id
-                    )
-                }
-                Some(adapter) => adapter,
-                None => {
-                    store
-                        .create_adapter(NewAdapter {
-                            agent_id: agent.record().id.to_string(),
-                            conversation_id: conversation.record().id.to_string(),
-                            name,
-                            source: AdapterSource::BuiltIn,
-                            config,
-                        })
-                        .await?
-                }
-            };
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "agent_id": agent.record().id,
-                    "conversation_id": conversation.record().id,
-                    "adapter_id": adapter.id,
-                    "socket_path": socket_path,
-                }))?
-            );
-        }
         AdapterCommands::List { include_disabled } => {
             let mut writer = TabWriter::new(std::io::stdout());
             writeln!(writer, "ADAPTER\tENABLED\tSOURCE\tNAME")?;
@@ -189,26 +93,6 @@ pub async fn handle_adapter_command(
         }
     }
     Ok(())
-}
-
-fn harbor_adapter_config(
-    tsx_path: &Path,
-    worker_path: &Path,
-    socket_path: &Path,
-    state_dir: &Path,
-) -> AdapterConfig {
-    AdapterConfig {
-        adapter_type: "harbor".to_string(),
-        worker_command: vec![
-            tsx_path.to_string_lossy().into_owned(),
-            worker_path.to_string_lossy().into_owned(),
-        ],
-        initialization: serde_json::json!({
-            "socketPath": socket_path,
-        }),
-        state_dir: Some(state_dir.to_string_lossy().into_owned()),
-        secret_env: Vec::new(),
-    }
 }
 
 #[derive(Debug)]
@@ -273,29 +157,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-
-    #[test]
-    fn harbor_adapter_config_uses_explicit_paths() {
-        let config = harbor_adapter_config(
-            Path::new("/repo/node_modules/.bin/tsx"),
-            Path::new("/repo/examples/exo/adapters/harbor/worker.ts"),
-            Path::new("/tmp/harbor.sock"),
-            Path::new("/tmp/harbor-state"),
-        );
-        assert_eq!(config.adapter_type, "harbor");
-        assert_eq!(
-            config.worker_command,
-            vec![
-                "/repo/node_modules/.bin/tsx",
-                "/repo/examples/exo/adapters/harbor/worker.ts"
-            ]
-        );
-        assert_eq!(
-            config.initialization,
-            serde_json::json!({ "socketPath": "/tmp/harbor.sock" })
-        );
-        assert_eq!(config.state_dir.as_deref(), Some("/tmp/harbor-state"));
-    }
 
     #[test]
     fn adapter_runner_lock_rejects_concurrent_holder() {

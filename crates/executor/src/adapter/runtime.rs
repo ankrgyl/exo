@@ -654,10 +654,32 @@ async fn resolve_message_conversation(
     adapter: &AdapterRecord,
     config: &AdapterConfig,
     target: &str,
-    _metadata: &serde_json::Value,
+    metadata: &serde_json::Value,
 ) -> Result<Arc<dyn HarnessConversation>> {
-    if !uses_target_conversation_scope(config) {
-        return Ok(root_conversation);
+    match conversation_scope(config)? {
+        AdapterConversationScope::Adapter => return Ok(root_conversation),
+        AdapterConversationScope::Explicit => {
+            let metadata = serde_json::from_value::<ExplicitConversationMetadata>(metadata.clone())
+                .context("explicit adapter message metadata is invalid")?;
+            let conversation = agent
+                .get_conversation(&metadata.conversation_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "explicit adapter target conversation not found: {}",
+                        metadata.conversation_id
+                    )
+                })?;
+            let record = AdapterTargetConversationRecord::new(
+                adapter.id.clone(),
+                target.to_string(),
+                conversation.record().id.to_string(),
+                now_ms(),
+            )?;
+            store.put_target_conversation(&record).await?;
+            return Ok(conversation);
+        }
+        AdapterConversationScope::Target => {}
     }
     if let Some(record) = store.get_target_conversation(&adapter.id, target).await? {
         if let Some(conversation) = agent.get_conversation(&record.conversation_id).await? {
@@ -705,12 +727,31 @@ async fn resolve_message_conversation(
     Ok(conversation)
 }
 
-fn uses_target_conversation_scope(config: &AdapterConfig) -> bool {
-    config
-        .initialization
-        .get("conversationScope")
-        .and_then(|value| value.as_str())
-        == Some("target")
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdapterRoutingConfig {
+    conversation_scope: Option<AdapterConversationScope>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum AdapterConversationScope {
+    Adapter,
+    Target,
+    Explicit,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExplicitConversationMetadata {
+    conversation_id: String,
+}
+
+fn conversation_scope(config: &AdapterConfig) -> Result<AdapterConversationScope> {
+    let routing = serde_json::from_value::<AdapterRoutingConfig>(config.initialization.clone())
+        .context("adapter routing configuration is invalid")?;
+    Ok(routing
+        .conversation_scope
+        .unwrap_or(AdapterConversationScope::Adapter))
 }
 
 fn target_conversation_slug(adapter: &AdapterRecord, target: &str) -> String {
@@ -1126,15 +1167,19 @@ mod tests {
     }
 
     #[test]
-    fn target_scope_only_when_explicitly_set() {
-        assert!(uses_target_conversation_scope(&config_with_scope(Some(
-            "target"
-        ))));
-        // Default and explicit "adapter" both stay on the root conversation.
-        assert!(!uses_target_conversation_scope(&config_with_scope(None)));
-        assert!(!uses_target_conversation_scope(&config_with_scope(Some(
-            "adapter"
-        ))));
+    fn conversation_scope_defaults_to_adapter() {
+        assert_eq!(
+            conversation_scope(&config_with_scope(None)).unwrap(),
+            AdapterConversationScope::Adapter
+        );
+        assert_eq!(
+            conversation_scope(&config_with_scope(Some("target"))).unwrap(),
+            AdapterConversationScope::Target
+        );
+        assert_eq!(
+            conversation_scope(&config_with_scope(Some("explicit"))).unwrap(),
+            AdapterConversationScope::Explicit
+        );
     }
 
     #[test]

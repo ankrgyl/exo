@@ -9,14 +9,14 @@ container and returns from `run()`, allowing Harbor to run its verifier.
 ## Lifecycle
 
 1. Harbor starts the task's Docker environment.
-2. `ExoAgent.setup()` creates or selects an Exo conversation and attaches
-   Harbor's running `main` container as its sandbox.
-3. `ExoAgent.run()` sends `task_started`; Exo works in that container and
-   replies with `task_complete`.
-4. `ExoAgent` detaches the container and returns, so Harbor can run its
-   verifier.
-5. `ContinualExoPlugin` sends the verification result back; Exo reflects and
-   replies with `feedback_processed` before Harbor advances to the next task.
+2. On first setup, `ExoAgent` creates the Exo agent and a dedicated setup
+   conversation, which configures one long-running Harbor adapter.
+3. Each task selects a separate work conversation, attaches Harbor's running
+   `main` container, and sends `task_started` to that conversation.
+4. Exo works in the container, replies with `task_complete`, and the agent
+   detaches the container so Harbor can run its verifier.
+5. `ContinualExoPlugin` routes the verification result back to the same work
+   conversation and waits for `feedback_processed` before Harbor advances.
 
 ## Running Harbor x Exo
 
@@ -38,17 +38,16 @@ harbor run \
   --plugin exo_harbor.continual:ContinualExoPlugin \
   --model '<harbor-model-label>' \
   --ak exo_repo_root="$PWD" \
-  --ak exo_model='<registered-exo-model>' \
-  --pk exo_repo_root="$PWD"
+  --ak exo_model='<registered-exo-model>'
 ```
 
-`conversation_mode=per_task` is the default and supports concurrent Harbor
-trials. Set `--ak conversation_mode=shared` to retain conversation context
-between sequential trials. Both modes reuse the same Exo agent, so agent-level
-state remains shared.
+`--ak` passes an agent constructor argument. `conversation_mode=per_task` is
+the default and creates a fresh work conversation for each task; set
+`--ak conversation_mode=shared` to reuse one work conversation and retain its
+context. Neither mode uses the adapter's setup conversation for task work.
 
-The continual plugin receives Harbor's awaited trial-ended hook. It sends
-rewards and verifier logs back to Exo, waits for `feedback_processed`, and
-writes `exo-feedback.json` beside Harbor's `result.json` before the next trial
-starts. The plugin requires Docker and `--n-concurrent 1`; this preserves the
-ordered learn-and-advance lifecycle.
+`exo_harbor.continual:ContinualExoPlugin` is Harbor's `module:class` import
+path for the job plugin. The plugin receives Harbor's awaited trial-ended hook,
+sends rewards and verifier logs back to Exo, waits for `feedback_processed`,
+and writes `exo-feedback.json` beside Harbor's `result.json`. It requires
+Docker and `--n-concurrent 1` to preserve the ordered lifecycle.

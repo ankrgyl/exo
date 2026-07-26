@@ -4,7 +4,6 @@ import asyncio
 import json
 import os
 import subprocess
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -13,14 +12,6 @@ from exo_harbor.protocol import probe
 
 class ExoCommandError(RuntimeError):
     pass
-
-
-@dataclass(frozen=True)
-class Adapter:
-    agent_id: str
-    conversation_id: str
-    adapter_id: str
-    socket_path: Path
 
 
 class ExoClient:
@@ -75,30 +66,33 @@ class ExoClient:
             "agent",
         )
 
-    async def ensure_adapter(
-        self, agent: str, conversation: str, socket_path: Path
-    ) -> Adapter:
-        worker = self.repo_root / "examples/exo/adapters/harbor/worker.ts"
-        tsx = self.repo_root / "node_modules/.bin/tsx"
+    async def conversation_id(self, agent: str, conversation: str) -> str:
         output = await self.run(
-            "adapters",
-            "ensure-harbor",
+            "conversation",
+            "show",
             agent,
             conversation,
-            "--socket-path",
-            str(socket_path),
-            "--worker-path",
-            str(worker),
-            "--tsx-path",
-            str(tsx),
         )
-        value = _json_object(output, "ensure-harbor output")
-        return Adapter(
-            agent_id=_required_string(value, "agent_id"),
-            conversation_id=_required_string(value, "conversation_id"),
-            adapter_id=_required_string(value, "adapter_id"),
-            socket_path=Path(_required_string(value, "socket_path")),
+        for line in output.splitlines():
+            key, separator, value = line.partition(":")
+            if separator and key == "id" and value.strip():
+                return value.strip()
+        raise ExoCommandError("conversation show output did not contain an id")
+
+    async def ensure_harbor_adapter(
+        self, agent: str, setup_conversation: str, socket_path: Path
+    ) -> None:
+        prompt = (
+            "Configure the Harbor adapter for this setup conversation. "
+            "Call list_adapters with includeDisabled=true. If there is no enabled "
+            "adapter named `harbor` with type `harbor` and socketPath exactly "
+            f"`{socket_path}`, call create_adapter with name `harbor`, source "
+            f'`library`, and config {{"type":"harbor","socketPath":'
+            f'"{socket_path}"}}. Do not create a duplicate. If an adapter named '
+            "`harbor` exists but is disabled or has different configuration, "
+            "report that clearly instead of changing or deleting it."
         )
+        await self.run("conversation", "send", agent, setup_conversation, prompt)
 
     async def attach(
         self,
@@ -134,9 +128,6 @@ class ExoClient:
             sandbox_id,
             "--json",
         )
-
-    async def delete_adapter(self, adapter_id: str) -> None:
-        await self.run("adapters", "delete", adapter_id)
 
     async def ensure_runner(self, socket_path: Path, timeout_sec: float) -> None:
         if await probe(socket_path):

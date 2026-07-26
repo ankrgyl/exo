@@ -16,7 +16,6 @@ from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import ExceptionInfo, TrialResult
 from harbor.trial.hooks import TrialHookEvent
 
-from exo_harbor.exo import ExoClient
 from exo_harbor.protocol import (
     VerificationException,
     VerificationResult,
@@ -29,9 +28,7 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class ExoTrialMetadata:
     conversation_id: str
-    adapter_id: str
     socket_path: Path
-    conversation_mode: Literal["per_task", "shared"]
 
 
 @dataclass(frozen=True)
@@ -41,7 +38,6 @@ class FeedbackSidecar:
     recorded_at: str
     summary: str | None = None
     error: str | None = None
-    adapter_deleted: bool = False
 
 
 class ContinualExoPlugin(BaseJobPlugin):
@@ -50,20 +46,12 @@ class ContinualExoPlugin(BaseJobPlugin):
     def __init__(
         self,
         *,
-        exo_repo_root: str = ".",
-        exo_root: str = "~/.exo",
-        exo_bin: str | None = None,
         feedback_timeout_sec: float | str = 600,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        repo_root = Path(exo_repo_root).expanduser().resolve()
-        self._exo_root = Path(exo_root)
-        self._exo_bin = exo_bin or str(repo_root / "target/debug/exo")
-        self._repo_root = repo_root
         self._feedback_timeout_sec = float(feedback_timeout_sec)
         self._job_dir: Path | None = None
-        self._exo: ExoClient | None = None
 
     async def on_job_start(self, job: Job) -> None:
         if job.config.environment.type != EnvironmentType.DOCKER:
@@ -77,19 +65,13 @@ class ContinualExoPlugin(BaseJobPlugin):
                 "(pass --n-concurrent 1)"
             )
         self._job_dir = job.job_dir
-        self._exo = ExoClient(
-            executable=self._exo_bin,
-            root=self._exo_root,
-            repo_root=self._repo_root,
-            logs_dir=job.job_dir,
-        )
         job.on_trial_ended(self._on_trial_ended)
 
     async def on_job_end(self, job_result: JobResult) -> None:
         return None
 
     async def _on_trial_ended(self, event: TrialHookEvent) -> None:
-        if self._job_dir is None or self._exo is None:
+        if self._job_dir is None:
             raise RuntimeError("ContinualExoPlugin has not been attached to a job")
         paths = TrialPaths(self._job_dir / event.trial_name)
         sidecar_path = paths.trial_dir / "exo-feedback.json"
@@ -109,16 +91,11 @@ class ContinualExoPlugin(BaseJobPlugin):
                 ),
                 timeout_sec=self._feedback_timeout_sec,
             )
-            adapter_deleted = False
-            if metadata.conversation_mode == "per_task":
-                await self._exo.delete_adapter(metadata.adapter_id)
-                adapter_deleted = True
             sidecar = FeedbackSidecar(
                 trial_id=str(event.trial_id),
                 status="processed",
                 recorded_at=_now(),
                 summary=response.summary,
-                adapter_deleted=adapter_deleted,
             )
         except Exception as error:
             logger.exception(
@@ -145,14 +122,9 @@ def _exo_metadata(result: TrialResult) -> ExoTrialMetadata:
         metadata = _metadata_object(context)
         if metadata is None:
             continue
-        mode = _required_string(metadata, "conversation_mode")
-        if mode not in ("per_task", "shared"):
-            raise ValueError("Exo conversation_mode must be per_task or shared")
         return ExoTrialMetadata(
             conversation_id=_required_string(metadata, "conversation_id"),
-            adapter_id=_required_string(metadata, "adapter_id"),
             socket_path=Path(_required_string(metadata, "socket_path")),
-            conversation_mode=mode,
         )
     raise ValueError("Harbor result does not contain Exo agent metadata")
 

@@ -2214,9 +2214,6 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
             },
         },
         Commands::Repl { agent, .. } => Some(agent.as_deref().unwrap_or(DEFAULT_REPL_SLUG)),
-        Commands::Adapters {
-            command: adapters::AdapterCommands::EnsureHarbor { agent, .. },
-        } => Some(agent.as_str()),
         Commands::Secret { .. }
         | Commands::Model { .. }
         | Commands::Provider { .. }

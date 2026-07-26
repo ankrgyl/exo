@@ -41,13 +41,10 @@ class ContinualExoPluginTest(unittest.IsolatedAsyncioTestCase):
             job = FakeJob(job_dir)
             await plugin.on_job_start(cast(Any, job))
             assert job.callback is not None
-            fake_exo = SimpleNamespace(delete_adapter=AsyncMock())
-            plugin._exo = cast(Any, fake_exo)
             context = AgentContext(
                 metadata={
                     "exo": {
                         "conversation_id": "conversation-id",
-                        "adapter_id": "adapter-id",
                         "socket_path": str(Path(directory) / "harbor.sock"),
                         "conversation_mode": "per_task",
                     }
@@ -80,11 +77,9 @@ class ContinualExoPluginTest(unittest.IsolatedAsyncioTestCase):
             request = send.await_args.args[1]
             self.assertEqual(request.rewards, {"reward": 1})
             self.assertEqual(request.verifier_stdout, "tests passed\n")
-            fake_exo.delete_adapter.assert_awaited_once_with("adapter-id")
             sidecar = json.loads((trial_dir / "exo-feedback.json").read_text())
             self.assertEqual(sidecar["status"], "processed")
             self.assertEqual(sidecar["summary"], "retained")
-            self.assertTrue(sidecar["adapter_deleted"])
 
     async def test_rejects_non_sequential_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
