@@ -11,6 +11,7 @@ use futures::{StreamExt, io::AsyncReadExt};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::fs;
+use url::Url;
 
 use super::runtime::send_adapter_message_with_handles;
 use super::store::AdapterStore;
@@ -29,6 +30,8 @@ const MAX_ATTACHMENT_BASE64_BYTES: usize = MAX_ATTACHMENT_BYTES.div_ceil(3) * 4 
 const ATTACHMENT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_ATTACHMENT_STDERR_BYTES: usize = 64 * 1024;
 const DEFAULT_EXOCHAT_BASE_URL: &str = "https://exoharness.ai";
+const DEFAULT_NOSTR_CHAT_RELAY_URL: &str = "wss://relay.openagents.com";
+const DEFAULT_NOSTR_CHAT_GROUP_ID: &str = "openagents-public";
 
 #[derive(Debug, Clone)]
 pub struct AdapterCreationOptions {
@@ -99,6 +102,7 @@ enum AdapterCreationConfig {
     Discord(DiscordAdapterCreationConfig),
     Slack(SlackAdapterCreationConfig),
     Exochat(ExochatAdapterCreationConfig),
+    NostrChat(NostrChatAdapterCreationConfig),
     AgentCli(AgentCliAdapterCreationConfig),
 }
 
@@ -195,6 +199,17 @@ struct ExochatAdapterCreationConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NostrChatAdapterCreationConfig {
+    #[serde(rename = "type")]
+    _adapter_type: NostrChatAdapterType,
+    relay_url: Option<String>,
+    group_id: Option<String>,
+    secret_key_secret_id: Option<String>,
+    trigger: NostrChatTrigger,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AgentCliAdapterCreationConfig {
     #[serde(rename = "type")]
     _adapter_type: AgentCliAdapterType,
@@ -253,6 +268,12 @@ enum ExochatAdapterType {
 }
 
 #[derive(Debug, Deserialize)]
+enum NostrChatAdapterType {
+    #[serde(rename = "nostr-chat")]
+    NostrChat,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum IrcTrigger {
     Mention,
@@ -276,6 +297,13 @@ enum DiscordTrigger {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SlackTrigger {
+    AllMessages,
+    MentionsOnly,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NostrChatTrigger {
     AllMessages,
     MentionsOnly,
 }
@@ -323,6 +351,7 @@ impl AdapterCreationConfig {
             Self::Discord(_) => "discord",
             Self::Slack(_) => "slack",
             Self::Exochat(_) => "exochat",
+            Self::NostrChat(_) => "nostr-chat",
             Self::AgentCli(_) => "agent-cli",
         }
     }
@@ -493,6 +522,35 @@ impl AdapterCreationConfig {
                     secret_env: Vec::new(),
                 })
             }
+            Self::NostrChat(config) => {
+                require_source(source, AdapterSource::Library, "nostr-chat")?;
+                let relay_url = nostr_chat_relay_url(config.relay_url)?;
+                let group_id = config
+                    .group_id
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| DEFAULT_NOSTR_CHAT_GROUP_ID.to_string());
+                let secret_env = config
+                    .secret_key_secret_id
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|secret_id| {
+                        vec![WorkerSecretEnvVar {
+                            env: "EXO_NOSTR_SECRET_KEY".to_string(),
+                            secret_id,
+                        }]
+                    })
+                    .unwrap_or_default();
+                Ok(AdapterConfig {
+                    adapter_type: "nostr-chat".to_string(),
+                    worker_command: options.worker_command("nostr-chat"),
+                    initialization: serde_json::json!({
+                        "relayUrl": relay_url,
+                        "groupId": group_id,
+                        "trigger": config.trigger.as_str(),
+                    }),
+                    state_dir: None,
+                    secret_env,
+                })
+            }
             Self::AgentCli(config) => {
                 require_source(source, AdapterSource::BuiltIn, "agent-cli")?;
                 if !config.mount_root.starts_with('/') {
@@ -534,6 +592,15 @@ impl ChatTrigger {
         match self {
             Self::AllMessages => "all_messages",
             Self::ContactsOnly => "contacts_only",
+        }
+    }
+}
+
+impl NostrChatTrigger {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::AllMessages => "all_messages",
+            Self::MentionsOnly => "mentions_only",
         }
     }
 }
@@ -596,6 +663,24 @@ fn exochat_base_url(value: Option<String>) -> Result<String> {
         bail!("exochat baseUrl must start with http:// or https://");
     }
     Ok(value)
+}
+
+fn nostr_chat_relay_url(value: Option<String>) -> Result<String> {
+    let relay_url = value
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_NOSTR_CHAT_RELAY_URL.to_string());
+    let parsed = Url::parse(&relay_url).context("nostr-chat relayUrl must be a valid URL")?;
+    if parsed.scheme() != "wss" && parsed.scheme() != "ws" {
+        bail!("nostr-chat relayUrl must start with wss:// or ws://");
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        bail!("nostr-chat relayUrl must not contain credentials, a query, or a fragment");
+    }
+    Ok(relay_url)
 }
 
 fn exochat_secret() -> String {
@@ -1449,6 +1534,81 @@ mod tests {
             .into_adapter_config(AdapterSource::Library, &test_creation_options())
             .unwrap_err();
         assert!(error.to_string().contains("channelId and secret"));
+    }
+
+    #[test]
+    fn nostr_chat_config_applies_portable_defaults_and_secret_binding() {
+        let parse = |relay_url: serde_json::Value,
+                     group_id: serde_json::Value,
+                     secret_key_secret_id: serde_json::Value|
+         -> AdapterCreationConfig {
+            serde_json::from_value(serde_json::json!({
+                "type": "nostr-chat",
+                "relayUrl": relay_url,
+                "groupId": group_id,
+                "secretKeySecretId": secret_key_secret_id,
+                "trigger": "mentions_only",
+            }))
+            .unwrap()
+        };
+        let adapter_config = parse(
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        )
+        .into_adapter_config(AdapterSource::Library, &test_creation_options())
+        .unwrap();
+        assert_eq!(adapter_config.adapter_type, "nostr-chat");
+        assert!(
+            adapter_config.worker_command[2].ends_with("/tmp/exo-adapters/nostr-chat/worker.ts")
+        );
+        assert_eq!(
+            adapter_config.initialization,
+            serde_json::json!({
+                "relayUrl": DEFAULT_NOSTR_CHAT_RELAY_URL,
+                "groupId": DEFAULT_NOSTR_CHAT_GROUP_ID,
+                "trigger": "mentions_only",
+            })
+        );
+        assert!(adapter_config.secret_env.is_empty());
+
+        let adapter_config = parse(
+            serde_json::json!("wss://relay.example.test"),
+            serde_json::json!("agents"),
+            serde_json::json!("nostr-agent"),
+        )
+        .into_adapter_config(AdapterSource::Library, &test_creation_options())
+        .unwrap();
+        assert_eq!(
+            adapter_config.initialization["relayUrl"],
+            "wss://relay.example.test"
+        );
+        assert_eq!(adapter_config.initialization["groupId"], "agents");
+        assert_eq!(
+            adapter_config.secret_env,
+            vec![WorkerSecretEnvVar {
+                env: "EXO_NOSTR_SECRET_KEY".to_string(),
+                secret_id: "nostr-agent".to_string(),
+            }]
+        );
+
+        let error = parse(
+            serde_json::json!("https://relay.example.test"),
+            serde_json::json!("agents"),
+            serde_json::Value::Null,
+        )
+        .into_adapter_config(AdapterSource::Library, &test_creation_options())
+        .unwrap_err();
+        assert!(error.to_string().contains("wss:// or ws://"));
+
+        let error = parse(
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        )
+        .into_adapter_config(AdapterSource::BuiltIn, &test_creation_options())
+        .unwrap_err();
+        assert!(error.to_string().contains("source"));
     }
 
     #[tokio::test]

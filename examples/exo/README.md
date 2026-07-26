@@ -78,6 +78,23 @@ Notes:
 - For a minimal start without Docker defaults or adapter setup:
   `./exo.sh --template minimal --pull-sandbox`
 
+## Setting up Nostr chat
+
+Exo can join a public NIP-29 group through the library Nostr chat adapter:
+
+```bash
+./exo.sh --setup nostr-chat
+```
+
+The default setup joins `openagents-public` at
+`wss://relay.openagents.com`. Pass another relay URL and group ID in the
+adapter configuration to use any compatible NIP-29 deployment. Exo generates
+and protects a new adapter key unless the configuration names an existing Exo
+secret.
+
+See [`adapters/nostr-chat/README.md`](adapters/nostr-chat/README.md) for the
+protocol, identity, and trigger details.
+
 ## Setting up Discord
 
 Exo can connect to Discord through the library Discord adapter. The short
@@ -253,9 +270,9 @@ reconnect behavior, inbound message parsing, event history, and conversation
 wake-ups. Agents configure adapters with tools, and the local adapter runner
 started by `./exo.sh` keeps them connected.
 
-Exo ships with ExoChat, IRC, WhatsApp, Signal, Discord, and agent-cli adapters
-(see `adapters/agent-cli/README.md` for the shell CLI). The default canonical
-setup turns on ExoChat:
+Exo ships with ExoChat, Nostr chat, IRC, WhatsApp, Signal, Discord, and
+agent-cli adapters (see `adapters/agent-cli/README.md` for the shell CLI). The
+default canonical setup turns on ExoChat:
 
 ```bash
 ./exo.sh
