@@ -111,15 +111,32 @@ function readCompactionSummaryTool(): ToolInstance {
 /**
  * Prompt block telling the agent its history has been compacted.
  *
- * Only emitted once a checkpoint exists: explaining compaction to an agent
- * whose history is still intact spends prompt space on nothing. The counts are
- * concrete so the agent can judge how much it is missing rather than guess.
+ * Only emitted once a checkpoint exists *and* its summary is actually in the
+ * prompt. Explaining compaction to an agent whose history is still intact
+ * spends prompt space on nothing — and worse, when a checkpoint's artifact
+ * cannot be read, materialization deliberately falls back to the **full** log
+ * and inserts no summary. Announcing a summary then would describe a context
+ * the agent does not have: it would go hunting for detail that is already in
+ * front of it, or tell the user history is missing when none is.
+ *
+ * The counts are concrete so the agent can judge how much it is missing rather
+ * than guess.
  */
 export async function compactionInstruction(
   context: TurnContext,
 ): Promise<Message | null> {
-  const checkpoint = await readActiveCheckpoint(conversationOf(context));
+  const conversation = conversationOf(context);
+  const checkpoint = await readActiveCheckpoint(conversation);
   if (checkpoint === null) {
+    return null;
+  }
+  // Same read the prompt assembly does; if it comes back empty, assembly took
+  // the full-history fallback and there is no summary to point at.
+  const summary = await conversation.readArtifactText({
+    artifactId: checkpoint.artifactId,
+    version: checkpoint.artifactVersion,
+  });
+  if (summary === null || summary.length === 0) {
     return null;
   }
   return {

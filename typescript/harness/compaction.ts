@@ -29,6 +29,22 @@ import {
 export const COMPACTION_CHECKPOINT_EVENT = "exo.compaction.v1";
 export const COMPACTION_FAILED_EVENT = "exo.compaction.failed.v1";
 
+/**
+ * Custom event carrying what a compaction's summarizer call cost.
+ *
+ * A *custom* event, not a `messages` one, and that is the whole point. Both
+ * materializers treat every messages event as a turn boundary and flush pending
+ * tool calls at it, so an accounting event that landed between a
+ * `tool_requested` and its `tool_result` would make them fabricate a failure for
+ * a call that succeeded and then append the real result as well.
+ *
+ * Writing it later does not fix that: turns on one conversation are not
+ * serialized, so "no call is outstanding" is a claim about every in-flight turn,
+ * not just the one doing the accounting. Custom events are ignored by prompt
+ * assembly outright, so no ordering rule remains to get wrong.
+ */
+export const COMPACTION_USAGE_EVENT = "exo.compaction.usage.v1";
+
 const TURN_ENDED = "turn_ended";
 
 /** Marker appended when compaction runs, pointing at the summary artifact. */
@@ -206,6 +222,26 @@ export function estimatedTokensFromChars(chars: number): number {
 }
 
 /**
+ * Output-token ceiling for a summarizer request sized from `maxSummaryChars`.
+ *
+ * `capSummary` only truncates *after* a response has been generated,
+ * transferred and billed, so on its own it bounds the stored summary but not
+ * the latency, memory or cost of producing it. This bounds the request itself.
+ *
+ * Generous on purpose: the multiplier leaves room so a model that respects the
+ * character instruction is never clipped mid-sentence, and `capSummary` remains
+ * the exact ceiling.
+ */
+export function summarizerMaxOutputTokens(maxSummaryChars: number): number {
+  const headroom = 2;
+  const floorTokens = 256;
+  return Math.max(
+    floorTokens,
+    estimatedTokensFromChars(maxSummaryChars) * headroom,
+  );
+}
+
+/**
  * At-most-once-per-turn gate around `shouldCompact`.
  *
  * Compaction can only cut at a `turn_ended` boundary, and no new one appears
@@ -320,6 +356,24 @@ function customEventPayload(
     : null;
 }
 
+/**
+ * True when `value` is a syntactically valid event id.
+ *
+ * Rust deserializes these as `Uuid7`, so a malformed id makes serde reject the
+ * whole checkpoint and the reader safely replays the full log. Accepting any
+ * string here would instead hand the bad cursor to `getEvents`, which rejects
+ * the request and fails materialization outright — turning a recoverable
+ * fallback into a hard error.
+ */
+function isEventId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      value,
+    )
+  );
+}
+
 /** True when a field is absent/null, or present with the expected type. */
 function isAbsentOrType(
   value: unknown,
@@ -355,7 +409,7 @@ export function checkpointFromEvent(
   const summaryChars = payload.summary_chars;
   const model = payload.model;
   if (
-    typeof upToEventId !== "string" ||
+    !isEventId(upToEventId) ||
     typeof artifactId !== "string" ||
     typeof artifactPath !== "string" ||
     typeof artifactVersion !== "number" ||
@@ -370,7 +424,11 @@ export function checkpointFromEvent(
   // value has the wrong type — so coercing a bad value to null here would let
   // the two runtimes pick different histories for the same event: Rust falls
   // back to the full log, TypeScript honours a checkpoint it half-understood.
-  if (!isAbsentOrType(payload.previous_checkpoint_id, "string")) {
+  if (
+    payload.previous_checkpoint_id !== undefined &&
+    payload.previous_checkpoint_id !== null &&
+    !isEventId(payload.previous_checkpoint_id)
+  ) {
     return null;
   }
   if (!isAbsentOrType(payload.prompt_tokens_before, "number")) {

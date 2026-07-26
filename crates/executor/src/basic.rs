@@ -16,7 +16,7 @@ use serde_json::json;
 use crate::compaction::{
     CompactionOutcome, SummarizeInput, estimated_tokens_from_chars, prompt_chars,
     read_active_checkpoint, read_summary, record_summarizer_usage, run_compaction, should_compact,
-    summarizer_instruction, summary_message, tool_definition_chars,
+    summarizer_instruction, summarizer_max_output_tokens, summary_message, tool_definition_chars,
 };
 use crate::execution_tracing::TurnExecutionTrace;
 use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor};
@@ -215,7 +215,6 @@ where
         agent_config: &AgentConfig,
         trigger: CompactionTrigger<'_>,
         attempted: &mut bool,
-        pending_usage: &mut Option<Box<UsageRecord>>,
     ) -> bool {
         let CompactionTrigger {
             model,
@@ -243,11 +242,9 @@ where
             .summary_model
             .clone()
             .unwrap_or_else(|| model.to_string());
-        // The summarizer's usage is collected here and handed back rather than
-        // written: this runs mid-round, and an accounting event between a
-        // `tool_requested` and its `tool_result` would make the materializer
-        // fabricate a failure for a call that succeeded. The caller writes it at
-        // a point where no call is outstanding.
+        // Collected during the summarizer call and written below. Safe to write
+        // right here, mid-round: it goes on a custom event, which prompt
+        // assembly ignores outright. See `COMPACTION_USAGE_EVENT`.
         let summarizer_usage: std::sync::Mutex<Option<Box<UsageRecord>>> =
             std::sync::Mutex::new(None);
         let outcome = run_compaction(
@@ -263,17 +260,16 @@ where
                     &summarizer_usage,
                     &agent_config.model,
                     &summary_model,
+                    config.max_summary_chars,
                 ))
             },
         )
         .await;
-        if let Some(usage) = summarizer_usage
+        let usage = summarizer_usage
             .lock()
             .expect("summarizer usage poisoned")
-            .take()
-        {
-            *pending_usage = Some(usage);
-        }
+            .take();
+        record_summarizer_usage(turn, usage).await;
 
         let conversation_id = conversation.record().id;
         match outcome {
@@ -316,6 +312,7 @@ where
         usage_sink: &std::sync::Mutex<Option<Box<UsageRecord>>>,
         binding: &str,
         model: &str,
+        max_summary_chars: u32,
     ) -> Result<String> {
         let model_binding = resolve_model_binding(conversation, binding).await?;
         let mut messages = vec![system_message(&summarizer_instruction(&input))];
@@ -330,7 +327,10 @@ where
                 messages,
                 // No tools: the summarizer reads, it does not act.
                 tools: Vec::new(),
-                max_output_tokens: None,
+                // Bound the response at request time. `cap_summary` truncates
+                // only after generation, so without this a runaway summary is
+                // paid for in full before being thrown away.
+                max_output_tokens: Some(summarizer_max_output_tokens(max_summary_chars)),
             })
             .await?;
         let text = assistant_messages_text(&response.messages);
@@ -350,16 +350,7 @@ where
         turn_trace: Option<&dyn TurnExecutionTrace>,
     ) -> Result<()> {
         let mut compaction_attempted = false;
-        // Compaction is latched to once per turn, so at most one of these
-        // exists. It is written only where an open tool round provably cannot
-        // exist — see `record_summarizer_usage` for why that matters.
-        let mut pending_usage: Option<Box<UsageRecord>> = None;
         for round in 0u32.. {
-            // Safe point: any tool round from the previous iteration has
-            // completed and its results are in the log. Flushing before the
-            // budget check means the early return below records it too.
-            record_summarizer_usage(turn.as_ref(), pending_usage.take()).await;
-
             if agent_config
                 .max_tool_round_trips
                 .is_some_and(|limit| round > limit)
@@ -403,7 +394,6 @@ where
                         prompt_chars,
                     },
                     &mut compaction_attempted,
-                    &mut pending_usage,
                 )
                 .await
             {
@@ -455,15 +445,11 @@ where
                     prompt_chars,
                 },
                 &mut compaction_attempted,
-                &mut pending_usage,
             )
             .await;
 
             let tool_requests = collect_tool_requests(&events);
             if tool_requests.is_empty() {
-                // Safe point: the model asked for no tools, so nothing is
-                // outstanding and this is the turn's last chance to record it.
-                record_summarizer_usage(turn.as_ref(), pending_usage.take()).await;
                 return Ok(());
             }
 

@@ -1400,6 +1400,32 @@ async fn compaction_fixture() -> (Arc<FakeExoHarness>, Arc<dyn ConversationHandl
     (exoharness, conversation)
 }
 
+/// Summarizer costs recorded on the conversation.
+///
+/// They ride on a custom event rather than a `messages` one, so that an
+/// accounting write can never land between a `tool_requested` and its
+/// `tool_result` and make the materializer fabricate a failure.
+async fn compaction_usage_records(
+    conversation: &dyn ConversationHandle,
+) -> Vec<exoharness::UsageRecord> {
+    conversation
+        .get_events(None)
+        .await
+        .expect("events")
+        .events
+        .into_iter()
+        .filter_map(|event| match event.data {
+            EventData::Custom {
+                event_type,
+                payload,
+            } if event_type == crate::compaction::COMPACTION_USAGE_EVENT => {
+                serde_json::from_value(payload).ok()
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 async fn open_turn(conversation: &dyn ConversationHandle) -> Arc<dyn TurnHandle> {
     conversation
         .begin_turn(BeginTurnRequest {
@@ -1799,7 +1825,6 @@ async fn the_summarizer_call_carries_model_credentials() {
                 prompt_chars: 1_000,
             },
             &mut false,
-            &mut None,
         )
         .await;
 
@@ -1848,7 +1873,6 @@ async fn compaction_is_attempted_at_most_once_per_turn() {
                     prompt_chars: 1_000,
                 },
                 &mut attempted,
-                &mut None,
             )
             .await;
     }
@@ -2375,7 +2399,6 @@ async fn summarizer_usage_is_recorded_without_entering_the_prompt() {
 
     let turn = open_turn(conversation.as_ref()).await;
     let mut attempted = false;
-    let mut pending_usage = None;
     executor
         .maybe_compact(
             conversation.as_ref(),
@@ -2396,27 +2419,11 @@ async fn summarizer_usage_is_recorded_without_entering_the_prompt() {
                 prompt_chars: u64::MAX,
             },
             &mut attempted,
-            &mut pending_usage,
         )
         .await;
-    // `maybe_compact` hands the record back rather than writing it mid-round;
-    // the turn loop flushes it at a safe point, so this test does the same.
-    crate::compaction::record_summarizer_usage(turn.as_ref(), pending_usage.take()).await;
     turn.finish().await.expect("finish turn");
 
-    let usage_events: Vec<_> = conversation
-        .get_events(None)
-        .await
-        .expect("events")
-        .events
-        .into_iter()
-        .filter_map(|event| match event.data {
-            EventData::Messages {
-                messages, usage, ..
-            } if messages.is_empty() => usage,
-            _ => None,
-        })
-        .collect();
+    let usage_events = compaction_usage_records(conversation.as_ref()).await;
     assert_eq!(
         usage_events.len(),
         1,
@@ -2773,19 +2780,90 @@ async fn the_usage_event_never_splits_a_tool_round() {
     );
 
     // And the accounting itself must survive the deferral.
-    let usage_events: Vec<_> = events
-        .into_iter()
-        .filter_map(|event| match event.data {
-            EventData::Messages {
-                messages, usage, ..
-            } if messages.is_empty() => usage,
-            _ => None,
-        })
-        .collect();
+    let usage_events = compaction_usage_records(conversation.as_ref()).await;
     assert_eq!(
         usage_events.len(),
         1,
         "the summarizer call should still be recorded exactly once"
     );
     assert_eq!(usage_events[0].cost_usd, Some(0.25));
+}
+
+/// The summarizer-usage event must be inert to prompt assembly, whoever is
+/// mid-tool-round at the time.
+///
+/// Deferring the write until *this* turn's round finished was not enough: turns
+/// on one conversation are not serialized, so another turn can have a
+/// `ToolRequested` outstanding when compaction records its cost. This
+/// reproduces the log ordering that produces — request, usage event, result —
+/// without needing real concurrency, because the ordering is the whole problem.
+///
+/// While the usage rode on an empty `Messages` event, the materializer treated
+/// it as a turn boundary, fabricated a "tool execution did not complete" failure
+/// for a call that succeeded, and then appended the real result after it.
+#[tokio::test]
+async fn a_usage_event_between_a_tool_request_and_its_result_is_inert() {
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["one", "two"]).await;
+
+    let tool_call_id = "call-1".to_string();
+    let turn = open_turn(conversation.as_ref()).await;
+    turn.add_events(vec![EventData::ToolRequested {
+        tool_call_id: tool_call_id.clone(),
+        response_id: None,
+        request: ToolRequest {
+            function_name: "shell".to_string(),
+            arguments: Map::new(),
+        },
+    }])
+    .await
+    .expect("append tool request");
+
+    // Another turn's compaction records what its summarizer cost, right here.
+    crate::compaction::record_summarizer_usage(
+        turn.as_ref(),
+        Some(Box::new(exoharness::UsageRecord {
+            model: "summary-model".to_string(),
+            prompt_tokens: Some(500),
+            completion_tokens: Some(20),
+            cost_usd: Some(0.25),
+            ..Default::default()
+        })),
+    )
+    .await;
+
+    turn.add_events(vec![EventData::ToolResult {
+        tool_call_id: tool_call_id.clone(),
+        result: json!({"ok": true}),
+    }])
+    .await
+    .expect("append tool result");
+    turn.finish().await.expect("finish turn");
+
+    let executor = test_executor();
+    let prompt = executor
+        .materialize_prompt_history(conversation.as_ref(), &[])
+        .await
+        .expect("materialize");
+    let text = prompt_text(&prompt);
+    assert!(
+        !text.contains("tool execution did not complete"),
+        "a completed tool call was reported as failed: {text}"
+    );
+    assert_eq!(
+        text.matches(tool_call_id.as_str()).count(),
+        1,
+        "the tool call should resolve exactly once: {text}"
+    );
+
+    // And the cost must still be recorded somewhere the aggregation can find it.
+    let events = conversation.get_events(None).await.expect("events").events;
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.data,
+            EventData::Custom { event_type, .. }
+                if event_type == crate::compaction::COMPACTION_USAGE_EVENT
+        )),
+        "the summarizer cost should be recorded"
+    );
 }

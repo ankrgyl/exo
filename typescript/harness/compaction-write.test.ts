@@ -13,11 +13,19 @@ import type { ArtifactVersion, Event, EventData, EventQuery } from "./index";
 
 // --- stubs -------------------------------------------------------------------
 
+// Event ids must be syntactically valid UUIDs: the decoder rejects malformed
+// ones because Rust does, and a fake like eventId(1) would exercise a laxer
+// contract than production. Zero-padded counters keep them sorting ascending
+// the way UUIDv7 does.
+function eventId(n: number): string {
+  return `01920000-0000-7000-8000-${String(n).padStart(12, "0")}`;
+}
+
 let nextId = 0;
 function event(type: string, extra: Record<string, unknown> = {}): Event {
   nextId += 1;
   return {
-    id: `evt-${String(nextId).padStart(6, "0")}`,
+    id: eventId(nextId),
     conversationId: "conv-1",
     createdAt: new Date(0).toISOString(),
     data: { type, ...extra },
@@ -302,7 +310,7 @@ describe("runCompaction", () => {
 describe("checkpoint payload shape", () => {
   it("matches what the read path decodes", () => {
     const payload = checkpointToPayload({
-      upToEventId: "evt-1",
+      upToEventId: eventId(1),
       artifactId: "art-1",
       artifactPath: "compaction/conv-1/1.md",
       artifactVersion: 1,

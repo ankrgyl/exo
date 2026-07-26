@@ -30,6 +30,21 @@ pub(crate) use exoharness::COMPACTION_CHECKPOINT_EVENT;
 
 pub(crate) const COMPACTION_FAILED_EVENT: &str = "exo.compaction.failed.v1";
 
+/// Custom event carrying what a compaction's summarizer call cost.
+///
+/// A *custom* event, not a `Messages` one, and that is the whole point. Both
+/// materializers treat every messages event as a turn boundary and flush pending
+/// tool calls at it, so an accounting event that happened to land between a
+/// `tool_requested` and its `tool_result` would make them fabricate a failure
+/// for a call that succeeded and then append the real result as well.
+///
+/// Writing it later does not fix that. Turns on one conversation are not
+/// serialized, so "no call is outstanding" is a claim about *every* in-flight
+/// turn, not just the one doing the accounting — and it was wrong twice before
+/// this. Custom events are ignored by prompt assembly outright, so there is no
+/// ordering rule left to get wrong, in any interleaving.
+pub const COMPACTION_USAGE_EVENT: &str = "exo.compaction.usage.v1";
+
 /// Marker appended when compaction runs, pointing at the summary artifact.
 ///
 /// Field names are snake_case on the wire and match the TypeScript harness
@@ -221,17 +236,39 @@ pub(crate) async fn record_summarizer_usage(
     let Some(usage) = usage else {
         return;
     };
+    let payload = match serde_json::to_value(&*usage) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!(%error, "could not serialize summarizer usage");
+            return;
+        }
+    };
     if let Err(error) = turn
-        .add_events(vec![EventData::Messages {
-            messages: Vec::new(),
-            response_id: None,
-            usage: Some(usage),
+        .add_events(vec![EventData::Custom {
+            event_type: COMPACTION_USAGE_EVENT.to_string(),
+            payload,
         }])
         .await
     {
         // Accounting is not worth failing a turn over.
         tracing::warn!(%error, "could not record summarizer usage");
     }
+}
+
+/// Output-token ceiling for a summarizer request sized from `max_summary_chars`.
+///
+/// `cap_summary` only truncates *after* a response has been generated,
+/// transferred and billed, so on its own it bounds the stored summary but not
+/// the latency, memory or cost of producing it. This bounds the request itself.
+///
+/// Generous on purpose: the multiplier leaves room so a model that respects the
+/// character instruction is never clipped mid-sentence, and `cap_summary`
+/// remains the exact ceiling.
+pub(crate) fn summarizer_max_output_tokens(max_summary_chars: u32) -> i64 {
+    const HEADROOM: u64 = 2;
+    const FLOOR_TOKENS: u64 = 256;
+    let from_cap = estimated_tokens_from_chars(u64::from(max_summary_chars)) * HEADROOM;
+    from_cap.max(FLOOR_TOKENS) as i64
 }
 
 /// Rough token count for a prompt of `chars` characters.
@@ -889,6 +926,21 @@ mod tests {
     #[test]
     fn cap_summary_leaves_short_input_alone() {
         assert_eq!(cap_summary("short", 100), "short");
+    }
+
+    #[test]
+    fn the_summarizer_request_is_bounded_by_the_summary_cap() {
+        // `cap_summary` truncates only after the response is generated,
+        // transferred and billed, so the request needs its own ceiling. It must
+        // leave headroom, or a model that respects the character instruction
+        // gets clipped mid-sentence.
+        let config = CompactionConfig::default();
+        let bound = summarizer_max_output_tokens(config.max_summary_chars);
+        let needed = estimated_tokens_from_chars(u64::from(config.max_summary_chars)) as i64;
+        assert!(bound > needed, "no headroom: {bound} vs {needed}");
+        assert!(bound < needed * 10, "not a bound at all: {bound}");
+        // A tiny cap must still permit a usable response.
+        assert!(summarizer_max_output_tokens(1) >= 256);
     }
 
     #[test]

@@ -16,11 +16,19 @@ import {
 
 // --- fixture -----------------------------------------------------------------
 
+// Event ids must be syntactically valid UUIDs: the decoder rejects malformed
+// ones because Rust does, and a fake like eventId(1) would exercise a laxer
+// contract than production. Zero-padded counters keep them sorting ascending
+// the way UUIDv7 does.
+function eventId(n: number): string {
+  return `01920000-0000-7000-8000-${String(n).padStart(12, "0")}`;
+}
+
 let nextId = 0;
 function event(type: string, extra: Record<string, unknown> = {}): Event {
   nextId += 1;
   return {
-    id: `evt-${String(nextId).padStart(6, "0")}`,
+    id: eventId(nextId),
     conversationId: "conv-1",
     createdAt: new Date(0).toISOString(),
     data: { type, ...extra },
@@ -32,7 +40,7 @@ function checkpointEvent(): Event {
   return event("custom", {
     event_type: COMPACTION_CHECKPOINT_EVENT,
     payload: checkpointToPayload({
-      upToEventId: "evt-000001",
+      upToEventId: eventId(1),
       artifactId: "art-1",
       artifactPath: "compaction/conv-1/summary.md",
       artifactVersion: 2,
@@ -142,7 +150,7 @@ describe("describe_compaction", () => {
     const checkpoint = result.checkpoint as Record<string, unknown>;
     expect(checkpoint.compactedEventCount).toBe(40);
     expect(checkpoint.summaryChars).toBe(512);
-    expect(checkpoint.upToEventId).toBe("evt-000001");
+    expect(checkpoint.upToEventId).toBe(eventId(1));
   });
 });
 
@@ -171,6 +179,18 @@ describe("compactionInstruction", () => {
     // No point spending prompt space explaining compaction to an agent whose
     // history is still entirely intact.
     expect(await compactionInstruction(makeContext({ events: [] }))).toBeNull();
+  });
+
+  it("stays silent when the checkpoint's summary cannot be read", async () => {
+    // Materialization falls back to the full log when the artifact is gone, so
+    // the prompt contains no summary. Announcing one would describe a context
+    // the agent does not have — it would hunt for detail already in front of
+    // it, or tell the user history is missing when none is.
+    expect(
+      await compactionInstruction(
+        makeContext({ events: [checkpointEvent()], summary: undefined }),
+      ),
+    ).toBeNull();
   });
 
   it("tells the agent its history was compacted and how to recover detail", async () => {

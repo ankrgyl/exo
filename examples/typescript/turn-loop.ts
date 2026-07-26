@@ -5,10 +5,13 @@ import {
   registerAgentToolsFromDirectoryIfExists,
   registerBuiltInTools,
   registerLibraryToolModulePath,
+  appendCustomEvent,
+  COMPACTION_USAGE_EVENT,
   CompactionGate,
   estimatedTokensFromChars,
   resolveCompactionPolicy,
   runCompaction,
+  summarizerMaxOutputTokens,
   turnMetadata,
   type BuiltInToolName,
   type CompactionPolicy,
@@ -126,11 +129,6 @@ async function runResponsesTurnLoop(
   let latestEventId: string | null = null;
 
   for (let round = 0; ; round += 1) {
-    // Safe point: any tool round from the previous iteration has completed and
-    // its results are in the log. Flushing before the budget check means the
-    // early return below records it too.
-    await flushSummarizerUsage(context, summarizerUsage);
-
     if (
       maxToolRoundTrips !== null &&
       maxToolRoundTrips !== undefined &&
@@ -191,6 +189,8 @@ async function runResponsesTurnLoop(
             summarizerUsage,
           ),
       });
+      await recordSummarizerUsage(context, summarizerUsage.usage);
+      summarizerUsage.usage = undefined;
       if (result.status === "compacted") {
         // The checkpoint just written replaces the prefix this prompt was built
         // from, so rebuild it before sending.
@@ -276,6 +276,8 @@ async function runResponsesTurnLoop(
             summarizerUsage,
           ),
       });
+      await recordSummarizerUsage(context, summarizerUsage.usage);
+      summarizerUsage.usage = undefined;
       if (result.status === "compacted") {
         // The cache holds exactly the prefix that was just replaced.
         history.invalidate();
@@ -290,9 +292,6 @@ async function runResponsesTurnLoop(
       if (hasSyntheticToolResult) {
         continue;
       }
-      // Safe point: the model asked for no tools, so nothing is outstanding and
-      // this is the turn's last chance to record it.
-      await flushSummarizerUsage(context, summarizerUsage);
       return latestEventId;
     }
 
@@ -319,35 +318,25 @@ async function appendTurnEvents(
 }
 
 /**
- * Write what the compaction summarizer cost, if anything is pending.
+ * Write what the compaction summarizer cost.
  *
- * The usage rides on a `messages` event because that is where this repo's cost
- * aggregation looks, and the message list is empty because history
- * materialization folds these events into the prompt — carrying the summarizer's
- * own reply here would inject it back into the context compaction just shrank.
- *
- * It must only be called where no tool call is outstanding. A messages event
- * between a `tool_requested` and its `tool_result` makes the materializer flush
- * the pending call, fabricating a "tool execution did not complete" failure for
- * a call that succeeded and then appending the real result after it.
- *
- * A turn that throws before reaching a flush point loses that one record; the
- * alternative was a special case in the materializer, which is the function
- * whose subtlety causes this class of bug in the first place.
+ * On its own custom event, which prompt assembly ignores — so unlike a
+ * `messages` event it is safe to write at any point, including while this or
+ * another turn has a tool call outstanding. See `COMPACTION_USAGE_EVENT`.
  */
-async function flushSummarizerUsage(
+async function recordSummarizerUsage(
   context: TurnContext,
-  sink: { usage: JsonObject | undefined },
+  usage: JsonObject | undefined,
 ): Promise<void> {
-  const usage = sink.usage;
   if (usage === undefined) {
     return;
   }
-  sink.usage = undefined;
   try {
-    await context.exoharness.current.turn.addEvents([
-      { type: "messages", messages: [], usage },
-    ]);
+    await appendCustomEvent(
+      context.exoharness.current.turn,
+      COMPACTION_USAGE_EVENT,
+      usage,
+    );
   } catch {
     // Accounting is not worth failing a turn over.
   }
@@ -430,6 +419,10 @@ async function summarizeWithModel(
       ],
       // No tools: the summarizer reads, it does not act.
       tools: [],
+      // Bound the response at request time. `capSummary` truncates only after
+      // generation, so without this a runaway summary is paid for in full
+      // before being thrown away.
+      maxOutputTokens: summarizerMaxOutputTokens(input.maxChars),
     },
     { parent: turnParent, roundIndex: round },
   );

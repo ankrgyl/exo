@@ -1,3 +1,29 @@
+The summarizer is a real, billable call, so its usage is recorded — on its own
+custom event, `exo.compaction.usage.v1`.
+
+**Not on a `messages` event**, and the reason is the same rule as above. Both
+materializers treat every messages event as a turn boundary and flush pending
+tool calls at it, so an accounting event that landed between a `tool_requested`
+and its `tool_result` would make them fabricate a failure for a call that
+succeeded and then append the real result too.
+
+Writing it "at a safe moment" is not a fix. Turns on one conversation are not
+serialized, so "no tool call is outstanding" is a claim about _every_ in-flight
+turn, not just the one doing the accounting — and this bug survived two attempts
+that reasoned about timing. A custom event is ignored by prompt assembly
+outright, so no ordering rule remains to get wrong in any interleaving.
+
+The cost of that choice is that spend aggregation has to look in two places:
+`crates/cli/src/tui.rs` sums both event kinds, and the
+`list_conversation_events` description tells the agent to do the same. Miss
+either and totals understate by exactly the cost of keeping conversations
+compact.
+
+The summarizer request also carries a `max_output_tokens` derived from
+`maxSummaryChars`. `capSummary` truncates only _after_ a response is generated,
+transferred and billed, so on its own it bounds the stored summary but not what
+producing it costs.
+
 # Conversation compaction
 
 A conversation's durable event log grows without bound. A prompt cannot. Without

@@ -16,6 +16,14 @@ import type { Event } from "./index";
 
 // --- event stream builders ---------------------------------------------------
 
+// Event ids must be syntactically valid UUIDs: the decoder rejects malformed
+// ones because Rust does, and a fake like eventId(1) would exercise a laxer
+// contract than production. Zero-padded counters keep them sorting ascending
+// the way UUIDv7 does.
+function eventId(n: number): string {
+  return `01920000-0000-7000-8000-${String(n).padStart(12, "0")}`;
+}
+
 let nextId = 0;
 
 // Event ids only need to sort ascending the way UUIDv7 does; zero-padded
@@ -23,7 +31,7 @@ let nextId = 0;
 function event(type: string, extra: Record<string, unknown> = {}): Event {
   nextId += 1;
   return {
-    id: `evt-${String(nextId).padStart(6, "0")}`,
+    id: eventId(nextId),
     conversationId: "conv-1",
     createdAt: new Date(0).toISOString(),
     data: { type, ...extra },
@@ -302,7 +310,7 @@ describe("capSummary", () => {
 describe("checkpoint events", () => {
   it("round-trips a checkpoint through its event payload", () => {
     const checkpoint: CompactionCheckpoint = {
-      upToEventId: "evt-000042",
+      upToEventId: eventId(42),
       artifactId: "art-1",
       artifactPath: "compaction/conv-1/1.md",
       artifactVersion: 1,
@@ -316,12 +324,39 @@ describe("checkpoint events", () => {
     expect(parsed).toEqual(checkpoint);
   });
 
+  it("rejects an id that is a string but not a UUID", () => {
+    // Rust parses these as Uuid7, so a malformed id makes it reject the whole
+    // checkpoint and safely replay the full log. Accepting the string here
+    // would instead hand the bad cursor to getEvents, which rejects the request
+    // and fails materialization — a hard error where Rust degrades gracefully.
+    const complete = {
+      up_to_event_id: eventId(1),
+      artifact_id: "art-1",
+      artifact_path: "compaction/1.md",
+      artifact_version: 1,
+      compacted_event_count: 4,
+      summary_chars: 20,
+      model: "m",
+    };
+    expect(checkpointFromEvent(checkpointEvent(complete))).not.toBeNull();
+    expect(
+      checkpointFromEvent(
+        checkpointEvent({ ...complete, up_to_event_id: "not-a-uuid" }),
+      ),
+    ).toBeNull();
+    expect(
+      checkpointFromEvent(
+        checkpointEvent({ ...complete, previous_checkpoint_id: "nope" }),
+      ),
+    ).toBeNull();
+  });
+
   it("rejects an optional field present with the wrong type", () => {
     // Rust models these as Option<T> and serde rejects a present-but-wrong-type
     // value, falling back to the full log. Coercing to null here would make the
     // two runtimes select different histories for the same event.
     const complete = {
-      up_to_event_id: "evt-1",
+      up_to_event_id: eventId(1),
       artifact_id: "art-1",
       artifact_path: "compaction/1.md",
       artifact_version: 1,
@@ -355,7 +390,7 @@ describe("checkpoint events", () => {
     // restarts the chain's cumulative total at zero, which is the number the
     // agent is shown to judge how much history it is missing.
     const complete = {
-      up_to_event_id: "evt-1",
+      up_to_event_id: eventId(1),
       artifact_id: "art-1",
       artifact_path: "compaction/1.md",
       artifact_version: 1,
@@ -382,7 +417,7 @@ describe("checkpoint events", () => {
     expect(
       checkpointFromEvent(
         checkpointEvent({
-          up_to_event_id: "evt-1",
+          up_to_event_id: eventId(1),
           artifact_path: "compaction/1.md",
           artifact_version: 1,
         }),
@@ -399,7 +434,7 @@ describe("checkpoint events", () => {
       checkpointFromEvent({
         type: COMPACTION_CHECKPOINT_EVENT,
         ...toPayload({
-          upToEventId: "evt-1",
+          upToEventId: eventId(1),
           artifactId: "art-1",
           artifactPath: "compaction/1.md",
           artifactVersion: 1,
