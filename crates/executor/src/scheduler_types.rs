@@ -9,8 +9,17 @@ pub const MAX_OUTPUT_BYTES: u64 = 2_000_000;
 pub const DEFAULT_TASK_LEASE_MS: u64 = 10 * 60 * 1_000;
 pub const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 10 * 60 * 1_000;
 
+/// Schema version written to every new [`ScheduledTaskRecord`]. Bump it in the
+/// same commit that changes the record's on-disk meaning, and add the matching
+/// step to [`migrate_scheduled_task`].
+pub const SCHEDULED_TASK_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScheduledTaskRecord {
+    /// Absent in records written before versioning; [`migrate_scheduled_task`]
+    /// reads those as version 0.
+    #[serde(default)]
+    pub schema_version: u32,
     pub id: String,
     pub agent_id: String,
     pub conversation_id: String,
@@ -102,6 +111,7 @@ impl ScheduledTaskRecord {
             );
         }
         Ok(Self {
+            schema_version: SCHEDULED_TASK_SCHEMA_VERSION,
             id: Uuid7::now().to_string(),
             agent_id: non_empty("agentId", request.agent_id)?,
             conversation_id: non_empty("conversationId", request.conversation_id)?,
@@ -163,6 +173,28 @@ impl ParsedSchedule {
     pub fn next_after_ms(&self, now_ms: u64) -> u64 {
         now_ms.saturating_add(self.interval_ms)
     }
+}
+
+/// Brings a record loaded from disk up to [`SCHEDULED_TASK_SCHEMA_VERSION`].
+///
+/// One `if` per version step, applied in order, so a new version is one more
+/// block at the bottom. A record from a newer build is an error rather than a
+/// guess: downgrading the harness must not silently reinterpret its state.
+pub fn migrate_scheduled_task(mut task: ScheduledTaskRecord) -> Result<ScheduledTaskRecord> {
+    // v0 (unversioned) -> v1: no field changes, the version itself is the change.
+    if task.schema_version == 0 {
+        task.schema_version = 1;
+    }
+
+    if task.schema_version != SCHEDULED_TASK_SCHEMA_VERSION {
+        bail!(
+            "scheduled task {} has schema version {}, which this build does not understand (expected {})",
+            task.id,
+            task.schema_version,
+            SCHEDULED_TASK_SCHEMA_VERSION
+        );
+    }
+    Ok(task)
 }
 
 pub fn now_ms() -> u64 {

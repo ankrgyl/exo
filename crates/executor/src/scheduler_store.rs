@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use exoharness::Uuid7;
+use serde::Serialize;
 use tokio::fs;
 
 use crate::scheduler_types::{
-    NewScheduledTask, ScheduledTaskRecord, ScheduledTaskRunRecord, now_ms,
+    NewScheduledTask, ScheduledTaskRecord, ScheduledTaskRunRecord, migrate_scheduled_task, now_ms,
 };
 
 #[derive(Debug, Clone)]
@@ -48,7 +50,7 @@ impl SchedulerStore {
             let bytes = fs::read(&path)
                 .await
                 .with_context(|| format!("failed to read scheduled task {}", path.display()))?;
-            tasks.push(serde_json::from_slice::<ScheduledTaskRecord>(&bytes)?);
+            tasks.push(decode_task(&bytes)?);
         }
         tasks.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
         Ok(tasks)
@@ -99,7 +101,7 @@ impl SchedulerStore {
     pub async fn get_task(&self, task_id: &str) -> Result<Option<ScheduledTaskRecord>> {
         let path = self.task_path(task_id);
         match fs::read(&path).await {
-            Ok(bytes) => Ok(Some(serde_json::from_slice::<ScheduledTaskRecord>(&bytes)?)),
+            Ok(bytes) => Ok(Some(decode_task(&bytes)?)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error)
                 .with_context(|| format!("failed to read scheduled task {}", path.display())),
@@ -109,7 +111,7 @@ impl SchedulerStore {
     pub async fn put_task(&self, task: &ScheduledTaskRecord) -> Result<()> {
         fs::create_dir_all(self.tasks_dir()).await?;
         let path = self.task_path(&task.id);
-        fs::write(&path, serde_json::to_vec_pretty(task)?)
+        write_json_file(&path, task)
             .await
             .with_context(|| format!("failed to write scheduled task {}", path.display()))
     }
@@ -136,7 +138,7 @@ impl SchedulerStore {
     pub async fn put_run(&self, run: &ScheduledTaskRunRecord) -> Result<()> {
         fs::create_dir_all(self.runs_dir(&run.task_id)).await?;
         let path = self.run_path(&run.task_id, &run.id);
-        fs::write(&path, serde_json::to_vec_pretty(run)?)
+        write_json_file(&path, run)
             .await
             .with_context(|| format!("failed to write scheduled task run {}", path.display()))
     }
@@ -156,6 +158,27 @@ impl SchedulerStore {
     fn run_path(&self, task_id: &str, run_id: &str) -> PathBuf {
         self.runs_dir(task_id).join(format!("{run_id}.json"))
     }
+}
+
+fn decode_task(bytes: &[u8]) -> Result<ScheduledTaskRecord> {
+    migrate_scheduled_task(serde_json::from_slice::<ScheduledTaskRecord>(bytes)?)
+}
+
+/// Writes JSON through a temp file so a crash mid-write leaves the previous
+/// record intact instead of a half-written one. Same shape as the adapter
+/// store's writer.
+async fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let temp_path = path.with_extension(format!("json.{}.tmp", Uuid7::now()));
+    fs::write(&temp_path, serde_json::to_vec_pretty(value)?)
+        .await
+        .with_context(|| format!("failed to write temp file {}", temp_path.display()))?;
+    fs::rename(&temp_path, path).await.with_context(|| {
+        format!(
+            "failed to replace {} with temp file {}",
+            path.display(),
+            temp_path.display()
+        )
+    })
 }
 
 async fn remove_file_if_exists(path: PathBuf) -> Result<()> {
@@ -183,6 +206,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::scheduler_types::SCHEDULED_TASK_SCHEMA_VERSION;
 
     #[tokio::test]
     async fn creates_and_lists_tasks() {
@@ -245,6 +269,101 @@ mod tests {
         let deleted = store.delete_task(&task.id).await.unwrap().unwrap();
         assert_eq!(deleted.id, task.id);
         assert!(store.get_task(&task.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn reads_unversioned_task_records_as_version_one() {
+        let tempdir = TempDir::new().unwrap();
+        let store = SchedulerStore::new(tempdir.path());
+        let task = store
+            .create_task(NewScheduledTask {
+                agent_id: "agent".to_string(),
+                conversation_id: "conversation".to_string(),
+                name: "check".to_string(),
+                schedule: "@every 1m".to_string(),
+                sandbox_mode: None,
+                setup_command: None,
+                command: vec!["true".to_string()],
+                report_prompt: "Report.".to_string(),
+                max_output_bytes: None,
+            })
+            .await
+            .unwrap();
+
+        // Rewrite the record the way a pre-versioning build left it on disk.
+        let path = store.task_path(&task.id);
+        let mut stored =
+            serde_json::from_slice::<serde_json::Value>(&tokio::fs::read(&path).await.unwrap())
+                .unwrap();
+        stored
+            .as_object_mut()
+            .expect("task record is a json object")
+            .remove("schema_version");
+        tokio::fs::write(&path, serde_json::to_vec_pretty(&stored).unwrap())
+            .await
+            .unwrap();
+
+        let migrated = store.get_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(migrated.schema_version, SCHEDULED_TASK_SCHEMA_VERSION);
+        assert_eq!(migrated, task);
+    }
+
+    #[tokio::test]
+    async fn rejects_task_records_from_a_newer_schema() {
+        let tempdir = TempDir::new().unwrap();
+        let store = SchedulerStore::new(tempdir.path());
+        let mut task = store
+            .create_task(NewScheduledTask {
+                agent_id: "agent".to_string(),
+                conversation_id: "conversation".to_string(),
+                name: "check".to_string(),
+                schedule: "@every 1m".to_string(),
+                sandbox_mode: None,
+                setup_command: None,
+                command: vec!["true".to_string()],
+                report_prompt: "Report.".to_string(),
+                max_output_bytes: None,
+            })
+            .await
+            .unwrap();
+        task.schema_version = SCHEDULED_TASK_SCHEMA_VERSION + 1;
+        store.put_task(&task).await.unwrap();
+
+        let error = store.get_task(&task.id).await.unwrap_err();
+        assert!(
+            error.to_string().contains("does not understand"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_writes_leave_no_temp_files_behind() {
+        let tempdir = TempDir::new().unwrap();
+        let store = SchedulerStore::new(tempdir.path());
+        let mut task = store
+            .create_task(NewScheduledTask {
+                agent_id: "agent".to_string(),
+                conversation_id: "conversation".to_string(),
+                name: "check".to_string(),
+                schedule: "@every 1m".to_string(),
+                sandbox_mode: None,
+                setup_command: None,
+                command: vec!["true".to_string()],
+                report_prompt: "Report.".to_string(),
+                max_output_bytes: None,
+            })
+            .await
+            .unwrap();
+        task.next_run_at_ms = 42;
+        store.put_task(&task).await.unwrap();
+
+        let mut entries = tokio::fs::read_dir(store.tasks_dir()).await.unwrap();
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        assert_eq!(names, vec![format!("{}.json", task.id)]);
+        assert_eq!(store.get_task(&task.id).await.unwrap().unwrap(), task);
     }
 
     #[tokio::test]
