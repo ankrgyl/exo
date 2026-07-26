@@ -621,6 +621,33 @@ export class CompactionGate {
   }
 
   /**
+   * Settle the gate on a completed attempt's *outcome* rather than on having
+   * tried.
+   *
+   * The gate answers "would re-attempting at this boundary reach the same
+   * answer?". For a skip that is yes by construction — not enough completed
+   * turns, a span already smaller than the cap, a summary that came back too
+   * big — and for a success there is nothing left to do. A *failure* is the
+   * opposite: a summarizer outage or a rejected artifact write says nothing
+   * about the next attempt, and settling on it lets one blip suppress every
+   * later check in the turn while the prompt keeps growing toward the wall this
+   * feature exists to avoid.
+   *
+   * Lives here rather than in the turn loop so it can be tested: a rule placed
+   * in `turn-loop.ts` cannot be mutation-checked, because nothing tests that
+   * file.
+   */
+  settle(
+    latestTurnEnded: string | null,
+    status: CompactionResult["status"],
+  ): void {
+    if (status === "failed") {
+      return;
+    }
+    this.markAttempted(latestTurnEnded);
+  }
+
+  /**
    * The whole decision, including the boundary read, with the two rules the
    * turn loop must not get wrong.
    *

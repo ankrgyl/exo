@@ -1001,6 +1001,31 @@ describe("CompactionGate", () => {
     expect(gate.shouldAttempt(args, boundary)).toBe(true);
   });
 
+  it("does not settle on a failed attempt", async () => {
+    // A summarizer outage or a rejected artifact write says nothing about the
+    // next attempt. Settling on it lets one blip suppress every later check in
+    // the turn while the prompt keeps growing toward the provider limit — the
+    // same permanent suppression the boolean latch caused, arriving through the
+    // failure path.
+    const gate = new CompactionGate();
+    expect(gate.shouldAttempt(args, boundary)).toBe(true);
+    gate.settle(boundary, "failed");
+    expect(gate.shouldAttempt(args, boundary)).toBe(true);
+  });
+
+  it("settles on an outcome that cannot change at the same boundary", async () => {
+    // The other half: a skip is deterministic at a fixed boundary — not enough
+    // completed turns, a span smaller than the cap — and re-scanning the log
+    // every round for it is the cost the gate exists to avoid.
+    const gate = new CompactionGate();
+    gate.settle(boundary, "skipped");
+    expect(gate.shouldAttempt(args, boundary)).toBe(false);
+
+    const succeeded = new CompactionGate();
+    succeeded.settle(boundary, "compacted");
+    expect(succeeded.shouldAttempt(args, boundary)).toBe(false);
+  });
+
   it("does not read the boundary when the threshold is not crossed", async () => {
     // The threshold check is free; the boundary read is a query. Doing it
     // unconditionally taxes every round of every turn, including turns on
