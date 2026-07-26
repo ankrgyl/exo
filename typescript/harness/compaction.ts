@@ -933,11 +933,28 @@ export function resolveCompactionPolicy(
 // A ratio of 0 or below would compact on every single round; above 1 would
 // never fire before the provider rejects the request. Clamp rather than throw:
 // a bad knob should degrade to the default, not brick the agent.
+/**
+ * A ratio of zero or less would compact on every round. One or more never fires
+ * the *accurate* trigger at all: it compares the provider's reported occupancy
+ * against the limit, and a request that succeeded cannot report more input than
+ * the model accepts — so at 1.0 the post-response check is dead and only the
+ * pessimistic preflight estimate remains, which is exactly the guess this
+ * feature does not want to be relying on. Clamping to 1.0, as this used to,
+ * produced that state silently while looking like it had honoured the setting.
+ *
+ * Both ends degrade to the default rather than erroring: a bad knob should not
+ * brick the agent. Values just below one (0.99) are legitimate and pass through.
+ */
 function clampRatio(value: number | null | undefined): number {
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    value <= 0 ||
+    value >= 1
+  ) {
     return DEFAULT_COMPACTION_POLICY.thresholdRatio;
   }
-  return Math.min(1, value);
+  return value;
 }
 
 /** Like `positiveIntOr`, but zero falls back too. */

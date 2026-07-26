@@ -14,10 +14,11 @@ use lingua::universal::{ToolContentPart, ToolResultContentPart};
 use serde_json::json;
 
 use crate::compaction::{
-    CompactionLatch, CompactionOutcome, PromptSize, SummarizeInput, previous_summary_message,
-    prompt_size, read_active_checkpoint, read_latest_turn_ended, read_summary_or_fall_back,
-    record_summarizer_usage, resolve_summarizer_model, run_compaction, should_compact,
-    summarizer_instruction, summarizer_max_output_tokens, summary_message, tool_definition_size,
+    CompactionLatch, CompactionOutcome, PromptSize, SummarizeInput, SummarizerModels,
+    previous_summary_message, prompt_size, read_active_checkpoint, read_latest_turn_ended,
+    read_summary_or_fall_back, record_summarizer_usage, resolve_summarizer_model, run_compaction,
+    should_compact, summarizer_instruction, summarizer_max_output_tokens, summary_message,
+    tool_definition_size,
 };
 use crate::execution_tracing::TurnExecutionTrace;
 use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor};
@@ -355,7 +356,10 @@ where
             conversation,
             turn,
             &config,
-            &summary_model,
+            SummarizerModels {
+                chosen: &summary_model,
+                agent: model,
+            },
             prompt_tokens,
             &|input| {
                 Box::pin(self.summarize(

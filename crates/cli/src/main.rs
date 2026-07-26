@@ -484,7 +484,9 @@ enum AgentCommands {
         #[arg(long)]
         no_compaction: bool,
         /// Compact once the prompt passes this fraction of the model's input
-        /// limit (0 < ratio <= 1).
+        /// limit (0 < ratio < 1). One or more is rejected and falls back to the
+        /// default: a successful request cannot report more input than the
+        /// model accepts, so at 1.0 the accurate trigger never fires.
         #[arg(long)]
         compaction_threshold_ratio: Option<f64>,
         /// Turns kept verbatim after a compaction cut.

@@ -113,14 +113,26 @@ impl Default for CompactionConfig {
 }
 
 impl CompactionConfig {
-    /// A ratio of zero or less would compact on every round; above one would
-    /// never fire before the provider rejects the request. Clamp rather than
-    /// error: a bad knob should degrade to the default, not brick the agent.
+    /// A ratio of zero or less would compact on every round. One or more never
+    /// fires the *accurate* trigger at all: it compares the provider's reported
+    /// occupancy against the limit, and a request that succeeded cannot report
+    /// more input than the model accepts — so at 1.0 the post-response check is
+    /// dead and only the pessimistic preflight estimate remains, which is
+    /// exactly the guess this feature does not want to be relying on. Clamping
+    /// to 1.0, as this used to, produced that state silently while looking like
+    /// it had honoured the setting.
+    ///
+    /// Both ends degrade to the default rather than erroring: a bad knob should
+    /// not brick the agent. Values just below one (0.99) are legitimate and
+    /// pass through untouched.
     pub(crate) fn effective_threshold_ratio(&self) -> f64 {
-        if !self.threshold_ratio.is_finite() || self.threshold_ratio <= 0.0 {
+        if !self.threshold_ratio.is_finite()
+            || self.threshold_ratio <= 0.0
+            || self.threshold_ratio >= 1.0
+        {
             return Self::default().threshold_ratio;
         }
-        self.threshold_ratio.min(1.0)
+        self.threshold_ratio
     }
 
     /// A cap of zero is not a tighter budget, it is a broken one: every eligible
@@ -549,6 +561,24 @@ pub(crate) enum CompactionOutcome {
     },
 }
 
+/// The two candidate summarizer models, so the choice can be revisited once the
+/// span is actually known.
+///
+/// `chosen` was resolved against the *materialized prompt* — the only size
+/// available before a cut point exists. That is usually right, but when a
+/// broken previous checkpoint forces a rebuild from the start of the log the
+/// span becomes far larger than the prompt that choice was made against, and a
+/// cheaper model's window may no longer hold it. `agent` is the fallback that
+/// was carrying this conversation a moment ago.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SummarizerModels<'a> {
+    /// Resolved against the prompt: the configured summary model, or the
+    /// agent's when that one did not fit.
+    pub chosen: &'a str,
+    /// The agent's own model, which fits the retained prompt by construction.
+    pub agent: &'a str,
+}
+
 /// Fold a conversation's older history into a summary checkpoint.
 ///
 /// Nothing here is allowed to fail the caller's turn. Compaction is a
@@ -560,7 +590,7 @@ pub(crate) async fn run_compaction(
     conversation: &dyn ConversationHandle,
     turn: &dyn TurnHandle,
     config: &CompactionConfig,
-    model: &str,
+    model: SummarizerModels<'_>,
     prompt_tokens_before: Option<u64>,
     summarize: &Summarizer<'_>,
 ) -> CompactionOutcome {
@@ -587,7 +617,7 @@ async fn compact(
     conversation: &dyn ConversationHandle,
     turn: &dyn TurnHandle,
     config: &CompactionConfig,
-    model: &str,
+    models: SummarizerModels<'_>,
     prompt_tokens_before: Option<u64>,
     summarize: &Summarizer<'_>,
 ) -> Result<CompactionOutcome> {
@@ -617,15 +647,36 @@ async fn compact(
     // full log. Everything before the broken checkpoint would then be gone from
     // the prompt for good. Rebuilding from the start of the log costs one larger
     // summarizer call and loses nothing.
+    let mut rebuilding_from_start = false;
     let previous = match (&existing, &previous_summary) {
         (Some(_), None) => {
             tracing::warn!(
                 conversation_id = %conversation.record().id,
                 "compaction: previous summary is unreadable; rebuilding from the start of the log"
             );
+            rebuilding_from_start = true;
             None
         }
         _ => existing,
+    };
+
+    // The model was chosen against the materialized prompt, which is the
+    // summary plus the retained tail. Rebuilding from the start of the log
+    // replaces that with the *whole* history, which can be far larger — so a
+    // cheaper summary model that comfortably fit the prompt may not fit this
+    // span, and the repair would be rejected while the agent's own model had
+    // room. Reverting to the agent's model is the conservative direction: it
+    // costs more per token and cannot be the reason the repair fails.
+    let model = if rebuilding_from_start && models.chosen != models.agent {
+        tracing::info!(
+            conversation_id = %conversation.record().id,
+            summary_model = %models.chosen,
+            agent_model = %models.agent,
+            "compaction: rebuilding from the start of the log; using the agent's model"
+        );
+        models.agent
+    } else {
+        models.chosen
     };
 
     // Only look at events after the last checkpoint: everything before it is
@@ -1864,11 +1915,28 @@ mod tests {
             zero.effective_threshold_ratio(),
             CompactionConfig::default().threshold_ratio
         );
-        let huge = CompactionConfig {
-            threshold_ratio: 5.0,
+        // One or more is not a laxer threshold, it is a dead accurate trigger:
+        // occupancy is compared against the model's limit, and a request that
+        // succeeded cannot report more input than the model accepts. Clamping
+        // to 1.0 produced that state silently while looking like it had
+        // honoured the setting.
+        for broken in [1.0, 5.0] {
+            let config = CompactionConfig {
+                threshold_ratio: broken,
+                ..CompactionConfig::default()
+            };
+            assert_eq!(
+                config.effective_threshold_ratio(),
+                CompactionConfig::default().threshold_ratio,
+                "ratio {broken} must fall back to the default"
+            );
+        }
+        // Just below one is legitimate and passes through untouched.
+        let tight = CompactionConfig {
+            threshold_ratio: 0.99,
             ..CompactionConfig::default()
         };
-        assert_eq!(huge.effective_threshold_ratio(), 1.0);
+        assert_eq!(tight.effective_threshold_ratio(), 0.99);
     }
 
     #[test]

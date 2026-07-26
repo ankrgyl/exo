@@ -948,9 +948,20 @@ describe("resolveCompactionPolicy", () => {
     expect(resolveCompactionPolicy({ threshold_ratio: 0 }).thresholdRatio).toBe(
       DEFAULT_COMPACTION_POLICY.thresholdRatio,
     );
-    expect(resolveCompactionPolicy({ threshold_ratio: 5 }).thresholdRatio).toBe(
-      1,
-    );
+    // One or more is not a laxer threshold, it is a dead accurate trigger:
+    // occupancy is compared against the model's limit, and a request that
+    // succeeded cannot report more input than the model accepts. Clamping to 1
+    // produced that state silently while looking like it had honoured the
+    // setting.
+    for (const broken of [1, 5]) {
+      expect(
+        resolveCompactionPolicy({ threshold_ratio: broken }).thresholdRatio,
+      ).toBe(DEFAULT_COMPACTION_POLICY.thresholdRatio);
+    }
+    // Just below one is legitimate and passes through untouched.
+    expect(
+      resolveCompactionPolicy({ threshold_ratio: 0.99 }).thresholdRatio,
+    ).toBe(0.99);
   });
 });
 
