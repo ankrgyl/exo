@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
+use cost::PricingTable;
 use exoharness::{
     AddEventsRequest, AddEventsResult, AgentHandle, AgentId, AgentRecord, Artifact,
     ArtifactVersion, BeginTurnRequest, Binding, BindingRecord, BindingType, ConversationHandle,
@@ -1791,11 +1792,14 @@ async fn the_summarizer_call_carries_model_credentials() {
                 }),
                 ..default_agent_config()
             },
-            "test-model",
-            None,
-            None,
-            1_000,
+            crate::basic::CompactionTrigger {
+                model: "test-model",
+                max_input_tokens: None,
+                prompt_tokens: None,
+                prompt_chars: 1_000,
+            },
             &mut false,
+            &mut None,
         )
         .await;
 
@@ -1837,11 +1841,14 @@ async fn compaction_is_attempted_at_most_once_per_turn() {
                 conversation.as_ref(),
                 turn.as_ref(),
                 &agent_config,
-                "test-model",
-                None,
-                None,
-                1_000,
+                crate::basic::CompactionTrigger {
+                    model: "test-model",
+                    max_input_tokens: None,
+                    prompt_tokens: None,
+                    prompt_chars: 1_000,
+                },
                 &mut attempted,
+                &mut None,
             )
             .await;
     }
@@ -2368,6 +2375,7 @@ async fn summarizer_usage_is_recorded_without_entering_the_prompt() {
 
     let turn = open_turn(conversation.as_ref()).await;
     let mut attempted = false;
+    let mut pending_usage = None;
     executor
         .maybe_compact(
             conversation.as_ref(),
@@ -2381,13 +2389,19 @@ async fn summarizer_usage_is_recorded_without_entering_the_prompt() {
                 }),
                 ..default_agent_config()
             },
-            "summary-model",
-            None,
-            None,
-            u64::MAX,
+            crate::basic::CompactionTrigger {
+                model: "summary-model",
+                max_input_tokens: None,
+                prompt_tokens: None,
+                prompt_chars: u64::MAX,
+            },
             &mut attempted,
+            &mut pending_usage,
         )
         .await;
+    // `maybe_compact` hands the record back rather than writing it mid-round;
+    // the turn loop flushes it at a safe point, so this test does the same.
+    crate::compaction::record_summarizer_usage(turn.as_ref(), pending_usage.take()).await;
     turn.finish().await.expect("finish turn");
 
     let usage_events: Vec<_> = conversation
@@ -2564,4 +2578,214 @@ async fn a_summary_is_not_promoted_to_a_system_instruction() {
         format!("{carrier:?}").contains("conversation_summary"),
         "the summary should be clearly delimited: {carrier:?}"
     );
+}
+
+/// A price table that gives `test-model` a known input limit, so the two
+/// compaction triggers read different numbers: the preflight estimates from
+/// characters, while the post-response trigger uses the provider's own count.
+fn pricing_with_input_limit(max_input_tokens: u32) -> Arc<PricingTable> {
+    let json = format!(
+        r#"{{"test-model": {{"litellm_provider": "openai", "input_cost_per_token": 1e-06,
+             "output_cost_per_token": 2e-06, "max_input_tokens": {max_input_tokens}}}}}"#
+    );
+    Arc::new(PricingTable::from_json_str(&json).expect("fixture parses"))
+}
+
+/// Compaction's accounting event must never land inside an open tool round.
+///
+/// The summarizer's usage rides on a `Messages` event so cost aggregation can
+/// see it. But the post-response trigger runs after the model's `ToolRequested`
+/// events are written and before the tools execute, so writing that event
+/// immediately puts it between a request and its result — and every materializer
+/// treats a messages event as a turn boundary, flushing pending calls first. The
+/// next materialization then fabricates a "tool execution did not complete"
+/// failure for a call that succeeded *and* appends the real result after it,
+/// leaving two results for one `tool_call_id`.
+///
+/// That is exactly the corruption the cut-on-`turn_ended` rule exists to
+/// prevent, arriving through the back door.
+///
+/// Reaching the post-response trigger takes some care: the preflight would
+/// otherwise fire first and latch. Giving the model a known input limit makes
+/// the two triggers read different numbers — a prompt small in characters but
+/// reported large in tokens slips past the preflight and trips the one that runs
+/// while a tool call is outstanding.
+#[tokio::test]
+async fn the_usage_event_never_splits_a_tool_round() {
+    let agent_id = Uuid7::now();
+    let conversation_id = Uuid7::now();
+    let exoharness = Arc::new(FakeExoHarness::new(agent_id, conversation_id));
+    let agent = exoharness
+        .get_agent(&agent_id)
+        .await
+        .expect("get agent")
+        .expect("agent exists");
+    let conversation = agent
+        .get_conversation(&conversation_id)
+        .await
+        .expect("get conversation")
+        .expect("conversation exists");
+
+    // History worth compacting, built with compaction off.
+    let bulk = Arc::new(FakeModelClient::new(
+        (0..4)
+            .map(|index| ModelResponse {
+                provider_cost_usd: None,
+                response_id: None,
+                messages: vec![assistant_message(&format!(
+                    "reply {index} {}",
+                    "x".repeat(4_000)
+                ))],
+                tool_calls: vec![],
+                usage: None,
+                model: None,
+                ttft: None,
+                duration: None,
+            })
+            .collect(),
+    ));
+    let builder = BasicExecutor::new(Arc::clone(&bulk), Arc::new(FakeToolRuntime::default()));
+    let off = AgentConfig {
+        compaction: Some(CompactionConfig {
+            enabled: false,
+            ..CompactionConfig::default()
+        }),
+        ..default_agent_config()
+    };
+    for index in 0..3 {
+        run_one_turn(&builder, agent.as_ref(), conversation.as_ref(), &off, index).await;
+    }
+
+    let tool_call_id = "call-1".to_string();
+    let model = Arc::new(FakeModelClient::new(vec![
+        // Round 0: the model asks for a tool and reports enough prompt tokens to
+        // trip the post-response trigger.
+        ModelResponse {
+            provider_cost_usd: None,
+            response_id: None,
+            messages: vec![assistant_message("calling a tool")],
+            tool_calls: vec![PendingToolCall {
+                tool_call_id: tool_call_id.clone(),
+                request: ToolRequest {
+                    function_name: "shell".to_string(),
+                    arguments: Map::new(),
+                },
+            }],
+            usage: Some(UniversalUsage {
+                prompt_tokens: Some(90_000),
+                completion_tokens: Some(10),
+                ..Default::default()
+            }),
+            model: Some("test-model".to_string()),
+            ttft: None,
+            duration: None,
+        },
+        // The summarizer call compaction makes, mid tool round.
+        ModelResponse {
+            provider_cost_usd: Some(0.25),
+            response_id: None,
+            messages: vec![assistant_message("A SUMMARY")],
+            tool_calls: vec![],
+            usage: Some(UniversalUsage {
+                prompt_tokens: Some(500),
+                completion_tokens: Some(20),
+                ..Default::default()
+            }),
+            model: Some("test-model".to_string()),
+            ttft: None,
+            duration: None,
+        },
+        // Round 1, after the tool result comes back.
+        ModelResponse {
+            provider_cost_usd: None,
+            response_id: None,
+            messages: vec![assistant_message("done")],
+            tool_calls: vec![],
+            usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
+        },
+    ]));
+    let executor = BasicExecutor::with_pricing(
+        Arc::clone(&model),
+        Arc::new(FakeToolRuntime::with_result(json!({"ok": true}))),
+        pricing_with_input_limit(100_000),
+    );
+    let on = AgentConfig {
+        compaction: Some(CompactionConfig {
+            enabled: true,
+            keep_recent_turns: 1,
+            // The seeded history is ~12k characters: well under the preflight's
+            // chars/3 estimate against a 70k-token threshold, so the preflight
+            // stays quiet and round 0's reported 90k tokens does the tripping.
+            max_summary_chars: 100,
+            ..CompactionConfig::default()
+        }),
+        ..default_agent_config()
+    };
+
+    let turn = conversation
+        .begin_turn(BeginTurnRequest {
+            session_id: None,
+            input: vec![user_message("use the tool")],
+        })
+        .await
+        .expect("begin turn");
+    HarnessExecutor::execute_turn(
+        &executor,
+        agent.as_ref(),
+        conversation.as_ref(),
+        Arc::clone(&turn),
+        &on,
+        &ConversationConfig::default(),
+        &(),
+        ExecutorStreamMode::Disabled,
+        None,
+    )
+    .await
+    .expect("execute turn");
+    turn.finish().await.expect("finish turn");
+
+    // The premise: compaction fired, and it fired mid tool round.
+    let events = conversation.get_events(None).await.expect("events").events;
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.data,
+            EventData::Custom { event_type, .. } if event_type == COMPACTION_CHECKPOINT_EVENT
+        )),
+        "the turn should have compacted; otherwise this proves nothing"
+    );
+
+    let prompt = executor
+        .materialize_prompt_history(conversation.as_ref(), &[])
+        .await
+        .expect("materialize");
+    let text = prompt_text(&prompt);
+    assert!(
+        !text.contains("tool execution did not complete"),
+        "a completed tool call was reported as failed: {text}"
+    );
+    assert_eq!(
+        text.matches(tool_call_id.as_str()).count(),
+        1,
+        "the tool call should resolve exactly once: {text}"
+    );
+
+    // And the accounting itself must survive the deferral.
+    let usage_events: Vec<_> = events
+        .into_iter()
+        .filter_map(|event| match event.data {
+            EventData::Messages {
+                messages, usage, ..
+            } if messages.is_empty() => usage,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        usage_events.len(),
+        1,
+        "the summarizer call should still be recorded exactly once"
+    );
+    assert_eq!(usage_events[0].cost_usd, Some(0.25));
 }

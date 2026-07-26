@@ -246,6 +246,19 @@ describe("capSummary", () => {
     expect(capSummary("short", 100)).toBe("short");
   });
 
+  it("keeps summary text rather than spending a tiny cap on the marker", () => {
+    // The marker is ~22 chars. Below that, spending the budget on it leaves a
+    // "summary" with no facts — non-empty, so the empty-summary guard lets it
+    // through and the checkpoint replaces real history with nothing.
+    for (let cap = 1; cap <= 25; cap += 1) {
+      const capped = capSummary("the user asked about billing", cap);
+      expect(capped.length).toBeLessThanOrEqual(cap);
+      expect(capped.length).toBeGreaterThan(0);
+      expect(capped.startsWith("\n...[")).toBe(false);
+    }
+    expect(capSummary("x".repeat(500), 100)).toContain("summary truncated");
+  });
+
   it("hard-truncates an oversized summary", () => {
     const capped = capSummary("x".repeat(500), 100);
     expect(capped.length).toBeLessThanOrEqual(100);

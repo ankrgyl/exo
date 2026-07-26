@@ -228,7 +228,15 @@ export function capSummary(summary: string, maxChars: number): string {
     return trimmed;
   }
   const marker = "\n...[summary truncated]";
-  const head = Math.max(0, maxChars - marker.length);
+  // A cap too small to hold the marker *and* real content spends the whole
+  // budget on the marker: the result is a prefix of "...[summary truncated]"
+  // with no facts in it, and because that is non-empty the empty-summary guard
+  // waves it through and checkpoints a cut whose summary says nothing. Keep the
+  // summary instead; a short true summary beats a longer empty one.
+  if (maxChars <= marker.length) {
+    return trimmed.slice(0, maxChars);
+  }
+  const head = maxChars - marker.length;
   return `${trimmed.slice(0, head)}${marker}`.slice(0, maxChars);
 }
 

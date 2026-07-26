@@ -115,6 +115,12 @@ character estimate is deliberately pessimistic (3 chars/token) because the two
 errors are asymmetric: compacting slightly early costs one summarizer call, while
 failing to fire costs the conversation.
 
+The estimate covers **messages and tool schemas**. Tools ride in the same request
+and consume the same window, and a harness can register a lot of them — sizing by
+messages alone lets a conversation sit under the threshold on message text while
+the request that actually goes out is over the limit, which is the very failure
+this trigger exists to catch.
+
 Both share a once-per-turn latch. No new `turn_ended` appears mid-turn, so the
 cut point cannot change within a turn; a second attempt would re-scan the log and
 re-run the summarizer for the same answer.
@@ -196,6 +202,22 @@ The summarizer is a real, billable call, so its usage is recorded — on a
 list is empty on purpose: history materialization folds these events into the
 prompt, so carrying the summarizer's reply there would inject it back into the
 context compaction just shrank.
+
+**That event must never be written mid-round**, and this is sharper than it
+looks. The post-response trigger runs after the model's `tool_requested` events
+are recorded but before the tools execute, so writing immediately puts the
+accounting event between a request and its result. Both materializers treat _any_
+messages event as a turn boundary and flush pending calls first, so the next
+materialization fabricates a "tool execution did not complete" failure for a call
+that succeeded _and_ appends the real result after it — two results for one
+`tool_call_id`. That is exactly the corruption the cut-on-`turn_ended` rule
+exists to prevent, reached through a side door.
+
+So the record is held and written at a point where no call can be outstanding:
+the top of the next round (the previous round's results are in the log) or just
+before the turn returns having requested no tools. A turn that fails in between
+loses that one record — chosen over teaching the materializer a special case,
+since the materializer's subtlety is what causes this class of bug.
 
 ## Caching
 

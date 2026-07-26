@@ -14,6 +14,7 @@ import {
   type CompactionPolicy,
   type EventData,
   type HarnessToolRegistry,
+  type JsonObject,
   type Message,
   type SummarizeInput,
   type TurnContext,
@@ -22,6 +23,7 @@ import {
   responseMessages,
   responseToLinguaEvents,
   responseToolCalls,
+  responseUsageRecord,
   runtimeFromModelBinding,
   type NativeResponsesRequest,
   type ResponsesRuntimeLike,
@@ -116,9 +118,18 @@ async function runResponsesTurnLoop(
   // whole event log each time makes a turn cost O(rounds x events).
   const history = new PromptHistoryCache();
   const compaction = new CompactionGate();
+  // Compaction is latched to once per turn, so at most one of these exists.
+  const summarizerUsage: { usage: JsonObject | undefined } = {
+    usage: undefined,
+  };
   let latestEventId: string | null = null;
 
   for (let round = 0; ; round += 1) {
+    // Safe point: any tool round from the previous iteration has completed and
+    // its results are in the log. Flushing before the budget check means the
+    // early return below records it too.
+    await flushSummarizerUsage(context, summarizerUsage);
+
     if (
       maxToolRoundTrips !== null &&
       maxToolRoundTrips !== undefined &&
@@ -150,7 +161,9 @@ async function runResponsesTurnLoop(
     // every later turn then replays the same oversized log and fails the same
     // way. This check is what makes that state recoverable. Mirrors the Rust
     // executor's pre-request trigger.
-    const preflightChars = promptChars(messages);
+    const toolDefinitions = tools.definitions();
+    const preflightChars =
+      promptChars(messages) + toolDefinitionChars(toolDefinitions);
     if (
       compaction.shouldAttempt({
         policy,
@@ -167,7 +180,15 @@ async function runResponsesTurnLoop(
         model: policy.summaryModel ?? model,
         promptTokensBefore: null,
         summarize: (input) =>
-          summarizeWithModel(runtime, policy, model, turnParent, round, input),
+          summarizeWithModel(
+            runtime,
+            policy,
+            model,
+            turnParent,
+            round,
+            input,
+            summarizerUsage,
+          ),
       });
       if (result.status === "compacted") {
         // The checkpoint just written replaces the prefix this prompt was built
@@ -183,7 +204,7 @@ async function runResponsesTurnLoop(
     const request: NativeResponsesRequest = {
       model,
       messages,
-      tools: tools.definitions(),
+      tools: toolDefinitions,
       maxOutputTokens: context.agentConfig.maxOutputTokens,
       metadata: turnMetadata(context),
     };
@@ -243,7 +264,15 @@ async function runResponsesTurnLoop(
         model: policy.summaryModel ?? model,
         promptTokensBefore: occupancy,
         summarize: (input) =>
-          summarizeWithModel(runtime, policy, model, turnParent, round, input),
+          summarizeWithModel(
+            runtime,
+            policy,
+            model,
+            turnParent,
+            round,
+            input,
+            summarizerUsage,
+          ),
       });
       if (result.status === "compacted") {
         // The cache holds exactly the prefix that was just replaced.
@@ -259,6 +288,9 @@ async function runResponsesTurnLoop(
       if (hasSyntheticToolResult) {
         continue;
       }
+      // Safe point: the model asked for no tools, so nothing is outstanding and
+      // this is the turn's last chance to record it.
+      await flushSummarizerUsage(context, summarizerUsage);
       return latestEventId;
     }
 
@@ -284,6 +316,41 @@ async function appendTurnEvents(
   return (await context.exoharness.current.turn.addEvents(data)).latestEventId;
 }
 
+/**
+ * Write what the compaction summarizer cost, if anything is pending.
+ *
+ * The usage rides on a `messages` event because that is where this repo's cost
+ * aggregation looks, and the message list is empty because history
+ * materialization folds these events into the prompt — carrying the summarizer's
+ * own reply here would inject it back into the context compaction just shrank.
+ *
+ * It must only be called where no tool call is outstanding. A messages event
+ * between a `tool_requested` and its `tool_result` makes the materializer flush
+ * the pending call, fabricating a "tool execution did not complete" failure for
+ * a call that succeeded and then appending the real result after it.
+ *
+ * A turn that throws before reaching a flush point loses that one record; the
+ * alternative was a special case in the materializer, which is the function
+ * whose subtlety causes this class of bug in the first place.
+ */
+async function flushSummarizerUsage(
+  context: TurnContext,
+  sink: { usage: JsonObject | undefined },
+): Promise<void> {
+  const usage = sink.usage;
+  if (usage === undefined) {
+    return;
+  }
+  sink.usage = undefined;
+  try {
+    await context.exoharness.current.turn.addEvents([
+      { type: "messages", messages: [], usage },
+    ]);
+  } catch {
+    // Accounting is not worth failing a turn over.
+  }
+}
+
 function promptChars(messages: Message[]): number {
   let total = 0;
   for (const message of messages) {
@@ -291,6 +358,23 @@ function promptChars(messages: Message[]): number {
       typeof message.content === "string"
         ? message.content.length
         : JSON.stringify(message.content).length;
+  }
+  return total;
+}
+
+/**
+ * Serialized size of the tool schemas sent with a request.
+ *
+ * Tools go into the same input window as the messages, and this harness
+ * registers a lot of them. Sizing a request by its messages alone lets a
+ * conversation sit under the compaction threshold on message text while the
+ * request that actually goes out is over the model's hard limit — which is the
+ * unrecoverable failure the preflight exists to prevent.
+ */
+function toolDefinitionChars(tools: unknown[]): number {
+  let total = 0;
+  for (const tool of tools) {
+    total += JSON.stringify(tool)?.length ?? 0;
   }
   return total;
 }
@@ -323,6 +407,9 @@ async function summarizeWithModel(
   turnParent: TraceParent,
   round: number,
   input: SummarizeInput,
+  // Filled with what this call cost. The caller writes it at a point where no
+  // tool call is outstanding — see `flushSummarizerUsage`.
+  usageSink: { usage: JsonObject | undefined },
 ): Promise<string> {
   const merge =
     input.previousSummary === null
@@ -344,5 +431,6 @@ async function summarizeWithModel(
     },
     { parent: turnParent, roundIndex: round },
   );
+  usageSink.usage = responseUsageRecord(response);
   return assistantMessagesText(responseMessages(response));
 }

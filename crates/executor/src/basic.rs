@@ -16,7 +16,7 @@ use serde_json::json;
 use crate::compaction::{
     CompactionOutcome, SummarizeInput, estimated_tokens_from_chars, prompt_chars,
     read_active_checkpoint, read_summary, record_summarizer_usage, run_compaction, should_compact,
-    summarizer_instruction, summary_message,
+    summarizer_instruction, summary_message, tool_definition_chars,
 };
 use crate::execution_tracing::TurnExecutionTrace;
 use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor};
@@ -80,6 +80,17 @@ impl<M, T> Clone for BasicExecutor<M, T> {
             pricing: Arc::clone(&self.pricing),
         }
     }
+}
+
+/// Everything the compaction trigger weighs, gathered at the call site.
+pub(crate) struct CompactionTrigger<'a> {
+    /// Already-resolved provider model id, for the price-table lookup.
+    pub(crate) model: &'a str,
+    pub(crate) max_input_tokens: Option<i64>,
+    /// Provider-reported input occupancy, when a response has come back.
+    pub(crate) prompt_tokens: Option<u64>,
+    /// Serialized size of the request, messages and tool schemas together.
+    pub(crate) prompt_chars: u64,
 }
 
 struct ToolRoundContext<'a> {
@@ -202,12 +213,16 @@ where
         conversation: &dyn ConversationHandle,
         turn: &dyn TurnHandle,
         agent_config: &AgentConfig,
-        model: &str,
-        max_input_tokens: Option<i64>,
-        prompt_tokens: Option<u64>,
-        prompt_chars: u64,
+        trigger: CompactionTrigger<'_>,
         attempted: &mut bool,
+        pending_usage: &mut Option<Box<UsageRecord>>,
     ) -> bool {
+        let CompactionTrigger {
+            model,
+            max_input_tokens,
+            prompt_tokens,
+            prompt_chars,
+        } = trigger;
         // At most one attempt per turn: compaction can only cut at a
         // `turn_ended` boundary, and none appears while a turn is in flight, so
         // a second attempt re-scans the log and re-runs the summarizer to reach
@@ -228,6 +243,13 @@ where
             .summary_model
             .clone()
             .unwrap_or_else(|| model.to_string());
+        // The summarizer's usage is collected here and handed back rather than
+        // written: this runs mid-round, and an accounting event between a
+        // `tool_requested` and its `tool_result` would make the materializer
+        // fabricate a failure for a call that succeeded. The caller writes it at
+        // a point where no call is outstanding.
+        let summarizer_usage: std::sync::Mutex<Option<Box<UsageRecord>>> =
+            std::sync::Mutex::new(None);
         let outcome = run_compaction(
             conversation,
             turn,
@@ -238,13 +260,20 @@ where
                 Box::pin(self.summarize(
                     input,
                     conversation,
-                    turn,
+                    &summarizer_usage,
                     &agent_config.model,
                     &summary_model,
                 ))
             },
         )
         .await;
+        if let Some(usage) = summarizer_usage
+            .lock()
+            .expect("summarizer usage poisoned")
+            .take()
+        {
+            *pending_usage = Some(usage);
+        }
 
         let conversation_id = conversation.record().id;
         match outcome {
@@ -284,7 +313,7 @@ where
         &self,
         input: SummarizeInput,
         conversation: &dyn ConversationHandle,
-        turn: &dyn TurnHandle,
+        usage_sink: &std::sync::Mutex<Option<Box<UsageRecord>>>,
         binding: &str,
         model: &str,
     ) -> Result<String> {
@@ -305,7 +334,8 @@ where
             })
             .await?;
         let text = assistant_messages_text(&response.messages);
-        record_summarizer_usage(turn, build_usage_record(&response, &self.pricing)).await;
+        *usage_sink.lock().expect("summarizer usage poisoned") =
+            build_usage_record(&response, &self.pricing);
         Ok(text)
     }
 
@@ -320,7 +350,16 @@ where
         turn_trace: Option<&dyn TurnExecutionTrace>,
     ) -> Result<()> {
         let mut compaction_attempted = false;
+        // Compaction is latched to once per turn, so at most one of these
+        // exists. It is written only where an open tool round provably cannot
+        // exist — see `record_summarizer_usage` for why that matters.
+        let mut pending_usage: Option<Box<UsageRecord>> = None;
         for round in 0u32.. {
+            // Safe point: any tool round from the previous iteration has
+            // completed and its results are in the log. Flushing before the
+            // budget check means the early return below records it too.
+            record_summarizer_usage(turn.as_ref(), pending_usage.take()).await;
+
             if agent_config
                 .max_tool_round_trips
                 .is_some_and(|limit| round > limit)
@@ -336,7 +375,10 @@ where
                     .await?;
             let model = request.model.clone();
             let max_input_tokens = self.pricing.max_input_tokens(&model);
-            let prompt_chars = prompt_chars(&request.messages);
+            // Tools count too: they ride in the same request and consume the
+            // same window, and a harness can register a lot of them.
+            let prompt_chars =
+                prompt_chars(&request.messages) + tool_definition_chars(&request.tools);
 
             // Compact *before* sending when the prompt already looks too large.
             //
@@ -354,11 +396,14 @@ where
                     conversation,
                     turn.as_ref(),
                     agent_config,
-                    &model,
-                    max_input_tokens,
-                    Some(estimated_tokens_from_chars(prompt_chars)),
-                    prompt_chars,
+                    CompactionTrigger {
+                        model: &model,
+                        max_input_tokens,
+                        prompt_tokens: Some(estimated_tokens_from_chars(prompt_chars)),
+                        prompt_chars,
+                    },
                     &mut compaction_attempted,
+                    &mut pending_usage,
                 )
                 .await
             {
@@ -403,16 +448,22 @@ where
                 conversation,
                 turn.as_ref(),
                 agent_config,
-                &model,
-                max_input_tokens,
-                prompt_tokens,
-                prompt_chars,
+                CompactionTrigger {
+                    model: &model,
+                    max_input_tokens,
+                    prompt_tokens,
+                    prompt_chars,
+                },
                 &mut compaction_attempted,
+                &mut pending_usage,
             )
             .await;
 
             let tool_requests = collect_tool_requests(&events);
             if tool_requests.is_empty() {
+                // Safe point: the model asked for no tools, so nothing is
+                // outstanding and this is the turn's last chance to record it.
+                record_summarizer_usage(turn.as_ref(), pending_usage.take()).await;
                 return Ok(());
             }
 

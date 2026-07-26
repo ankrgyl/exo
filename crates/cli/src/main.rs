@@ -546,6 +546,8 @@ enum AgentCommands {
         #[arg(long)]
         compaction_summary_model: Option<String>,
         #[arg(long)]
+        clear_compaction_summary_model: bool,
+        #[arg(long)]
         clear_braintrust: bool,
         #[arg(long)]
         braintrust_org: Option<String>,
@@ -1104,6 +1106,7 @@ async fn main() -> Result<()> {
                 compaction_threshold_ratio,
                 compaction_keep_recent_turns,
                 compaction_summary_model,
+                clear_compaction_summary_model,
                 clear_braintrust,
                 braintrust_org,
                 braintrust_project,
@@ -1254,11 +1257,17 @@ async fn main() -> Result<()> {
                 if no_compaction && compaction {
                     bail!("--compaction and --no-compaction are mutually exclusive");
                 }
+                if clear_compaction_summary_model && compaction_summary_model.is_some() {
+                    bail!(
+                        "--compaction-summary-model and --clear-compaction-summary-model are mutually exclusive"
+                    );
+                }
                 if no_compaction
                     || compaction
                     || compaction_threshold_ratio.is_some()
                     || compaction_keep_recent_turns.is_some()
                     || compaction_summary_model.is_some()
+                    || clear_compaction_summary_model
                 {
                     let current = config.compaction.clone().unwrap_or_default();
                     let updated = CompactionConfig {
@@ -1273,7 +1282,15 @@ async fn main() -> Result<()> {
                             .unwrap_or(current.threshold_ratio),
                         keep_recent_turns: compaction_keep_recent_turns
                             .unwrap_or(current.keep_recent_turns),
-                        summary_model: compaction_summary_model.or(current.summary_model.clone()),
+                        // Without an explicit clear, an override set once could
+                        // never be removed: every later update preserved it, so
+                        // the documented default of following the agent's model
+                        // was unreachable.
+                        summary_model: if clear_compaction_summary_model {
+                            None
+                        } else {
+                            compaction_summary_model.or(current.summary_model.clone())
+                        },
                         ..current.clone()
                     };
                     if updated != current {

@@ -240,7 +240,15 @@ pub(crate) fn cap_summary(summary: &str, max_chars: u32) -> String {
         return trimmed.to_string();
     }
     const MARKER: &str = "\n...[summary truncated]";
-    let head_chars = max_chars.saturating_sub(MARKER.chars().count());
+    // A cap too small to hold the marker *and* real content spends the whole
+    // budget on the marker: the result is a prefix of "...[summary truncated]"
+    // with no facts in it, and because that is non-empty the empty-summary guard
+    // waves it through and checkpoints a cut whose summary says nothing. Keep
+    // the summary instead; a short true summary beats a longer empty one.
+    if max_chars <= MARKER.chars().count() {
+        return trimmed.chars().take(max_chars).collect();
+    }
+    let head_chars = max_chars - MARKER.chars().count();
     let head: String = trimmed.chars().take(head_chars).collect();
     format!("{head}{MARKER}").chars().take(max_chars).collect()
 }
@@ -581,6 +589,20 @@ pub(crate) fn prompt_chars(messages: &[Message]) -> u64 {
         .sum()
 }
 
+/// Serialized size of the tool schemas sent with a request.
+///
+/// Tools go into the same input window as the messages, and agent harnesses can
+/// register a lot of them. Sizing a request by its messages alone lets a
+/// conversation sit under the compaction threshold on message text while the
+/// request that actually goes out is over the model's hard limit — which is the
+/// unrecoverable failure the pre-request trigger exists to prevent.
+pub(crate) fn tool_definition_chars(tools: &[crate::ToolDefinition]) -> u64 {
+    tools
+        .iter()
+        .map(|tool| serde_json::to_string(tool).map(|s| s.len()).unwrap_or(0) as u64)
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,6 +876,24 @@ mod tests {
     #[test]
     fn cap_summary_leaves_short_input_alone() {
         assert_eq!(cap_summary("short", 100), "short");
+    }
+
+    #[test]
+    fn a_tiny_cap_keeps_summary_text_rather_than_the_marker() {
+        // The marker is ~22 chars. Below that, spending the budget on it leaves
+        // a "summary" with no facts — non-empty, so the empty-summary guard lets
+        // it through and the checkpoint replaces real history with nothing.
+        for cap in 1..=25u32 {
+            let capped = cap_summary("the user asked about billing", cap);
+            assert!(capped.chars().count() <= cap as usize, "cap {cap}");
+            assert!(!capped.is_empty(), "cap {cap}");
+            assert!(
+                !capped.starts_with("\n...["),
+                "cap {cap} produced only a truncation marker: {capped:?}"
+            );
+        }
+        // Comfortably above the marker length, the marker is still used.
+        assert!(cap_summary(&"x".repeat(500), 100).contains("summary truncated"));
     }
 
     #[test]

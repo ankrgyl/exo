@@ -1169,6 +1169,19 @@ export function responseToLinguaEvents(response: Response): EventData[] {
   return events;
 }
 
+/**
+ * Usage + cost for a response, in the shape the `messages` event carries.
+ *
+ * Exported so a caller can record what an out-of-band model call cost — the
+ * compaction summarizer, for one — without routing its text through
+ * `responseToLinguaEvents` and into the conversation's prompt history.
+ */
+export function responseUsageRecord(
+  response: Response,
+): JsonObject | undefined {
+  return usageRecord(response);
+}
+
 // Policy: attach raw usage + cost to the messages event. cost_usd is filled from
 // the shared price cache; left unset if the cache is unavailable.
 function usageRecord(response: Response): JsonObject | undefined {
