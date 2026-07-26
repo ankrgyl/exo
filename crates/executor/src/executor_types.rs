@@ -289,7 +289,7 @@ impl ExecutionCancellation {
         self.0.cancel();
     }
 
-    pub(crate) async fn cancelled(&self) {
+    pub async fn cancelled(&self) {
         self.0.cancelled().await;
     }
 }

@@ -336,6 +336,8 @@ mod tests {
 
     struct FakeConversation {
         record: ConversationRecord,
+        cancel_when_requested: bool,
+        turn_started: Arc<tokio::sync::Notify>,
     }
 
     #[async_trait::async_trait]
@@ -384,12 +386,24 @@ mod tests {
         async fn send_stream_with_cancellation(
             &self,
             request: SendRequest,
-            _cancellation: ExecutionCancellation,
+            cancellation: ExecutionCancellation,
         ) -> Result<ExecutionStreamHandle> {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let session_id = request.session_id.unwrap_or_else(Uuid7::now);
             let turn_id = Uuid7::now();
             let latest_event_id = Uuid7::now();
+            if self.cancel_when_requested {
+                self.turn_started.notify_one();
+                tokio::spawn(async move {
+                    cancellation.cancelled().await;
+                    drop(tx.send(Ok(ExecutionStreamEvent::Cancelled(SendResult {
+                        session_id,
+                        turn_id,
+                        latest_event_id,
+                    }))));
+                });
+                return Ok(ExecutionStreamHandle::new(UnboundedReceiverStream::new(rx)));
+            }
             tx.send(Ok(ExecutionStreamEvent::Chunk(
                 lingua::UniversalStreamChunk::text_delta(0, "hello"),
             )))
@@ -458,6 +472,8 @@ mod tests {
                 name: "ACP".into(),
                 latest_event_id: None,
             },
+            cancel_when_requested: false,
+            turn_started: Arc::new(tokio::sync::Notify::new()),
         });
         let updates = Arc::new(Mutex::new(Vec::<acp::SessionUpdate>::new()));
         let notification_updates = Arc::clone(&updates);
@@ -519,5 +535,58 @@ mod tests {
                 .iter()
                 .any(|update| { matches!(update, acp::SessionUpdate::ToolCallUpdate(_)) })
         );
+    }
+
+    #[tokio::test]
+    async fn acp_cancel_notification_cancels_the_active_exo_turn() {
+        let turn_started = Arc::new(tokio::sync::Notify::new());
+        let conversation: Arc<dyn HarnessConversation> = Arc::new(FakeConversation {
+            record: ConversationRecord {
+                id: Uuid7::now(),
+                slug: "acp-cancel".into(),
+                name: "ACP cancel".into(),
+                latest_event_id: None,
+            },
+            cancel_when_requested: true,
+            turn_started: Arc::clone(&turn_started),
+        });
+        let (agent_transport, client_transport) = Channel::duplex();
+        let server = tokio::spawn(serve_transport(conversation, agent_transport));
+
+        Client
+            .builder()
+            .connect_with(client_transport, async move |connection| {
+                connection
+                    .send_request(acp::InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = connection
+                    .send_request(acp::NewSessionRequest::new(
+                        std::env::current_dir().map_err(anyhow::Error::from)?,
+                    ))
+                    .block_task()
+                    .await?;
+                let session_id = session.session_id;
+                let prompt_connection = connection.clone();
+                let prompt_session_id = session_id.clone();
+                let prompt = tokio::spawn(async move {
+                    prompt_connection
+                        .send_request(acp::PromptRequest::new(
+                            prompt_session_id,
+                            vec![acp::ContentBlock::Text(acp::TextContent::new("wait"))],
+                        ))
+                        .block_task()
+                        .await
+                });
+                turn_started.notified().await;
+                connection.send_notification(acp::CancelNotification::new(session_id))?;
+                let response = prompt.await.map_err(anyhow::Error::from)??;
+                assert_eq!(response.stop_reason, acp::StopReason::Cancelled);
+                assert!(response.meta.is_some());
+                Ok(())
+            })
+            .await
+            .expect("ACP client");
+        server.await.expect("server task").expect("ACP server");
     }
 }
