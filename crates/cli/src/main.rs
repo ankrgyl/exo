@@ -6,19 +6,20 @@ mod env_tests;
 mod mount_tests;
 #[cfg(test)]
 mod naming_tests;
+mod render;
 #[cfg(test)]
 mod repl_tests;
 #[cfg(test)]
 mod secret_tests;
 mod tui;
+mod tui_app;
 
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -37,13 +38,12 @@ use executor::{
     default_vercel_image, effective_sandbox_scope, load_agent_config, send_conversation_wakeup,
     serve_exoharness_http_listener_with_options,
 };
-use lingua::Message;
-use lingua::universal::{AssistantContent, AssistantContentPart, ToolContentPart, UserContent};
 use serde::Deserialize;
 use tabwriter::TabWriter;
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::env::CliEnvironment;
+use crate::render::{Verbosity, print_message};
 use tui::run_chat_repl;
 
 #[derive(Debug, Parser)]
@@ -410,6 +410,12 @@ enum Commands {
         /// Conversation slug to use or create (default: a fresh generated slug).
         #[arg(long)]
         conversation: Option<String>,
+        /// How much tool detail to print: minimal, compact, or full.
+        #[arg(long, value_enum, default_value_t = Verbosity::default())]
+        verbosity: Verbosity,
+        /// Use the legacy line-mode repl instead of the full-screen TUI.
+        #[arg(long)]
+        legacy_tui: bool,
     },
     Adapters {
         #[command(subcommand)]
@@ -865,6 +871,8 @@ async fn main() -> Result<()> {
             model,
             agent,
             conversation,
+            verbosity,
+            legacy_tui,
         } => {
             let agent_slug =
                 agent.unwrap_or_else(|| default_repl_agent_slug(harness_selection.as_ref()));
@@ -938,7 +946,14 @@ async fn main() -> Result<()> {
                 }
             };
 
-            run_chat_repl(Arc::clone(&agent), conversation).await?;
+            // Non-interactive stdin/stdout (pipes, CI) can't host the
+            // full-screen TUI; fall back to line mode automatically.
+            let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+            if legacy_tui || !interactive {
+                run_chat_repl(Arc::clone(&agent), conversation, verbosity).await?;
+            } else {
+                tui_app::run_chat_tui(Arc::clone(&agent), conversation, verbosity).await?;
+            }
         }
         Commands::Agent { command } => match command {
             AgentCommands::List => {
@@ -1517,7 +1532,7 @@ async fn main() -> Result<()> {
                     conversation.record().id
                 );
                 if repl {
-                    run_chat_repl(Arc::clone(&agent), conversation).await?;
+                    run_chat_repl(Arc::clone(&agent), conversation, Verbosity::default()).await?;
                 } else {
                     println!(
                         "start chatting with it via `{}`",
@@ -1558,7 +1573,7 @@ async fn main() -> Result<()> {
                         .ok_or_else(|| {
                             anyhow!("forked conversation not found: {}", forked.record().slug)
                         })?;
-                    run_chat_repl(agent, conversation).await?;
+                    run_chat_repl(agent, conversation, Verbosity::default()).await?;
                 } else {
                     println!(
                         "start chatting with it via `{}`",
@@ -1882,7 +1897,7 @@ async fn main() -> Result<()> {
                 send_conversation_wakeup(conversation.as_ref(), prompt).await?;
                 let messages = conversation.messages().await?;
                 for message in &messages[previous_messages.len()..] {
-                    print_message(message);
+                    print_message(message, Verbosity::Full);
                 }
             }
             ConversationCommands::Delete {
@@ -2808,81 +2823,6 @@ async fn run_sandbox_shell_command(
     Ok(serde_json::from_value(result)?)
 }
 
-pub(crate) fn print_message(message: &Message) {
-    let timestamp = compact_timestamp();
-    match message {
-        Message::User { content } => {
-            println!("{timestamp} user: {}", render_user_content(content));
-        }
-        Message::Assistant { content, .. } => {
-            println!(
-                "{timestamp} assistant: {}",
-                render_assistant_content(content)
-            );
-        }
-        Message::Tool { content } => {
-            for part in content {
-                let ToolContentPart::ToolResult(result) = part;
-                println!("{timestamp} tool {}: {}", result.tool_name, result.output);
-            }
-        }
-        Message::System { content } => {
-            println!("{timestamp} system: {}", render_user_content(content));
-        }
-        Message::Developer { content } => {
-            println!("{timestamp} developer: {}", render_user_content(content));
-        }
-    }
-}
-
-pub(crate) fn compact_timestamp() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() % 86_400)
-        .unwrap_or(0);
-    let hours = seconds / 3_600;
-    let minutes = (seconds % 3_600) / 60;
-    let seconds = seconds % 60;
-    format!("[{hours:02}:{minutes:02}:{seconds:02}]")
-}
-
-fn render_user_content(content: &UserContent) -> String {
-    match content {
-        UserContent::String(text) => text.clone(),
-        UserContent::Array(parts) => parts
-            .iter()
-            .map(|part| match part {
-                lingua::universal::UserContentPart::Text(text) => text.text.clone(),
-                _ => "[non-text user content]".to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-    }
-}
-
-pub(crate) fn render_assistant_content(content: &AssistantContent) -> String {
-    match content {
-        AssistantContent::String(text) => text.clone(),
-        AssistantContent::Array(parts) => parts
-            .iter()
-            .map(|part| match part {
-                AssistantContentPart::Text(text) => text.text.clone(),
-                AssistantContentPart::Reasoning { text, .. } => format!("[reasoning] {text}"),
-                AssistantContentPart::ToolCall {
-                    tool_name,
-                    arguments,
-                    ..
-                } => format!("[tool_call {tool_name}] {arguments}"),
-                AssistantContentPart::ToolResult {
-                    tool_name, output, ..
-                } => format!("[tool_result {tool_name}] {output}"),
-                AssistantContentPart::File { .. } => "[file]".to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-    }
-}
-
 fn repl_command(agent_slug: &str, conversation_slug: &str) -> String {
     format!("exo repl --agent {agent_slug} --conversation {conversation_slug}")
 }
@@ -3010,6 +2950,8 @@ mod create_tests {
                 model: None,
                 agent: None,
                 conversation: None,
+                verbosity: crate::render::Verbosity::Compact,
+                legacy_tui: false,
             }
         ));
     }
