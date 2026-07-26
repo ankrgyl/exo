@@ -9,6 +9,8 @@ import {
   checkpointFromEvent,
   compactionWouldNotShrink,
   overHardInputLimit,
+  summaryMessageSize,
+  summaryWouldNotShrink,
   PromptSize,
   promptSize,
   resolveCompactionPolicy,
@@ -527,10 +529,30 @@ describe("compactionWouldNotShrink", () => {
   });
 
   it("counts the previous summary's wrapper too", () => {
-    // A previous summary sits in the prompt wrapped as well, so it costs its
-    // own envelope on the current-size side of the comparison.
-    expect(compactionWouldNotShrink(ascii(0), ascii(cap), cap)).toBe(true);
-    expect(compactionWouldNotShrink(ascii(1), ascii(cap), cap)).toBe(false);
+    // A previous summary sits in the prompt wrapped *and serialized*, so the
+    // caller measures the whole message (`summaryMessageSize`) and passes that.
+    // Adding the envelope in here instead would have hidden the JSON escaping
+    // that the raw text does not carry.
+    const enveloped = ascii(cap + envelope);
+    expect(compactionWouldNotShrink(ascii(0), enveloped, cap)).toBe(true);
+    expect(compactionWouldNotShrink(ascii(1), enveloped, cap)).toBe(false);
+  });
+
+  it("measures the summary as the prompt will encode it", () => {
+    // Everything else in a prompt size is measured after serialization, so a
+    // summary measured raw is undercounted by every character JSON has to
+    // escape — and a summary of quoted code is mostly those.
+    const quoted = '"'.repeat(4_000);
+    const raw = summaryMessageSize("").plus(PromptSize.ofText(quoted));
+    const encoded = summaryMessageSize(quoted);
+    expect(raw.bytes).toBeLessThan(encoded.bytes);
+
+    // A span strictly between the two. Against the encoded size the
+    // replacement is a loss and must be refused; against the raw size it looks
+    // like a win, which is the bug.
+    const span = ascii(Math.floor((raw.bytes + encoded.bytes) / 2));
+    expect(summaryWouldNotShrink(span, null, quoted)).toBe(true);
+    expect(summaryWouldNotShrink(span, null, "x".repeat(200))).toBe(false);
   });
 
   it("prices the character cap in the span's own bytes per character", () => {
@@ -561,6 +583,15 @@ describe("resolveSummarizerModel", () => {
   it("keeps the configured summary model when the prompt fits it", () => {
     expect(resolveSummarizerModel({ ...base, promptTokens: 40_000 })).toBe(
       "small",
+    );
+  });
+
+  it("reserves room for the summarizer's own instruction", () => {
+    // The summarizer request is not a subset of the agent's: the agent
+    // instructions come out and the summarizer's instruction and merge wrapper
+    // go in. A prompt sitting exactly on the limit therefore does not fit.
+    expect(resolveSummarizerModel({ ...base, promptTokens: 50_000 })).toBe(
+      "big",
     );
   });
 

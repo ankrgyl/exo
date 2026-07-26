@@ -567,7 +567,15 @@ export function resolveSummarizerModel(
   if (summaryModelInputLimit === null || summaryModelInputLimit <= 0) {
     return summaryModel;
   }
-  if (promptTokens <= summaryModelInputLimit) {
+  // Reserve what the summarizer request adds on top of the material.
+  //
+  // `promptTokens` measures the *agent's* request, and the summarizer's is not
+  // a subset of it: the agent instructions come out, and the summarizer's own
+  // instruction and merge wrapper go in. Usually the span is the smaller of the
+  // two — it excludes the retained turns and the tool schemas — but with
+  // `keepRecentTurns` low and few tools it is nearly the whole prompt, and then
+  // the overhead is the difference between fitting and being rejected.
+  if (promptTokens + summarizerOverheadTokens() <= summaryModelInputLimit) {
     return summaryModel;
   }
   // Only switch if the agent's model has more room; an unknown limit there is
@@ -1229,8 +1237,9 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
   const compactedMessages = materializeEventsToMessages(compactedEvents);
 
   const spanSize = promptSize(compactedMessages);
+  // The whole message, escaping included — the unit `spanSize` is already in.
   const previousSummarySize =
-    summaryToChain === null ? null : PromptSize.ofText(summaryToChain);
+    summaryToChain === null ? null : summaryMessageSize(summaryToChain);
 
   // Prices the summary at the configured ceiling, which is the right question
   // for housekeeping: a cut that reclaims less than a summary's worth is not
@@ -1408,8 +1417,13 @@ export function summaryWouldNotShrink(
   previousSummary: PromptSize | null,
   summary: string,
 ): boolean {
-  // The replacement is the summary *and* the wrapper it is delivered in.
-  const replacement = summaryEnvelopeSize().plus(PromptSize.ofText(summary));
+  // Measured as the message it will actually be, not as the wrapper plus the
+  // raw text. `span` is serialized JSON — every quote, backslash and newline in
+  // it already costs two characters — so pricing the replacement from the
+  // unescaped string compares two different units. A summary full of quoted
+  // code can encode to nearly twice what `ofText` reports, which is exactly the
+  // margin this guard is deciding.
+  const replacement = summaryMessageSize(summary);
   const current = replacedSize(span, previousSummary);
   return (
     current.bytes <= replacement.bytes ||
@@ -1442,9 +1456,44 @@ function replacedSize(
   span: PromptSize,
   previousSummary: PromptSize | null,
 ): PromptSize {
-  return previousSummary === null
-    ? span
-    : span.plus(summaryEnvelopeSize()).plus(previousSummary);
+  // `previousSummary` is the summary **as it sits in the prompt**: a whole
+  // serialized message, envelope included. Measuring it that way rather than
+  // wrapping a raw-text size here is what keeps both sides of the comparison in
+  // the same unit — see `summaryMessageSize`.
+  return previousSummary === null ? span : span.plus(previousSummary);
+}
+
+/**
+ * Size of a summary as the prompt will actually carry it: wrapped in
+ * `summaryMessage` and serialized.
+ *
+ * The distinction from `summaryEnvelopeSize().plus(PromptSize.ofText(text))` is
+ * JSON escaping. Everything else in a prompt size is measured post-
+ * serialization, so measuring summary text raw undercounts it by every quote,
+ * backslash and newline it contains — and a summary of quoted code is mostly
+ * those. Mirrors `summary_message_size` in the Rust executor.
+ */
+export function summaryMessageSize(text: string): PromptSize {
+  return promptSize([summaryMessage(text)]);
+}
+
+/**
+ * Tokens the summarizer request costs beyond the span itself: its instruction
+ * and the wrapper a merged previous summary arrives in.
+ *
+ * Measured against the merge variant, which is the larger of the two and the one
+ * every compaction after the first uses. A fixed overhead, so it can be reserved
+ * before the span is known. Mirrors `summarizer_overhead_tokens` in Rust.
+ */
+function summarizerOverheadTokens(): number {
+  return promptSize(
+    summarizerMessages({
+      messages: [],
+      previousSummary: "",
+      maxChars: 0,
+      model: "",
+    }),
+  ).estimatedTokens();
 }
 
 /**

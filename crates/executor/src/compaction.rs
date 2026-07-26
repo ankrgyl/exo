@@ -787,9 +787,10 @@ async fn compact(
     );
 
     let span_size = prompt_size(&messages);
+    // The whole message, escaping included — the unit `span_size` is already in.
     let previous_summary_size = previous_summary
         .as_ref()
-        .map(|summary| PromptSize::of_str(summary));
+        .map(|summary| summary_message_size(summary));
 
     // Prices the summary at the configured ceiling, which is the right question
     // for housekeeping: a cut that reclaims less than a summary's worth is not
@@ -1202,7 +1203,17 @@ pub(crate) fn resolve_summarizer_model(
     let Some(summary_limit) = summary_model_input_limit.filter(|limit| *limit > 0) else {
         return summary_model;
     };
-    if prompt_tokens <= summary_limit as u64 {
+    // Reserve what the summarizer request adds on top of the material.
+    //
+    // `prompt_tokens` measures the *agent's* request, and the summarizer's is
+    // not a subset of it: the agent instructions come out, and the summarizer's
+    // own instruction and merge wrapper go in. Usually the span is the smaller
+    // of the two — it excludes the retained turns and the tool schemas — but
+    // with `keep_recent_turns` low and few tools it is nearly the whole prompt,
+    // and then the overhead is the difference between fitting and being
+    // rejected. Rejected exactly at the context wall, which is where compaction
+    // is least able to afford it.
+    if prompt_tokens + summarizer_overhead_tokens() <= summary_limit as u64 {
         return summary_model;
     }
     // Only switch if the agent's model has more room; an unknown limit there is
@@ -1271,8 +1282,13 @@ fn summary_would_not_shrink(
     previous_summary: Option<PromptSize>,
     summary: &str,
 ) -> bool {
-    // The replacement is the summary *and* the wrapper it is delivered in.
-    let replacement = summary_envelope_size() + PromptSize::of_str(summary);
+    // Measured as the message it will actually be, not as the wrapper plus the
+    // raw text. `span` is serialized JSON — every quote, backslash and newline
+    // in it already costs two characters — so pricing the replacement from the
+    // unescaped string compares two different units. A summary full of quoted
+    // code can encode to nearly twice what `of_str` reports, which is exactly
+    // the margin this guard is deciding.
+    let replacement = summary_message_size(summary);
     let current = replaced_size(span, previous_summary);
     current.bytes() <= replacement.bytes()
         || current.estimated_tokens() <= replacement.estimated_tokens()
@@ -1286,17 +1302,32 @@ fn replaced_bytes(span: PromptSize, previous_summary: Option<PromptSize>) -> u64
     replaced_size(span, previous_summary).bytes()
 }
 
-/// `span` plus the enveloped previous summary, as a measurable size rather than
+/// `span` plus the previous summary's message, as a measurable size rather than
 /// a single number — so callers can ask about bytes or tokens without the
-/// envelope arithmetic drifting between them.
+/// arithmetic drifting between them.
 ///
-/// The span carries no envelope of its own: it sits in the prompt as ordinary
-/// messages. Only a summary is wrapped.
+/// `previous_summary` is the summary **as it sits in the prompt**: a whole
+/// serialized message, envelope included. Measuring it that way rather than
+/// wrapping a raw-text size here is what keeps both sides of the comparison in
+/// the same unit — see `summary_message_size`. The span needs no such treatment:
+/// it is already a set of serialized messages.
 fn replaced_size(span: PromptSize, previous_summary: Option<PromptSize>) -> PromptSize {
     match previous_summary {
-        Some(summary) => span + summary_envelope_size() + summary,
+        Some(summary) => span + summary,
         None => span,
     }
+}
+
+/// Size of a summary as the prompt will actually carry it: wrapped in
+/// `summary_message` and serialized.
+///
+/// The distinction from `summary_envelope_size() + PromptSize::of_str(text)` is
+/// JSON escaping. Everything else in a prompt size is measured post-
+/// serialization, so measuring summary text raw undercounts it by every quote,
+/// backslash and newline it contains — and a summary of quoted code is mostly
+/// those.
+fn summary_message_size(text: &str) -> PromptSize {
+    prompt_size(std::slice::from_ref(&summary_message(text)))
 }
 
 /// Size the `summary_message` wrapper adds, summary text excluded.
@@ -1353,6 +1384,26 @@ pub(crate) fn previous_summary_message(previous: &str) -> Message {
 /// Ordered by what is most expensive to lose. Specifics (paths, ids, error
 /// text) go first among the "preserve" rules because they are exactly what a
 /// summary tends to drop and what is hardest to recover afterwards.
+/// Tokens the summarizer request costs beyond the span itself: its instruction
+/// and the wrapper a merged previous summary arrives in.
+///
+/// Measured against the merge variant, which is the larger of the two and the
+/// one every compaction after the first uses. A fixed overhead, so it can be
+/// reserved before the span is known.
+fn summarizer_overhead_tokens() -> u64 {
+    let with_merge = SummarizeInput {
+        messages: Vec::new(),
+        previous_summary: Some(String::new()),
+        max_chars: 0,
+        model: String::new(),
+    };
+    let scaffold = [
+        crate::harness_helpers::system_message(&summarizer_instruction(&with_merge)),
+        previous_summary_message(""),
+    ];
+    prompt_size(&scaffold).estimated_tokens()
+}
+
 pub(crate) fn summarizer_instruction(input: &SummarizeInput) -> String {
     let merge = match &input.previous_summary {
         None => "",
@@ -1822,18 +1873,51 @@ mod tests {
             None,
             cap
         ));
-        // A previous summary sits in the prompt wrapped too, so it carries its
-        // own envelope on the current-size side of the comparison.
+        // A previous summary sits in the prompt wrapped *and serialized*, so the
+        // caller measures the whole message (`summary_message_size`) and passes
+        // that. Adding the envelope in here instead would have hidden the JSON
+        // escaping that the raw text does not carry.
         assert!(compaction_would_not_shrink(
             ascii(0),
-            Some(ascii(u64::from(cap))),
+            Some(ascii(u64::from(cap) + envelope)),
             cap
         ));
         assert!(!compaction_would_not_shrink(
             ascii(1),
-            Some(ascii(u64::from(cap))),
+            Some(ascii(u64::from(cap) + envelope)),
             cap
         ));
+    }
+
+    #[test]
+    fn the_measured_guard_counts_the_summary_as_the_prompt_will_encode_it() {
+        // Everything else in a prompt size is measured after serialization, so a
+        // summary measured raw is undercounted by every character JSON has to
+        // escape — and a summary of quoted code is mostly those.
+        let quoted = "\"".repeat(4_000);
+        let raw = summary_envelope_size() + PromptSize::of_str(&quoted);
+        let encoded = summary_message_size(&quoted);
+        assert!(
+            raw.bytes() < encoded.bytes(),
+            "the fixture has to be one escaping actually inflates: {raw:?} vs {encoded:?}"
+        );
+
+        // A span strictly between the two measurements. Against the encoded
+        // size the replacement is a loss and must be refused; against the raw
+        // size it looks like a win, which is the bug.
+        let between = (raw.bytes() + encoded.bytes()) / 2;
+        let span = PromptSize {
+            ascii_bytes: between,
+            other_bytes: 0,
+            chars: between,
+        };
+        assert!(
+            summary_would_not_shrink(span, None, &quoted),
+            "measuring the summary raw would call this a win; encoded it is a loss"
+        );
+
+        // And the same span against a summary that genuinely fits.
+        assert!(!summary_would_not_shrink(span, None, &"x".repeat(200)));
     }
 
     #[test]
@@ -1899,6 +1983,13 @@ mod tests {
         // with no way back, so pay for the agent's model instead.
         assert_eq!(
             resolve_summarizer_model("small".into(), "big", Some(50_000), Some(200_000), 60_000),
+            "big"
+        );
+        // The summarizer request is not a subset of the agent's: the agent
+        // instructions come out and the summarizer's instruction and merge
+        // wrapper go in. A prompt sitting exactly on the limit does not fit.
+        assert_eq!(
+            resolve_summarizer_model("small".into(), "big", Some(50_000), Some(200_000), 50_000),
             "big"
         );
         // No published limit for the summary model: nothing to check against,

@@ -276,7 +276,10 @@ the only symptom would be a conversation that stops compacting exactly when it
 has grown large enough to need it.
 
 `resolveSummarizerModel` therefore falls back to the agent's own model when the
-prompt does not fit the configured one. The agent's model fits by construction:
+prompt does not fit the configured one — reserving the summarizer request's own
+fixed overhead as it does, since that request is not a subset of the agent's:
+the agent instructions come out and the summarizer's instruction and merge
+wrapper go in. The agent's model fits by construction:
 it was carrying that prompt a moment ago. The yardstick is the whole prompt
 rather than the span that will actually be summarized — an over-estimate, since
 the span excludes the kept turns and the tool schemas, but the span is not known
@@ -325,6 +328,13 @@ written in the same script as the material it summarizes, so an ASCII
 conversation prices at ~1 byte per character and a CJK one at 3 — where a fixed
 worst-case 4 would stop ASCII conversations compacting until their spans reached
 32KB.
+
+Both sides of that comparison have to be in the same unit, and the unit is
+**serialized bytes**. The span is measured after JSON encoding, so the summary
+has to be too: measuring its raw text undercounts it by every quote, backslash
+and newline the encoder has to escape, and a summary of quoted code is mostly
+those. `summary_message_size` measures the message the prompt will actually
+carry, envelope included, and the previous summary is measured the same way.
 
 **That rate is a heuristic, so the question is asked twice.** "A summary is
 written in the script it summarizes" is usually true and cannot be relied on: a
