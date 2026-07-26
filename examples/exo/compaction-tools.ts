@@ -132,10 +132,21 @@ export async function compactionInstruction(
   }
   // Same read the prompt assembly does; if it comes back empty, assembly took
   // the full-history fallback and there is no summary to point at.
-  const summary = await conversation.readArtifactText({
-    artifactId: checkpoint.artifactId,
-    version: checkpoint.artifactVersion,
-  });
+  //
+  // A read that *throws* is the same situation and must not escape. This runs
+  // while instructions are being assembled, before materialization gets its
+  // chance to fall back — so propagating would fail every turn on a
+  // conversation whose raw log is perfectly usable, over a notice that is
+  // decoration.
+  let summary: string | null = null;
+  try {
+    summary = await conversation.readArtifactText({
+      artifactId: checkpoint.artifactId,
+      version: checkpoint.artifactVersion,
+    });
+  } catch {
+    return null;
+  }
   if (summary === null || summary.length === 0) {
     return null;
   }

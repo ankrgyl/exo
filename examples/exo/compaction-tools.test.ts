@@ -62,6 +62,8 @@ function makeContext(options: {
   events: Event[];
   summary?: string;
   compaction?: Record<string, unknown> | null;
+  /** Makes the artifact read reject rather than return null. */
+  failArtifactReads?: boolean;
 }): TurnContext {
   const conversation = {
     record: { id: "conv-1", slug: "conv-1", name: "conv" },
@@ -82,6 +84,9 @@ function makeContext(options: {
       return { events, cursor: events.at(-1)?.id };
     },
     async readArtifactText() {
+      if (options.failArtifactReads) {
+        throw new Error("artifact store unavailable");
+      }
       return options.summary ?? null;
     },
   };
@@ -194,6 +199,22 @@ describe("compactionInstruction", () => {
     expect(
       await compactionInstruction(
         makeContext({ events: [checkpointEvent()], summary: undefined }),
+      ),
+    ).toBeNull();
+  });
+
+  it("stays silent when the artifact store refuses the read", async () => {
+    // This runs while instructions are assembled, before materialization gets
+    // its chance to fall back — so letting the rejection escape would fail
+    // every turn on a conversation whose raw log is perfectly usable, over a
+    // notice that is decoration.
+    expect(
+      await compactionInstruction(
+        makeContext({
+          events: [checkpointEvent()],
+          summary: "S",
+          failArtifactReads: true,
+        }),
       ),
     ).toBeNull();
   });

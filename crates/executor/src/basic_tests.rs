@@ -1979,7 +1979,10 @@ async fn the_summarizer_call_carries_model_credentials() {
                 prompt_size: PromptSize {
                     ascii_bytes: 1_000,
                     other_bytes: 0,
+                    chars: 1_000,
                 },
+                round: 0,
+                turn_trace: None,
             },
             &mut false,
         )
@@ -1991,6 +1994,74 @@ async fn the_summarizer_call_carries_model_credentials() {
     assert!(
         requests[0].tools.is_empty(),
         "the summarizer reads, it does not act"
+    );
+}
+
+#[tokio::test]
+async fn summarizer_usage_names_the_model_even_when_the_provider_does_not() {
+    // `ModelResponse::model` is optional and providers may leave it unset. The
+    // turn's own rounds fill it from the request before accounting, because
+    // `build_usage_record` has no other way to find a price-table entry — with
+    // it empty the compaction usage event is filed under a blank model with no
+    // cost, which defeats the point of recording it. Routing the summarizer
+    // through `complete_model_round` is what applies the same normalization.
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+
+    let model = Arc::new(FakeModelClient::new(vec![ModelResponse {
+        provider_cost_usd: None,
+        response_id: Some(Uuid7::now()),
+        messages: vec![assistant_message("SUMMARY")],
+        tool_calls: vec![],
+        usage: Some(UniversalUsage {
+            prompt_tokens: Some(1_000),
+            completion_tokens: Some(50),
+            ..Default::default()
+        }),
+        // The case under test: the provider echoes no model id.
+        model: None,
+        ttft: None,
+        duration: None,
+    }]));
+    let executor = BasicExecutor::new(Arc::clone(&model), Arc::new(FakeToolRuntime::default()));
+    let turn = open_turn(conversation.as_ref()).await;
+
+    executor
+        .maybe_compact(
+            conversation.as_ref(),
+            turn.as_ref(),
+            &AgentConfig {
+                compaction: Some(CompactionConfig {
+                    keep_recent_turns: 1,
+                    fallback_char_budget: 0,
+                    summary_model: Some("cheap-summary-model".to_string()),
+                    ..CompactionConfig::default()
+                }),
+                ..default_agent_config()
+            },
+            crate::basic::CompactionTrigger {
+                model: "test-model",
+                max_input_tokens: None,
+                prompt_tokens: None,
+                prompt_size: PromptSize {
+                    ascii_bytes: 1_000,
+                    other_bytes: 0,
+                    chars: 1_000,
+                },
+                round: 0,
+                turn_trace: None,
+            },
+            &mut false,
+        )
+        .await;
+    turn.finish().await.expect("finish turn");
+
+    let usage = compaction_usage_records(conversation.as_ref()).await;
+    assert_eq!(usage.len(), 1, "one summarizer call, one usage event");
+    assert_eq!(
+        usage[0].model, "cheap-summary-model",
+        "usage must name the model actually asked for: {:?}",
+        usage[0]
     );
 }
 
@@ -2030,7 +2101,10 @@ async fn compaction_is_attempted_at_most_once_per_turn() {
                     prompt_size: PromptSize {
                         ascii_bytes: 1_000,
                         other_bytes: 0,
+                        chars: 1_000,
                     },
+                    round: 0,
+                    turn_trace: None,
                 },
                 &mut attempted,
             )
@@ -2579,6 +2653,8 @@ async fn summarizer_usage_is_recorded_without_entering_the_prompt() {
                 prompt_tokens: None,
                 // Far past any budget, so the fallback trigger fires.
                 prompt_size: prompt_size(&[user_message(&"x".repeat(1_000_000))]),
+                round: 0,
+                turn_trace: None,
             },
             &mut attempted,
         )

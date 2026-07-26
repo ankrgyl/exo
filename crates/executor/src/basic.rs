@@ -92,6 +92,21 @@ pub(crate) struct CompactionTrigger<'a> {
     pub(crate) prompt_tokens: Option<u64>,
     /// Serialized size of the request, messages and tool schemas together.
     pub(crate) prompt_size: PromptSize,
+    /// Round index and trace sink for the summarizer's own model call. It is a
+    /// real, billable request whose output shapes every later prompt, so it
+    /// belongs in the same trace as the round that triggered it.
+    pub(crate) round: usize,
+    pub(crate) turn_trace: Option<&'a dyn TurnExecutionTrace>,
+}
+
+/// Where a summarizer request is sent, and where it is recorded.
+struct SummarizerCall<'a> {
+    /// Model binding name, for credentials and base URL.
+    binding: &'a str,
+    /// Already-resolved model id, which may be the summary model or the agent's.
+    model: &'a str,
+    round: usize,
+    turn_trace: Option<&'a dyn TurnExecutionTrace>,
 }
 
 struct ToolRoundContext<'a> {
@@ -249,6 +264,8 @@ where
             max_input_tokens,
             prompt_tokens,
             prompt_size,
+            round,
+            turn_trace,
         } = trigger;
         // At most one attempt per turn: compaction can only cut at a
         // `turn_ended` boundary, and none appears while a turn is in flight, so
@@ -304,8 +321,12 @@ where
                     input,
                     conversation,
                     &summarizer_usage,
-                    &agent_config.model,
-                    &summary_model,
+                    SummarizerCall {
+                        binding: &agent_config.model,
+                        model: &summary_model,
+                        round,
+                        turn_trace,
+                    },
                 ))
             },
         )
@@ -355,9 +376,14 @@ where
         input: SummarizeInput,
         conversation: &dyn ConversationHandle,
         usage_sink: &std::sync::Mutex<Option<Box<UsageRecord>>>,
-        binding: &str,
-        model: &str,
+        call: SummarizerCall<'_>,
     ) -> Result<String> {
+        let SummarizerCall {
+            binding,
+            model,
+            round,
+            turn_trace,
+        } = call;
         let model_binding = resolve_model_binding(conversation, binding).await?;
         let instruction = summarizer_instruction(&input);
         let SummarizeInput {
@@ -373,20 +399,32 @@ where
         }
         messages.extend(span);
 
+        // Through `complete_model_round` rather than `ModelClient::complete`
+        // directly. That is the only path that opens an LLM trace span, and the
+        // only one that fills `response.model` from the request when a provider
+        // does not echo it back — without which `build_usage_record` has no
+        // model to look up in the price table and files this call's cost under
+        // an empty string. Streaming is off: nobody is watching a summary being
+        // written, and the turn's own stream should not carry it.
         let response = self
-            .model
-            .complete(ModelRequest {
-                model: model.to_string(),
-                api_key: model_binding.api_key,
-                base_url: model_binding.base_url,
-                messages,
-                // No tools: the summarizer reads, it does not act.
-                tools: Vec::new(),
-                // Bound the response at request time. `cap_summary` truncates
-                // only after generation, so without this a runaway summary is
-                // paid for in full before being thrown away.
-                max_output_tokens: Some(summarizer_max_output_tokens(max_chars)),
-            })
+            .complete_model_round(
+                ModelRequest {
+                    model: model.to_string(),
+                    api_key: model_binding.api_key,
+                    base_url: model_binding.base_url,
+                    messages,
+                    // No tools: the summarizer reads, it does not act.
+                    tools: Vec::new(),
+                    // Bound the response at request time. `cap_summary`
+                    // truncates only after generation, so without this a
+                    // runaway summary is paid for in full before being thrown
+                    // away.
+                    max_output_tokens: Some(summarizer_max_output_tokens(max_chars)),
+                },
+                round,
+                ExecutorStreamMode::Disabled,
+                turn_trace,
+            )
             .await?;
         let text = assistant_messages_text(&response.messages);
         *usage_sink.lock().expect("summarizer usage poisoned") =
@@ -446,6 +484,8 @@ where
                         max_input_tokens,
                         prompt_tokens: Some(prompt_size.estimated_tokens()),
                         prompt_size,
+                        round: round as usize,
+                        turn_trace,
                     },
                     &mut compaction_attempted,
                 )
@@ -497,6 +537,8 @@ where
                     max_input_tokens,
                     prompt_tokens,
                     prompt_size,
+                    round: round as usize,
+                    turn_trace,
                 },
                 &mut compaction_attempted,
             )

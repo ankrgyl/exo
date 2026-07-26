@@ -187,7 +187,20 @@ pub(crate) fn select_cut_point(events: &[Event], keep_recent_turns: u32) -> Opti
     None
 }
 
-/// True when some `TurnStarted` in `events` has no matching `TurnEnded`.
+/// Completed turns after which an unfinished one is treated as abandoned.
+///
+/// A process that dies between `TurnStarted` and `TurnEnded` leaves a marker
+/// nothing will ever balance. Honouring it forever would make `has_pending_turn`
+/// reject every future boundary, so a conversation that survived one crash could
+/// never compact again and would grow until the model refused it — an
+/// unrecoverable outcome, traded for the recoverable one this check exists to
+/// avoid (a live turn seeing its own input paraphrased). A turn genuinely still
+/// waiting on a model response across this many *completed* turns of the same
+/// conversation is not a case worth protecting.
+const ABANDONED_TURN_GRACE: usize = 8;
+
+/// True when some `TurnStarted` in `events` has no matching `TurnEnded` and is
+/// recent enough to still plausibly be running.
 ///
 /// A `TurnEnded` marker proves *its own* turn finished, not that the
 /// conversation is quiescent. Turns on one conversation are not serialized, so
@@ -199,16 +212,42 @@ pub(crate) fn select_cut_point(events: &[Event], keep_recent_turns: u32) -> Opti
 ///
 /// `has_pending_tool_call` cannot see this: the turn has not requested a tool
 /// yet, and may never.
+///
+/// Turns are matched by `turn_id`, not by counting. A plain counter cannot tell
+/// *which* start is unmatched — after a crash, later turns' `TurnEnded` markers
+/// balance the abandoned one and the imbalance appears to belong to the newest
+/// turn instead, which is exactly the turn that never ages out.
 fn has_pending_turn(events: &[Event]) -> bool {
-    let mut open = 0i64;
+    // Open turns, each remembering how many turns had already ended when it
+    // started, so its age can be measured in completed turns.
+    let mut identified: HashMap<exoharness::TurnId, usize> = HashMap::new();
+    // Markers the harness did not attribute to a turn. Matched newest-first:
+    // under last-in-first-out an abandoned start stays at the bottom and ages,
+    // where first-in-first-out would hand it every subsequent turn's end.
+    let mut anonymous: Vec<usize> = Vec::new();
+    let mut ended = 0usize;
+
     for event in events {
-        match &event.data {
-            EventData::TurnStarted => open += 1,
-            EventData::TurnEnded => open -= 1,
+        match (&event.data, event.turn_id) {
+            (EventData::TurnStarted, Some(turn_id)) => {
+                identified.insert(turn_id, ended);
+            }
+            (EventData::TurnStarted, None) => anonymous.push(ended),
+            (EventData::TurnEnded, turn_id) => {
+                ended += 1;
+                let matched = turn_id.is_some_and(|turn_id| identified.remove(&turn_id).is_some());
+                if !matched {
+                    anonymous.pop();
+                }
+            }
             _ => {}
         }
     }
-    open > 0
+
+    identified
+        .values()
+        .chain(anonymous.iter())
+        .any(|ended_at_start| ended - ended_at_start < ABANDONED_TURN_GRACE)
 }
 
 /// True when some `ToolRequested` in `events` has no matching `ToolResult`.
@@ -285,6 +324,8 @@ pub(crate) struct PromptSize {
     pub ascii_bytes: u64,
     /// UTF-8 bytes outside ASCII.
     pub other_bytes: u64,
+    /// Code points, so a cap expressed in characters can be priced in bytes.
+    pub chars: u64,
 }
 
 impl PromptSize {
@@ -293,6 +334,7 @@ impl PromptSize {
         Self {
             ascii_bytes,
             other_bytes: text.len() as u64 - ascii_bytes,
+            chars: text.chars().count() as u64,
         }
     }
 
@@ -300,6 +342,12 @@ impl PromptSize {
     /// no-growth guard — both of which want a size, not a token count.
     pub fn bytes(self) -> u64 {
         self.ascii_bytes + self.other_bytes
+    }
+
+    /// Bytes each character of this text costs, rounded up. Used to price a
+    /// character cap against a byte measurement without assuming a script.
+    fn bytes_per_char(self) -> u64 {
+        self.bytes().div_ceil(self.chars.max(1)).max(1)
     }
 
     /// Conservative token estimate, for the pre-request trigger.
@@ -316,6 +364,7 @@ impl std::ops::Add for PromptSize {
         Self {
             ascii_bytes: self.ascii_bytes + other.ascii_bytes,
             other_bytes: self.other_bytes + other.other_bytes,
+            chars: self.chars + other.chars,
         }
     }
 }
@@ -555,10 +604,10 @@ async fn compact(
     );
 
     if compaction_would_not_shrink(
-        prompt_size(&messages).bytes(),
+        prompt_size(&messages),
         previous_summary
             .as_ref()
-            .map(|summary| summary.chars().count() as u64),
+            .map(|summary| PromptSize::of_str(summary)),
         config.effective_max_summary_chars(),
     ) {
         return Ok(CompactionOutcome::Skipped {
@@ -800,30 +849,38 @@ pub(crate) fn resolve_summarizer_model(
 /// huge tool result, say. Replacing a smaller prefix with a summary that could
 /// be larger grows the prompt instead of shrinking it.
 ///
-/// Both sides are measured as they appear in a prompt, envelope included: the
-/// summary does not go in bare, it goes in wrapped by `summary_message`, and
-/// that wrapper is several hundred characters of its own. Comparing bare summary
-/// text against enveloped span text makes the guard too permissive by exactly
-/// the wrapper's size — which is precisely the band where compaction is least
-/// likely to pay for itself.
+/// Everything here is measured in **serialized bytes**, including the envelope
+/// `summary_message` wraps the summary in. Two unit slips are possible and both
+/// were made: comparing bare summary text against enveloped span text (too
+/// permissive by the wrapper's size), and comparing a byte-counted span against
+/// a cap counted in *characters* — an 8000-character emoji summary is 32KB, so
+/// a 9KB span looked like a win and would have quadrupled.
+///
+/// The cap is a character count, so pricing it in bytes needs a bytes-per-
+/// character rate. That rate is taken from the span itself rather than assumed:
+/// a summary is written in the same script as the material it summarizes, so an
+/// ASCII conversation is priced at ~1 byte per character and a CJK one at 3
+/// — where a fixed worst-case 4 would stop ASCII conversations compacting at
+/// all until their spans reached 32KB.
 fn compaction_would_not_shrink(
-    span_chars: u64,
-    previous_summary_chars: Option<u64>,
+    span: PromptSize,
+    previous_summary: Option<PromptSize>,
     max_summary_chars: u32,
 ) -> bool {
-    let envelope = summary_envelope_chars();
+    let envelope = summary_envelope_bytes();
     // The previous summary is already wrapped where it sits in the prompt, so
     // it costs its own envelope too.
-    let current = span_chars + previous_summary_chars.map_or(0, |chars| envelope + chars);
-    current <= envelope + max_summary_chars as u64
+    let current = span.bytes() + previous_summary.map_or(0, |summary| envelope + summary.bytes());
+    let replacement = envelope + u64::from(max_summary_chars) * span.bytes_per_char();
+    current <= replacement
 }
 
-/// Prompt cost of the `summary_message` wrapper, excluding the summary itself.
+/// Serialized bytes the `summary_message` wrapper adds, summary text excluded.
 ///
 /// Measured rather than hard-coded so it cannot drift out of step with the
 /// wrapper text: the guard that uses it decides whether compaction is worth
 /// running at all, and a stale constant would quietly bias that decision.
-fn summary_envelope_chars() -> u64 {
+fn summary_envelope_bytes() -> u64 {
     prompt_size(std::slice::from_ref(&summary_message(""))).bytes()
 }
 
@@ -1152,6 +1209,75 @@ mod tests {
         assert!(!splits_a_tool_round(&events, cut.up_to_event_id));
     }
 
+    /// A complete turn with both markers carrying the same `turn_id`, the way
+    /// the harness writes them.
+    fn identified_turn(label: &str) -> Vec<Event> {
+        let turn_id = Uuid7::now();
+        let with_turn = |mut event: Event| {
+            event.turn_id = Some(turn_id);
+            event
+        };
+        vec![
+            with_turn(event(EventData::TurnStarted)),
+            with_turn(messages_event(&format!("turn {label}"))),
+            with_turn(event(EventData::TurnEnded)),
+        ]
+    }
+
+    #[test]
+    fn an_abandoned_turn_stops_blocking_compaction_once_it_ages_out() {
+        // A process that dies between TurnStarted and TurnEnded leaves a marker
+        // nothing will ever balance. Honouring it forever means compaction is
+        // permanently dead on that conversation — it grows until the model
+        // refuses it, with no way back. That is strictly worse than the
+        // paraphrase risk the pending-turn check exists to avoid.
+        let crashed_turn_id = Uuid7::now();
+        let mut crashed = event(EventData::TurnStarted);
+        crashed.turn_id = Some(crashed_turn_id);
+        let mut crashed_input = messages_event("turn that never finished");
+        crashed_input.turn_id = Some(crashed_turn_id);
+
+        let mut events = vec![crashed, crashed_input];
+        // The grace is measured at the *candidate* boundary, and `keep` holds
+        // some turns back from being candidates — so it takes a couple more
+        // completed turns than the grace itself before a cut becomes legal.
+        for index in 0..(ABANDONED_TURN_GRACE + 2) {
+            events.extend(identified_turn(&format!("after-{index}")));
+        }
+
+        let cut = select_cut_point(&events, 1)
+            .expect("an abandoned turn must not block compaction forever");
+        // The cut lands among the completed turns that followed the crash.
+        let cut_index = events
+            .iter()
+            .position(|candidate| candidate.id == cut.up_to_event_id)
+            .expect("cut event present");
+        assert!(matches!(events[cut_index].data, EventData::TurnEnded));
+    }
+
+    #[test]
+    fn a_recently_started_turn_still_blocks_the_boundary() {
+        // The other half of the same rule: within the grace window an open turn
+        // is treated as live, because it probably is.
+        let open_turn_id = Uuid7::now();
+        let mut open = event(EventData::TurnStarted);
+        open.turn_id = Some(open_turn_id);
+        let mut open_input = messages_event("turn still waiting on the model");
+        open_input.turn_id = Some(open_turn_id);
+
+        let mut events = identified_turn("first");
+        let quiescent = events.last().expect("first turn ended").id;
+        events.push(open);
+        events.push(open_input);
+        events.extend(identified_turn("second"));
+        events.extend(identified_turn("third"));
+
+        // Second and third ended while the open turn was still running, so the
+        // only usable boundary is the one before it started.
+        let cut = select_cut_point(&events, 1).expect("cut point");
+        assert_eq!(cut.up_to_event_id, quiescent);
+    }
+
     #[test]
     fn refuses_a_boundary_where_another_turn_is_still_open() {
         // Turns A and C overlap: C has appended its user message and is waiting
@@ -1187,28 +1313,58 @@ mod tests {
 
     #[test]
     fn the_no_growth_guard_counts_the_summary_envelope() {
-        let envelope = summary_envelope_chars();
+        let envelope = summary_envelope_bytes();
         assert!(
             envelope > 100,
-            "the wrapper is substantial enough to matter: {envelope} chars"
+            "the wrapper is substantial enough to matter: {envelope} bytes"
         );
         let cap = 1_000u32;
-        // What replaces the span is the wrapper *plus* up to `cap` characters of
-        // summary, so a span smaller than both cannot shrink the prompt.
+        let ascii = |bytes: u64| PromptSize::of_str(&"x".repeat(bytes as usize));
+
+        // What replaces the span is the wrapper *plus* up to `cap` characters
+        // of summary, so a span smaller than both cannot shrink the prompt.
         assert!(compaction_would_not_shrink(
-            cap as u64 + envelope,
+            ascii(u64::from(cap) + envelope),
             None,
             cap
         ));
         assert!(!compaction_would_not_shrink(
-            cap as u64 + envelope + 1,
+            ascii(u64::from(cap) + envelope + 1),
             None,
             cap
         ));
         // A previous summary sits in the prompt wrapped too, so it carries its
         // own envelope on the current-size side of the comparison.
-        assert!(compaction_would_not_shrink(0, Some(cap as u64), cap));
-        assert!(!compaction_would_not_shrink(1, Some(cap as u64), cap));
+        assert!(compaction_would_not_shrink(
+            ascii(0),
+            Some(ascii(u64::from(cap))),
+            cap
+        ));
+        assert!(!compaction_would_not_shrink(
+            ascii(1),
+            Some(ascii(u64::from(cap))),
+            cap
+        ));
+    }
+
+    #[test]
+    fn the_no_growth_guard_prices_the_cap_in_the_span_s_own_bytes_per_char() {
+        // The cap counts characters; the span counts bytes. An 8000-character
+        // emoji summary is ~32KB, so measuring a multibyte span against a
+        // character cap as if both were bytes lets compaction quadruple a
+        // prompt while reporting that it shrank it.
+        let cap = 1_000u32;
+        let emoji_span = PromptSize::of_str(&"🙂".repeat(cap as usize));
+        assert_eq!(emoji_span.bytes(), u64::from(cap) * 4);
+        // Four bytes per character in, four bytes per character out: a span of
+        // exactly `cap` emoji cannot be beaten by a summary of `cap` emoji.
+        assert!(compaction_would_not_shrink(emoji_span, None, cap));
+
+        // ASCII of the same byte count is a different story — there the
+        // summary really is capped at about `cap` bytes, so the span is worth
+        // replacing.
+        let ascii_span = PromptSize::of_str(&"x".repeat(cap as usize * 4));
+        assert!(!compaction_would_not_shrink(ascii_span, None, cap));
     }
 
     #[test]

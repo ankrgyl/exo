@@ -62,6 +62,12 @@ class StubTarget {
   private readonly artifacts = new Map<string, string>();
   private artifactSeq = 0;
   failArtifactWrite = false;
+  /**
+   * Makes `readArtifactText` throw rather than return null. The two are
+   * different failures — a vanished artifact and a store that will not answer —
+   * and the write path has to survive both.
+   */
+  failArtifactReads = false;
 
   constructor(events: Event[]) {
     this.events = events;
@@ -89,6 +95,9 @@ class StubTarget {
   }
 
   async readArtifactText(args: { artifactId: string }): Promise<string | null> {
+    if (this.failArtifactReads) {
+      throw new Error("artifact store unavailable");
+    }
     return this.artifacts.get(args.artifactId) ?? null;
   }
 
@@ -253,6 +262,36 @@ describe("runCompaction", () => {
     // The surviving checkpoint points at the winner's artifact, not the
     // loser's — which was written before the race was noticed.
     expect(payload.artifact_id).toBe(artifactId(1));
+  });
+
+  it("rebuilds from the log when the prior summary read rejects", async () => {
+    // Distinct from a missing artifact: the store errors. Letting that escape
+    // fails the whole compaction, and every later attempt hits the same
+    // artifact and fails identically — so an oversized conversation could never
+    // publish a replacement checkpoint. Falling back costs one larger
+    // summarizer call and loses nothing.
+    const stub = target([...turn("a"), ...turn("b"), ...turn("c")]);
+    await runCompaction(args(stub));
+    expect(checkpointEvents(stub)).toHaveLength(1);
+
+    stub.appended.length = 0;
+    stub.events.push(...turn("d"), ...turn("e"));
+    stub.failArtifactReads = true;
+    const seen: (string | null)[] = [];
+    const result = await runCompaction(
+      args(stub, {
+        summarize: (async (input) => {
+          seen.push(input.previousSummary);
+          return "REBUILT SUMMARY";
+        }) satisfies SummarizeFn,
+      }),
+    );
+
+    expect(result.status).toBe("compacted");
+    // No previous summary to merge, so the pass rebuilt from the start.
+    expect(seen[0]).toBeNull();
+    const payload = checkpointPayload(checkpointEvents(stub)[0]);
+    expect(payload.previous_checkpoint_id).toBeNull();
   });
 
   it("caps an oversized summary rather than trusting the model", async () => {

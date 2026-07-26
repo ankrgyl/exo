@@ -89,11 +89,26 @@ message and be waiting on a model response when that marker lands. Cutting there
 would fold the other turn's own request into the summary, and its next round
 would materialize a prompt where its verbatim input has been replaced by a
 paraphrase — while its later events keep arriving after the cut. So a boundary is
-usable only when every turn open before it has also closed, which the selector
-checks by balancing `turn_started` against `turn_ended`. The pending-tool-call
+usable only when every turn open before it has also closed. The pending-tool-call
 check cannot see this case: the other turn has not requested a tool yet, and may
 never. Both markers therefore have to be in the scan query — dropping
 `turn_started` does not fail loudly, it just makes the check blind.
+
+**But "open" has to age out.** A process that dies between `turn_started` and
+`turn_ended` leaves a marker nothing will ever balance, and honouring it forever
+means compaction is permanently dead on that conversation — it grows until the
+model refuses it, with no way back. That is strictly worse than the failure the
+check prevents: a live turn seeing its own input paraphrased is recoverable, an
+unusable conversation is not. An unfinished turn therefore stops blocking once
+`ABANDONED_TURN_GRACE` (8) other turns have _completed_ after it.
+
+Turns are matched by `turn_id`, not by counting starts against ends. A plain
+counter cannot tell _which_ start is unmatched: after a crash, later turns'
+`turn_ended` markers balance the abandoned one and the imbalance appears to
+belong to the newest turn — which is exactly the turn that never ages out. Where
+the harness leaves a marker unattributed, the fallback matches newest-first, so
+an abandoned start sinks to the bottom of the stack and ages rather than being
+handed every subsequent turn's end.
 
 A property test over randomised event streams covers the tool-round invariant in
 both languages. Mutating the cut point to land mid-round makes it fail; so does
@@ -264,6 +279,17 @@ bare summary text to enveloped span text makes the guard too permissive by
 exactly the wrapper's size — precisely the band where compaction is least likely
 to pay for itself.
 
+The guard has a second unit trap, easy to miss because both numbers look like
+sizes. The span is measured in serialized **bytes**; the cap counts
+**characters**. An 8000-character emoji summary is 32KB, so a 9KB span compared
+naively against an 8000 cap looks like a clear win and would quadruple the
+prompt. Pricing the cap in bytes needs a bytes-per-character rate, and that rate
+is taken from the span itself rather than assumed worst-case: a summary is
+written in the same script as the material it summarizes, so an ASCII
+conversation prices at ~1 byte per character and a CJK one at 3 — where a fixed
+worst-case 4 would stop ASCII conversations compacting until their spans reached
+32KB.
+
 ## What survives compaction
 
 - **Instructions** — rebuilt every round, never sourced from events.
@@ -282,12 +308,17 @@ stopped shrinking.
 An empty summary is refused outright: checkpointing one would drop real history
 and put nothing in its place, which is strictly worse than a large prompt. A
 checkpoint whose artifact has vanished falls back to full history for the same
-reason — and so does one whose artifact the store _refuses_. A missing artifact
-and an erroring read are different failures but the same situation: the raw log
-is intact either way, so propagating the error would take a working conversation
-down over something recoverable, and take it down repeatedly, since every later
-turn consults the same checkpoint. Losing the summary costs prompt space; losing
-the turn costs the agent.
+reason — and so does one whose artifact the store _refuses_, on the read path,
+on the write path (where an unreadable previous summary rebuilds from the start
+of the log rather than failing the compaction), and in `compactionInstruction`,
+which runs while instructions are assembled and so gets no later chance to fall
+back.
+
+A missing artifact and an erroring read are different failures but the same
+situation: the raw log is intact either way, so propagating the error would take
+a working conversation down over something recoverable, and take it down
+repeatedly, since every later turn consults the same checkpoint. Losing the
+summary costs prompt space; losing the turn costs the agent.
 
 That fallback is also why an unreadable summary **stops the chain**. Compacting
 from a broken checkpoint's boundary would summarize only the tail and then write
@@ -436,6 +467,9 @@ summarizer for the same result.
   script at once; the provider's own count is the accurate mechanism.
 - Summaries are flat, not hierarchical. If a flat summary proves lossy in
   practice, tiered summaries are the next step.
+- The summarizer call is a real model round and goes through
+  `complete_model_round`, so it is traced and its usage names the model it
+  actually asked for. Building its request by hand is how it lost both.
 - Summary _quality_ is not covered by the test suite — the deterministic tests
   inject a fake summarizer. A fact-retention eval (plant facts before the cut,
   check recall after) belongs in Braintrust, which is already wired through

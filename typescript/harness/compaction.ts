@@ -160,8 +160,22 @@ export function selectCutPoint(
 }
 
 /**
+ * Completed turns after which an unfinished one is treated as abandoned.
+ *
+ * A process that dies between `turn_started` and `turn_ended` leaves a marker
+ * nothing will ever balance. Honouring it forever would make `hasPendingTurn`
+ * reject every future boundary, so a conversation that survived one crash could
+ * never compact again and would grow until the model refused it — an
+ * unrecoverable outcome, traded for the recoverable one this check exists to
+ * avoid (a live turn seeing its own input paraphrased). A turn genuinely still
+ * waiting on a model response across this many *completed* turns of the same
+ * conversation is not a case worth protecting.
+ */
+export const ABANDONED_TURN_GRACE = 8;
+
+/**
  * True when some `turn_started` at or before `index` has no matching
- * `turn_ended`.
+ * `turn_ended` and is recent enough to still plausibly be running.
  *
  * A `turn_ended` marker proves *its own* turn finished, not that the
  * conversation is quiescent. Turns on one conversation are not serialized, so
@@ -173,18 +187,46 @@ export function selectCutPoint(
  *
  * `hasPendingToolCall` cannot see this: the turn has not requested a tool yet,
  * and may never.
+ *
+ * Turns are matched by `turnId`, not by counting. A plain counter cannot tell
+ * *which* start is unmatched — after a crash, later turns' `turn_ended` markers
+ * balance the abandoned one and the imbalance appears to belong to the newest
+ * turn instead, which is exactly the turn that never ages out.
  */
 function hasPendingTurn(events: Event[], index: number): boolean {
-  let open = 0;
+  // Open turns, each remembering how many turns had already ended when it
+  // started, so its age can be measured in completed turns.
+  const identified = new Map<string, number>();
+  // Markers the harness did not attribute to a turn. Matched newest-first:
+  // under last-in-first-out an abandoned start stays at the bottom and ages,
+  // where first-in-first-out would hand it every subsequent turn's end.
+  const anonymous: number[] = [];
+  let ended = 0;
+
   for (let i = 0; i <= index; i += 1) {
-    const type = events[i].data.type;
-    if (type === TURN_STARTED) {
-      open += 1;
-    } else if (type === TURN_ENDED) {
-      open -= 1;
+    const event = events[i];
+    const turnId = event.turnId;
+    if (event.data.type === TURN_STARTED) {
+      if (typeof turnId === "string") {
+        identified.set(turnId, ended);
+      } else {
+        anonymous.push(ended);
+      }
+    } else if (event.data.type === TURN_ENDED) {
+      ended += 1;
+      const matched = typeof turnId === "string" && identified.delete(turnId);
+      if (!matched) {
+        anonymous.pop();
+      }
     }
   }
-  return open > 0;
+
+  for (const endedAtStart of [...identified.values(), ...anonymous]) {
+    if (ended - endedAtStart < ABANDONED_TURN_GRACE) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** True when some tool_requested at or before `index` has no tool_result yet. */
@@ -278,13 +320,17 @@ export class PromptSize {
     readonly asciiBytes = 0,
     /** UTF-8 bytes outside ASCII. */
     readonly otherBytes = 0,
+    /** Code points, so a cap expressed in characters can be priced in bytes. */
+    readonly chars = 0,
   ) {}
 
   /** Size of a string as UTF-8, without allocating an encoded copy of it. */
   static ofText(text: string): PromptSize {
     let ascii = 0;
     let other = 0;
+    let chars = 0;
     for (let i = 0; i < text.length; i += 1) {
+      chars += 1;
       const unit = text.charCodeAt(i);
       if (unit < 0x80) {
         ascii += 1;
@@ -304,7 +350,7 @@ export class PromptSize {
         other += 3;
       }
     }
-    return new PromptSize(ascii, other);
+    return new PromptSize(ascii, other, chars);
   }
 
   /** Size of a value as the JSON that will actually be sent. */
@@ -315,18 +361,29 @@ export class PromptSize {
   static sum(sizes: PromptSize[]): PromptSize {
     let ascii = 0;
     let other = 0;
+    let chars = 0;
     for (const size of sizes) {
       ascii += size.asciiBytes;
       other += size.otherBytes;
+      chars += size.chars;
     }
-    return new PromptSize(ascii, other);
+    return new PromptSize(ascii, other, chars);
   }
 
   plus(other: PromptSize): PromptSize {
     return new PromptSize(
       this.asciiBytes + other.asciiBytes,
       this.otherBytes + other.otherBytes,
+      this.chars + other.chars,
     );
+  }
+
+  /**
+   * Bytes each character of this text costs, rounded up. Used to price a
+   * character cap against a byte measurement without assuming a script.
+   */
+  bytesPerChar(): number {
+    return Math.max(1, Math.ceil(this.bytes / Math.max(1, this.chars)));
   }
 
   /**
@@ -858,10 +915,7 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
 
   const existing = await readActiveCheckpointEvent(conversation);
   const previousSummary = existing
-    ? await conversation.readArtifactText({
-        artifactId: existing.checkpoint.artifactId,
-        version: existing.checkpoint.artifactVersion,
-      })
+    ? await readSummaryOrFallBack(conversation, existing.checkpoint)
     : null;
 
   // A checkpoint whose summary artifact cannot be read must not be chained off.
@@ -893,8 +947,8 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
 
   if (
     compactionWouldNotShrink(
-      promptSize(compactedMessages).bytes,
-      previousSummary === null ? null : codePointCount(previousSummary),
+      promptSize(compactedMessages),
+      previousSummary === null ? null : PromptSize.ofText(previousSummary),
       policy.maxSummaryChars,
     )
   ) {
@@ -981,36 +1035,70 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
  * tool result, say. Replacing a smaller prefix with a summary that could be
  * larger grows the prompt instead of shrinking it.
  *
- * Both sides are measured as they appear in a prompt, envelope included: the
- * summary does not go in bare, it goes in wrapped by `summaryMessage`, and that
- * wrapper is several hundred characters of its own. Comparing bare summary text
- * against enveloped span text makes the guard too permissive by exactly the
- * wrapper's size — which is precisely the band where compaction is least likely
- * to pay for itself.
+ * Everything here is measured in **serialized bytes**, including the envelope
+ * `summaryMessage` wraps the summary in. Two unit slips are possible and both
+ * were made: comparing bare summary text against enveloped span text (too
+ * permissive by the wrapper's size), and comparing a byte-counted span against a
+ * cap counted in *characters* — an 8000-character emoji summary is 32KB, so a
+ * 9KB span looked like a win and would have quadrupled.
+ *
+ * The cap is a character count, so pricing it in bytes needs a bytes-per-
+ * character rate. That rate is taken from the span itself rather than assumed: a
+ * summary is written in the same script as the material it summarizes, so an
+ * ASCII conversation is priced at ~1 byte per character and a CJK one at 3 —
+ * where a fixed worst-case 4 would stop ASCII conversations compacting at all
+ * until their spans reached 32KB.
  */
 export function compactionWouldNotShrink(
-  spanChars: number,
-  previousSummaryChars: number | null,
+  span: PromptSize,
+  previousSummary: PromptSize | null,
   maxSummaryChars: number,
 ): boolean {
-  const envelope = summaryEnvelopeChars();
+  const envelope = summaryEnvelopeBytes();
   // The previous summary is already wrapped where it sits in the prompt, so it
   // costs its own envelope too.
   const current =
-    spanChars +
-    (previousSummaryChars === null ? 0 : envelope + previousSummaryChars);
-  return current <= envelope + maxSummaryChars;
+    span.bytes +
+    (previousSummary === null ? 0 : envelope + previousSummary.bytes);
+  const replacement = envelope + maxSummaryChars * span.bytesPerChar();
+  return current <= replacement;
 }
 
 /**
- * Prompt cost of the `summaryMessage` wrapper, excluding the summary itself.
+ * Serialized bytes the `summaryMessage` wrapper adds, summary text excluded.
  *
  * Measured rather than hard-coded so it cannot drift out of step with the
  * wrapper text: the guard that uses it decides whether compaction is worth
  * running at all, and a stale constant would quietly bias that decision.
  */
-function summaryEnvelopeChars(): number {
+function summaryEnvelopeBytes(): number {
   return promptSize([summaryMessage("")]).bytes;
+}
+
+/**
+ * The checkpoint's summary text, or null if it cannot be had — whether the
+ * artifact is missing or the store refuses to hand it over.
+ *
+ * The two must not be distinguished. A missing artifact already means "rebuild
+ * from the start of the log", which loses nothing; letting an errored read
+ * escape instead fails the whole compaction, and every later attempt hits the
+ * same artifact and fails identically — so an oversized conversation could
+ * never publish a replacement checkpoint and would grow until the model refused
+ * it. Mirrors `readCheckpointSummary` on the read path and
+ * `read_summary_or_fall_back` in the Rust executor.
+ */
+async function readSummaryOrFallBack(
+  conversation: Conversation,
+  checkpoint: CompactionCheckpoint,
+): Promise<string | null> {
+  try {
+    return await conversation.readArtifactText({
+      artifactId: checkpoint.artifactId,
+      version: checkpoint.artifactVersion,
+    });
+  } catch {
+    return null;
+  }
 }
 
 function summaryArtifactPath(conversation: Conversation): string {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ABANDONED_TURN_GRACE,
   COMPACTION_CHECKPOINT_EVENT,
   CompactionGate,
   DEFAULT_COMPACTION_POLICY,
@@ -173,6 +174,62 @@ describe("selectCutPoint", () => {
       if (cut === null) continue;
       expect(splitsAToolRound(events, cut.upToEventId)).toBe(false);
     }
+  });
+
+  /**
+   * A complete turn with both markers carrying the same turnId, the way the
+   * harness writes them.
+   */
+  function identifiedTurn(label: string): Event[] {
+    nextId += 1;
+    const turnId = `turn-${nextId}`;
+    const withTurn = (e: Event): Event => ({ ...e, turnId });
+    return [
+      withTurn(event("turn_started")),
+      withTurn(messages(`turn ${label}`)),
+      withTurn(event("turn_ended")),
+    ];
+  }
+
+  it("lets an abandoned turn age out instead of blocking forever", () => {
+    // A process that dies between turn_started and turn_ended leaves a marker
+    // nothing will ever balance. Honouring it forever means compaction is
+    // permanently dead on that conversation — it grows until the model refuses
+    // it, with no way back. That is strictly worse than the paraphrase risk the
+    // pending-turn check exists to avoid.
+    const crashedTurnId = "turn-crashed";
+    const events: Event[] = [
+      { ...event("turn_started"), turnId: crashedTurnId },
+      { ...messages("turn that never finished"), turnId: crashedTurnId },
+    ];
+    // The grace is measured at the *candidate* boundary, and keep holds some
+    // turns back from being candidates — so it takes a couple more completed
+    // turns than the grace itself before a cut becomes legal.
+    for (let i = 0; i < ABANDONED_TURN_GRACE + 2; i += 1) {
+      events.push(...identifiedTurn(`after-${i}`));
+    }
+
+    const cut = selectCutPoint(events, 1);
+    expect(cut).not.toBeNull();
+    const cutEvent = events.find((e) => e.id === cut!.upToEventId);
+    expect(cutEvent?.data.type).toBe("turn_ended");
+  });
+
+  it("still blocks on a turn that started recently", () => {
+    // The other half of the same rule: within the grace window an open turn is
+    // treated as live, because it probably is.
+    const openTurnId = "turn-open";
+    const first = identifiedTurn("first");
+    const quiescent = first.at(-1)!.id;
+    const events: Event[] = [
+      ...first,
+      { ...event("turn_started"), turnId: openTurnId },
+      { ...messages("turn still waiting on the model"), turnId: openTurnId },
+      ...identifiedTurn("second"),
+      ...identifiedTurn("third"),
+    ];
+
+    expect(selectCutPoint(events, 1)?.upToEventId).toBe(quiescent);
   });
 
   it("refuses a boundary where another turn is still open", () => {
@@ -348,20 +405,41 @@ describe("compactionWouldNotShrink", () => {
   // measured the way the guard measures a span, so neither editing the wrapper
   // text nor changing the size unit can quietly invalidate the test.
   const envelope = promptSize([summaryMessage("")]).bytes;
+  const ascii = (bytes: number) => PromptSize.ofText("x".repeat(bytes));
 
   it("counts the wrapper the summary is delivered in", () => {
     expect(envelope).toBeGreaterThan(100);
     // What replaces the span is the wrapper *plus* up to `cap` characters of
     // summary, so a span smaller than both cannot shrink the prompt.
-    expect(compactionWouldNotShrink(cap + envelope, null, cap)).toBe(true);
-    expect(compactionWouldNotShrink(cap + envelope + 1, null, cap)).toBe(false);
+    expect(compactionWouldNotShrink(ascii(cap + envelope), null, cap)).toBe(
+      true,
+    );
+    expect(compactionWouldNotShrink(ascii(cap + envelope + 1), null, cap)).toBe(
+      false,
+    );
   });
 
   it("counts the previous summary's wrapper too", () => {
     // A previous summary sits in the prompt wrapped as well, so it costs its
     // own envelope on the current-size side of the comparison.
-    expect(compactionWouldNotShrink(0, cap, cap)).toBe(true);
-    expect(compactionWouldNotShrink(1, cap, cap)).toBe(false);
+    expect(compactionWouldNotShrink(ascii(0), ascii(cap), cap)).toBe(true);
+    expect(compactionWouldNotShrink(ascii(1), ascii(cap), cap)).toBe(false);
+  });
+
+  it("prices the character cap in the span's own bytes per character", () => {
+    // The cap counts characters; the span counts bytes. An 8000-character
+    // emoji summary is ~32KB, so measuring a multibyte span against a
+    // character cap as if both were bytes lets compaction quadruple a prompt
+    // while reporting that it shrank it.
+    const emojiSpan = PromptSize.ofText("🙂".repeat(cap));
+    expect(emojiSpan.bytes).toBe(cap * 4);
+    // Four bytes per character in, four bytes per character out: a span of
+    // exactly `cap` emoji cannot be beaten by a summary of `cap` emoji.
+    expect(compactionWouldNotShrink(emojiSpan, null, cap)).toBe(true);
+
+    // ASCII of the same byte count is a different story — there the summary
+    // really is capped at ~cap bytes, so the span is worth replacing.
+    expect(compactionWouldNotShrink(ascii(cap * 4), null, cap)).toBe(false);
   });
 });
 
