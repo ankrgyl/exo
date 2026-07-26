@@ -1,29 +1,3 @@
-The summarizer is a real, billable call, so its usage is recorded — on its own
-custom event, `exo.compaction.usage.v1`.
-
-**Not on a `messages` event**, and the reason is the same rule as above. Both
-materializers treat every messages event as a turn boundary and flush pending
-tool calls at it, so an accounting event that landed between a `tool_requested`
-and its `tool_result` would make them fabricate a failure for a call that
-succeeded and then append the real result too.
-
-Writing it "at a safe moment" is not a fix. Turns on one conversation are not
-serialized, so "no tool call is outstanding" is a claim about _every_ in-flight
-turn, not just the one doing the accounting — and this bug survived two attempts
-that reasoned about timing. A custom event is ignored by prompt assembly
-outright, so no ordering rule remains to get wrong in any interleaving.
-
-The cost of that choice is that spend aggregation has to look in two places:
-`crates/cli/src/tui.rs` sums both event kinds, and the
-`list_conversation_events` description tells the agent to do the same. Miss
-either and totals understate by exactly the cost of keeping conversations
-compact.
-
-The summarizer request also carries a `max_output_tokens` derived from
-`maxSummaryChars`. `capSummary` truncates only _after_ a response is generated,
-transferred and billed, so on its own it bounds the stored summary but not what
-producing it costs.
-
 # Conversation compaction
 
 A conversation's durable event log grows without bound. A prompt cannot. Without
@@ -242,27 +216,31 @@ a perfectly readable checkpoint over it — disarming the fallback and dropping
 everything before the break from the prompt for good. Instead, compaction
 rebuilds from the start of the log: one larger summarizer call, nothing lost.
 
-The summarizer is a real, billable call, so its usage is recorded — on a
-`messages` event, which is where this repo's cost aggregation looks. The message
-list is empty on purpose: history materialization folds these events into the
-prompt, so carrying the summarizer's reply there would inject it back into the
-context compaction just shrank.
+The summarizer is a real, billable call, so its usage is recorded — on its own
+custom event, `exo.compaction.usage.v1`.
 
-**That event must never be written mid-round**, and this is sharper than it
-looks. The post-response trigger runs after the model's `tool_requested` events
-are recorded but before the tools execute, so writing immediately puts the
-accounting event between a request and its result. Both materializers treat _any_
-messages event as a turn boundary and flush pending calls first, so the next
-materialization fabricates a "tool execution did not complete" failure for a call
-that succeeded _and_ appends the real result after it — two results for one
-`tool_call_id`. That is exactly the corruption the cut-on-`turn_ended` rule
-exists to prevent, reached through a side door.
+**Not on a `messages` event**, and the reason is the same rule as above. Both
+materializers treat every messages event as a turn boundary and flush pending
+tool calls at it, so an accounting event that landed between a `tool_requested`
+and its `tool_result` would make them fabricate a failure for a call that
+succeeded and then append the real result too.
 
-So the record is held and written at a point where no call can be outstanding:
-the top of the next round (the previous round's results are in the log) or just
-before the turn returns having requested no tools. A turn that fails in between
-loses that one record — chosen over teaching the materializer a special case,
-since the materializer's subtlety is what causes this class of bug.
+Writing it "at a safe moment" is not a fix. Turns on one conversation are not
+serialized, so "no tool call is outstanding" is a claim about _every_ in-flight
+turn, not just the one doing the accounting — and this bug survived two attempts
+that reasoned about timing. A custom event is ignored by prompt assembly
+outright, so no ordering rule remains to get wrong in any interleaving.
+
+The cost of that choice is that spend aggregation has to look in two places:
+`crates/cli/src/tui.rs` sums both event kinds, and the
+`list_conversation_events` description tells the agent to do the same. Miss
+either and totals understate by exactly the cost of keeping conversations
+compact.
+
+The summarizer request also carries a `max_output_tokens` derived from
+`maxSummaryChars`. `capSummary` truncates only _after_ a response is generated,
+transferred and billed, so on its own it bounds the stored summary but not what
+producing it costs.
 
 ## Caching
 
