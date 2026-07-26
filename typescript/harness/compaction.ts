@@ -478,7 +478,14 @@ export function resolveCompactionPolicy(
       raw.keep_recent_turns,
       DEFAULT_COMPACTION_POLICY.keepRecentTurns,
     ),
-    maxSummaryChars: positiveIntOr(
+    // Strictly positive, unlike the fields below. A cap of zero is not a
+    // tighter budget but a broken one: every eligible compaction would pay for
+    // a summarizer call, `capSummary` would reduce the result to nothing, and
+    // the empty-summary guard would refuse to write a checkpoint — so the
+    // conversation burns a model call per turn and never compacts. Zero *is*
+    // meaningful for `keepRecentTurns` (keep none) and `fallbackCharBudget`
+    // (always over budget), so this is not a change to the shared helper.
+    maxSummaryChars: nonZeroIntOr(
       raw.max_summary_chars,
       DEFAULT_COMPACTION_POLICY.maxSummaryChars,
     ),
@@ -498,6 +505,15 @@ function clampRatio(value: number | null | undefined): number {
     return DEFAULT_COMPACTION_POLICY.thresholdRatio;
   }
   return Math.min(1, value);
+}
+
+/** Like `positiveIntOr`, but zero falls back too. */
+function nonZeroIntOr(
+  value: number | null | undefined,
+  fallback: number,
+): number {
+  const resolved = positiveIntOr(value, fallback);
+  return resolved === 0 ? fallback : resolved;
 }
 
 function positiveIntOr(

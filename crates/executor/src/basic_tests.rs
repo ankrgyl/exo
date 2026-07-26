@@ -2867,3 +2867,97 @@ async fn a_usage_event_between_a_tool_request_and_its_result_is_inert() {
         "the summarizer cost should be recorded"
     );
 }
+
+/// A warm history cache must notice a checkpoint it did not write.
+///
+/// The generation counter only counts this executor instance's own
+/// compactions, and the incremental event query filters custom events out — so
+/// a checkpoint written by another executor instance, or by the TypeScript
+/// runtime over the same conversation, is invisible to a warm entry. Without a
+/// re-read this instance replays the compacted prefix from its cache forever.
+///
+/// This is the Rust twin of the TypeScript
+/// `notices a checkpoint written by another turn` case.
+#[tokio::test]
+async fn a_warm_cache_notices_a_checkpoint_written_elsewhere() {
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+
+    let executor = test_executor();
+    let before = executor
+        .materialize_prompt_history(conversation.as_ref(), &[])
+        .await
+        .expect("materialize");
+    assert!(prompt_text(&before).contains("ancient"));
+
+    // Someone else compacts. Crucially, *not* through `executor`, so its
+    // generation counter never moves and `invalidate_history_cache` is never
+    // called — exactly what a second process or the TypeScript runtime looks
+    // like from here.
+    let turn = open_turn(conversation.as_ref()).await;
+    let outcome = run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &CompactionConfig {
+            keep_recent_turns: 1,
+            ..CompactionConfig::default()
+        },
+        "summary-model",
+        None,
+        &|_input| Box::pin(async { Ok("SUMMARY".to_string()) }),
+    )
+    .await;
+    let CompactionOutcome::Compacted { .. } = outcome else {
+        panic!("expected compaction, got {outcome:?}");
+    };
+    turn.finish().await.expect("finish turn");
+
+    let after = executor
+        .materialize_prompt_history(conversation.as_ref(), &[])
+        .await
+        .expect("materialize");
+    let text = prompt_text(&after);
+    assert!(
+        text.contains("SUMMARY"),
+        "the warm cache ignored a checkpoint it did not write: {text}"
+    );
+    assert!(
+        !text.contains("ancient"),
+        "the compacted prefix is still being replayed: {text}"
+    );
+}
+
+/// A summary cap of zero is a broken knob, not a tight one.
+///
+/// Left as-is it lets every eligible compaction pay for a summarizer call whose
+/// result `cap_summary` reduces to nothing, which the empty-summary guard then
+/// refuses to checkpoint — a model call per turn, forever, and a conversation
+/// that never compacts. Clamped, it behaves like the default.
+#[tokio::test]
+async fn a_zero_summary_cap_falls_back_to_the_default() {
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+
+    let turn = open_turn(conversation.as_ref()).await;
+    let outcome = run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &CompactionConfig {
+            keep_recent_turns: 1,
+            max_summary_chars: 0,
+            ..CompactionConfig::default()
+        },
+        "summary-model",
+        None,
+        &|_input| Box::pin(async { Ok("A REAL SUMMARY".to_string()) }),
+    )
+    .await;
+
+    let CompactionOutcome::Compacted { checkpoint } = outcome else {
+        panic!("a zero cap should not prevent compaction, got {outcome:?}");
+    };
+    assert!(
+        checkpoint.summary_chars > 0,
+        "the checkpoint recorded an empty summary"
+    );
+}

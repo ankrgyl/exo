@@ -254,8 +254,18 @@ cache holds; a stale cache would keep serving pre-compaction history from memory
 the prompt would never shrink, and nothing would error. Both implementations have
 a test for this, and stubbing out the invalidation makes it fail.
 
-Invalidation alone is not sufficient, because turns on one conversation are not
-serialized. A turn that read a pre-checkpoint entry and then blocked in
+**Invalidation alone is not sufficient**, for two separate reasons.
+
+First, the cache must re-read the active checkpoint on _every_ materialization,
+not only when priming. Invalidation reaches the cache of whoever compacted;
+a checkpoint written by another executor instance, or by the other runtime over
+the same conversation, reaches nothing — and the incremental query filters custom
+events out, so a warm entry would never see it and would replay the compacted
+prefix indefinitely. Both runtimes therefore track which checkpoint an entry was
+built against and rebuild when it changes. The cost is one bounded `desc limit 1`
+query per round.
+
+Second, turns on one conversation are not serialized. A turn that read a pre-checkpoint entry and then blocked in
 `getEvents` would, on resuming, write its stale snapshot back _over_ the
 invalidation — and that entry carries its own cursor and `summary: None`, so
 every later prompt keeps replaying the compacted prefix indefinitely. The Rust

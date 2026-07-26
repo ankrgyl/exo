@@ -127,15 +127,32 @@ where
             cache.get(&conversation_id).cloned()
         };
 
-        // On a cold cache, start from the newest checkpoint rather than the top
-        // of the log: everything before it is represented by the summary. A
-        // warm cache already spans the checkpoint, so it keeps its own cursor.
+        // Re-read the active checkpoint every time, warm cache or not.
+        //
+        // `cache_generation` only counts *this* executor instance's own
+        // compactions. A checkpoint written by another instance, or by the
+        // TypeScript runtime over the same conversation, bumps nothing here —
+        // and the incremental query below filters custom events out, so a warm
+        // entry would never see it. The cache would then replay the compacted
+        // prefix from this instance forever. One bounded `desc limit 1` query
+        // against a scan the round is doing anyway; the same check
+        // `PromptHistoryCache` makes on the TypeScript side.
+        let active = read_active_checkpoint(conversation).await?;
+        let active_checkpoint_id = active.as_ref().map(|(event_id, _)| *event_id);
+
+        // An entry built against a different checkpoint — or against none — is
+        // describing a prompt that no longer exists. Rebuild rather than extend.
+        let cached_entry = match &cached_entry {
+            Some(entry) if entry.checkpoint_event_id == active_checkpoint_id => cached_entry,
+            _ => None,
+        };
+
         let summary = match &cached_entry {
             Some(entry) => entry.summary.clone(),
-            None => match read_active_checkpoint(conversation).await? {
-                // A checkpoint whose artifact has vanished is worse than none:
-                // it would cut history out with nothing standing in for it.
-                // Fall back to the full replay instead.
+            // A checkpoint whose artifact has vanished is worse than none: it
+            // would cut history out with nothing standing in for it. Fall back
+            // to the full replay instead.
+            None => match active {
                 Some((_, checkpoint)) => {
                     read_summary(conversation, &checkpoint)
                         .await?
@@ -190,6 +207,10 @@ where
                         messages: event_messages.clone(),
                         tool_call_names,
                         summary: summary.clone(),
+                        // Tracked even when the summary was unreadable and we
+                        // fell back to the full log: re-priming every round
+                        // would defeat the cache entirely.
+                        checkpoint_event_id: active_checkpoint_id,
                     },
                 );
             }
@@ -260,7 +281,7 @@ where
                     &summarizer_usage,
                     &agent_config.model,
                     &summary_model,
-                    config.max_summary_chars,
+                    config.effective_max_summary_chars(),
                 ))
             },
         )
@@ -933,6 +954,10 @@ struct HistoryCacheEntry {
     /// been compacted. Cached alongside the messages so a warm cache does not
     /// re-read the checkpoint artifact on every round.
     summary: Option<CachedSummary>,
+    /// Which checkpoint this entry was built against, so a checkpoint written
+    /// by anyone else — another executor instance, the TypeScript runtime —
+    /// invalidates it. `None` means "built with no checkpoint active".
+    checkpoint_event_id: Option<EventId>,
 }
 
 #[derive(Debug, Clone)]

@@ -121,6 +121,19 @@ impl CompactionConfig {
         }
         self.threshold_ratio.min(1.0)
     }
+
+    /// A cap of zero is not a tighter budget, it is a broken one: every eligible
+    /// compaction would pay for a summarizer call, `cap_summary` would reduce
+    /// the result to nothing, and the empty-summary guard would refuse to write
+    /// a checkpoint — so the conversation burns a model call per turn and never
+    /// compacts. Clamp to the default rather than error, matching
+    /// `effective_threshold_ratio`: a bad knob should degrade, not brick.
+    pub(crate) fn effective_max_summary_chars(&self) -> u32 {
+        if self.max_summary_chars == 0 {
+            return Self::default().max_summary_chars;
+        }
+        self.max_summary_chars
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -447,7 +460,7 @@ async fn compact(
         + previous_summary
             .as_ref()
             .map_or(0, |summary| summary.chars().count() as u64);
-    if span_chars <= config.max_summary_chars as u64 {
+    if span_chars <= config.effective_max_summary_chars() as u64 {
         return Ok(CompactionOutcome::Skipped {
             reason: "compactable history is already smaller than the summary cap".to_string(),
         });
@@ -456,11 +469,11 @@ async fn compact(
     let summarized = summarize(SummarizeInput {
         messages,
         previous_summary,
-        max_chars: config.max_summary_chars,
+        max_chars: config.effective_max_summary_chars(),
     })
     .await?;
 
-    let summary = cap_summary(&summarized, config.max_summary_chars);
+    let summary = cap_summary(&summarized, config.effective_max_summary_chars());
     if summary.is_empty() {
         // Checkpointing an empty summary would drop real history and put
         // nothing in its place — strictly worse than an oversized prompt.
