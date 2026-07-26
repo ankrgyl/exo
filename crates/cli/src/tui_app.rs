@@ -1,9 +1,3 @@
-//! Prototype full-screen TUI for the chat repl (`exo repl --tui`).
-//!
-//! Unlike the line-mode repl, the transcript is app state we own, so streamed
-//! text, tool-call lines, and their `✓`/`✗` receipts are just mutations of a
-//! line buffer — no terminal tricks, and typing never interleaves with output.
-
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -38,8 +32,7 @@ const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
 
 // Slash-command registry for the TUI: names, aliases, arguments, and help all
 // live in this clap tree. `multicall` makes the first token the command name,
-// and clap's built-in `help` subcommand serves `/help`. The line-mode repl
-// keeps its own simpler handwritten parser.
+// and clap's built-in `help` subcommand serves `/help`.
 #[derive(Debug, clap::Parser)]
 #[command(name = "repl", multicall = true, about = "repl slash commands")]
 struct ReplCli {
@@ -52,8 +45,6 @@ enum ReplCommand {
     /// Exit the repl
     #[command(alias = "exit")]
     Quit,
-    /// Reprint the conversation transcript
-    History,
     /// Summarize token usage and dollar cost
     #[command(alias = "usage")]
     Cost,
@@ -382,7 +373,6 @@ impl TuiApp {
         let conversation = Arc::clone(&self.conversation);
         match command {
             ReplCommand::Quit => return Ok(true),
-            ReplCommand::History => self.load_transcript().await?,
             ReplCommand::Verbosity { level } => match level {
                 Some(verbosity) => {
                     self.verbosity = verbosity;
