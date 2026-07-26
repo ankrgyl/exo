@@ -175,6 +175,9 @@ describe("runCompaction", () => {
     expect(seen[0]).toBe("SUMMARY OF EVERYTHING");
     const checkpoints = checkpointEvents(stub);
     expect(checkpoints[0].previous_checkpoint_id).not.toBeNull();
+    // The count is what the agent is shown to judge how much history it is
+    // missing, so it has to cover the whole chain, not just this pass.
+    expect(Number(checkpoints[0].compacted_event_count)).toBeGreaterThan(4);
   });
 
   it("caps an oversized summary rather than trusting the model", async () => {

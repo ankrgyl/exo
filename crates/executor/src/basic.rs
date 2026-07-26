@@ -175,7 +175,7 @@ where
     /// input limit. Deliberately infallible: compaction is housekeeping, and a
     /// summarizer outage should leave an oversized prompt rather than kill the
     /// turn. `run_compaction` records its own failure events.
-    async fn maybe_compact(
+    pub(crate) async fn maybe_compact(
         &self,
         conversation: &dyn ConversationHandle,
         turn: &dyn TurnHandle,
@@ -194,6 +194,9 @@ where
             return;
         }
 
+        // `summary_model` overrides the model id within the agent's existing
+        // binding, so a cheaper model from the same provider costs no extra
+        // configuration. `model` here is the already-resolved provider id.
         let summary_model = config
             .summary_model
             .clone()
@@ -204,7 +207,9 @@ where
             &config,
             &summary_model,
             prompt_tokens,
-            &|input| Box::pin(self.summarize(input, &summary_model)),
+            &|input| {
+                Box::pin(self.summarize(input, conversation, &agent_config.model, &summary_model))
+            },
         )
         .await;
 
@@ -233,7 +238,20 @@ where
     }
 
     /// Summarize a compacted span with a model call carrying no tools.
-    async fn summarize(&self, input: SummarizeInput, model: &str) -> Result<String> {
+    ///
+    /// Credentials come from the agent's resolved model binding; `model`
+    /// overrides only the model id within it. Building this request by hand
+    /// would drop the API key and base URL and fail auth against every real
+    /// provider — and because compaction failures are deliberately non-fatal,
+    /// the only symptom would be compaction silently never working.
+    async fn summarize(
+        &self,
+        input: SummarizeInput,
+        conversation: &dyn ConversationHandle,
+        binding: &str,
+        model: &str,
+    ) -> Result<String> {
+        let model_binding = resolve_model_binding(conversation, binding).await?;
         let mut messages = vec![system_message(&summarizer_instruction(&input))];
         messages.extend(input.messages);
 
@@ -241,8 +259,8 @@ where
             .model
             .complete(ModelRequest {
                 model: model.to_string(),
-                api_key: None,
-                base_url: None,
+                api_key: model_binding.api_key,
+                base_url: model_binding.base_url,
                 messages,
                 // No tools: the summarizer reads, it does not act.
                 tools: Vec::new(),

@@ -59,6 +59,9 @@ pub struct CompactionConfig {
     pub keep_recent_turns: u32,
     /// Hard ceiling on summary size; the model is not trusted to respect it.
     pub max_summary_chars: u32,
+    /// Model id used for summaries, within the agent's existing model binding.
+    /// A model id, not a binding name: the point is to use a cheaper model from
+    /// the same provider without extra configuration.
     pub summary_model: Option<String>,
     /// Used when the price table has no input limit for the model.
     pub fallback_char_budget: u64,
@@ -332,8 +335,14 @@ async fn compact(
         artifact_id: written.artifact_id,
         artifact_path: written.path,
         artifact_version: written.version,
+        // Cumulative across the chain. This is the number the agent is shown
+        // to judge how much history it is missing, so counting only this pass
+        // would understate it on every compaction after the first.
+        compacted_event_count: previous
+            .as_ref()
+            .map_or(0, |previous| previous.compacted_event_count)
+            + cut.compacted_event_count,
         previous_checkpoint_id: previous.map(|previous| previous.up_to_event_id),
-        compacted_event_count: cut.compacted_event_count,
         summary_chars: summary.chars().count() as u64,
         prompt_tokens_before,
         model: model.to_string(),

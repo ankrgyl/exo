@@ -54,6 +54,11 @@ export interface CompactionPolicy {
   keepRecentTurns: number;
   /** Hard ceiling on summary size; the model is not trusted to respect it. */
   maxSummaryChars: number;
+  /**
+   * Model id used for summaries, within the agent's existing model binding. A
+   * model id, not a binding name: the point is to use a cheaper model from the
+   * same provider without extra configuration.
+   */
   summaryModel: string | null;
   /** Used when the price table has no input limit for the model. */
   fallbackCharBudget: number;
@@ -401,7 +406,11 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
     artifactPath: written.path,
     artifactVersion: written.version,
     previousCheckpointId: previous?.upToEventId ?? null,
-    compactedEventCount: cut.compactedEventCount,
+    // Cumulative across the chain. This is the number the agent is shown to
+    // judge how much history it is missing, so counting only this pass would
+    // understate it on every compaction after the first.
+    compactedEventCount:
+      (previous?.compactedEventCount ?? 0) + cut.compactedEventCount,
     summaryChars: summary.length,
     promptTokensBefore,
     model,

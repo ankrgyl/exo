@@ -490,7 +490,8 @@ enum AgentCommands {
         /// Turns kept verbatim after a compaction cut.
         #[arg(long)]
         compaction_keep_recent_turns: Option<u32>,
-        /// Model used to write summaries; defaults to the agent's model.
+        /// Model id used for summaries, within the agent's existing model
+        /// binding. Defaults to the agent's model.
         #[arg(long)]
         compaction_summary_model: Option<String>,
         #[arg(long)]

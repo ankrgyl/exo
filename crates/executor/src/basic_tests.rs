@@ -1699,3 +1699,55 @@ async fn shared_materialize_helper_honors_a_checkpoint() {
     assert!(text.contains("recent"), "{text}");
     assert!(!text.contains("ancient"), "{text}");
 }
+
+#[tokio::test]
+async fn the_summarizer_call_carries_model_credentials() {
+    // The summarizer is a separate model call from the turn's own. Building its
+    // request by hand rather than through the resolved binding drops the API key
+    // and base URL, so it fails auth against any real provider. The failure path
+    // is deliberately graceful, so the symptom would be compaction silently
+    // never working — exactly the kind of bug that reaches production.
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+
+    let model = Arc::new(FakeModelClient::new(vec![ModelResponse {
+        provider_cost_usd: None,
+        response_id: Some(Uuid7::now()),
+        messages: vec![assistant_message("SUMMARY")],
+        tool_calls: vec![],
+        usage: None,
+        model: None,
+        ttft: None,
+        duration: None,
+    }]));
+    let executor = BasicExecutor::new(Arc::clone(&model), Arc::new(FakeToolRuntime::default()));
+    let turn = open_turn(conversation.as_ref()).await;
+
+    executor
+        .maybe_compact(
+            conversation.as_ref(),
+            turn.as_ref(),
+            &AgentConfig {
+                compaction: Some(CompactionConfig {
+                    keep_recent_turns: 1,
+                    // No input limit is known for the fake model, so force the
+                    // trigger through the character-budget fallback.
+                    fallback_char_budget: 0,
+                    ..CompactionConfig::default()
+                }),
+                ..default_agent_config()
+            },
+            "test-model",
+            None,
+            1_000,
+        )
+        .await;
+
+    let requests = model.observed_requests();
+    assert_eq!(requests.len(), 1, "summarizer should have been called");
+    assert_eq!(requests[0].api_key.as_deref(), Some("test-key"));
+    assert!(
+        requests[0].tools.is_empty(),
+        "the summarizer reads, it does not act"
+    );
+}

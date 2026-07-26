@@ -120,14 +120,14 @@ including tool rounds that span a batch boundary.
 
 ## Configuration
 
-| Field                | Default       | Meaning                                               |
-| -------------------- | ------------- | ----------------------------------------------------- |
-| `enabled`            | `true`        | Off means unbounded prompts.                          |
-| `thresholdRatio`     | `0.7`         | Fraction of the input limit that triggers compaction. |
-| `keepRecentTurns`    | `3`           | Turns kept verbatim after the cut.                    |
-| `maxSummaryChars`    | `8000`        | Hard ceiling on summary size.                         |
-| `summaryModel`       | agent's model | Use a cheaper model for summaries.                    |
-| `fallbackCharBudget` | `400000`      | Used when the model's input limit is unknown.         |
+| Field                | Default       | Meaning                                                   |
+| -------------------- | ------------- | --------------------------------------------------------- |
+| `enabled`            | `true`        | Off means unbounded prompts.                              |
+| `thresholdRatio`     | `0.7`         | Fraction of the input limit that triggers compaction.     |
+| `keepRecentTurns`    | `3`           | Turns kept verbatim after the cut.                        |
+| `maxSummaryChars`    | `8000`        | Hard ceiling on summary size.                             |
+| `summaryModel`       | agent's model | Model id (within the agent's binding) used for summaries. |
+| `fallbackCharBudget` | `400000`      | Used when the model's input limit is unknown.             |
 
 From the CLI:
 
