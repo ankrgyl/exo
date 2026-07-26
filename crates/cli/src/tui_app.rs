@@ -700,13 +700,19 @@ impl TuiApp {
     }
 
     fn push_user_line(&mut self, text: &str) {
-        self.transcript.push(Line::from(vec![
-            Span::styled(
-                format!("{} user: ", compact_timestamp()),
-                Style::new().dim(),
-            ),
-            Span::styled(text.to_string(), Style::new().bold()),
-        ]));
+        // Ratatui lines cannot hold newlines; multi-line messages become one
+        // transcript line each, with the prefix only on the first.
+        for (index, piece) in text.split('\n').enumerate() {
+            let mut spans = Vec::new();
+            if index == 0 {
+                spans.push(Span::styled(
+                    format!("{} user: ", compact_timestamp()),
+                    Style::new().dim(),
+                ));
+            }
+            spans.push(Span::styled(piece.to_string(), Style::new().bold()));
+            self.transcript.push(Line::from(spans));
+        }
         self.scrollback = 0;
     }
 
