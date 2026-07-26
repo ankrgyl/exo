@@ -94,13 +94,25 @@ check cannot see this case: the other turn has not requested a tool yet, and may
 never. Both markers therefore have to be in the scan query — dropping
 `turn_started` does not fail loudly, it just makes the check blind.
 
-**But "open" has to age out.** A process that dies between `turn_started` and
-`turn_ended` leaves a marker nothing will ever balance, and honouring it forever
-means compaction is permanently dead on that conversation — it grows until the
-model refuses it, with no way back. That is strictly worse than the failure the
-check prevents: a live turn seeing its own input paraphrased is recoverable, an
-unusable conversation is not. An unfinished turn therefore stops blocking once
-`ABANDONED_TURN_GRACE` (8) other turns have _completed_ after it.
+**But "unfinished" has to age out.** A process that dies mid-turn leaves markers
+nothing will ever balance — a `turn_started` with no `turn_ended`, or a
+`tool_requested` with no `tool_result`. Honouring either forever means compaction
+is permanently dead on that conversation: it grows until the model refuses it,
+with no way back. A cut landing _before_ the orphan is what makes that permanent,
+since every later scan starts at the checkpoint and still contains it. That is
+strictly worse than the failures these checks prevent, which are all recoverable.
+Unfinished work therefore stops blocking once `ABANDONED_WORK_GRACE` (8) turns
+have _completed_ since it began — one constant for both checks, because it is the
+same question with the same answer.
+
+The grace is easier to justify for a stranded tool call than for an open turn.
+Cutting across a _live_ call makes the materializer fabricate a
+`{ok: false, "tool execution did not complete"}` for a call that succeeded; for
+an _abandoned_ one that fabricated result is simply true. Note also where that
+check does its work: while the requesting turn is still open the pending-turn
+check refuses the boundary anyway, so the tool-call grace only decides the case
+where a turn _ended_ leaving a call unresolved — a crashed or truncated log,
+essentially by definition.
 
 Turns are matched by `turn_id`, not by counting starts against ends. A plain
 counter cannot tell _which_ start is unmatched: after a crash, later turns'
@@ -112,7 +124,9 @@ handed every subsequent turn's end.
 
 A property test over randomised event streams covers the tool-round invariant in
 both languages. Mutating the cut point to land mid-round makes it fail; so does
-dropping the open-turn check from an overlapping-turn fixture.
+dropping the open-turn check from an overlapping-turn fixture. Both graces are
+pinned from both sides: removing one lets an abandoned marker block forever, and
+shrinking it lets a boundary cut across work that is still running.
 
 ## When compaction triggers
 

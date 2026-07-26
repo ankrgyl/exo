@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  ABANDONED_TURN_GRACE,
+  ABANDONED_WORK_GRACE,
   COMPACTION_CHECKPOINT_EVENT,
   CompactionGate,
   DEFAULT_COMPACTION_POLICY,
@@ -205,7 +205,7 @@ describe("selectCutPoint", () => {
     // The grace is measured at the *candidate* boundary, and keep holds some
     // turns back from being candidates — so it takes a couple more completed
     // turns than the grace itself before a cut becomes legal.
-    for (let i = 0; i < ABANDONED_TURN_GRACE + 2; i += 1) {
+    for (let i = 0; i < ABANDONED_WORK_GRACE + 2; i += 1) {
       events.push(...identifiedTurn(`after-${i}`));
     }
 
@@ -274,6 +274,55 @@ describe("selectCutPoint", () => {
     const cut = selectCutPoint(events, 1);
     expect(cut).not.toBeNull();
     expect(splitsAToolRound(events, cut!.upToEventId)).toBe(false);
+  });
+
+  /**
+   * A turn that died after requesting a tool: the request is there, its result
+   * never arrives, but the boundary does — the supervisor closed the turn, or
+   * the log was truncated after that marker. This is the shape
+   * `hasPendingToolCall`'s grace exists for; while the turn is still open
+   * `hasPendingTurn` refuses the boundary anyway.
+   */
+  function crashedToolTurn(label: string): Event[] {
+    return [
+      messages(`turn ${label}`),
+      event("tool_requested", {
+        tool_call_id: `${label}-orphan`,
+        request: { function_name: "shell", arguments: {} },
+      }),
+      turnEnded(),
+    ];
+  }
+
+  it("lets an abandoned tool call age out instead of blocking forever", () => {
+    // A request whose result will never arrive rejects every boundary that
+    // contains it. Once a cut lands before it that is permanent: later scans
+    // start at the checkpoint and still see the request, so the conversation
+    // can never compact again.
+    const events = turn("a", 1);
+    const orphanIndex = events.length + 1;
+    events.push(...crashedToolTurn("c"));
+    for (let i = 0; i < ABANDONED_WORK_GRACE + 2; i += 1) {
+      events.push(...turn(`after-${i}`, 1));
+    }
+
+    const cut = selectCutPoint(events, 1);
+    expect(cut).not.toBeNull();
+    const cutIndex = events.findIndex((e) => e.id === cut!.upToEventId);
+    // Stopping short of the orphan is what makes the block permanent.
+    expect(cutIndex).toBeGreaterThan(orphanIndex);
+  });
+
+  it("still blocks on a tool call requested recently", () => {
+    // The other half of the rule. A call requested moments ago is probably
+    // running, and cutting across it fabricates a failure for a call that is
+    // about to succeed — the corruption the grace must not open up.
+    const events = turn("a", 1);
+    const quiescent = events.at(-1)!.id;
+    events.push(...crashedToolTurn("c"));
+    events.push(...turn("d", 1));
+
+    expect(selectCutPoint(events, 1)?.upToEventId).toBe(quiescent);
   });
 });
 

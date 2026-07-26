@@ -160,18 +160,20 @@ export function selectCutPoint(
 }
 
 /**
- * Completed turns after which an unfinished one is treated as abandoned.
+ * Completed turns after which unfinished work is treated as abandoned.
  *
- * A process that dies between `turn_started` and `turn_ended` leaves a marker
- * nothing will ever balance. Honouring it forever would make `hasPendingTurn`
- * reject every future boundary, so a conversation that survived one crash could
- * never compact again and would grow until the model refused it — an
- * unrecoverable outcome, traded for the recoverable one this check exists to
- * avoid (a live turn seeing its own input paraphrased). A turn genuinely still
- * waiting on a model response across this many *completed* turns of the same
- * conversation is not a case worth protecting.
+ * A process that dies mid-turn leaves markers nothing will ever balance — a
+ * `turn_started` with no `turn_ended`, or a `tool_requested` with no
+ * `tool_result`. Honouring either forever makes the corresponding check reject
+ * every future boundary, so a conversation that survived one crash could never
+ * compact again and would grow until the model refused it. That is
+ * unrecoverable, and it is being traded against failures that are not.
+ *
+ * One constant rather than one per check: it is the same question — "is this
+ * still running?" — with the same answer, and two that must stay in sync is
+ * worse than one.
  */
-export const ABANDONED_TURN_GRACE = 8;
+export const ABANDONED_WORK_GRACE = 8;
 
 /**
  * True when some `turn_started` at or before `index` has no matching
@@ -222,27 +224,56 @@ function hasPendingTurn(events: Event[], index: number): boolean {
   }
 
   for (const endedAtStart of [...identified.values(), ...anonymous]) {
-    if (ended - endedAtStart < ABANDONED_TURN_GRACE) {
+    if (ended - endedAtStart < ABANDONED_WORK_GRACE) {
       return true;
     }
   }
   return false;
 }
 
-/** True when some tool_requested at or before `index` has no tool_result yet. */
+/**
+ * True when some `tool_requested` at or before `index` has no matching
+ * `tool_result` and is recent enough to still plausibly be running.
+ *
+ * The grace is the same one `hasPendingTurn` uses, and for a stronger reason.
+ * Cutting across a *live* call makes the materializer fabricate a
+ * `{ok: false, "tool execution did not complete"}` for a call that succeeded —
+ * the corruption this whole module is built around. But for an *abandoned*
+ * call that fabricated result is simply true: the tool did not complete, and
+ * never will. Blocking forever to avoid stating a fact costs the conversation.
+ *
+ * Note where this check does its work. While the requesting turn is still
+ * open, `hasPendingTurn` already refuses the boundary, so this only decides the
+ * case where a turn *ended* leaving a call unresolved — which is the crashed or
+ * truncated log, essentially by definition. A cut landing before the orphan is
+ * what makes it permanent: later scans start at that checkpoint and still
+ * contain it.
+ */
 function hasPendingToolCall(events: Event[], index: number): boolean {
-  const pending = new Set<string>();
+  // Pending call id -> turns completed when it was requested, so its age can
+  // be measured in completed turns.
+  const pending = new Map<string, number>();
+  let ended = 0;
   for (let i = 0; i <= index; i += 1) {
     const data = events[i].data;
+    if (data.type === TURN_ENDED) {
+      ended += 1;
+      continue;
+    }
     const callId = data.tool_call_id;
     if (typeof callId !== "string") continue;
     if (data.type === "tool_requested") {
-      pending.add(callId);
+      pending.set(callId, ended);
     } else if (data.type === "tool_result") {
       pending.delete(callId);
     }
   }
-  return pending.size > 0;
+  for (const endedAtRequest of pending.values()) {
+    if (ended - endedAtRequest < ABANDONED_WORK_GRACE) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export interface ShouldCompactArgs {

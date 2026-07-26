@@ -187,17 +187,19 @@ pub(crate) fn select_cut_point(events: &[Event], keep_recent_turns: u32) -> Opti
     None
 }
 
-/// Completed turns after which an unfinished one is treated as abandoned.
+/// Completed turns after which unfinished work is treated as abandoned.
 ///
-/// A process that dies between `TurnStarted` and `TurnEnded` leaves a marker
-/// nothing will ever balance. Honouring it forever would make `has_pending_turn`
-/// reject every future boundary, so a conversation that survived one crash could
-/// never compact again and would grow until the model refused it — an
-/// unrecoverable outcome, traded for the recoverable one this check exists to
-/// avoid (a live turn seeing its own input paraphrased). A turn genuinely still
-/// waiting on a model response across this many *completed* turns of the same
-/// conversation is not a case worth protecting.
-const ABANDONED_TURN_GRACE: usize = 8;
+/// A process that dies mid-turn leaves markers nothing will ever balance — a
+/// `TurnStarted` with no `TurnEnded`, or a `ToolRequested` with no `ToolResult`.
+/// Honouring either forever makes the corresponding check reject every future
+/// boundary, so a conversation that survived one crash can never compact again
+/// and grows until the model refuses it. That is unrecoverable, and it is being
+/// traded against failures that are not.
+///
+/// One constant rather than one per check: it is the same question — "is this
+/// still running?" — with the same answer, and two that must stay in sync is
+/// worse than one.
+const ABANDONED_WORK_GRACE: usize = 8;
 
 /// True when some `TurnStarted` in `events` has no matching `TurnEnded` and is
 /// recent enough to still plausibly be running.
@@ -247,22 +249,45 @@ fn has_pending_turn(events: &[Event]) -> bool {
     identified
         .values()
         .chain(anonymous.iter())
-        .any(|ended_at_start| ended - ended_at_start < ABANDONED_TURN_GRACE)
+        .any(|ended_at_start| ended - ended_at_start < ABANDONED_WORK_GRACE)
 }
 
-/// True when some `ToolRequested` in `events` has no matching `ToolResult`.
+/// True when some `ToolRequested` in `events` has no matching `ToolResult` and
+/// is recent enough to still plausibly be running.
+///
+/// The grace is the same one `has_pending_turn` uses, and for a stronger reason.
+/// Cutting across a *live* call makes `extend_message_history` fabricate a
+/// `{ok: false, "tool execution did not complete"}` for a call that succeeded —
+/// the corruption this whole module is built around. But for an *abandoned*
+/// call that fabricated result is simply true: the tool did not complete, and
+/// never will. Blocking forever to avoid stating a fact costs the conversation.
+///
+/// Note where this check does its work. While the requesting turn is still
+/// open, `has_pending_turn` already refuses the boundary, so this only decides
+/// the case where a turn *ended* leaving a call unresolved — which is the
+/// crashed or truncated log, essentially by definition. A cut landing before the
+/// orphan is what makes it permanent: later scans start at that checkpoint and
+/// still contain it.
 fn has_pending_tool_call(events: &[Event]) -> bool {
-    let mut pending: Vec<&str> = Vec::new();
+    // Pending call id -> turns completed when it was requested, so its age can
+    // be measured in completed turns.
+    let mut pending: HashMap<&str, usize> = HashMap::new();
+    let mut ended = 0usize;
     for event in events {
         match &event.data {
-            EventData::ToolRequested { tool_call_id, .. } => pending.push(tool_call_id.as_str()),
+            EventData::TurnEnded => ended += 1,
+            EventData::ToolRequested { tool_call_id, .. } => {
+                pending.insert(tool_call_id.as_str(), ended);
+            }
             EventData::ToolResult { tool_call_id, .. } => {
-                pending.retain(|id| *id != tool_call_id.as_str());
+                pending.remove(tool_call_id.as_str());
             }
             _ => {}
         }
     }
-    !pending.is_empty()
+    pending
+        .values()
+        .any(|ended_at_request| ended - ended_at_request < ABANDONED_WORK_GRACE)
 }
 
 /// Trigger predicate. Prefers the provider's own `prompt_tokens` against the
@@ -1298,6 +1323,66 @@ mod tests {
         assert!(!splits_a_tool_round(&events, cut.up_to_event_id));
     }
 
+    /// A turn that died after requesting a tool: the request is there, its
+    /// result never arrives, but the boundary does — the supervisor closed the
+    /// turn, or the log was truncated after that marker. This is the shape
+    /// `has_pending_tool_call`'s grace exists for; while the turn is still open
+    /// `has_pending_turn` refuses the boundary anyway.
+    fn crashed_tool_turn(label: &str) -> Vec<Event> {
+        vec![
+            messages_event(&format!("turn {label}")),
+            event(EventData::ToolRequested {
+                tool_call_id: format!("{label}-orphan"),
+                response_id: None,
+                request: ToolRequest {
+                    function_name: "shell".to_string(),
+                    arguments: Map::new(),
+                },
+            }),
+            event(EventData::TurnEnded),
+        ]
+    }
+
+    #[test]
+    fn an_abandoned_tool_call_stops_blocking_compaction_once_it_ages_out() {
+        // A request whose result will never arrive rejects every boundary that
+        // contains it. Once a cut lands before it that is permanent: later
+        // scans start at the checkpoint and still see the request, so the
+        // conversation can never compact again.
+        let mut events = turn("a", 1);
+        let orphan_index = events.len() + 1;
+        events.extend(crashed_tool_turn("c"));
+        for index in 0..(ABANDONED_WORK_GRACE + 2) {
+            events.extend(turn(&format!("after-{index}"), 1));
+        }
+
+        let cut = select_cut_point(&events, 1)
+            .expect("an abandoned tool call must not block compaction forever");
+        let cut_index = events
+            .iter()
+            .position(|candidate| candidate.id == cut.up_to_event_id)
+            .expect("cut event present");
+        assert!(
+            cut_index > orphan_index,
+            "cut stopped at {cut_index}, before the orphan at {orphan_index}: \
+             every later scan would find the same orphan and refuse again"
+        );
+    }
+
+    #[test]
+    fn a_recently_requested_tool_call_still_blocks_the_boundary() {
+        // The other half of the rule. A call requested moments ago is probably
+        // running, and cutting across it fabricates a failure for a call that
+        // is about to succeed — the corruption the grace must not open up.
+        let mut events = turn("a", 1);
+        let quiescent = events.last().expect("first turn ended").id;
+        events.extend(crashed_tool_turn("c"));
+        events.extend(turn("d", 1));
+
+        let cut = select_cut_point(&events, 1).expect("cut point");
+        assert_eq!(cut.up_to_event_id, quiescent);
+    }
+
     /// A complete turn with both markers carrying the same `turn_id`, the way
     /// the harness writes them.
     fn identified_turn(label: &str) -> Vec<Event> {
@@ -1330,7 +1415,7 @@ mod tests {
         // The grace is measured at the *candidate* boundary, and `keep` holds
         // some turns back from being candidates — so it takes a couple more
         // completed turns than the grace itself before a cut becomes legal.
-        for index in 0..(ABANDONED_TURN_GRACE + 2) {
+        for index in 0..(ABANDONED_WORK_GRACE + 2) {
             events.extend(identified_turn(&format!("after-{index}")));
         }
 
