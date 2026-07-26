@@ -180,7 +180,6 @@ async function runResponsesTurnLoop(
       readLatestTurnEnded(conversation),
     );
     if (preflight !== null) {
-      compaction.markAttempted(preflight.latestTurnEnded);
       // A configured summary model can have a smaller input window than the
       // agent's; when the prompt does not fit it, summarize with the agent's
       // model rather than losing the compaction to a rejected request.
@@ -213,6 +212,13 @@ async function runResponsesTurnLoop(
       });
       await recordSummarizerUsage(context, summarizerUsage.usage);
       summarizerUsage.usage = undefined;
+      // Settle on the outcome, not on having tried: a summarizer outage or a
+      // rejected artifact write says nothing about the next attempt, and
+      // marking before the result let one blip suppress every later check in
+      // the turn while the prompt kept growing.
+      if (result.status !== "failed") {
+        compaction.markAttempted(preflight.latestTurnEnded);
+      }
       if (result.status === "compacted") {
         // The checkpoint just written replaces the prefix this prompt was built
         // from, so rebuild it before sending.
@@ -288,7 +294,6 @@ async function runResponsesTurnLoop(
       () => readLatestTurnEnded(conversation),
     );
     if (roundAttempt !== null) {
-      compaction.markAttempted(roundAttempt.latestTurnEnded);
       // A configured summary model can have a smaller input window than the
       // agent's; when the prompt does not fit it, summarize with the agent's
       // model rather than losing the compaction to a rejected request.
@@ -321,6 +326,11 @@ async function runResponsesTurnLoop(
       });
       await recordSummarizerUsage(context, summarizerUsage.usage);
       summarizerUsage.usage = undefined;
+      // See the preflight site: the latch answers "would retrying reach the
+      // same answer?", and a failure is precisely the case where it might not.
+      if (result.status !== "failed") {
+        compaction.markAttempted(roundAttempt.latestTurnEnded);
+      }
       if (result.status === "compacted") {
         // The cache holds exactly the prefix that was just replaced.
         history.invalidate();

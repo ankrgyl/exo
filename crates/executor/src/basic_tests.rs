@@ -635,6 +635,9 @@ struct FakeState {
     /// that optional compaction metadata must not take down a materialization
     /// whose raw messages are perfectly readable.
     fail_checkpoint_queries: bool,
+    /// Every `get_events` call, so a test can show that a settled latch stops
+    /// paying for the scan rather than merely reaching the same answer.
+    event_queries: usize,
 }
 
 struct FakeConversationState {
@@ -649,6 +652,11 @@ impl FakeExoHarness {
             .lock()
             .expect("state poisoned")
             .fail_artifact_reads = true;
+    }
+
+    /// How many `get_events` calls this harness has served.
+    fn event_query_count(&self) -> usize {
+        self.state.lock().expect("state poisoned").event_queries
     }
 
     /// Make every later checkpoint query fail, leaving history queries intact.
@@ -706,6 +714,7 @@ impl FakeExoHarness {
                 on_get_events: None,
                 fail_artifact_reads: false,
                 fail_checkpoint_queries: false,
+                event_queries: 0,
                 conversation: FakeConversationState {
                     record: ConversationRecord {
                         id: conversation_id,
@@ -1024,7 +1033,8 @@ impl ConversationHandle for FakeConversationHandle {
         if let Some(hook) = hook {
             hook();
         }
-        let state = self.state.lock().expect("state poisoned");
+        let mut state = self.state.lock().expect("state poisoned");
+        state.event_queries += 1;
         let mut events = state.conversation.events.clone();
 
         if state.fail_checkpoint_queries
@@ -2327,15 +2337,16 @@ async fn summarizer_usage_names_the_model_even_when_the_provider_does_not() {
 }
 
 #[tokio::test]
-async fn compaction_is_attempted_at_most_once_per_turn() {
-    // No new turn_ended event appears while a turn is in flight, so the cut
-    // point cannot change within it. Retrying on every round of a long tool
-    // loop would re-scan the log and re-run the summarizer for the same answer
-    // — real money, spent silently.
+async fn a_transient_compaction_failure_is_retried_within_the_turn() {
+    // The latch answers "would re-attempting at this boundary reach the same
+    // answer?". A summarizer outage or a rejected artifact write is precisely
+    // the case where it might not — so settling on *having tried* let one blip
+    // suppress every later check in the turn while the prompt kept growing
+    // toward the wall this feature exists to avoid.
     let (_harness, conversation) = compaction_fixture().await;
     seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
 
-    // Every summarizer call fails, so nothing latches via a successful cut.
+    // Every summarizer call fails: an outage that lasts the whole turn.
     let model = Arc::new(FakeModelClient::new(Vec::new()));
     let executor = BasicExecutor::new(Arc::clone(&model), Arc::new(FakeToolRuntime::default()));
     let turn = open_turn(conversation.as_ref()).await;
@@ -2374,8 +2385,64 @@ async fn compaction_is_attempted_at_most_once_per_turn() {
 
     assert_eq!(
         model.observed_requests().len(),
-        1,
-        "summarizer should be called once per turn, not once per round"
+        5,
+        "a failed attempt must not settle the latch: the store may recover \
+         mid-turn, and the prompt is still over the threshold"
+    );
+}
+
+#[tokio::test]
+async fn a_settled_latch_still_stops_re_attempting_within_the_turn() {
+    // The other half. Retrying after a *deterministic* answer — here, a
+    // conversation with too few completed turns to cut — re-scans the log every
+    // round of a long tool loop for an answer that cannot have changed, since
+    // cuts land only on `TurnEnded` and the newest one is the same.
+    let (harness, conversation) = compaction_fixture().await;
+    // Two turns, keeping one: never enough to cut.
+    seed_completed_turns(conversation.as_ref(), &["only", "recent"]).await;
+
+    let executor = test_executor();
+    let turn = open_turn(conversation.as_ref()).await;
+    let agent_config = AgentConfig {
+        compaction: Some(CompactionConfig {
+            keep_recent_turns: 8,
+            fallback_char_budget: 0,
+            ..CompactionConfig::default()
+        }),
+        ..default_agent_config()
+    };
+
+    let mut latch = CompactionLatch::default();
+    let before = harness.event_query_count();
+    for _ in 0..5 {
+        executor
+            .maybe_compact(
+                conversation.as_ref(),
+                turn.as_ref(),
+                &agent_config,
+                crate::basic::CompactionTrigger {
+                    model: "test-model",
+                    max_input_tokens: None,
+                    prompt_tokens: None,
+                    prompt_size: PromptSize {
+                        ascii_bytes: 1_000,
+                        other_bytes: 0,
+                        chars: 1_000,
+                    },
+                    round: 0,
+                    turn_trace: None,
+                },
+                &mut latch,
+            )
+            .await;
+    }
+    let queries = harness.event_query_count() - before;
+
+    // One boundary read plus one scan for the first attempt; the four that
+    // follow cost a boundary read each and stop there.
+    assert!(
+        queries <= 7,
+        "a settled latch should stop the scan, saw {queries} queries"
     );
 }
 

@@ -325,7 +325,6 @@ where
         if latch.is_settled(latest_turn_ended) {
             return false;
         }
-        latch.mark_attempted(latest_turn_ended);
 
         // `summary_model` overrides the model id within the agent's existing
         // binding, so a cheaper model from the same provider costs no extra
@@ -378,6 +377,20 @@ where
             .expect("summarizer usage poisoned")
             .take();
         record_summarizer_usage(turn, usage).await;
+
+        // Settle the latch on the *outcome*, not on having tried.
+        //
+        // The latch answers "would re-attempting at this boundary reach the same
+        // answer?". For a skip that is yes by construction — not enough
+        // completed turns, a span already smaller than the cap — and for a
+        // success there is nothing left to do. A *failure* is the opposite: a
+        // summarizer outage or a rejected artifact write says nothing about the
+        // next attempt, and marking before the attempt (as this did) let one
+        // blip suppress every later check in the turn while the prompt kept
+        // growing toward the wall the feature exists to avoid.
+        if !matches!(outcome, CompactionOutcome::Failed { .. }) {
+            latch.mark_attempted(latest_turn_ended);
+        }
 
         let conversation_id = conversation.record().id;
         match outcome {
