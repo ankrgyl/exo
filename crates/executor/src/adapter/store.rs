@@ -7,10 +7,14 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use super::types::{
-    AdapterAttachment, AdapterEventRecord, AdapterEventType, AdapterInboundMessageRecord,
-    AdapterOutboundMessageRecord, AdapterRecord, AdapterTargetConversationRecord, NewAdapter,
-    now_ms,
+    AdapterAttachment, AdapterDeliveryStatus, AdapterEventRecord, AdapterEventType,
+    AdapterInboundMessageRecord, AdapterLifecycleState, AdapterOutboundMessageRecord,
+    AdapterRecord, AdapterTargetConversationRecord, NewAdapter, now_ms,
 };
+
+const MAX_QUEUED_MESSAGES_PER_ADAPTER: usize = 1_000;
+const MAX_MESSAGES_PER_CLAIM: usize = 100;
+pub(crate) const MAX_DELIVERY_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct AdapterStore {
@@ -109,6 +113,19 @@ impl AdapterStore {
             return Ok(None);
         };
         adapter.enabled = false;
+        adapter.lifecycle_state = AdapterLifecycleState::Disabled;
+        adapter.updated_at_ms = now_ms();
+        self.put_adapter(&adapter).await?;
+        Ok(Some(adapter))
+    }
+
+    pub async fn enable_adapter(&self, adapter_id: &str) -> Result<Option<AdapterRecord>> {
+        let Some(mut adapter) = self.get_adapter(adapter_id).await? else {
+            return Ok(None);
+        };
+        adapter.enabled = true;
+        adapter.lifecycle_state = AdapterLifecycleState::Starting;
+        adapter.last_error = None;
         adapter.updated_at_ms = now_ms();
         self.put_adapter(&adapter).await?;
         Ok(Some(adapter))
@@ -122,6 +139,8 @@ impl AdapterStore {
         remove_dir_if_exists(self.events_dir(adapter_id)).await?;
         remove_dir_if_exists(self.outbox_dir(adapter_id)).await?;
         remove_dir_if_exists(self.inflight_dir(adapter_id)).await?;
+        remove_dir_if_exists(self.delivered_dir(adapter_id)).await?;
+        remove_dir_if_exists(self.failed_dir(adapter_id)).await?;
         remove_dir_if_exists(self.inbound_seen_dir(adapter_id)).await?;
         remove_dir_if_exists(self.target_conversations_dir(adapter_id)).await?;
         Ok(Some(adapter))
@@ -133,6 +152,7 @@ impl AdapterStore {
         };
         adapter.last_connected_at_ms = Some(now_ms());
         adapter.last_error = None;
+        adapter.lifecycle_state = AdapterLifecycleState::Running;
         adapter.updated_at_ms = now_ms();
         self.put_adapter(&adapter).await?;
         Ok(Some(adapter))
@@ -147,6 +167,7 @@ impl AdapterStore {
             return Ok(None);
         };
         adapter.last_error = Some(error.into());
+        adapter.lifecycle_state = AdapterLifecycleState::Error;
         adapter.updated_at_ms = now_ms();
         self.put_adapter(&adapter).await?;
         Ok(Some(adapter))
@@ -236,6 +257,13 @@ impl AdapterStore {
     ) -> Result<AdapterOutboundMessageRecord> {
         let message =
             AdapterOutboundMessageRecord::new(adapter_id, text, target, attachments, now_ms())?;
+        let queued = count_json_files(&self.outbox_dir(&message.adapter_id)).await?
+            + count_json_files(&self.inflight_dir(&message.adapter_id)).await?;
+        if queued >= MAX_QUEUED_MESSAGES_PER_ADAPTER {
+            anyhow::bail!(
+                "adapter outbound queue is full (maximum {MAX_QUEUED_MESSAGES_PER_ADAPTER} messages)"
+            );
+        }
         fs::create_dir_all(self.outbox_dir(&message.adapter_id)).await?;
         let path = self.outbox_path(&message.adapter_id, &message.id);
         write_json_file(&path, &message).await.with_context(|| {
@@ -263,7 +291,9 @@ impl AdapterStore {
             .await
             .with_context(|| format!("failed to read adapter outbox directory {outbox_dir:?}"))?;
         let mut messages = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
+        while messages.len() < MAX_MESSAGES_PER_CLAIM
+            && let Some(entry) = entries.next_entry().await?
+        {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
@@ -271,16 +301,14 @@ impl AdapterStore {
             let bytes = fs::read(&path).await.with_context(|| {
                 format!("failed to read adapter outbound message {}", path.display())
             })?;
-            let message = serde_json::from_slice::<AdapterOutboundMessageRecord>(&bytes)?;
+            let mut message = serde_json::from_slice::<AdapterOutboundMessageRecord>(&bytes)?;
+            message.status = AdapterDeliveryStatus::InFlight;
+            message.attempt = message.attempt.saturating_add(1);
+            message.updated_at_ms = now_ms();
             fs::create_dir_all(self.inflight_dir(adapter_id)).await?;
             let inflight_path = self.inflight_path(adapter_id, &message.id);
-            fs::rename(&path, &inflight_path).await.with_context(|| {
-                format!(
-                    "failed to claim adapter outbound message {} into {}",
-                    path.display(),
-                    inflight_path.display()
-                )
-            })?;
+            write_json_file(&inflight_path, &message).await?;
+            remove_file_if_exists(path).await?;
             messages.push(message);
         }
         messages.sort_by_key(|message| message.created_at_ms);
@@ -291,30 +319,62 @@ impl AdapterStore {
         &self,
         adapter_id: &str,
         message_id: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<AdapterOutboundMessageRecord>> {
+        let Some(mut message) = self
+            .read_pending_outbound_message(adapter_id, message_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let completed_at_ms = now_ms();
+        message.status = AdapterDeliveryStatus::Delivered;
+        message.updated_at_ms = completed_at_ms;
+        message.completed_at_ms = Some(completed_at_ms);
+        message.last_error = None;
+        fs::create_dir_all(self.delivered_dir(adapter_id)).await?;
+        write_json_file(&self.delivered_path(adapter_id, message_id), &message).await?;
         remove_file_if_exists(self.inflight_path(adapter_id, message_id)).await?;
         remove_file_if_exists(self.outbox_path(adapter_id, message_id)).await?;
-        Ok(())
+        Ok(Some(message))
+    }
+
+    pub async fn nack_outbound_message(
+        &self,
+        adapter_id: &str,
+        message_id: &str,
+        error: impl Into<String>,
+    ) -> Result<Option<AdapterOutboundMessageRecord>> {
+        let Some(mut message) = self
+            .read_pending_outbound_message(adapter_id, message_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        message.last_error = Some(error.into());
+        message.updated_at_ms = now_ms();
+        remove_file_if_exists(self.inflight_path(adapter_id, message_id)).await?;
+        remove_file_if_exists(self.outbox_path(adapter_id, message_id)).await?;
+        if message.attempt >= MAX_DELIVERY_ATTEMPTS {
+            message.status = AdapterDeliveryStatus::Failed;
+            message.completed_at_ms = Some(message.updated_at_ms);
+            fs::create_dir_all(self.failed_dir(adapter_id)).await?;
+            write_json_file(&self.failed_path(adapter_id, message_id), &message).await?;
+        } else {
+            message.status = AdapterDeliveryStatus::Queued;
+            fs::create_dir_all(self.outbox_dir(adapter_id)).await?;
+            write_json_file(&self.outbox_path(adapter_id, message_id), &message).await?;
+        }
+        Ok(Some(message))
     }
 
     pub async fn requeue_outbound_message(&self, adapter_id: &str, message_id: &str) -> Result<()> {
-        let inflight_path = self.inflight_path(adapter_id, message_id);
-        match fs::metadata(&inflight_path).await {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        }
-        fs::create_dir_all(self.outbox_dir(adapter_id)).await?;
-        let outbox_path = self.outbox_path(adapter_id, message_id);
-        fs::rename(&inflight_path, &outbox_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to requeue adapter outbound message {} into {}",
-                    inflight_path.display(),
-                    outbox_path.display()
-                )
-            })
+        self.nack_outbound_message(
+            adapter_id,
+            message_id,
+            "worker stopped before acknowledging command",
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn requeue_inflight_messages(&self, adapter_id: &str) -> Result<()> {
@@ -475,6 +535,46 @@ impl AdapterStore {
             .join(format!("{message_id}.json"))
     }
 
+    fn delivered_dir(&self, adapter_id: &str) -> PathBuf {
+        self.root.join("outbox-delivered").join(adapter_id)
+    }
+
+    fn delivered_path(&self, adapter_id: &str, message_id: &str) -> PathBuf {
+        self.delivered_dir(adapter_id)
+            .join(format!("{message_id}.json"))
+    }
+
+    fn failed_dir(&self, adapter_id: &str) -> PathBuf {
+        self.root.join("outbox-failed").join(adapter_id)
+    }
+
+    fn failed_path(&self, adapter_id: &str, message_id: &str) -> PathBuf {
+        self.failed_dir(adapter_id)
+            .join(format!("{message_id}.json"))
+    }
+
+    async fn read_pending_outbound_message(
+        &self,
+        adapter_id: &str,
+        message_id: &str,
+    ) -> Result<Option<AdapterOutboundMessageRecord>> {
+        for path in [
+            self.inflight_path(adapter_id, message_id),
+            self.outbox_path(adapter_id, message_id),
+        ] {
+            match fs::read(&path).await {
+                Ok(bytes) => {
+                    return Ok(Some(
+                        serde_json::from_slice::<AdapterOutboundMessageRecord>(&bytes)?,
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(None)
+    }
+
     fn target_conversations_dir(&self, adapter_id: &str) -> PathBuf {
         self.root.join("target-conversations").join(adapter_id)
     }
@@ -522,6 +622,21 @@ async fn remove_dir_if_exists(path: PathBuf) -> Result<()> {
         }
     }
 }
+
+async fn count_json_files(path: &Path) -> Result<usize> {
+    let mut entries = match fs::read_dir(path).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let mut count = 0;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.path().extension().and_then(|ext| ext.to_str()) == Some("json") {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
 /// FNV-1a of an adapter target, used for both the target-conversation mapping
 /// filename and the derived conversation slug. `pub(crate)` so the runtime
 /// derives the same slug the store keys by — they must agree.
@@ -562,7 +677,7 @@ mod tests {
                 agent_id: "agent".to_string(),
                 conversation_id: "conversation".to_string(),
                 name: "irc".to_string(),
-                source: AdapterSource::BuiltIn,
+                source: AdapterSource::Library,
                 config: AdapterConfig {
                     adapter_type: "irc".to_string(),
                     worker_command: vec!["node".to_string(), "irc.js".to_string()],
@@ -599,6 +714,13 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let enabled = store
+            .enable_adapter(&adapter.id)
+            .await
+            .unwrap()
+            .expect("adapter should exist");
+        assert!(enabled.enabled);
+        assert_eq!(enabled.lifecycle_state, AdapterLifecycleState::Starting);
         assert!(store.delete_adapter(&adapter.id).await.unwrap().is_some());
         assert!(store.get_adapter(&adapter.id).await.unwrap().is_none());
     }
@@ -615,7 +737,7 @@ mod tests {
                 agent_id: "agent".to_string(),
                 conversation_id: "root".to_string(),
                 name: "discord".to_string(),
-                source: AdapterSource::BuiltIn,
+                source: AdapterSource::Library,
                 config: AdapterConfig {
                     adapter_type: "discord".to_string(),
                     worker_command: vec!["node".to_string()],
@@ -718,6 +840,15 @@ mod tests {
             .acknowledge_outbound_message("adapter", &message.id)
             .await
             .unwrap();
+        let delivered: AdapterOutboundMessageRecord = serde_json::from_slice(
+            &fs::read(store.delivered_path("adapter", &message.id))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(delivered.status, AdapterDeliveryStatus::Delivered);
+        assert_eq!(delivered.attempt, 1);
+        assert!(delivered.completed_at_ms.is_some());
         assert!(
             store
                 .claim_outbound_messages("adapter")
@@ -753,6 +884,51 @@ mod tests {
         let claimed_again = store.claim_outbound_messages("adapter").await.unwrap();
         assert_eq!(claimed_again.len(), 1);
         assert_eq!(claimed_again[0].id, message.id);
+        assert_eq!(claimed_again[0].attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn nacks_retry_then_preserve_terminal_failure() {
+        let tempdir = TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        let message = store
+            .enqueue_outbound_message("adapter".to_string(), "hello".to_string(), None, Vec::new())
+            .await
+            .unwrap();
+
+        for attempt in 1..=MAX_DELIVERY_ATTEMPTS {
+            let claimed = store.claim_outbound_messages("adapter").await.unwrap();
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(claimed[0].attempt, attempt);
+            let nacked = store
+                .nack_outbound_message("adapter", &message.id, format!("failure {attempt}"))
+                .await
+                .unwrap()
+                .unwrap();
+            if attempt < MAX_DELIVERY_ATTEMPTS {
+                assert_eq!(nacked.status, AdapterDeliveryStatus::Queued);
+            } else {
+                assert_eq!(nacked.status, AdapterDeliveryStatus::Failed);
+                assert!(nacked.completed_at_ms.is_some());
+            }
+        }
+
+        assert!(
+            store
+                .claim_outbound_messages("adapter")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let failed: AdapterOutboundMessageRecord = serde_json::from_slice(
+            &fs::read(store.failed_path("adapter", &message.id))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(failed.status, AdapterDeliveryStatus::Failed);
+        assert_eq!(failed.attempt, MAX_DELIVERY_ATTEMPTS);
+        assert_eq!(failed.last_error.as_deref(), Some("failure 3"));
     }
 
     #[tokio::test]

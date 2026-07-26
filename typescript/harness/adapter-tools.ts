@@ -4,6 +4,7 @@ import type { HarnessToolRegistry, ToolInstance } from "./tools";
 export type AdapterToolName =
   | "create_adapter"
   | "list_adapters"
+  | "enable_adapter"
   | "disable_adapter"
   | "delete_adapter"
   | "send_adapter_message";
@@ -13,6 +14,7 @@ export function registerAdapterTools(
   names: AdapterToolName[] = [
     "create_adapter",
     "list_adapters",
+    "enable_adapter",
     "disable_adapter",
     "delete_adapter",
     "send_adapter_message",
@@ -30,6 +32,7 @@ function createAdapterToolInstances(): ToolInstance[] {
   return [
     createAdapterTool(),
     listAdaptersTool(),
+    enableAdapterTool(),
     disableAdapterTool(),
     deleteAdapterTool(),
     sendAdapterMessageTool(),
@@ -42,7 +45,7 @@ function createAdapterTool(): ToolInstance {
     definition: {
       name: "create_adapter",
       description:
-        "Create and enable a long-running adapter for this conversation. Use source 'built_in' with config type 'irc' or 'agent-cli'. Use source 'library' with config type 'exochat', 'whatsapp', 'signal', 'discord', or 'slack' for shipped library adapters.",
+        "Create and enable a shipped long-running adapter for this conversation. Use source 'library'.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -54,7 +57,7 @@ function createAdapterTool(): ToolInstance {
           },
           source: {
             type: "string",
-            enum: ["built_in", "library"],
+            enum: ["library"],
             description: "Adapter source.",
           },
           config: adapterConfigSchema(),
@@ -71,6 +74,16 @@ function createAdapterTool(): ToolInstance {
       },
     },
   };
+}
+
+function enableAdapterTool(): ToolInstance {
+  return hostTool({
+    name: "enable_adapter",
+    description: "Re-enable a disabled adapter for this conversation.",
+    parameters: adapterIdParameters(
+      "Adapter id returned by create_adapter or list_adapters.",
+    ),
+  });
 }
 
 function listAdaptersTool(): ToolInstance {
@@ -507,13 +520,13 @@ function adapterConfigSchema(): ToolDefinition["parameters"] {
             description:
               "Optional stable relay channel id. Use null to generate and persist one in adapter state.",
           },
-          secret: {
+          secretId: {
             type: ["string", "null"],
             description:
-              "Optional shared channel secret. Use null to generate and persist one in adapter state.",
+              "Optional Exoharness secret reference containing the shared channel secret. Use null with channelId null to generate a host-stored secret.",
           },
         },
-        required: ["type", "baseUrl", "channelId", "secret"],
+        required: ["type", "baseUrl", "channelId", "secretId"],
       },
       {
         type: "object",
@@ -552,11 +565,10 @@ function transformCreateAdapterArguments(args: JsonObject): JsonObject {
 }
 
 function validateAdapterSource(source: string, type: string): void {
-  if ((type === "irc" || type === "agent-cli") && source !== "built_in") {
-    throw new Error(`${type} adapters must use source 'built_in'`);
-  }
   if (
-    (type === "exochat" ||
+    (type === "irc" ||
+      type === "agent-cli" ||
+      type === "exochat" ||
       type === "whatsapp" ||
       type === "signal" ||
       type === "discord" ||

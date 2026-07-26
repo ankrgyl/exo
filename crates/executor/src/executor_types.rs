@@ -69,7 +69,7 @@ pub struct TypeScriptHarnessConfig {
 }
 
 pub fn default_enable_agent_tool_creation() -> bool {
-    true
+    false
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]

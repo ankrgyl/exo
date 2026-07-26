@@ -65,13 +65,20 @@ Tools have two layers, and both matter:
 
 1. **Definition (TypeScript)**: the model only sees tools registered in the
    TypeScript registry each turn (`examples/exo/harness.ts`). Sources are
-   built-in tools, library tool modules, and agent-installed tools in
-   `.exo/agent-tools/` (managed with `install_agent_tool` /
-   `uninstall_agent_tool`).
+   built-in tools, library tool modules, and registry-installed tools managed
+   with `inspect_tools` / `manage_tool`. The older `.exo/agent-tools/` scan and
+   `install_agent_tool` / `uninstall_agent_tool` tools are compatibility
+   surfaces enabled only by `enableAgentToolCreation`.
 2. **Execution (TypeScript or Rust)**: a tool's handler can run entirely in
    TypeScript, or delegate to the Rust runtime via
    `execution.context.executeTool(...)`, which dispatches on the function name
    in `crates/executor/src/harness_tool.rs`.
+
+For a local manifest tool, create its directory under
+`/workspace/exo/.exo/tool-sources/<name>` and call `manage_tool` with the
+workspace-relative path `.exo/tool-sources/<name>`. `shell` sees sandbox paths,
+while `manage_tool` resolves local sources in the host harness; never pass
+`/tmp/...` or another absolute sandbox path.
 
 ### Adding a Rust-backed tool
 
@@ -85,8 +92,8 @@ definition that delegates to it:
    `registerHostTool` from `examples/exo/host-tools.ts`, wired into the
    registry in `examples/exo/harness.ts` (see `sandbox-tools.ts` for the
    pattern).
-3. Rebuild and restart with `guardian_action restart_all` (with build) so both
-   the Rust binary and the harness pick up the change.
+3. Call `rebuild_and_restart_exo` so both the Rust binary and the harness pick
+   up the change.
 4. Never create an agent-installed tool with the same name as a Rust-backed
    tool; the registry conflict makes calls ambiguous.
 
@@ -109,18 +116,20 @@ inside the conversation before touching host services:
    manual restart); `adapter_runner_draining` records a graceful shutdown
    beginning. This is the immutable history of what happened to you — use it
    to answer "was I restarted, when, and why?".
-4. Only escalate to `guardian_action` logs or restarts once the event history
-   shows a host-side problem (worker crash loops, repeated disconnects, send
-   failures).
+4. Only ask the operator to inspect guardian logs once the event history shows
+   a host-side problem (worker crash loops, repeated disconnects, send failures).
 
 ## Maintenance Rules
 
-- Prefer `guardian_action` for host-side build, status, logs, and service restarts.
+- Use `rebuild_and_restart_exo` for the fixed self-update build-and-restart path.
+- Service status and logs are operator CLI responsibilities:
+  `examples/exo/scripts/exo-service-guardian status` and
+  `examples/exo/scripts/exo-service-guardian logs`.
 - Use the `shell` tool for sandbox-local inspection and experiments.
 - Use `snapshot_sandbox` before risky filesystem changes.
-- Use `guardian_action restart_all` after code changes that require host services
-  to pick up a new build. Restart actions are deferred briefly so the current
-  turn can finish before services stop; check status/logs after they come back.
+- Use `rebuild_and_restart_exo` after code changes that require host services
+  to pick up a new build. The restart is deferred briefly so the current turn
+  can finish before services stop.
 - In control mode, service guardian builds write `.exo/exo-control.restart`;
   the `./exo.sh --control` wrapper restarts only the child `exo repl` and
   keeps the user's terminal open.

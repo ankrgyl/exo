@@ -4,8 +4,8 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use exoharness::{
-    AgentHandle, ConversationHandle, Result, RunInSandboxRequest, SandboxProcess, ToolRequest,
-    ToolResult, Uuid7,
+    AgentHandle, ConversationHandle, PutSecretRequest, Result, RunInSandboxRequest, SandboxProcess,
+    Secret, ToolRequest, ToolResult, Uuid7,
 };
 use futures::{StreamExt, io::AsyncReadExt};
 use serde::Deserialize;
@@ -190,7 +190,7 @@ struct ExochatAdapterCreationConfig {
     _adapter_type: ExochatAdapterType,
     base_url: Option<String>,
     channel_id: Option<String>,
-    secret: Option<String>,
+    secret_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,7 +334,7 @@ impl AdapterCreationConfig {
     ) -> Result<AdapterConfig> {
         match self {
             Self::Irc(config) => {
-                require_source(source, AdapterSource::BuiltIn, "irc")?;
+                require_source(source, AdapterSource::Library, "irc")?;
                 Ok(AdapterConfig {
                     adapter_type: "irc".to_string(),
                     worker_command: options.worker_command("irc"),
@@ -476,25 +476,33 @@ impl AdapterCreationConfig {
             Self::Exochat(config) => {
                 require_source(source, AdapterSource::Library, "exochat")?;
                 let channel_id = config.channel_id.filter(|value| !value.trim().is_empty());
-                let secret = config.secret.filter(|value| !value.trim().is_empty());
-                if channel_id.is_some() != secret.is_some() {
-                    bail!("exochat channelId and secret must either both be set or both be null");
+                let secret_id = config.secret_id.filter(|value| !value.trim().is_empty());
+                if channel_id.is_some() != secret_id.is_some() {
+                    bail!("exochat channelId and secretId must either both be set or both be null");
                 }
                 let base_url = exochat_base_url(config.base_url)?;
+                let generated = secret_id.is_none();
                 Ok(AdapterConfig {
                     adapter_type: "exochat".to_string(),
                     worker_command: options.worker_command("exochat"),
                     initialization: serde_json::json!({
                         "baseUrl": base_url,
                         "channelId": channel_id.unwrap_or_else(|| Uuid7::now().to_string()),
-                        "secret": secret.unwrap_or_else(exochat_secret),
+                        "secret": generated.then(exochat_secret),
                     }),
                     state_dir: None,
-                    secret_env: Vec::new(),
+                    secret_env: secret_id
+                        .map(|secret_id| {
+                            vec![WorkerSecretEnvVar {
+                                env: "EXO_EXOCHAT_SECRET".to_string(),
+                                secret_id,
+                            }]
+                        })
+                        .unwrap_or_default(),
                 })
             }
             Self::AgentCli(config) => {
-                require_source(source, AdapterSource::BuiltIn, "agent-cli")?;
+                require_source(source, AdapterSource::Library, "agent-cli")?;
                 if !config.mount_root.starts_with('/') {
                     bail!("agent-cli mountRoot must be an absolute host path");
                 }
@@ -602,6 +610,36 @@ fn exochat_secret() -> String {
     URL_SAFE_NO_PAD.encode(format!("{}:{}", Uuid7::now(), Uuid7::now()))
 }
 
+async fn bind_exochat_secret(agent: &dyn AgentHandle, config: &mut AdapterConfig) -> Result<()> {
+    if config
+        .secret_env
+        .iter()
+        .any(|secret| secret.env == "EXO_EXOCHAT_SECRET")
+    {
+        return Ok(());
+    }
+    let initialization = config
+        .initialization
+        .as_object_mut()
+        .context("exochat initialization must be an object")?;
+    let secret = initialization
+        .remove("secret")
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .context("exochat initialization secret is required")?;
+    let secret_name = format!("exochat-{}", Uuid7::now());
+    let secret_id = agent
+        .put_secret(PutSecretRequest {
+            name: secret_name,
+            secret: Secret::Key { value: secret },
+        })
+        .await?;
+    config.secret_env.push(WorkerSecretEnvVar {
+        env: "EXO_EXOCHAT_SECRET".to_string(),
+        secret_id: secret_id.to_string(),
+    });
+    Ok(())
+}
+
 fn worker_command(path: PathBuf) -> Vec<String> {
     vec![
         "pnpm".to_string(),
@@ -620,7 +658,10 @@ pub async fn execute_create_adapter_tool(
     let args =
         serde_json::from_value::<CreateAdapterArguments>(Value::Object(request.arguments.clone()))?;
     let adapter_type = args.config.adapter_type();
-    let config = args.config.into_adapter_config(args.source, options)?;
+    let mut config = args.config.into_adapter_config(args.source, options)?;
+    if config.adapter_type == "exochat" {
+        bind_exochat_secret(agent, &mut config).await?;
+    }
     let adapter = store
         .create_adapter(NewAdapter {
             agent_id: agent.record().id.to_string(),
@@ -635,7 +676,7 @@ pub async fn execute_create_adapter_tool(
     }
     Ok(serde_json::json!({
         "ok": true,
-        "adapter": adapter_tool_result(adapter),
+        "adapter": adapter_tool_result(agent, adapter).await?,
     }))
 }
 
@@ -655,35 +696,71 @@ pub async fn execute_list_adapters_tool(
             args.include_disabled.unwrap_or(false),
         )
         .await?;
-    let adapters = adapters
-        .into_iter()
-        .map(adapter_tool_result)
-        .collect::<Vec<_>>();
+    let mut results = Vec::with_capacity(adapters.len());
+    for adapter in adapters {
+        results.push(adapter_tool_result(agent, adapter).await?);
+    }
     Ok(serde_json::json!({
         "ok": true,
-        "adapters": adapters,
+        "adapters": results,
     }))
 }
 
-fn adapter_tool_result(adapter: super::types::AdapterRecord) -> serde_json::Value {
+async fn adapter_tool_result(
+    agent: &dyn AgentHandle,
+    adapter: super::types::AdapterRecord,
+) -> Result<serde_json::Value> {
     let mut value = serde_json::to_value(&adapter).expect("adapter record serializes");
     if adapter.config.adapter_type == "exochat"
-        && let Some(chat_url) = exochat_chat_url(&adapter.config)
+        && let Some(chat_url) = exochat_chat_url(agent, &adapter.config).await?
         && let serde_json::Value::Object(object) = &mut value
     {
         object.insert("chatUrl".to_string(), serde_json::Value::String(chat_url));
     }
-    value
+    Ok(value)
 }
 
-fn exochat_chat_url(config: &AdapterConfig) -> Option<String> {
-    let init = config.initialization.as_object()?;
-    let base_url = init.get("baseUrl")?.as_str()?.trim_end_matches('/');
-    let channel_id = init.get("channelId")?.as_str()?;
-    let secret = init.get("secret")?.as_str()?;
-    Some(format!(
-        "{base_url}/chat?role=user&c={channel_id}#k={secret}"
-    ))
+async fn exochat_chat_url(
+    agent: &dyn AgentHandle,
+    config: &AdapterConfig,
+) -> Result<Option<String>> {
+    let Some(init) = config.initialization.as_object() else {
+        return Ok(None);
+    };
+    let Some(base_url) = init.get("baseUrl").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(channel_id) = init.get("channelId").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(secret_ref) = config
+        .secret_env
+        .iter()
+        .find(|secret| secret.env == "EXO_EXOCHAT_SECRET")
+        .map(|secret| secret.secret_id.as_str())
+    else {
+        return Ok(None);
+    };
+    let secret_id = if let Ok(id) = secret_ref.parse() {
+        id
+    } else {
+        let Some(metadata) = agent
+            .list_secrets()
+            .await?
+            .into_iter()
+            .find(|secret| secret.name == secret_ref)
+        else {
+            return Ok(None);
+        };
+        metadata.id
+    };
+    let Some(Secret::Key { value: secret }) = agent.get_secret(&secret_id).await? else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "{}/chat?role=user&c={channel_id}#k={secret}",
+        base_url.trim_end_matches('/')
+    )))
 }
 
 pub async fn execute_list_adapter_events_tool(
@@ -739,6 +816,30 @@ pub async fn execute_disable_adapter_tool(
         "ok": true,
         "adapterId": args.adapter_id,
         "disabled": true,
+    }))
+}
+
+pub async fn execute_enable_adapter_tool(
+    conversation: &dyn ConversationHandle,
+    agent: &dyn AgentHandle,
+    store: &AdapterStore,
+    request: &ToolRequest,
+) -> Result<ToolResult> {
+    let args =
+        serde_json::from_value::<AdapterIdArguments>(Value::Object(request.arguments.clone()))?;
+    let Some(adapter) = store.get_adapter(&args.adapter_id).await? else {
+        return Ok(not_found());
+    };
+    if adapter.agent_id != agent.record().id.to_string()
+        || adapter.conversation_id != conversation.record().id.to_string()
+    {
+        return Ok(not_found());
+    }
+    store.enable_adapter(&args.adapter_id).await?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "adapterId": args.adapter_id,
+        "enabled": true,
     }))
 }
 
@@ -811,7 +912,7 @@ pub async fn execute_send_adapter_message_tool(
         attachments,
     )
     .await?;
-    send_adapter_message_with_handles(
+    let message = send_adapter_message_with_handles(
         agent,
         conversation,
         store,
@@ -824,7 +925,8 @@ pub async fn execute_send_adapter_message_tool(
     Ok(serde_json::json!({
         "ok": true,
         "adapterId": args.adapter_id,
-        "sent": true,
+        "queued": true,
+        "messageId": message.id,
     }))
 }
 
@@ -1311,7 +1413,7 @@ mod tests {
                     "agentId": "spoofed-agent",
                     "conversationId": "spoofed-conversation",
                     "name": "irc",
-                    "source": "built_in",
+                    "source": "library",
                     "config": {
                         "type": "irc",
                         "server": "irc.example.test",
@@ -1357,6 +1459,67 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(list_result["adapters"].as_array().unwrap().len(), 1);
+
+        execute_disable_adapter_tool(
+            conversation.as_ref(),
+            agent.as_ref(),
+            &store,
+            &tool_request(
+                "disable_adapter",
+                serde_json::json!({ "adapterId": adapter_id }),
+            ),
+        )
+        .await
+        .unwrap();
+        let enable_result = execute_enable_adapter_tool(
+            conversation.as_ref(),
+            agent.as_ref(),
+            &store,
+            &tool_request(
+                "enable_adapter",
+                serde_json::json!({ "adapterId": adapter_id }),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(enable_result["enabled"], true);
+        assert!(
+            store
+                .get_adapter(adapter_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+
+        let send_result = execute_send_adapter_message_tool(
+            agent.as_ref(),
+            conversation.as_ref(),
+            &test_agent_config(),
+            &ConversationConfig::default(),
+            &store,
+            &tool_request(
+                "send_adapter_message",
+                serde_json::json!({
+                    "adapterId": adapter_id,
+                    "text": "hello",
+                    "target": "#exo",
+                    "attachments": null
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(send_result["queued"], true);
+        assert!(send_result["messageId"].as_str().is_some());
+        assert_eq!(
+            store
+                .claim_outbound_messages(adapter_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1370,7 +1533,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.adapter_type(), "agent-cli");
         let adapter_config = config
-            .into_adapter_config(AdapterSource::BuiltIn, &test_creation_options())
+            .into_adapter_config(AdapterSource::Library, &test_creation_options())
             .unwrap();
         assert_eq!(adapter_config.adapter_type, "agent-cli");
         assert!(
@@ -1388,7 +1551,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_cli_config_rejects_relative_mount_root_and_wrong_source() {
+    fn agent_cli_config_rejects_relative_mount_root() {
         let parse = |mount_root: &str| -> AdapterCreationConfig {
             serde_json::from_value(serde_json::json!({
                 "type": "agent-cli",
@@ -1399,27 +1562,24 @@ mod tests {
             .unwrap()
         };
         let error = parse("projects")
-            .into_adapter_config(AdapterSource::BuiltIn, &test_creation_options())
-            .unwrap_err();
-        assert!(error.to_string().contains("absolute host path"));
-        let error = parse("/Users/me/projects")
             .into_adapter_config(AdapterSource::Library, &test_creation_options())
             .unwrap_err();
-        assert!(error.to_string().contains("source"));
+        assert!(error.to_string().contains("absolute host path"));
     }
 
     #[test]
-    fn exochat_config_applies_defaults_and_requires_library_source() {
-        let parse =
-            |channel_id: serde_json::Value, secret: serde_json::Value| -> AdapterCreationConfig {
-                serde_json::from_value(serde_json::json!({
-                    "type": "exochat",
-                    "baseUrl": null,
-                    "channelId": channel_id,
-                    "secret": secret,
-                }))
-                .unwrap()
-            };
+    fn exochat_config_applies_defaults() {
+        let parse = |channel_id: serde_json::Value,
+                     secret_id: serde_json::Value|
+         -> AdapterCreationConfig {
+            serde_json::from_value(serde_json::json!({
+                "type": "exochat",
+                "baseUrl": null,
+                "channelId": channel_id,
+                "secretId": secret_id,
+            }))
+            .unwrap()
+        };
         let adapter_config = parse(serde_json::Value::Null, serde_json::Value::Null)
             .into_adapter_config(AdapterSource::Library, &test_creation_options())
             .unwrap();
@@ -1435,25 +1595,36 @@ mod tests {
                 .is_some()
         );
         assert!(adapter_config.initialization["secret"].as_str().is_some());
-        let chat_url = exochat_chat_url(&adapter_config).unwrap();
-        assert!(chat_url.starts_with("https://exoharness.ai/chat?role=user&c="));
-        assert!(chat_url.contains("#k="));
         assert!(adapter_config.secret_env.is_empty());
-
-        let error = parse(serde_json::Value::Null, serde_json::Value::Null)
-            .into_adapter_config(AdapterSource::BuiltIn, &test_creation_options())
-            .unwrap_err();
-        assert!(error.to_string().contains("source"));
 
         let error = parse(serde_json::json!("channel"), serde_json::Value::Null)
             .into_adapter_config(AdapterSource::Library, &test_creation_options())
             .unwrap_err();
-        assert!(error.to_string().contains("channelId and secret"));
+        assert!(error.to_string().contains("channelId and secretId"));
     }
 
     #[tokio::test]
     async fn exochat_adapter_tool_result_includes_chat_url() {
         let tempdir = TempDir::new().unwrap();
+        let exoharness = BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
+            .await
+            .unwrap();
+        let agent = exoharness
+            .new_agent(NewAgentRequest {
+                slug: "agent".to_string(),
+                name: "Agent".to_string(),
+            })
+            .await
+            .unwrap();
+        let secret_id = agent
+            .put_secret(PutSecretRequest {
+                name: "exochat-test".to_string(),
+                secret: Secret::Key {
+                    value: "secret-456".to_string(),
+                },
+            })
+            .await
+            .unwrap();
         let store = AdapterStore::new(tempdir.path().join("adapters"));
         let adapter = store
             .create_adapter(NewAdapter {
@@ -1467,15 +1638,17 @@ mod tests {
                     initialization: serde_json::json!({
                         "baseUrl": "https://chat.example.test",
                         "channelId": "channel-123",
-                        "secret": "secret-456",
                     }),
                     state_dir: None,
-                    secret_env: Vec::new(),
+                    secret_env: vec![WorkerSecretEnvVar {
+                        env: "EXO_EXOCHAT_SECRET".to_string(),
+                        secret_id: secret_id.to_string(),
+                    }],
                 },
             })
             .await
             .unwrap();
-        let result = adapter_tool_result(adapter);
+        let result = adapter_tool_result(agent.as_ref(), adapter).await.unwrap();
         assert_eq!(
             result["chatUrl"],
             "https://chat.example.test/chat?role=user&c=channel-123#k=secret-456"

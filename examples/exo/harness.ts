@@ -3,27 +3,19 @@ import { existsSync, readFileSync } from "node:fs";
 import {
   defineHarness,
   registerBuiltInTools,
-  registerAgentToolsFromDirectoryIfExists,
   registerLibraryToolModulePath,
-  registerAdapterTools,
-  registerSkillTools,
   skillsInstruction,
-  type BuiltInToolName,
   type HarnessToolRegistry,
   type Message,
   type TurnContext,
 } from "@exo/harness";
 
-import { registerSchedulerTools } from "./scheduler-tools";
-import { registerSandboxTools } from "./sandbox-tools";
-import { registerGuardianTools } from "./guardian-tools";
-import { registerIntrospectionTools } from "./introspection-tools";
-import { memoryInstruction, registerMemoryTools } from "./memory-tools";
-import { registerTodoTools, todoInstruction } from "./todo-tools";
-import { registerWebTools } from "./web-tools";
+import { memoryInstruction } from "./memory-tools";
+import { resolveExoProfile } from "./profiles";
+import { todoInstruction } from "./todo-tools";
 import {
   basicHarnessInstructions,
-  defaultBuiltInToolNames,
+  registerConfiguredAgentTools,
   runResponsesHarnessTurn,
 } from "../typescript/turn-loop";
 
@@ -55,27 +47,14 @@ export async function registerExoTools(
   tools: HarnessToolRegistry,
   context: TurnContext,
 ): Promise<void> {
-  registerBuiltInTools(tools, context, builtInToolNames(context));
-  registerSchedulerTools(tools);
-  registerAdapterTools(tools);
-  registerIntrospectionTools(tools);
-  registerSandboxTools(tools);
-  registerGuardianTools(tools);
-  registerMemoryTools(tools);
-  registerTodoTools(tools);
-  registerSkillTools(tools);
-  registerWebTools(tools);
+  const profile = resolveExoProfile();
+  registerBuiltInTools(tools, context, profile.builtInToolNames(context));
+  await profile.registerTools(tools, context);
   for (const modulePath of context.agentConfig.typescript?.toolModulePaths ??
     []) {
     await registerLibraryToolModulePath(tools, context, modulePath);
   }
-  if (context.agentConfig.enableAgentToolCreation) {
-    await registerAgentToolsFromDirectoryIfExists(tools, context);
-  }
-}
-
-function builtInToolNames(context: TurnContext): BuiltInToolName[] {
-  return defaultBuiltInToolNames(context);
+  await registerConfiguredAgentTools(tools, context);
 }
 
 export async function exoInstructions(
@@ -105,7 +84,10 @@ You can schedule recurring sandbox work with schedule_sandbox_task, inspect acti
 You can inspect sandbox filesystem snapshots with list_sandbox_snapshots, capture a checkpoint with snapshot_sandbox, and rewind to a previous checkpoint with rewind_sandbox.
 
 ## Self-maintenance (guardian)
-You can use guardian_action for host-side self-maintenance such as checking service status, building Exo, viewing logs, and restarting the scheduler or adapter runners while preserving .exo state. guardian_action restart actions are deferred briefly so the current turn can finish before services stop; guardian builds also ask the control REPL wrapper to refresh its child process without closing the user's terminal. After requesting one, report that it was scheduled and use status/logs after services come back.
+Use rebuild_and_restart_exo after changing Exo itself. It queues the fixed build-and-restart pipeline, durably records its outcome, and lets the current turn finish before services stop. The existing guardian reboot notice wakes active adapter conversations after a successful restart. Service status and logs remain operator CLI responsibilities.
+
+## Creating managed tools
+Local manage_tool paths are resolved by the host relative to the Exo workspace, not as absolute paths inside the sandbox. Create tool source under ${repoPath}/.exo/tool-sources/<name>, include exo-tool.json, then install it with the relative local path .exo/tool-sources/<name>. Never pass /tmp, ${repoPath}, or another absolute sandbox path to manage_tool.
 
 ## Adapters
 You can create long-running external adapters with create_adapter, inspect them with list_adapters, disable/delete them, and send explicit outbound replies with send_adapter_message. Use cancel_scheduled_task or disable_adapter when history should be preserved; use delete_scheduled_task or delete_adapter when the user asks to remove something entirely.
@@ -138,7 +120,7 @@ Use web_search to find current information on the web and web_fetch to read a sp
     },
     {
       role: "developer",
-      content: `Your own source tree is mounted in the sandbox at ${repoPath}. Start with ${selfMapPath} when you need to inspect or modify Exo itself. Use guardian_action for host-side builds and service restarts after code changes.`,
+      content: `Your own source tree is mounted in the sandbox at ${repoPath}. Start with ${selfMapPath} when you need to inspect or modify Exo itself. Use rebuild_and_restart_exo to validate, build, and activate Exo changes.`,
     },
   ];
   const localPrompt = readLocalPrompt();

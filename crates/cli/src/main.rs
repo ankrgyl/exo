@@ -11,6 +11,7 @@ mod render;
 mod repl_tests;
 #[cfg(test)]
 mod secret_tests;
+mod tools;
 mod tui;
 mod tui_app;
 
@@ -421,6 +422,11 @@ enum Commands {
         #[command(subcommand)]
         command: adapters::AdapterCommands,
     },
+    /// Inspect locally installed tool modules.
+    Tools {
+        #[command(subcommand)]
+        command: tools::ToolCommands,
+    },
     Serve {
         #[arg(long, default_value = "127.0.0.1:4766")]
         bind: SocketAddr,
@@ -821,6 +827,10 @@ async fn main() -> Result<()> {
     );
     let env_vars = env.into_vars();
     let harness_selection = cli.harness.clone();
+    if let Commands::Tools { command } = &cli.command {
+        tools::handle_tool_command(&cli.root, command)?;
+        return Ok(());
+    }
     if let Some(config) = serve_config(&cli.command) {
         serve_exoharness_http(&exo_config, config).await?;
         return Ok(());
@@ -853,6 +863,7 @@ async fn main() -> Result<()> {
     .await?;
 
     match cli.command {
+        Commands::Tools { .. } => unreachable!("tools commands return before harness startup"),
         Commands::Adapters { command } => {
             adapters::handle_adapter_command(&cli.root, Arc::clone(&harness), command).await?;
         }
@@ -903,7 +914,7 @@ async fn main() -> Result<()> {
                             name: Some(agent_slug),
                             harness: to_agent_harness_kind(harness_kind),
                             typescript,
-                            enable_agent_tool_creation: true,
+                            enable_agent_tool_creation: false,
                             sandbox_image: harness_selection
                                 .as_ref()
                                 .and_then(HarnessSelection::default_sandbox_image)
@@ -1008,7 +1019,7 @@ async fn main() -> Result<()> {
                         typescript,
                         enable_agent_tool_creation: tool_creation
                             .map(EnabledDisabled::enabled)
-                            .unwrap_or(true),
+                            .unwrap_or(false),
                         sandbox_image,
                         sandbox_provider: sandbox_provider
                             .map(SandboxProvider::from)
@@ -2127,6 +2138,7 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
         | Commands::Model { .. }
         | Commands::Provider { .. }
         | Commands::Adapters { .. }
+        | Commands::Tools { .. }
         | Commands::Serve { .. } => None,
     }
 }

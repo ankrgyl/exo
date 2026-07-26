@@ -1,75 +1,88 @@
 ---
 title: Tools
-description: Functions the model can call during a turn — an executor concept the exoharness records but does not own.
+description: Trusted functions the harness exposes to the model during a turn.
 ---
 
 # Tools
 
-A **tool** is a function the model can call during a turn: run a shell
-command, write a file, search the web. Tools are an **executor** concept —
-the executor decides which tools the model sees and runs them. The
-exoharness doesn't define tools; it only records `tool_requested` and
-`tool_result` [events](./data-model) so the activity is durable.
+A **tool** is a function the model calls during an active turn. The harness
+validates its arguments, executes it, and records durable `tool_requested` and
+`tool_result` events. Large results are stored as artifacts with a compact
+preview in model context.
 
-## Anatomy of a tool
+Tools are an executor concept. Exoharness supplies durable events, artifacts,
+bindings, secrets, and sandbox processes; the TypeScript harness decides which
+tools the model sees and how their handlers run.
 
-A tool is a plain object with a JSON-schema `definition` the model sees and
-an `initialize()` that returns the handler which runs when the model calls
-it:
+## Trust model
 
-```ts
-const tool = defineTool({
-  definition: {
-    name: "...",
-    description: "...",
-    parameters: { type: "object", additionalProperties: false, properties: { /* ... */ } },
-  },
-  initializationParameters: { type: "object", additionalProperties: false, properties: {} },
-  initialize() {
-    return { async execute(args, execution) { /* ... */ } };
-  },
-});
+TypeScript tool modules run as trusted code in the harness process. Loading one
+is a trust decision. Commands that a handler starts inside the conversation
+sandbox still use that sandbox's policy, but there is not yet a capability
+sandbox around the tool module itself.
+
+Credentials belong in Exoharness secrets. Tool configuration refers to a
+secret; definitions, prompts, and results must not contain the raw value.
+
+## Local tool sources
+
+Tools can be installed from a workspace-relative directory or a Git repository
+pinned to an immutable commit. Both may select a contained subdirectory. Exo
+copies the selected source into its managed `.exo/tools/` store and records it
+in a small lockfile.
+
+Each source contains an `exo-tool.json` with exactly `schemaVersion`, `id`, and
+`module`. The TypeScript module owns its model-facing name, description, input
+and output schemas, handler, and initialization contract.
+
+There is one workspace-local registry and no agent or conversation tool scope.
+Each `tools.lock.json` tool entry contains only `id`, `source`,
+`initialization`, and `installPath`. Malformed lockfiles fail clearly. Broken
+installed modules are logged and skipped without persistent audit or
+quarantine state, and failed installs clean their staging data.
+
+Configured library modules remain supported. The legacy `install_agent_tool`
+and `uninstall_agent_tool` tools and `.exo/agent-tools/` directory are opt-in
+compatibility paths through `enable_agent_tool_creation`, which defaults to
+`false`.
+
+## Manage and inspect
+
+`manage_tool` is the only write surface. It can install or remove tools.
+Install is an upsert by stable manifest id and accepts only workspace-relative
+directories or exact pinned Git commits, with optional contained
+subdirectories. For a tool created with sandbox `shell`, write under
+`/workspace/exo/.exo/tool-sources/<name>` and install the relative path
+`.exo/tool-sources/<name>`. Absolute sandbox paths are rejected because
+`manage_tool` runs in the host harness. Changes are available on the next model
+round.
+
+`inspect_tools` is read-only and supports `list` and `get` for active or
+installed tools. The operator CLI is also read-only:
+
+```text
+exo tools list
+exo tools get <id>
 ```
 
-`execution.context` is the full turn context, so a tool can run sandbox
-commands, read events, or write artifacts. See the
-[Custom Agent Quickstart](../tutorials/write-your-own-agent) for building
-one step by step.
+## Bootstrap and profiles
 
-## Where tools run
+The bootstrap profile has four tools:
 
-Tool handlers run in the **harness (host) process**, not inside the
-sandbox. To do work in the isolated environment, a tool calls the built-in
-`shell` tool or `context.startSandboxProcess(...)`. This keeps the
-trust boundary clear: the model's requested action runs where the harness
-controls it.
+```text
+shell
+inspect_tools
+manage_tool
+rebuild_and_restart_exo
+```
 
-## Where tools come from
+The practical profile adds the shipped scheduler, adapter, sandbox recovery,
+introspection, memory, todo, skill, and web tools. Bootstrap and practical are
+the only profiles.
 
-The registry a turn exposes is assembled from three sources:
+Code mode, generic adapter command generation, and treating the scheduler as an
+adapter are also deferred. Scheduling continues through the current scheduler
+service.
 
-- **Built-in** — shipped with the harness runtime: `shell` (run commands in
-  the sandbox), and `install_agent_tool` / `uninstall_agent_tool` (let the
-  agent write and remove its own tools).
-- **Library** — tool modules you ship and load by path
-  (`--tool-module <path>`), like the tutorials' `todowrite`.
-- **Agent-created** — tools the agent writes at runtime via
-  `install_agent_tool`, stored under `.exo/agent-tools/` and loaded when the
-  agent is configured for tool creation.
-
-## Registration is per round
-
-The tool registry is rebuilt on **every model round**. So a tool the agent
-installs mid-turn with `install_agent_tool` is visible on the very next
-round — which is what lets an agent extend itself and immediately use the
-result.
-
-## Results become durable
-
-A tool's result is recorded as a `tool_result` event. Large results are
-also stored as versioned [artifacts](./data-model), and the model sees a
-compact inline preview rather than the full payload — so a big command
-output doesn't bloat the prompt while the complete result stays retrievable.
-
-See [The Canonical Agent](./canonical-agent) for the full tool surface
-of the shipped agent (scheduling, adapters, snapshots, memory, guardian).
+See [Adapters](./adapters) for the long-running integrations that can wake a
+conversation.

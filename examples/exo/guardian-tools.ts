@@ -1,11 +1,17 @@
 import { spawn } from "node:child_process";
-import { closeSync, mkdirSync, openSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 
 import type {
   HarnessToolRegistry,
   JsonObject,
-  ToolDefinition,
   ToolInstance,
   ToolResult,
 } from "@exo/harness";
@@ -17,217 +23,68 @@ const GUARDIAN_SCRIPT = new URL(
 const ROOT_DIR = new URL("../..", import.meta.url).pathname;
 const STATE_DIR = join(ROOT_DIR, ".exo");
 const DEFERRED_LOG_PATH = join(STATE_DIR, "exo-service-guardian-actions.log");
-const MAX_OUTPUT_CHARS = 20_000;
-const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
+const UPDATE_DIR = join(STATE_DIR, "guardian-updates");
 const DEFERRED_RESTART_DELAY_SECONDS = 2;
-const BUILD_MARKER = "EXO_BUILD_MARKER_2026_06_08_A";
-
-type GuardianAction =
-  | "status"
-  | "build"
-  | "start_services"
-  | "stop_services"
-  | "restart_services"
-  | "restart_adapters"
-  | "restart_scheduler"
-  | "restart_all"
-  | "logs";
-
-type GuardianLogTarget = "scheduler" | "adapters" | "all";
-
-const ACTION_TO_COMMAND: Record<GuardianAction, string> = {
-  status: "status",
-  build: "build",
-  start_services: "start-services",
-  stop_services: "stop-services",
-  restart_services: "restart-services",
-  restart_adapters: "restart-adapters",
-  restart_scheduler: "restart-scheduler",
-  restart_all: "restart-all",
-  logs: "logs",
-};
 
 export function registerGuardianTools(registry: HarnessToolRegistry): void {
-  registry.register(guardianActionTool());
+  registry.register(rebuildAndRestartExoTool());
 }
 
-function guardianActionTool(): ToolInstance {
+export function rebuildAndRestartExoTool(): ToolInstance {
   return {
     source: "built_in",
     definition: {
-      name: "guardian_action",
+      name: "rebuild_and_restart_exo",
       description:
-        "Ask the host-side Exo guardian to build Exo, inspect service status/logs, or restart the scheduler and adapter runners while preserving .exo state. Builds request the control REPL wrapper to refresh its child process. Restart actions are deferred briefly so the current turn can finish before services are stopped. Before requesting a restart, consider announcing the brief downtime on active external adapters with send_adapter_message in the same turn; after adapters come back you will receive a wakeup prompting you to announce your return. Use this instead of manually killing host processes.",
-      parameters: guardianParameters(),
+        "Validate and rebuild Exo, then restart its guardian-managed scheduler and adapter services. This narrow operation is asynchronous: it durably records an update, lets the current turn finish, and returns an update id. The existing guardian reboot notice wakes active adapter conversations after a successful restart.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {},
+        required: [],
+      },
     },
     handler: {
-      execute(args) {
-        return executeGuardianAction(parseGuardianArguments(args));
+      execute() {
+        return Promise.resolve(queueRebuildAndRestart());
       },
     },
   };
 }
 
-function guardianParameters(): ToolDefinition["parameters"] {
-  return {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      action: {
-        type: "string",
-        enum: Object.keys(ACTION_TO_COMMAND),
-        description:
-          "Guardian action to run. restart_all restarts scheduler and adapters after a short deferred handoff; set build=true to compile first.",
-      },
-      build: {
-        type: ["boolean", "null"],
-        description:
-          "For action restart_all, whether to build Exo before restarting services.",
-      },
-      logTarget: {
-        type: ["string", "null"],
-        enum: ["scheduler", "adapters", "all", null],
-        description:
-          "For action logs, which log stream to show. Use null or all for both scheduler and adapters.",
-      },
-    },
-    required: ["action", "build", "logTarget"],
-  };
-}
-
-type GuardianArguments = {
-  action: GuardianAction;
-  build: boolean;
-  logTarget: GuardianLogTarget;
-};
-
-function parseGuardianArguments(args: JsonObject): GuardianArguments {
-  const action = args.action;
-  if (typeof action !== "string" || !(action in ACTION_TO_COMMAND)) {
-    throw new Error(
-      "guardian_action action must be a supported guardian action",
-    );
-  }
-  const build = args.build;
-  if (build !== undefined && build !== null && typeof build !== "boolean") {
-    throw new Error("guardian_action build must be boolean or null");
-  }
-  const logTarget = args.logTarget;
-  if (
-    logTarget !== undefined &&
-    logTarget !== null &&
-    logTarget !== "scheduler" &&
-    logTarget !== "adapters" &&
-    logTarget !== "all"
-  ) {
-    throw new Error(
-      "guardian_action logTarget must be scheduler, adapters, all, or null",
-    );
-  }
-  return {
-    action: action as GuardianAction,
-    build: build === true,
-    logTarget: (logTarget ?? "all") as GuardianLogTarget,
-  };
-}
-
-async function executeGuardianAction(
-  args: GuardianArguments,
-): Promise<ToolResult> {
-  const command = ACTION_TO_COMMAND[args.action];
-  const commandArgs = [command];
-  if (args.action === "restart_all" && args.build) {
-    commandArgs.push("--build");
-  }
-  if (args.action === "logs" && args.logTarget !== "all") {
-    commandArgs.push(args.logTarget);
-  }
-
-  if (shouldDeferAction(args.action)) {
-    const result = runGuardianDeferred(commandArgs);
-    return {
-      ok: true,
-      action: args.action,
-      deferred: true,
-      pid: result.pid,
-      delaySeconds: DEFERRED_RESTART_DELAY_SECONDS,
-      command: result.command,
-      logPath: result.logPath,
-      stdout: `Scheduled guardian ${args.action} in ${DEFERRED_RESTART_DELAY_SECONDS}s. Follow ${result.logPath} for build/restart output, then call guardian_action logs or status after services come back.`,
-      stderr: "",
-    };
-  }
-
-  const result = await runGuardian(commandArgs);
-  return {
-    ok: result.exitCode === 0,
-    action: args.action,
-    buildMarker: BUILD_MARKER,
-    command: [GUARDIAN_SCRIPT, ...commandArgs],
-    exitCode: result.exitCode,
-    timedOut: result.timedOut,
-    stdout: clampOutput(result.stdout),
-    stderr: clampOutput(result.stderr),
-  };
-}
-
-function shouldDeferAction(action: GuardianAction): boolean {
-  return (
-    action === "restart_all" ||
-    action === "restart_services" ||
-    action === "restart_adapters" ||
-    action === "restart_scheduler" ||
-    action === "stop_services"
-  );
-}
-
-type ProcessResult = {
-  exitCode: number;
-  timedOut: boolean;
-  stdout: string;
-  stderr: string;
-};
-
-function runGuardian(args: string[]): Promise<ProcessResult> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(GUARDIAN_SCRIPT, args, {
-      cwd: ROOT_DIR,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 1000).unref();
-    }, DEFAULT_TIMEOUT_MS);
-
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-    child.on("error", (error) => {
-      clearTimeout(timeout);
-      reject(error);
-    });
-    child.on("close", (code) => {
-      clearTimeout(timeout);
-      resolve({
-        exitCode: code ?? 1,
-        timedOut,
-        stdout,
-        stderr,
-      });
-    });
+function queueRebuildAndRestart(): ToolResult {
+  const updateId = randomUUID();
+  const outcomePath = join(UPDATE_DIR, `${updateId}.json`);
+  mkdirSync(UPDATE_DIR, { recursive: true });
+  writeJsonAtomically(outcomePath, {
+    updateId,
+    operation: "rebuild_and_restart_exo",
+    status: "queued",
+    requestedAt: new Date().toISOString(),
   });
+  const result = runGuardianDeferredWithOutcome(
+    ["restart-all", "--build"],
+    updateId,
+    outcomePath,
+  );
+  return {
+    ok: true,
+    updateId,
+    status: "queued",
+    deferred: true,
+    pid: result.pid,
+    delaySeconds: DEFERRED_RESTART_DELAY_SECONDS,
+    outcomePath,
+    logPath: result.logPath,
+    command: result.command,
+  };
 }
 
-function runGuardianDeferred(args: string[]): {
+function runGuardianDeferredWithOutcome(
+  args: string[],
+  updateId: string,
+  outcomePath: string,
+): {
   command: string[];
   logPath: string;
   pid: number | null;
@@ -239,9 +96,11 @@ function runGuardianDeferred(args: string[]): {
     "bash",
     [
       "-lc",
-      'delay="$1"; shift; printf "\\n[%s] deferred guardian command:" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; for arg in "$@"; do printf " %q" "$arg"; done; printf "\\n"; sleep "$delay"; exec "$@"',
-      "exo-service-guardian-deferred",
+      'delay="$1"; record="$2"; update_id="$3"; shift 3; printf "\\n[%s] queued rebuild update %s:" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$update_id"; for arg in "$@"; do printf " %q" "$arg"; done; printf "\\n"; sleep "$delay"; set +e; "$@"; code=$?; completed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; if [ "$code" -eq 0 ]; then status=succeeded; else status=failed; fi; tmp="${record}.tmp.$$"; printf \'{"updateId":"%s","operation":"rebuild_and_restart_exo","status":"%s","exitCode":%s,"completedAt":"%s"}\\n\' "$update_id" "$status" "$code" "$completed_at" >"$tmp"; mv "$tmp" "$record"; exit "$code"',
+      "exo-rebuild-and-restart-deferred",
       String(DEFERRED_RESTART_DELAY_SECONDS),
+      outcomePath,
+      updateId,
       ...command,
     ],
     {
@@ -259,9 +118,8 @@ function runGuardianDeferred(args: string[]): {
   };
 }
 
-function clampOutput(output: string): string {
-  if (output.length <= MAX_OUTPUT_CHARS) {
-    return output;
-  }
-  return `${output.slice(0, MAX_OUTPUT_CHARS)}\n... truncated ${output.length - MAX_OUTPUT_CHARS} chars`;
+function writeJsonAtomically(path: string, value: JsonObject): void {
+  const temporaryPath = `${path}.tmp.${process.pid}`;
+  writeFileSync(temporaryPath, `${JSON.stringify(value)}\n`, "utf8");
+  renameSync(temporaryPath, path);
 }

@@ -18,7 +18,10 @@ const baseUrl = normalizeBaseUrl(
     "https://exoharness.ai",
 );
 const configuredChannelId = optionalStringField(config, "channelId");
-const configuredSecret = optionalStringField(config, "secret");
+const configuredSecret =
+  optionalStringField(config, "secret") ??
+  process.env.EXO_EXOCHAT_SECRET?.trim() ??
+  null;
 const stateDir =
   process.env.EXO_ADAPTER_STATE_DIR ??
   `.exo/adapters/exochat/${process.env.EXO_ADAPTER_ID ?? "default"}`;

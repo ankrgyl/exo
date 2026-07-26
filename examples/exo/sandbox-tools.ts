@@ -7,6 +7,7 @@ import type {
 import { hostTool } from "./host-tools";
 
 export type SandboxToolName =
+  | "get_sandbox_status"
   | "list_sandbox_snapshots"
   | "snapshot_sandbox"
   | "rewind_sandbox";
@@ -14,6 +15,7 @@ export type SandboxToolName =
 export function registerSandboxTools(
   registry: HarnessToolRegistry,
   names: SandboxToolName[] = [
+    "get_sandbox_status",
     "list_sandbox_snapshots",
     "snapshot_sandbox",
     "rewind_sandbox",
@@ -29,10 +31,20 @@ export function registerSandboxTools(
 
 function createSandboxToolInstances(): ToolInstance[] {
   return [
+    getSandboxStatusTool(),
     listSandboxSnapshotsTool(),
     snapshotSandboxTool(),
     rewindSandboxTool(),
   ];
+}
+
+function getSandboxStatusTool(): ToolInstance {
+  return hostTool({
+    name: "get_sandbox_status",
+    description:
+      "Inspect whether the selected Exo sandbox exists and report its id and configured scope without starting it.",
+    parameters: scopeParameters(),
+  });
 }
 
 function listSandboxSnapshotsTool(): ToolInstance {

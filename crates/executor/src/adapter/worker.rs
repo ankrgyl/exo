@@ -17,6 +17,7 @@ use super::types::{AdapterAttachment, AdapterConfig};
 pub enum WorkerCommand {
     SendMessage {
         id: String,
+        attempt: u32,
         #[serde(default)]
         target: Option<String>,
         text: String,
@@ -116,7 +117,7 @@ where
     let mut lines = BufReader::new(stdout).lines();
     let mut stop_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     let pending_events = Arc::new(AtomicUsize::new(0));
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = mpsc::channel(256);
     let mut event_task = tokio::spawn(process_worker_events(
         event_rx,
         on_event,
@@ -155,7 +156,7 @@ where
                     "adapter worker event"
                 );
                 pending_events.fetch_add(1, Ordering::SeqCst);
-                if event_tx.send(event).is_err() {
+                if event_tx.send(event).await.is_err() {
                     break Err(anyhow!("adapter event handler stopped"));
                 }
             }
@@ -205,7 +206,7 @@ async fn terminate_worker_process_group(pid: Option<u32>) {
 async fn terminate_worker_process_group(_pid: Option<u32>) {}
 
 async fn process_worker_events<F, Fut>(
-    mut event_rx: mpsc::UnboundedReceiver<WorkerEvent>,
+    mut event_rx: mpsc::Receiver<WorkerEvent>,
     mut on_event: F,
     pending_events: Arc<AtomicUsize>,
 ) -> Result<()>
@@ -422,6 +423,7 @@ mod tests {
         event_started_rx.await.unwrap();
         outbound.lock().unwrap().push(WorkerCommand::SendMessage {
             id: "command".to_string(),
+            attempt: 1,
             target: Some("target".to_string()),
             text: "pong".to_string(),
             attachments: Vec::new(),

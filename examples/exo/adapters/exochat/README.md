@@ -38,13 +38,14 @@ The setup prompt creates a library adapter similar to:
     "type": "exochat",
     "baseUrl": null,
     "channelId": null,
-    "secret": null
+    "secretId": null
   }
 }
 ```
 
-`baseUrl: null` uses the default hosted ExoChat relay. `channelId` and
-`secret` are generated and persisted in the adapter state directory when omitted.
+`baseUrl: null` uses the default hosted ExoChat relay. With both `channelId`
+and `secretId` null, Exo generates a channel and stores its secret in the host
+secret store. To reconnect to an existing channel, provide both values.
 
 ## Content
 

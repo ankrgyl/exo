@@ -69,6 +69,10 @@ export class HarnessToolRegistry {
     return [...this.tools.values()].map((tool) => tool.definition);
   }
 
+  instances(): ToolInstance[] {
+    return [...this.tools.values()];
+  }
+
   get(name: string): ToolInstance | undefined {
     return this.tools.get(name);
   }

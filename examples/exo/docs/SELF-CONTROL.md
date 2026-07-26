@@ -41,7 +41,7 @@ Exo should always be able to inspect the code that defines its own behavior, cha
 - `examples/exo/scripts/exo-service-guardian` is the host service supervisor: it builds Exo, shows service status, prints scheduler and adapter logs, and restarts the scheduler or adapter runners while preserving `.exo` state.
 - `./exo.sh --control` is the terminal supervisor: it keeps the user's terminal open, streams service logs, runs the interactive `exo repl` as a child, and can restart only that child after a rebuild.
 
-The model-visible `guardian_action` tool wraps the guardian script with a strict allowlist: `status`, `build`, `start_services`, `stop_services`, `restart_services`, `restart_adapters`, `restart_scheduler`, `restart_all`, and `logs`. It does not accept arbitrary shell commands. The `restart_*` actions are deferred briefly and handed to a detached guardian process so the current model turn can finish and report that the restart was scheduled. `restart_all` is the normal self-reboot path; `start_services`, `stop_services`, and `restart_services` are lower-level controls for the guardian-managed scheduler and adapter runner.
+The model-visible `rebuild_and_restart_exo` tool exposes one fixed self-update operation: validate and build Exo, then hand a scheduler and adapter restart to a detached guardian process so the current model turn can finish. Service status, logs, and targeted service controls stay in the operator-facing `examples/exo/scripts/exo-service-guardian` CLI.
 
 Service restarts drain instead of killing blindly: the guardian writes a restart marker (`.exo/exo-adapters.restart` or `.exo/exo-scheduler.restart`); the runner claims the marker, finishes in-flight wakeup turns or scheduler passes, and exits on its own. A runner that never claims the marker is stopped with a process-tree kill after a short wait. Adapter workers run in their own process groups so stopping a worker also terminates the `pnpm`/`tsx`/`node` children holding the external connection. Builds also write `.exo/exo-control.restart`, which the control wrapper claims to restart only the `exo repl` child without closing the user's terminal.
 
@@ -93,9 +93,9 @@ This is deliberately not embedding-based retrieval. For a small set of short fac
 
 Exo should be able to inspect each of its components when debugging or evolving them, before escalating to restarts.
 
-- **Host services**: `guardian_action` with `status` shows service state (including pending restart markers); `logs` prints scheduler and adapter runner logs (`logTarget`: `scheduler`, `adapters`, or both). `start_services`, `stop_services`, and `restart_services` manage the guardian-supervised scheduler and adapter runner directly, while `restart_adapters`, `restart_scheduler`, and `restart_all` are the usual targeted restart actions. Deferred guardian actions log to `.exo/exo-service-guardian-actions.log`.
+- **Host services**: operators use `examples/exo/scripts/exo-service-guardian status` for service state and `examples/exo/scripts/exo-service-guardian logs` for scheduler and adapter runner logs. The agent uses `rebuild_and_restart_exo` only for its fixed self-update flow. Deferred rebuild output is written to `.exo/exo-service-guardian-actions.log`.
 - **Adapters**: `list_adapters` returns each adapter's `enabled` state plus health fields `last_connected_at_ms` and `last_error`. `list_adapter_events` returns per-adapter telemetry newest first — `connected`, `disconnected`, `inbound`, `outbound`, `error`, and `lifecycle` records — with `eventType` and `sinceMs` filters. The diagnosis path is: health fields first, then event history, then guardian logs, then restarts.
-- **Scheduler**: `list_scheduled_tasks` shows tasks and their recent run results (exit codes, errors). Scheduler runner logs are reachable through `guardian_action logs`.
+- **Scheduler**: `list_scheduled_tasks` shows tasks and their recent run results (exit codes, errors). Operators can inspect scheduler runner logs through the guardian CLI.
 - **Conversation and host lifecycle**: `list_conversation_events` (area 2).
 - **Sandbox processes**: the shell tool itself, plus sandbox process events recorded in the conversation log.
 
@@ -121,7 +121,9 @@ Gap: there is no sandbox _cloning_ — starting a second sandbox from an existin
 
 **Tools.** Tools are layered: the TypeScript registry defines what the model can see and call, and a handler either runs in TypeScript or delegates execution to the Rust tool runtime (`crates/executor/src/harness_tool.rs`) via `execution.context.executeTool(...)` with the same function name. Rust-backed tools therefore always need a TypeScript definition; `registerHostTool` in `examples/exo/host-tools.ts` is the standard bridge, and `examples/exo/sandbox-tools.ts` is the reference example. A Rust match arm without a registered TypeScript definition is unreachable, and an agent-installed tool must never reuse the name of a Rust-backed tool.
 
-For agent-generated tools, `install_agent_tool` provides the host-validated installation path: the agent writes a small TypeScript tool module with a strict input schema and a handler, the host validates and installs it as an agent-owned tool, and it becomes available on the next model turn (not halfway through the current call). `uninstall_agent_tool` removes it. Generated tools should use stable platform APIs, avoid extra npm dependencies by default, and declare required initialization such as environment variable names for API keys. New Rust-backed capability goes through the code-edit path instead (area 1): implement the match arm, register the definition, rebuild, restart.
+`inspect_tools` and `manage_tool` are the default discovery and installation path for registry-backed tools. Registry-installed tools load every turn regardless of the legacy compatibility flag. The older `install_agent_tool` / `uninstall_agent_tool` pair and `.exo/agent-tools/` scan are available only when `enableAgentToolCreation` is explicitly enabled. New Rust-backed capability goes through the code-edit path instead (area 1): implement the match arm, register the definition, rebuild, restart.
+
+Local `manage_tool` sources must be workspace-relative. Create them under `/workspace/exo/.exo/tool-sources/<name>` from sandbox `shell`, then install `.exo/tool-sources/<name>`. Absolute paths such as `/tmp/...` belong to the sandbox filesystem and are not valid host-local source paths.
 
 **Skills.** Between prompt text and code-backed tools sits a third extension
 surface: durable skills in the standard agent-skills format (`SKILL.md` with
@@ -141,7 +143,7 @@ Only names and descriptions are injected each turn; bodies load on demand. See
 - `delete_adapter` removes the record and stored state for permanent cleanup.
 - `send_adapter_message` sends an intentional outbound reply to an external target.
 
-There is no separate `start_adapter`/`stop_adapter`/`restart_adapter`: starting is creating an enabled adapter, stopping is disabling. A future resume surface should be explicit (`enable_adapter` or `restart_adapter`) so a disabled adapter can come back without being recreated. The safety boundary: inbound adapter messages wake the conversation, but model text is never automatically posted back externally — `send_adapter_message` is always an explicit decision.
+There is no separate `start_adapter`/`stop_adapter`/`restart_adapter`: starting is creating an enabled adapter, stopping is disabling, and `enable_adapter` resumes a disabled adapter without recreating it. The safety boundary: inbound adapter messages wake the conversation, but model text is never automatically posted back externally — `send_adapter_message` is always an explicit decision.
 
 ## 6. Prompt Evolution
 
@@ -150,7 +152,7 @@ Exo's behavior is defined by a small set of prompt surfaces it can read (and, th
 - `examples/exo/prompts/me.md` — the durable identity prompt: broad behavioral rules such as when to inspect state first, when to prefer reversible operations, and how to think about external side effects.
 - `examples/exo/harness.ts` — assembles the developer prompt each turn and describes the available self-control surfaces at a high level.
 - `examples/exo/SELF.md` — the compact self map for navigating its own code.
-- Tool definitions — `examples/exo/sandbox-tools.ts`, `scheduler-tools.ts`, `guardian-tools.ts`, `introspection-tools.ts`, and `typescript/harness/adapter-tools.ts` carry model-visible descriptions and JSON schemas; these are the most direct prompts for when and how to call each tool. `typescript/harness/built-in-tools.ts` describes `shell`, `install_agent_tool`, and `uninstall_agent_tool`, including the generated-tool contract.
+- Tool definitions — `examples/exo/sandbox-tools.ts`, `scheduler-tools.ts`, `guardian-tools.ts`, `introspection-tools.ts`, and `typescript/harness/adapter-tools.ts` carry model-visible descriptions and JSON schemas; these are the most direct prompts for when and how to call each tool. `typescript/harness/built-in-tools.ts` describes `shell`, `inspect_tools`, `manage_tool`, and the opt-in legacy creation tools.
 - `examples/exo/adapters/*/setup-prompt.md` — setup-time guidance for creating specific adapters.
 - Wakeup prompts — `crates/executor/src/adapter/runtime.rs` builds the inbound-message wakeup prompts (including the reply-externally contract), and `crates/executor/src/scheduler_runtime.rs` builds scheduled-task wakeup prompts from each task's `reportPrompt`.
 - `.exo/exo-profile.md` (or `EXO_LOCAL_PROMPT_FILE`) — local, user-specific instructions that are not checked in.
@@ -180,8 +182,8 @@ The likely path is an export/import pair: a guardian-level `export` action that 
 Self-modification needs a verification loop, or failed changes accumulate as corruption. Today this exists as practice and primitives rather than as a single tool:
 
 - **Before a change**: `snapshot_sandbox` for filesystem experiments; a clean git state for code changes.
-- **Validating a change**: build via `guardian_action build` (or `cargo`/`pnpm` checks in the sandbox against the repo mount), run the relevant tests, and for behavior changes, restart and observe (`status`, `logs`, the reboot wakeup, and the event log).
+- **Validating a change**: run relevant `cargo`/`pnpm` checks in the sandbox against the repo mount, then call `rebuild_and_restart_exo` to validate, build, and activate the change. Observe the reboot wakeup and event log; operators inspect status and logs through the guardian CLI when needed.
 - **Adopting a change**: commit to git; restart services on the new build with the drain/marker flow.
-- **Rolling back**: `git revert`/`restore` for code, `rewind_sandbox` for filesystem state, `uninstall_agent_tool` for installed tools, `disable_adapter` for adapters — while the event log (area 2) preserves the record of what was tried, so the next attempt starts from knowledge rather than amnesia.
+- **Rolling back**: `git revert`/`restore` for code, `rewind_sandbox` for filesystem state, `manage_tool` for registry-installed tools, `disable_adapter` for adapters — while the event log (area 2) preserves the record of what was tried, so the next attempt starts from knowledge rather than amnesia.
 
 Gap worth closing eventually: a canary path — run the changed build against a cloned sandbox or forked conversation (areas 4 and 7) and compare behavior before adopting it on the live instance, instead of validating on the only copy of itself.

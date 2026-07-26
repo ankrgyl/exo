@@ -16,8 +16,9 @@ use lingua::universal::{TextContentPart, UserContent, UserContentPart};
 use super::store::{AdapterStore, stable_target_key};
 use super::tools::download_attachment;
 use super::types::{
-    AdapterAttachment, AdapterAttachmentKind, AdapterConfig, AdapterEventType, AdapterRecord,
-    AdapterTargetConversationRecord, now_ms,
+    AdapterAttachment, AdapterAttachmentKind, AdapterConfig, AdapterDeliveryStatus,
+    AdapterEventType, AdapterOutboundMessageRecord, AdapterRecord, AdapterTargetConversationRecord,
+    now_ms,
 };
 use super::worker::{WorkerCommand, WorkerEvent, run_worker_loop};
 use crate::conversation_events::{
@@ -379,7 +380,7 @@ pub async fn send_adapter_message_with_handles(
     text: &str,
     target: Option<&str>,
     attachments: Vec<AdapterAttachment>,
-) -> Result<()> {
+) -> Result<AdapterOutboundMessageRecord> {
     if !adapter.enabled {
         bail!("adapter is disabled: {}", adapter.id);
     }
@@ -397,18 +398,7 @@ pub async fn send_adapter_message_with_handles(
     // The outbound message is durably queued in the AdapterStore outbox, and
     // the event below records it for audit without adding adapter bookkeeping
     // to the agent-visible conversation history.
-    store
-        .record_event(
-            adapter.id.clone(),
-            AdapterEventType::Outbound,
-            format!(
-                "queued {} adapter message{}",
-                adapter.config.adapter_type,
-                target.map(|t| format!(" to {t}")).unwrap_or_default(),
-            ),
-        )
-        .await?;
-    store
+    let message = store
         .enqueue_outbound_message(
             adapter.id.clone(),
             text.to_string(),
@@ -416,8 +406,20 @@ pub async fn send_adapter_message_with_handles(
             attachments,
         )
         .await?;
+    store
+        .record_event(
+            adapter.id.clone(),
+            AdapterEventType::Outbound,
+            format!(
+                "queued {} adapter message {}{}",
+                adapter.config.adapter_type,
+                message.id,
+                target.map(|t| format!(" to {t}")).unwrap_or_default(),
+            ),
+        )
+        .await?;
     notify_adapter_outbound(&adapter.id);
-    Ok(())
+    Ok(message)
 }
 
 async fn run_adapter_loop(
@@ -474,6 +476,7 @@ async fn run_adapter_loop(
                     .into_iter()
                     .map(|message| WorkerCommand::SendMessage {
                         id: message.id,
+                        attempt: message.attempt,
                         target: message.target,
                         text: message.text,
                         attachments: message.attachments,
@@ -617,21 +620,51 @@ async fn handle_worker_event(
             Ok(())
         }
         WorkerEvent::CommandAck { command_id } => {
-            store
+            let delivered = store
                 .acknowledge_outbound_message(&adapter.id, &command_id)
-                .await
+                .await?;
+            if let Some(delivered) = delivered {
+                store
+                    .record_event(
+                        adapter.id.clone(),
+                        AdapterEventType::Outbound,
+                        format!(
+                            "delivered adapter message {} on attempt {}",
+                            delivered.id, delivered.attempt
+                        ),
+                    )
+                    .await?;
+            }
+            Ok(())
         }
         WorkerEvent::CommandNack {
             command_id,
             message,
         } => {
-            store.mark_error(&adapter.id, message.clone()).await?;
-            store
-                .record_event(adapter.id.clone(), AdapterEventType::Error, message)
+            let delivery = store
+                .nack_outbound_message(&adapter.id, &command_id, message.clone())
                 .await?;
+            let Some(delivery) = delivery else {
+                return Ok(());
+            };
+            let terminal = delivery.status == AdapterDeliveryStatus::Failed;
+            let summary = format!(
+                "{} adapter message {} after attempt {}: {}",
+                if terminal { "failed" } else { "retrying" },
+                delivery.id,
+                delivery.attempt,
+                message
+            );
+            if terminal {
+                store.mark_error(&adapter.id, summary.clone()).await?;
+            }
             store
-                .acknowledge_outbound_message(&adapter.id, &command_id)
-                .await
+                .record_event(adapter.id.clone(), AdapterEventType::Error, summary)
+                .await?;
+            if !terminal {
+                notify_adapter_outbound(&adapter.id);
+            }
+            Ok(())
         }
         WorkerEvent::Disconnected { reason } => {
             record_worker_lifecycle(
@@ -1113,6 +1146,7 @@ mod tests {
             name: "discord-dev".to_string(),
             source: super::super::types::AdapterSource::Library,
             enabled: true,
+            lifecycle_state: super::super::types::AdapterLifecycleState::Running,
             created_at_ms: 0,
             updated_at_ms: 0,
             config: test_adapter_config(),
@@ -1144,7 +1178,7 @@ mod tests {
                 agent_id: "agent".to_string(),
                 conversation_id: "conversation".to_string(),
                 name: "discord-dev".to_string(),
-                source: super::super::types::AdapterSource::BuiltIn,
+                source: super::super::types::AdapterSource::Library,
                 config: config_with_scope(Some("target")),
             },
             0,
