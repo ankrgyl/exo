@@ -42,6 +42,16 @@ fn default_event_kinds() -> Vec<EventKind> {
         EventKind::custom(HOST_EVENT_REBOOT),
         EventKind::custom(HOST_EVENT_ADAPTER_RUNNER_STARTED),
         EventKind::custom(HOST_EVENT_ADAPTER_RUNNER_DRAINING),
+        // Compaction is the one thing that removes history from the agent's
+        // own prompt, so it belongs in the default lifecycle view rather than
+        // behind an explicit query.
+        EventKind::custom(crate::compaction::COMPACTION_CHECKPOINT_EVENT),
+        EventKind::custom(crate::compaction::COMPACTION_FAILED_EVENT),
+        // Compaction's summarizer is a billable call recorded on its own event.
+        // The tool description points agents here to total conversation spend,
+        // so leaving it out would hide those calls from an audit that the
+        // documentation promised would show them.
+        EventKind::custom(crate::compaction::COMPACTION_USAGE_EVENT),
     ]
 }
 

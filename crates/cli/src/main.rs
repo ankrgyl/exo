@@ -1,5 +1,32 @@
 mod adapters;
 mod env;
+/// Assemble a compaction override from CLI flags. `None` means "use the
+/// defaults", which are on: leaving compaction off lets a long-running
+/// conversation grow until it exceeds the model's input limit, after which
+/// every turn fails permanently.
+fn build_compaction_config(
+    no_compaction: bool,
+    threshold_ratio: Option<f64>,
+    keep_recent_turns: Option<u32>,
+    summary_model: Option<String>,
+) -> Option<CompactionConfig> {
+    if !no_compaction
+        && threshold_ratio.is_none()
+        && keep_recent_turns.is_none()
+        && summary_model.is_none()
+    {
+        return None;
+    }
+    let defaults = CompactionConfig::default();
+    Some(CompactionConfig {
+        enabled: !no_compaction,
+        threshold_ratio: threshold_ratio.unwrap_or(defaults.threshold_ratio),
+        keep_recent_turns: keep_recent_turns.unwrap_or(defaults.keep_recent_turns),
+        summary_model,
+        ..defaults
+    })
+}
+
 #[cfg(test)]
 mod env_tests;
 #[cfg(test)]
@@ -22,6 +49,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use executor::CompactionConfig;
 use executor::{
     AgentHarnessKind, BasicExoHarness, BasicExoHarnessConfig, BasicHarness, BasicToolRuntime,
     Binding, BraintrustProject, BraintrustRuntimeConfig, BraintrustTracingConfig,
@@ -450,6 +478,24 @@ enum AgentCommands {
         max_output_tokens: Option<i64>,
         #[arg(long)]
         max_tool_round_trips: Option<u32>,
+        /// Disable conversation compaction. Without it a long-running
+        /// conversation eventually exceeds the model input limit and every
+        /// later turn fails.
+        #[arg(long)]
+        no_compaction: bool,
+        /// Compact once the prompt passes this fraction of the model's input
+        /// limit (0 < ratio < 1). One or more is rejected and falls back to the
+        /// default: a successful request cannot report more input than the
+        /// model accepts, so at 1.0 the accurate trigger never fires.
+        #[arg(long)]
+        compaction_threshold_ratio: Option<f64>,
+        /// Turns kept verbatim after a compaction cut.
+        #[arg(long)]
+        compaction_keep_recent_turns: Option<u32>,
+        /// Model id used for summaries, within the agent's existing model
+        /// binding. Defaults to the agent's model.
+        #[arg(long)]
+        compaction_summary_model: Option<String>,
         #[arg(long)]
         braintrust_org: Option<String>,
         #[arg(long)]
@@ -491,6 +537,18 @@ enum AgentCommands {
         max_tool_round_trips: Option<u32>,
         #[arg(long)]
         clear_max_tool_round_trips: bool,
+        #[arg(long)]
+        no_compaction: bool,
+        #[arg(long)]
+        compaction: bool,
+        #[arg(long)]
+        compaction_threshold_ratio: Option<f64>,
+        #[arg(long)]
+        compaction_keep_recent_turns: Option<u32>,
+        #[arg(long)]
+        compaction_summary_model: Option<String>,
+        #[arg(long)]
+        clear_compaction_summary_model: bool,
         #[arg(long)]
         clear_braintrust: bool,
         #[arg(long)]
@@ -891,6 +949,7 @@ async fn main() -> Result<()> {
                     }
                     harness
                         .create_agent(CreateAgentRequest {
+                            compaction: None,
                             slug: agent_slug.clone(),
                             name: Some(agent_slug),
                             harness: to_agent_harness_kind(harness_kind),
@@ -953,6 +1012,10 @@ async fn main() -> Result<()> {
                 model,
                 max_output_tokens,
                 max_tool_round_trips,
+                no_compaction,
+                compaction_threshold_ratio,
+                compaction_keep_recent_turns,
+                compaction_summary_model,
                 braintrust_org,
                 braintrust_project,
                 braintrust_project_id,
@@ -987,6 +1050,12 @@ async fn main() -> Result<()> {
                     });
                 let agent = harness
                     .create_agent(CreateAgentRequest {
+                        compaction: build_compaction_config(
+                            no_compaction,
+                            compaction_threshold_ratio,
+                            compaction_keep_recent_turns,
+                            compaction_summary_model,
+                        ),
                         slug,
                         name: Some(name),
                         harness: agent_harness_kind,
@@ -1034,6 +1103,12 @@ async fn main() -> Result<()> {
                 clear_max_output_tokens,
                 max_tool_round_trips,
                 clear_max_tool_round_trips,
+                no_compaction,
+                compaction,
+                compaction_threshold_ratio,
+                compaction_keep_recent_turns,
+                compaction_summary_model,
+                clear_compaction_summary_model,
                 clear_braintrust,
                 braintrust_org,
                 braintrust_project,
@@ -1177,6 +1252,51 @@ async fn main() -> Result<()> {
                     let sandbox_scope = SandboxScope::from(sandbox_scope);
                     if config.sandbox.scope != sandbox_scope {
                         config.sandbox.scope = sandbox_scope;
+                        changed = true;
+                    }
+                }
+
+                if no_compaction && compaction {
+                    bail!("--compaction and --no-compaction are mutually exclusive");
+                }
+                if clear_compaction_summary_model && compaction_summary_model.is_some() {
+                    bail!(
+                        "--compaction-summary-model and --clear-compaction-summary-model are mutually exclusive"
+                    );
+                }
+                if no_compaction
+                    || compaction
+                    || compaction_threshold_ratio.is_some()
+                    || compaction_keep_recent_turns.is_some()
+                    || compaction_summary_model.is_some()
+                    || clear_compaction_summary_model
+                {
+                    let current = config.compaction.clone().unwrap_or_default();
+                    let updated = CompactionConfig {
+                        enabled: if no_compaction {
+                            false
+                        } else if compaction {
+                            true
+                        } else {
+                            current.enabled
+                        },
+                        threshold_ratio: compaction_threshold_ratio
+                            .unwrap_or(current.threshold_ratio),
+                        keep_recent_turns: compaction_keep_recent_turns
+                            .unwrap_or(current.keep_recent_turns),
+                        // Without an explicit clear, an override set once could
+                        // never be removed: every later update preserved it, so
+                        // the documented default of following the agent's model
+                        // was unreachable.
+                        summary_model: if clear_compaction_summary_model {
+                            None
+                        } else {
+                            compaction_summary_model.or(current.summary_model.clone())
+                        },
+                        ..current.clone()
+                    };
+                    if updated != current {
+                        config.compaction = Some(updated);
                         changed = true;
                     }
                 }

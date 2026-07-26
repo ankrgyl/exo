@@ -1,25 +1,50 @@
 import {
+  PromptHistoryCache,
+  assistantMessagesText,
   createToolRegistry,
-  materializePromptMessages,
   registerAgentToolsFromDirectoryIfExists,
   registerBuiltInTools,
   registerLibraryToolModulePath,
+  appendCustomEvent,
+  COMPACTION_USAGE_EVENT,
+  CompactionGate,
+  resolveCompactionPolicy,
+  PromptSize,
+  promptSize,
+  readLatestTurnEnded,
+  resolveSummarizerModel,
+  runCompaction,
+  summarizerMaxOutputTokens,
+  summarizerMessages,
+  toolDefinitionSize,
   turnMetadata,
   type BuiltInToolName,
   type EventData,
   type HarnessToolRegistry,
+  type JsonObject,
   type Message,
+  type SummarizeInput,
   type TurnContext,
 } from "@exo/harness";
 import {
+  responseMessages,
   responseToLinguaEvents,
+  responseCacheCreationTokens,
   responseToolCalls,
+  responseUsageRecord,
   runtimeFromModelBinding,
   type NativeResponsesRequest,
   type ResponsesRuntimeLike,
   type TraceParent,
 } from "@exo/model-runtime/responses";
-import { ensureTable } from "@exo/model-runtime/cost";
+import {
+  ensureTable,
+  getTable,
+  inputOccupancy,
+  maxInputTokens,
+  maxOutputTokens,
+  type PricingTable,
+} from "@exo/model-runtime/cost";
 
 import { resolveLlmBinding } from "./shared";
 
@@ -98,6 +123,15 @@ async function runResponsesTurnLoop(
 ): Promise<string | null> {
   const { conversation } = context.exoharness.current;
   const maxToolRoundTrips = context.agentConfig.maxToolRoundTrips;
+  const policy = resolveCompactionPolicy(context.agentConfig.compaction);
+  // One cache per turn: the loop materializes every round, so re-reading the
+  // whole event log each time makes a turn cost O(rounds x events).
+  const history = new PromptHistoryCache();
+  const compaction = new CompactionGate();
+  // Compaction is latched to once per turn, so at most one of these exists.
+  const summarizerUsage: { usage: JsonObject | undefined } = {
+    usage: undefined,
+  };
   let latestEventId: string | null = null;
 
   for (let round = 0; ; round += 1) {
@@ -115,16 +149,93 @@ async function runResponsesTurnLoop(
     if (options.registerTools) {
       await options.registerTools(tools, context);
     }
-    const messages = await materializePromptMessages(
-      conversation,
-      options.instructions
-        ? await options.instructions(context)
-        : basicHarnessInstructions(context),
+    const instructions = options.instructions
+      ? await options.instructions(context)
+      : basicHarnessInstructions(context);
+    let messages = [
+      ...instructions,
+      ...(await history.materialize(conversation)),
+    ];
+
+    // Compact *before* sending when the prompt already looks too large.
+    //
+    // The post-response trigger below is more accurate — it uses the provider's
+    // own counts — but it only ever runs after a successful call. A prompt
+    // already past the model's hard limit is rejected outright, and that error
+    // leaves the turn before anything can shrink the history responsible for it;
+    // every later turn then replays the same oversized log and fails the same
+    // way. This check is what makes that state recoverable. Mirrors the Rust
+    // executor's pre-request trigger.
+    const toolDefinitions = tools.definitions();
+    const preflightSize = promptSize(messages).plus(
+      toolDefinitionSize(toolDefinitions),
     );
+    const preflightTable = getTable() ?? new Map();
+    const preflightArgs = {
+      policy,
+      promptTokens: preflightSize.estimatedTokens(),
+      maxInputTokens: maxInputTokens(preflightTable, model),
+      promptSize: preflightSize,
+    };
+    const preflight = await compaction.consider(preflightArgs, () =>
+      readLatestTurnEnded(conversation),
+    );
+    if (preflight !== null) {
+      // A configured summary model can have a smaller input window than the
+      // agent's; when the prompt does not fit it, summarize with the agent's
+      // model rather than losing the compaction to a rejected request.
+      const summaryModel = resolveSummarizerModel({
+        summaryModel: policy.summaryModel ?? model,
+        agentModel: model,
+        summaryModelInputLimit: maxInputTokens(
+          preflightTable,
+          policy.summaryModel ?? model,
+        ),
+        agentModelInputLimit: maxInputTokens(preflightTable, model),
+        promptTokens: preflightSize.estimatedTokens(),
+      });
+      const result = await runCompaction({
+        conversation,
+        turn: context.exoharness.current.turn,
+        policy,
+        model: summaryModel,
+        agentModel: model,
+        promptTokensBefore: null,
+        // Decided by the gate, not here: the turn loop is the one file with no
+        // tests, so the rule lives where it can be mutation-checked.
+        overInputLimit: preflight.overInputLimit,
+        summarize: (input) =>
+          summarizeWithModel(
+            runtime,
+            turnParent,
+            round,
+            input,
+            summarizerUsage,
+            preflightTable,
+          ),
+      });
+      await recordSummarizerUsage(context, summarizerUsage.usage);
+      summarizerUsage.usage = undefined;
+      compaction.settle(
+        preflight.latestTurnEnded,
+        result,
+        preflight.overInputLimit,
+      );
+      if (result.status === "compacted") {
+        // The checkpoint just written replaces the prefix this prompt was built
+        // from, so rebuild it before sending.
+        history.invalidate();
+        messages = [
+          ...instructions,
+          ...(await history.materialize(conversation)),
+        ];
+      }
+    }
+
     const request: NativeResponsesRequest = {
       model,
       messages,
-      tools: tools.definitions(),
+      tools: toolDefinitions,
       maxOutputTokens: context.agentConfig.maxOutputTokens,
       metadata: turnMetadata(context),
     };
@@ -149,6 +260,86 @@ async function runResponsesTurnLoop(
     const events = responseToLinguaEvents(response);
     if (events.length > 0) {
       latestEventId = await appendTurnEvents(context, events);
+    }
+
+    // Compact between rounds, using the token count the provider just reported.
+    // Doing it here rather than at turn start means a single runaway turn can
+    // still bring its own prompt back under the limit.
+    const table = getTable() ?? new Map();
+    const modelInputLimit = maxInputTokens(table, model);
+    // Occupancy, not `input_tokens`: on Anthropic-family providers the latter
+    // counts only the fresh slice, so a heavily cached prompt that fills the
+    // window reports a tiny number and would never trip the threshold.
+    const occupancy = response.usage
+      ? inputOccupancy(table, model, {
+          prompt: response.usage.input_tokens,
+          completion: response.usage.output_tokens,
+          cached: response.usage.input_tokens_details?.cached_tokens,
+          cacheCreation: responseCacheCreationTokens(response),
+        })
+      : null;
+    // Walking the whole prompt is only needed when there is no provider count
+    // to work from — either the price table does not know the model's limit
+    // (the trigger's fallback path) or the response carried no usage (the
+    // summary-model fit check below).
+    const materialized =
+      modelInputLimit === null || occupancy === null
+        ? promptSize(messages)
+        : new PromptSize();
+    const roundAttempt = await compaction.consider(
+      {
+        policy,
+        promptTokens: occupancy,
+        maxInputTokens: modelInputLimit,
+        promptSize: materialized,
+      },
+      () => readLatestTurnEnded(conversation),
+    );
+    if (roundAttempt !== null) {
+      // A configured summary model can have a smaller input window than the
+      // agent's; when the prompt does not fit it, summarize with the agent's
+      // model rather than losing the compaction to a rejected request.
+      const summaryModel = resolveSummarizerModel({
+        summaryModel: policy.summaryModel ?? model,
+        agentModel: model,
+        summaryModelInputLimit: maxInputTokens(
+          table,
+          policy.summaryModel ?? model,
+        ),
+        agentModelInputLimit: modelInputLimit,
+        promptTokens: occupancy ?? materialized.estimatedTokens(),
+      });
+      const result = await runCompaction({
+        conversation,
+        turn: context.exoharness.current.turn,
+        policy,
+        model: summaryModel,
+        agentModel: model,
+        promptTokensBefore: occupancy,
+        // Never a rescue: this runs on a response that came back, which proves
+        // its prompt fit.
+        overInputLimit: false,
+        summarize: (input) =>
+          summarizeWithModel(
+            runtime,
+            turnParent,
+            round,
+            input,
+            summarizerUsage,
+            table,
+          ),
+      });
+      await recordSummarizerUsage(context, summarizerUsage.usage);
+      summarizerUsage.usage = undefined;
+      compaction.settle(
+        roundAttempt.latestTurnEnded,
+        result,
+        roundAttempt.overInputLimit,
+      );
+      if (result.status === "compacted") {
+        // The cache holds exactly the prefix that was just replaced.
+        history.invalidate();
+      }
     }
 
     const toolCalls = responseToolCalls(response);
@@ -182,4 +373,74 @@ async function appendTurnEvents(
   data: EventData[],
 ): Promise<string> {
   return (await context.exoharness.current.turn.addEvents(data)).latestEventId;
+}
+
+/**
+ * Write what the compaction summarizer cost.
+ *
+ * On its own custom event, which prompt assembly ignores — so unlike a
+ * `messages` event it is safe to write at any point, including while this or
+ * another turn has a tool call outstanding. See `COMPACTION_USAGE_EVENT`.
+ */
+async function recordSummarizerUsage(
+  context: TurnContext,
+  usage: JsonObject | undefined,
+): Promise<void> {
+  if (usage === undefined) {
+    return;
+  }
+  try {
+    await appendCustomEvent(
+      context.exoharness.current.turn,
+      COMPACTION_USAGE_EVENT,
+      usage,
+    );
+  } catch {
+    // Accounting is not worth failing a turn over.
+  }
+}
+
+/**
+ * Summarize a compacted span with a model call carrying no tools.
+ *
+ * The prompt itself comes from `summarizerMessages`, which is where the rule
+ * that summarized content never rides at developer priority is enforced.
+ */
+async function summarizeWithModel(
+  runtime: ResponsesRuntimeLike,
+  // From `input.model`, not the caller's choice: `runCompaction` reverts to the
+  // agent's model when it rebuilds from the start of the log, and that decision
+  // has to reach the request, not just the checkpoint metadata.
+  turnParent: TraceParent,
+  round: number,
+  input: SummarizeInput,
+  // Filled with what this call cost. Written on a custom event, which prompt
+  // assembly ignores outright — see `COMPACTION_USAGE_EVENT`.
+  usageSink: { usage: JsonObject | undefined },
+  // The price table, not a precomputed ceiling: the model is not settled until
+  // `runCompaction` has seen the span — a rebuild from the start of the log
+  // switches to the agent's model — so a ceiling derived from the *configured*
+  // summary model can be one the model actually used will reject.
+  pricing: PricingTable,
+): Promise<string> {
+  const response = await runtime.complete(
+    {
+      model: input.model,
+      messages: summarizerMessages(input),
+      // No tools: the summarizer reads, it does not act.
+      tools: [],
+      // Bound the response at request time. `capSummary` truncates only after
+      // generation, so without this a runaway summary is paid for in full
+      // before being thrown away. Clamped to what this model accepts:
+      // providers that validate the field reject an over-large request
+      // outright, which would fail every summarizer call rather than one.
+      maxOutputTokens: summarizerMaxOutputTokens(
+        input.maxChars,
+        maxOutputTokens(pricing, input.model),
+      ),
+    },
+    { parent: turnParent, roundIndex: round },
+  );
+  usageSink.usage = responseUsageRecord(response);
+  return assistantMessagesText(responseMessages(response));
 }

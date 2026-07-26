@@ -14,6 +14,10 @@ import {
   type TurnContext,
 } from "@exo/harness";
 
+import {
+  compactionInstruction,
+  registerCompactionTools,
+} from "./compaction-tools";
 import { registerSchedulerTools } from "./scheduler-tools";
 import { registerSandboxTools } from "./sandbox-tools";
 import { registerGuardianTools } from "./guardian-tools";
@@ -65,6 +69,7 @@ export async function registerExoTools(
   registerTodoTools(tools);
   registerSkillTools(tools);
   registerWebTools(tools);
+  registerCompactionTools(tools);
   for (const modulePath of context.agentConfig.typescript?.toolModulePaths ??
     []) {
     await registerLibraryToolModulePath(tools, context, modulePath);
@@ -130,7 +135,10 @@ For any task with three or more steps, call todowrite first, then track your pla
 You also support durable skills in the standard agent-skills format (SKILL.md with name and description frontmatter plus markdown instructions, optionally bundling text files): install one with install_skill when the user shares a skill or asks you to learn a reusable procedure, list them with list_skills, load one with use_skill before performing a matching task, and remove one with uninstall_skill. Installed skill names and descriptions are shown to you each turn. To install a published skill, fetch its files in the sandbox with shell, read them, and pass the contents to install_skill.
 
 ## Web access
-Use web_search to find current information on the web and web_fetch to read a specific page as text; these run on the host, so prefer them over sandbox curl for quick lookups.`,
+Use web_search to find current information on the web and web_fetch to read a specific page as text; these run on the host, so prefer them over sandbox curl for quick lookups.
+
+## Context compaction
+This conversation can run far longer than any single prompt. Once the prompt grows past a share of the model's input limit, older history is replaced by a summary and the raw events stay in the event log. describe_compaction reports the policy and whether a checkpoint is active, read_compaction_summary returns the summary text, and list_conversation_events reaches the raw history behind it.`,
     },
     {
       role: "developer",
@@ -159,6 +167,10 @@ Use web_search to find current information on the web and web_fetch to read a sp
   const skills = await skillsInstruction(context);
   if (skills !== null) {
     instructions.push(skills);
+  }
+  const compaction = await compactionInstruction(context);
+  if (compaction !== null) {
+    instructions.push(compaction);
   }
   return instructions;
 }

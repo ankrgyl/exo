@@ -79,6 +79,7 @@ async fn rlm_send_executes_repl_steps_and_persists_final_answer() {
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
             max_tool_round_trips: Some(4),
+            compaction: None,
             braintrust: None,
         })
         .await
@@ -224,6 +225,7 @@ async fn rlm_subquery_variable_can_store_final_answer() {
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
             max_tool_round_trips: Some(6),
+            compaction: None,
             braintrust: None,
         })
         .await
@@ -295,6 +297,8 @@ async fn rlm_send_stream_suppresses_internal_control_text() {
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
             max_tool_round_trips: None,
+            compaction: None,
+
             braintrust: None,
         })
         .await
@@ -411,6 +415,8 @@ globalThis.answer = String(\n\
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
             max_tool_round_trips: None,
+            compaction: None,
+
             braintrust: None,
         })
         .await
@@ -487,6 +493,8 @@ async fn rlm_can_finish_by_setting_final_in_repl() {
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
             max_tool_round_trips: None,
+            compaction: None,
+
             braintrust: None,
         })
         .await
@@ -649,4 +657,111 @@ async fn register_test_model(exoharness: &dyn ExoHarness) {
         })
         .await
         .expect("test model should register");
+}
+
+/// RLM leaves its transcript alone, even with compaction enabled.
+///
+/// Its context is *out-of-band*: `build_rlm_root_prompt` embeds only a short
+/// preview and a character count, while the full text goes into the JS REPL's
+/// `context` variable. So the transcript never occupies the model window, and
+/// summarizing it would give up the precise access this executor exists to
+/// provide in exchange for reclaiming nothing. The policy is documented as
+/// basic-executor-only on `AgentConfig::compaction`.
+#[tokio::test(flavor = "current_thread")]
+async fn rlm_does_not_compact_its_out_of_band_transcript() {
+    let tempdir = TempDir::new().expect("tempdir should exist");
+    let exoharness = Arc::new(
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
+            .await
+            .expect("basic exoharness should initialize"),
+    ) as Arc<dyn ExoHarness>;
+
+    let model = Arc::new(FakeModelClient::new(
+        (0..8)
+            .map(|_| ModelResponse {
+                provider_cost_usd: None,
+                response_id: Some(Uuid7::now()),
+                messages: vec![assistant_message("FINAL(ok)")],
+                tool_calls: Vec::new(),
+                usage: None,
+                model: None,
+                ttft: None,
+                duration: None,
+            })
+            .collect(),
+    ));
+    let harness = RlmHarness::new(exoharness, Arc::clone(&model));
+    register_test_model(harness.exoharness_handle().as_ref()).await;
+
+    let agent = harness
+        .create_agent(CreateAgentRequest {
+            slug: "demo".to_string(),
+            name: Some("Demo".to_string()),
+            harness: crate::AgentHarnessKind::Rlm,
+            typescript: None,
+            enable_agent_tool_creation: true,
+            sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
+            sandbox_scope: None,
+            enable_networking: false,
+            model: "gpt-5.4".to_string(),
+            max_output_tokens: Some(512),
+            max_tool_round_trips: None,
+            // Aggressively on. RLM must ignore it anyway.
+            compaction: Some(crate::compaction::CompactionConfig {
+                enabled: true,
+                keep_recent_turns: 1,
+                fallback_char_budget: 0,
+                max_summary_chars: 100,
+                ..crate::compaction::CompactionConfig::default()
+            }),
+            braintrust: None,
+        })
+        .await
+        .expect("agent should be created");
+    let conversation = agent
+        .create_conversation(CreateConversationRequest::default())
+        .await
+        .expect("conversation should be created");
+
+    for index in 0..3 {
+        conversation
+            .send(SendRequest {
+                input: vec![user_message(&format!(
+                    "question {index} {}",
+                    "y".repeat(3_000)
+                ))],
+                session_id: None,
+            })
+            .await
+            .expect("send should succeed");
+    }
+
+    let events = conversation
+        .exoharness_handle()
+        .get_events(None)
+        .await
+        .expect("events should load")
+        .events;
+    assert!(
+        !events.iter().any(|event| matches!(
+            &event.data,
+            EventData::Custom { event_type, .. }
+                if event_type == crate::compaction::COMPACTION_CHECKPOINT_EVENT
+        )),
+        "RLM must not write compaction checkpoints"
+    );
+
+    // And the earliest turn is still reachable in full, which is the property a
+    // summary would have destroyed.
+    let messages = conversation.messages().await.expect("messages should load");
+    let transcript = messages
+        .iter()
+        .map(|message| format!("{message:?}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        transcript.contains("question 0"),
+        "the oldest turn must survive verbatim in RLM's context"
+    );
 }

@@ -16,6 +16,7 @@ use tokio::sync::OwnedMutexGuard;
 use tokio_stream::{Stream, wrappers::UnboundedReceiverStream};
 
 use crate::braintrust::BraintrustTracingConfig;
+use crate::compaction::CompactionConfig;
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct AgentConfig {
@@ -30,6 +31,17 @@ pub struct AgentConfig {
     pub model: String,
     pub max_output_tokens: Option<i64>,
     pub max_tool_round_trips: Option<u32>,
+    /// Conversation compaction policy. `None` uses the defaults, which are on:
+    /// an uncompacted long-running conversation eventually exceeds the model's
+    /// input limit and then fails permanently.
+    ///
+    /// **Applies to the basic executor only.** RLM ignores it: its transcript is
+    /// loaded into the JS REPL's out-of-band `context` rather than the model
+    /// input (the root prompt carries only a preview and a character count), so
+    /// summarizing it would cost precision without reclaiming any of the window
+    /// it never occupied. See `docs/design/compaction.md`.
+    #[serde(default)]
+    pub compaction: Option<CompactionConfig>,
     pub braintrust: Option<BraintrustTracingConfig>,
 }
 

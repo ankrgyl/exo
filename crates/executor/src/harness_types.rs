@@ -7,6 +7,7 @@ use exoharness::{
 };
 use lingua::Message;
 
+use crate::compaction::CompactionConfig;
 use crate::{
     AgentConfig, AgentHarnessKind, BraintrustTracingConfig, ConversationConfig,
     ConversationModelConfig, ExecutionStreamHandle, SandboxScope, SendRequest, SendResult,
@@ -72,6 +73,7 @@ pub struct CreateAgentRequest {
     pub model: String,
     pub max_output_tokens: Option<i64>,
     pub max_tool_round_trips: Option<u32>,
+    pub compaction: Option<CompactionConfig>,
     pub braintrust: Option<BraintrustTracingConfig>,
 }
 

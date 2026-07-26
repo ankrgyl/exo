@@ -67,10 +67,18 @@ where
         turn_trace: Option<&dyn TurnExecutionTrace>,
         event_tx: Option<&mpsc::UnboundedSender<Result<ExecutionStreamEvent>>>,
     ) -> Result<()> {
+        let model_binding = resolve_model_binding(conversation, &agent_config.model).await?;
+
+        // Deliberately the full log, not a compacted view. RLM's transcript is
+        // *out-of-band*: the root prompt carries only a short preview and a
+        // character count, while the text itself lives in the JS REPL's
+        // `context` variable. Summarizing it would give up precision — the one
+        // thing this executor exists to provide — in exchange for shrinking a
+        // model window it never occupied. See `compaction_policy_is_unsupported`
+        // below.
         let context_messages = materialize_conversation_messages(conversation)
             .await
             .context("failed to materialize conversation messages for RLM context")?;
-        let model_binding = resolve_model_binding(conversation, &agent_config.model).await?;
         let context_text = messages_to_transcript(&context_messages);
         let history_messages = messages_to_history_messages(&context_messages);
         let mut js_state = JsReplState::new(&context_text, &history_messages)?;

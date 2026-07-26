@@ -17,6 +17,16 @@ pub struct ModelEntry {
     pub cache_read_input_token_cost: Option<f64>,
     #[serde(default)]
     pub cache_creation_input_token_cost: Option<f64>,
+    /// Present in the upstream LiteLLM data; compaction reads it to size the
+    /// prompt budget. Not every priced entry carries one.
+    #[serde(default)]
+    pub max_input_tokens: Option<i64>,
+    /// Also upstream, and a separate number from `max_input_tokens` — a model
+    /// with a 200k window can still cap a single response at 8k. Compaction
+    /// reads it so a summarizer request cannot ask for more than the model will
+    /// accept.
+    #[serde(default)]
+    pub max_output_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -80,6 +90,47 @@ impl PricingTable {
             .map(|(_, entry)| entry)
     }
 
+    /// The model's input-token limit, or `None` when unknown. Resolves through
+    /// the same prefix matching as pricing, so dated revisions inherit it.
+    pub fn max_input_tokens(&self, model: &str) -> Option<i64> {
+        self.lookup(model)?
+            .max_input_tokens
+            .filter(|limit| *limit > 0)
+    }
+
+    /// The model's per-response output limit, or `None` when unknown. Resolves
+    /// through the same prefix matching as pricing.
+    pub fn max_output_tokens(&self, model: &str) -> Option<i64> {
+        self.lookup(model)?
+            .max_output_tokens
+            .filter(|limit| *limit > 0)
+    }
+
+    /// Total tokens occupying the model's input window for one call — the number
+    /// to compare against `max_input_tokens`.
+    ///
+    /// This is *not* always `prompt_tokens`. For Anthropic-family providers that
+    /// number counts only the fresh slice, with cache reads and cache writes
+    /// reported separately and billed additively (the same asymmetry
+    /// `compute_cost_usd` handles). Comparing the fresh slice alone against the
+    /// context limit understates occupancy by exactly the cached prefix — which
+    /// on a long, well-cached conversation is nearly the whole window, so a
+    /// threshold check would never fire on the workload that needs it most.
+    ///
+    /// `None` when the model is unknown or reported no prompt tokens; callers
+    /// fall back to their own budget in that case.
+    pub fn input_occupancy(&self, model: &str, tokens: TokenCounts) -> Option<u64> {
+        let entry = self.lookup(model)?;
+        let prompt = tokens.prompt?.max(0) as u64;
+        if !is_additive(entry.litellm_provider.as_deref()) {
+            // Already inclusive of cache reads.
+            return Some(prompt);
+        }
+        let cached = tokens.prompt_cached.unwrap_or(0).max(0) as u64;
+        let created = tokens.prompt_cache_creation.unwrap_or(0).max(0) as u64;
+        Some(prompt + cached + created)
+    }
+
     /// USD cost for one call, or `None` if the model is unknown or unpriced.
     pub fn compute_cost_usd(&self, model: &str, tokens: TokenCounts) -> Option<f64> {
         let entry = self.lookup(model)?;
@@ -122,11 +173,13 @@ mod tests {
         "claude-sonnet-4-6": {
             "litellm_provider": "anthropic", "input_cost_per_token": 3e-06,
             "output_cost_per_token": 1.5e-05, "cache_read_input_token_cost": 3e-07,
-            "cache_creation_input_token_cost": 3.75e-06
+            "cache_creation_input_token_cost": 3.75e-06,
+            "max_input_tokens": 200000, "max_output_tokens": 64000
         },
         "gpt-4o-mini": {
             "litellm_provider": "openai", "input_cost_per_token": 1.5e-07,
-            "output_cost_per_token": 6e-07, "cache_read_input_token_cost": 7.5e-08
+            "output_cost_per_token": 6e-07, "cache_read_input_token_cost": 7.5e-08,
+            "max_input_tokens": 128000, "max_output_tokens": 16384
         },
         "gpt-4": { "litellm_provider": "openai", "input_cost_per_token": 3e-05, "output_cost_per_token": 6e-05 },
         "us.anthropic.claude-sonnet-4-6": {
@@ -154,6 +207,48 @@ mod tests {
             prompt_cached: Some(cached),
             prompt_cache_creation: Some(created),
         }
+    }
+
+    #[test]
+    fn input_occupancy_adds_cached_tokens_for_additive_providers() {
+        // A window that is nearly all cache hits: 5k fresh over a 185k cached
+        // prefix. Anthropic reports the 5k as `prompt_tokens`, so counting that
+        // alone would put a 195k-token prompt at 2.5% of a 200k window and
+        // compaction would never fire.
+        let occupancy = table()
+            .input_occupancy("claude-sonnet-4-6", counts(5_000, 100, 185_000, 5_000))
+            .expect("priced model");
+        assert_eq!(occupancy, 195_000);
+
+        let limit = table().max_input_tokens("claude-sonnet-4-6").unwrap();
+        assert!(occupancy as f64 > 0.7 * limit as f64);
+    }
+
+    #[test]
+    fn input_occupancy_trusts_prompt_tokens_for_inclusive_providers() {
+        // OpenAI's `prompt_tokens` already includes cache reads; adding them
+        // again would double-count the cached prefix and compact too eagerly.
+        assert_eq!(
+            table()
+                .input_occupancy("gpt-4o-mini", counts(50_000, 100, 40_000, 0))
+                .expect("priced model"),
+            50_000
+        );
+    }
+
+    #[test]
+    fn input_occupancy_resolves_dated_revisions_and_unknown_models() {
+        assert_eq!(
+            table()
+                .input_occupancy("claude-sonnet-4-6-20251022", counts(10, 0, 90, 0))
+                .expect("prefix match"),
+            100
+        );
+        assert!(
+            table()
+                .input_occupancy("some-unlisted-model", counts(10, 0, 0, 0))
+                .is_none()
+        );
     }
 
     #[test]
@@ -239,5 +334,42 @@ mod tests {
                 .compute_cost_usd("acme-llm-9000", counts(100, 50, 0, 0))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn max_input_tokens_reads_the_model_limit() {
+        assert_eq!(table().max_input_tokens("claude-sonnet-4-6"), Some(200_000));
+        assert_eq!(table().max_input_tokens("gpt-4o-mini"), Some(128_000));
+    }
+
+    #[test]
+    fn max_input_tokens_resolves_dated_revisions() {
+        assert_eq!(
+            table().max_input_tokens("claude-sonnet-4-6-20251022"),
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn max_input_tokens_is_none_when_absent_or_unknown() {
+        // Priced entries need not carry a limit; callers must fall back rather
+        // than read a missing limit as zero.
+        assert_eq!(table().max_input_tokens("gpt-4"), None);
+        assert_eq!(table().max_input_tokens("acme-llm-9000"), None);
+    }
+
+    #[test]
+    fn max_output_tokens_is_read_separately_from_the_input_limit() {
+        // Two different numbers on the same entry: a 200k window that still
+        // caps one response well below it. Reading the input limit in place of
+        // the output limit is exactly the mistake this guards.
+        assert_eq!(table().max_output_tokens("claude-sonnet-4-6"), Some(64_000));
+        assert_eq!(table().max_output_tokens("gpt-4o-mini"), Some(16_384));
+        assert_eq!(
+            table().max_output_tokens("claude-sonnet-4-6-20251022"),
+            Some(64_000)
+        );
+        assert_eq!(table().max_output_tokens("gpt-4"), None);
+        assert_eq!(table().max_output_tokens("acme-llm-9000"), None);
     }
 }

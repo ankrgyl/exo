@@ -11,6 +11,13 @@ export type ModelEntry = {
   output_cost_per_token?: number;
   cache_read_input_token_cost?: number;
   cache_creation_input_token_cost?: number;
+  // Present in the upstream litellm data and already retained by parseTable;
+  // compaction reads it to size the prompt budget.
+  max_input_tokens?: number;
+  // Also upstream, and a separate number from max_input_tokens — a model with a
+  // 200k window can still cap a single response at 8k. Compaction reads it so a
+  // summarizer request cannot ask for more than the model will accept.
+  max_output_tokens?: number;
 };
 
 export type PricingTable = Map<string, ModelEntry>;
@@ -55,6 +62,60 @@ export function lookup(
     }
   }
   return best;
+}
+
+// The model's input-token limit, or null when unknown. Not every priced entry
+// carries one, so callers must have a fallback rather than assume a limit.
+export function maxInputTokens(
+  table: PricingTable,
+  model: string,
+): number | null {
+  const limit = lookup(table, model)?.max_input_tokens;
+  return typeof limit === "number" && limit > 0 ? limit : null;
+}
+
+// The model's per-response output limit, or null when unknown. A separate
+// number from maxInputTokens, resolved through the same prefix matching.
+export function maxOutputTokens(
+  table: PricingTable,
+  model: string,
+): number | null {
+  const limit = lookup(table, model)?.max_output_tokens;
+  return typeof limit === "number" && limit > 0 ? limit : null;
+}
+
+/**
+ * Total tokens occupying the model's input window for one call — the number to
+ * compare against `maxInputTokens`.
+ *
+ * This is *not* always `prompt_tokens`. For Anthropic-family providers that
+ * number counts only the fresh slice, with cache reads and writes reported
+ * separately and billed additively (the same asymmetry `computeCostUsd`
+ * handles). Comparing the fresh slice alone against the context limit
+ * understates occupancy by exactly the cached prefix — which on a long,
+ * well-cached conversation is nearly the whole window, so a threshold check
+ * would never fire on the workload that needs it most.
+ *
+ * Null when the model is unknown or reported no prompt tokens; callers fall
+ * back to their own budget in that case.
+ */
+export function inputOccupancy(
+  table: PricingTable,
+  model: string,
+  tokens: TokenCounts,
+): number | null {
+  const entry = lookup(table, model);
+  if (!entry || tokens.prompt == null) return null;
+  const prompt = Math.max(0, tokens.prompt);
+  if (!isAdditive(entry.litellm_provider)) {
+    // Already inclusive of cache reads.
+    return prompt;
+  }
+  return (
+    prompt +
+    Math.max(0, tokens.cached ?? 0) +
+    Math.max(0, tokens.cacheCreation ?? 0)
+  );
 }
 
 export function computeCostUsd(

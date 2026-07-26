@@ -423,6 +423,83 @@ pub enum EventData {
     },
 }
 
+/// Custom event marking a compaction checkpoint.
+///
+/// Compaction is an executor concern and deliberately not a first-class
+/// exoharness concept — but the checkpoint payload stores *event ids* as
+/// cursors, and forking rewrites every event id it copies. Whoever renumbers
+/// ids has to fix the references to them, so the constant and the remapping
+/// live here, where fork does its work.
+pub const COMPACTION_CHECKPOINT_EVENT: &str = "exo.compaction.v1";
+
+/// The event-id fields of a compaction checkpoint payload.
+///
+/// `rest` preserves every other field verbatim, so remapping cannot silently
+/// drop parts of a payload this crate has no reason to understand.
+#[derive(Debug, Serialize, Deserialize)]
+struct CheckpointCursors {
+    up_to_event_id: EventId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_checkpoint_id: Option<EventId>,
+    #[serde(flatten)]
+    rest: serde_json::Map<String, Value>,
+}
+
+impl EventData {
+    /// Rewrite any event ids this event stores in its payload, given a map from
+    /// old id to new.
+    ///
+    /// Forking copies events under fresh ids. A compaction checkpoint whose
+    /// `up_to_event_id` still pointed into the source conversation would name an
+    /// event that does not exist in the fork — and because the regenerated ids
+    /// are newer than the stale cursor, an "everything after this" query would
+    /// match the *entire* copied history while the summary was prepended anyway.
+    /// The forked prompt would then replay what it just summarized.
+    ///
+    /// Ids with no entry in `remap` are left alone: a checkpoint that predates
+    /// the fork point is not copied, so nothing in the fork should refer to it.
+    ///
+    /// Public because it is a requirement on *any* backend that renumbers events
+    /// while copying them, not just this crate's.
+    pub fn remap_event_ids(self, remap: &HashMap<EventId, EventId>) -> Self {
+        let Self::Custom {
+            event_type,
+            payload,
+        } = self
+        else {
+            return self;
+        };
+        if event_type != COMPACTION_CHECKPOINT_EVENT {
+            return Self::Custom {
+                event_type,
+                payload,
+            };
+        }
+        // A payload this crate cannot parse is passed through untouched rather
+        // than dropped: the executor treats a malformed checkpoint as absent and
+        // falls back to the full history, which is safe.
+        let Ok(mut cursors) = serde_json::from_value::<CheckpointCursors>(payload.clone()) else {
+            return Self::Custom {
+                event_type,
+                payload,
+            };
+        };
+        if let Some(new_id) = remap.get(&cursors.up_to_event_id) {
+            cursors.up_to_event_id = *new_id;
+        }
+        if let Some(previous) = cursors.previous_checkpoint_id
+            && let Some(new_id) = remap.get(&previous)
+        {
+            cursors.previous_checkpoint_id = Some(*new_id);
+        }
+        let payload = serde_json::to_value(&cursors).unwrap_or(payload);
+        Self::Custom {
+            event_type,
+            payload,
+        }
+    }
+}
+
 impl EventData {
     /// Tag identifying this event's variant. Source of truth for the
     /// `EventQuery::types` filter on `get_events`.

@@ -20,15 +20,16 @@ use tokio::time::{sleep, timeout};
 use crate::test_support::{local_test_config, local_test_config_with_daytona};
 use crate::{
     Artifact, ArtifactVersion, BasicExoHarness, BeginTurnRequest, Binding, BoxAsyncRead,
-    BoxAsyncWrite, CloseSandboxProcessInputRequest, CreateSandboxRequest, DurableFileSystem,
-    EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness, FileSystemMountMode,
-    ForkConversationRequest, ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest,
-    NewConversationRequest, PutSecretRequest, RunInSandboxRequest, SandboxCommand,
-    SandboxCommandOutput, SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy,
-    SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
-    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec,
-    Secret, SnapshotKind, SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    BoxAsyncWrite, COMPACTION_CHECKPOINT_EVENT, CloseSandboxProcessInputRequest,
+    CreateSandboxRequest, DurableFileSystem, EventData, EventId, EventKind, EventQuery,
+    EventQueryDirection, ExoHarness, FileSystemMountMode, ForkConversationRequest,
+    ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest, NewConversationRequest,
+    PutSecretRequest, RunInSandboxRequest, SandboxCommand, SandboxCommandOutput, SandboxKey,
+    SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent, SandboxProcessEventQuery,
+    SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin, SandboxProvider,
+    SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotKind, SnapshotPayload,
+    StartSandboxProcessRequest, StartSandboxRequest, Uuid7, WaitSandboxProcessRequest,
+    WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const DEFAULT_DURABLE_CONTRACT_MOUNT_PATH: &str = "/home/exo/workspace";
@@ -2156,4 +2157,144 @@ async fn daytona_sandbox_binding_drives_provider_config() {
     assert_eq!(config.target.as_deref(), Some("experimental"));
     assert_eq!(config.organization_id.as_deref(), Some("org-1"));
     assert_eq!(config.api_url, crate::DEFAULT_DAYTONA_API_URL);
+}
+
+/// Forking renumbers every copied event, so a compaction checkpoint's cursors
+/// have to follow.
+///
+/// Left stale, `up_to_event_id` names an event that does not exist in the fork —
+/// and since the regenerated ids are all *newer* than the stale cursor, an
+/// "everything after this" query matches the entire copied history while the
+/// summary is prepended anyway. The fork would replay exactly what it just
+/// summarized, and could blow the context limit doing it.
+#[tokio::test]
+async fn fork_remaps_compaction_checkpoint_cursors() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
+        .await
+        .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(NewConversationRequest {
+            slug: Some("base".to_string()),
+            name: Some("Base".to_string()),
+        })
+        .await
+        .expect("conversation");
+
+    let turn = conversation
+        .begin_turn(BeginTurnRequest {
+            session_id: None,
+            input: vec![user_message("first")],
+        })
+        .await
+        .expect("turn");
+    turn.add_events(vec![EventData::Messages {
+        messages: vec![assistant_message("reply")],
+        response_id: None,
+        usage: None,
+    }])
+    .await
+    .expect("append messages");
+    turn.finish().await.expect("finish turn");
+
+    // The event the checkpoint will point at, and which the fork will renumber.
+    let boundary = conversation
+        .get_events(None)
+        .await
+        .expect("events")
+        .events
+        .last()
+        .expect("at least one event")
+        .id;
+
+    let turn = conversation
+        .begin_turn(BeginTurnRequest {
+            session_id: None,
+            input: vec![user_message("second")],
+        })
+        .await
+        .expect("turn");
+    turn.add_events(vec![EventData::Custom {
+        event_type: COMPACTION_CHECKPOINT_EVENT.to_string(),
+        payload: serde_json::json!({
+            "up_to_event_id": boundary,
+            "artifact_id": Uuid7::now(),
+            "artifact_path": "compaction/summary.md",
+            "artifact_version": 1,
+            "previous_checkpoint_id": null,
+            "compacted_event_count": 2,
+            "summary_chars": 20,
+            "prompt_tokens_before": 100,
+            "model": "test-model",
+        }),
+    }])
+    .await
+    .expect("append checkpoint");
+    turn.finish().await.expect("finish turn");
+
+    let forked = conversation
+        .fork(ForkConversationRequest {
+            up_to_inclusive: None,
+            slug: Some("fork".to_string()),
+            name: Some("Fork".to_string()),
+        })
+        .await
+        .expect("fork");
+
+    let events = forked.get_events(None).await.expect("forked events").events;
+    let checkpoint = events
+        .iter()
+        .find_map(|event| match &event.data {
+            EventData::Custom {
+                event_type,
+                payload,
+            } if event_type == COMPACTION_CHECKPOINT_EVENT => Some(payload),
+            _ => None,
+        })
+        .expect("fork should carry the checkpoint");
+    let cursor: EventId = serde_json::from_value(
+        checkpoint
+            .get("up_to_event_id")
+            .expect("checkpoint has a cursor")
+            .clone(),
+    )
+    .expect("cursor is an event id");
+
+    assert_ne!(
+        cursor, boundary,
+        "the cursor still points into the source conversation"
+    );
+    assert!(
+        events.iter().any(|event| event.id == cursor),
+        "the cursor must name an event that exists in the fork"
+    );
+
+    // The whole point of the cursor: it has to sit *inside* the copied history,
+    // not before all of it, or the retained tail is the entire log again.
+    let after = events.iter().filter(|event| event.id > cursor).count();
+    assert!(
+        after < events.len(),
+        "a cursor older than every forked event reclaims nothing: \
+         {after} of {} events follow it",
+        events.len()
+    );
+
+    // Other payload fields must survive the rewrite untouched.
+    assert_eq!(
+        checkpoint.get("artifact_path").and_then(|v| v.as_str()),
+        Some("compaction/summary.md")
+    );
+    assert_eq!(
+        checkpoint
+            .get("compacted_event_count")
+            .and_then(|v| v.as_u64()),
+        Some(2)
+    );
 }

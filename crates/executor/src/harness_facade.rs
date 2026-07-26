@@ -136,6 +136,7 @@ where
             model: request.model,
             max_output_tokens: request.max_output_tokens,
             max_tool_round_trips: request.max_tool_round_trips,
+            compaction: request.compaction.clone(),
             braintrust: request.braintrust,
         };
         let agent = self

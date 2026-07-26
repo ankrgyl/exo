@@ -77,6 +77,21 @@ pub(crate) async fn resolve_conversation_handle(
         .find(|conversation| conversation.record().slug == conversation_ref))
 }
 
+/// Conversation history as messages: the **full** log, deliberately ignoring
+/// compaction checkpoints.
+///
+/// Compaction bounds a *prompt*. This helper does not build one. Its two callers
+/// both want the real history:
+///
+/// - `HarnessConversation::messages()` answers "what is in this conversation",
+///   and the whole point of never mutating the log is that this stays complete.
+/// - The RLM executor loads it into the JS REPL's out-of-band `context`, which
+///   never enters the model input (the root prompt carries only a short
+///   preview), so summarizing it would trade away precision for no saving in the
+///   window it is not occupying.
+///
+/// `BasicExecutor::materialize_prompt_history` is the checkpoint-aware path, and
+/// it is the one that assembles prompts.
 pub(crate) async fn materialize_conversation_messages(
     conversation: &dyn ConversationHandle,
 ) -> Result<Vec<Message>> {

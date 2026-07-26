@@ -2282,8 +2282,15 @@ impl ConversationHandle for BasicConversationHandle {
             .await?;
 
         let mut latest_event_id = None;
+        // Events that store event ids in their payload (compaction checkpoints)
+        // must follow the renumbering, or they point into the source
+        // conversation. Ids only ever refer backwards, and this walks the log in
+        // order, so every referent is already mapped by the time it is needed.
+        let mut remap: HashMap<EventId, EventId> = HashMap::new();
         for mut event in events {
             let new_event_id = Uuid7::now();
+            remap.insert(event.id, new_event_id);
+            event.data = event.data.remap_event_ids(&remap);
             event.id = new_event_id;
             event.conversation_id = record.id;
             event.created_at = new_event_id.timestamp().expect("uuid7 timestamp");

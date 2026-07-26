@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use executor::{
-    ConversationHandle, EventData, EventId, EventKind, EventQuery, EventQueryDirection,
-    ExecutionStreamEvent, HarnessAgent, HarnessConversation, SandboxId, SandboxProvider,
-    SendRequest, SessionId, SnapshotId, StartSandboxRequest,
+    COMPACTION_USAGE_EVENT, ConversationHandle, EventData, EventId, EventKind, EventQuery,
+    EventQueryDirection, ExecutionStreamEvent, HarnessAgent, HarnessConversation, SandboxId,
+    SandboxProvider, SendRequest, SessionId, SnapshotId, StartSandboxRequest, UsageRecord,
 };
 use lingua::universal::{UserContent, UserContentPart};
 use lingua::{Message, UniversalStreamChunk};
@@ -394,14 +394,31 @@ impl ChatRepl {
                     limit: Some(REMOTE_HISTORY_PAGE_SIZE),
                     session_id: None,
                     turn_id: None,
-                    types: Some(vec![EventKind::MESSAGES]),
+                    // Compaction's summarizer is a real billable call, and its
+                    // usage rides on a custom event rather than a `messages`
+                    // one — a messages event landing mid-tool-round corrupts
+                    // prompt assembly. Omitting it here would understate spend
+                    // by exactly the cost of keeping conversations compact.
+                    types: Some(vec![
+                        EventKind::MESSAGES,
+                        EventKind::custom(COMPACTION_USAGE_EVENT),
+                    ]),
                 }))
                 .await?;
             for event in &result.events {
-                if let EventData::Messages {
-                    usage: Some(usage), ..
-                } = &event.data
-                {
+                let usage = match &event.data {
+                    EventData::Messages {
+                        usage: Some(usage), ..
+                    } => Some(usage.as_ref().clone()),
+                    EventData::Custom {
+                        event_type,
+                        payload,
+                    } if event_type == COMPACTION_USAGE_EVENT => {
+                        serde_json::from_value::<UsageRecord>(payload.clone()).ok()
+                    }
+                    _ => None,
+                };
+                if let Some(usage) = usage {
                     let entry = per_model.entry(usage.model.clone()).or_default();
                     entry.calls += 1;
                     entry.prompt += usage.prompt_tokens.unwrap_or(0);
