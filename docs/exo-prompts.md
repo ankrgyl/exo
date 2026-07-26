@@ -381,7 +381,6 @@ Examples:
 
 - Discord setup refers to the secret id `discord-bot-token`.
 - Discord voice uses `openai` for STT/TTS when enabled.
-- Fal image generation requires `FAL_KEY` in the host environment.
 
 ## Prompt Safety Notes
 
