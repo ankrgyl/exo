@@ -1,6 +1,7 @@
 import {
   DEFAULT_COMPACTION_POLICY,
   readActiveCheckpoint,
+  readActiveCheckpointSummaryText,
   resolveCompactionPolicy,
   type CompactionCheckpoint,
   type CompactionPolicy,
@@ -130,23 +131,22 @@ export async function compactionInstruction(
   if (checkpoint === null) {
     return null;
   }
-  // Same read the prompt assembly does; if it comes back empty, assembly took
-  // the full-history fallback and there is no summary to point at.
+  // Literally the same read the prompt assembly does, not merely an equivalent
+  // one: `readActiveCheckpointSummaryText` memoizes by artifact version, so the
+  // text this sees is the text materialization will use. Two independent reads
+  // can disagree — this one succeeds, materialization's fails transiently, and
+  // the agent gets the full raw log underneath a notice insisting the older part
+  // was replaced by a summary above it, which is the failure this notice exists
+  // to prevent.
   //
-  // A read that *throws* is the same situation and must not escape. This runs
+  // A read that cannot be had comes back null rather than throwing. This runs
   // while instructions are being assembled, before materialization gets its
-  // chance to fall back — so propagating would fail every turn on a
-  // conversation whose raw log is perfectly usable, over a notice that is
-  // decoration.
-  let summary: string | null = null;
-  try {
-    summary = await conversation.readArtifactText({
-      artifactId: checkpoint.artifactId,
-      version: checkpoint.artifactVersion,
-    });
-  } catch {
-    return null;
-  }
+  // chance to fall back — so propagating would fail every turn on a conversation
+  // whose raw log is perfectly usable, over a notice that is decoration.
+  const summary = await readActiveCheckpointSummaryText(
+    conversation,
+    checkpoint,
+  );
   if (summary === null || summary.length === 0) {
     return null;
   }

@@ -154,12 +154,21 @@ occupy the window like any other — ignoring them makes the turn that fills the
 cache look small at exactly the moment it is largest.
 
 When either value is unavailable — the price table is fetched over the network
-and is explicitly best-effort — a character budget stands in. That budget is
+and is explicitly best-effort — `fallbackCharBudget` stands in. That budget is
 deliberately sized for a _small_ window (~32k tokens), not a typical one: it is
 only reached when the real limit is unknown, so it has to be safe for the
 smallest model it might be standing in for. Guessing high gets the request
 rejected, and with no response the accurate trigger never runs; guessing low just
 compacts earlier than necessary.
+
+**The fallback compares estimated tokens, not raw bytes.** The knob is a byte
+figure, but bytes are not what fills a context window: the same 64KB is ~21k
+tokens of ASCII and ~32k of Hangul or emoji. Comparing bytes therefore let
+exactly the scripts that tokenize densest sail past a small window while the
+trigger reported slack — the same unit confusion the preflight measurement had,
+surviving in the one branch that runs when nothing can check the model's real
+limit. The budget is converted at the ASCII rate, so an ASCII prompt still fires
+at the documented number of bytes and a denser script fires earlier.
 
 ### Two triggers, and why both are needed
 
@@ -317,6 +326,16 @@ conversation prices at ~1 byte per character and a CJK one at 3 — where a fixe
 worst-case 4 would stop ASCII conversations compacting until their spans reached
 32KB.
 
+**That rate is a heuristic, so the question is asked twice.** "A summary is
+written in the script it summarizes" is usually true and cannot be relied on: a
+summary that reaches for another script is 4 bytes per character where the span
+was 1. So the estimate stays a cheap pre-filter — its job is to avoid paying for
+a summarizer call that obviously cannot pay for itself — and a second check runs
+once the summary exists and can be _measured_ rather than predicted. A summary
+that came back larger than the history it would replace is discarded, already
+paid for, rather than published: a checkpoint would persist the enlarged prompt
+until the next cut.
+
 ## What survives compaction
 
 - **Instructions** — rebuilt every round, never sourced from events.
@@ -340,6 +359,27 @@ on the write path (where an unreadable previous summary rebuilds from the start
 of the log rather than failing the compaction), and in `compactionInstruction`,
 which runs while instructions are assembled and so gets no later chance to fall
 back.
+
+The rule covers the query that finds the checkpoint, not only the artifact behind
+it. A failed checkpoint lookup is treated as "no checkpoint" and logged: the raw
+messages are readable, so failing the turn over optional compaction metadata is
+the same trade, and that query runs before anyone knows whether the conversation
+even has a checkpoint or has compaction switched off. No extra retry logic is
+needed for the cache — an entry records the checkpoint id it was built against,
+and the `None` recorded during an outage stops matching the moment the query
+recovers.
+
+**Falling back gracefully in two places is not the same as agreeing.** The notice
+and the prompt read the same summary, moments apart, and two independent reads
+can land on different sides of a transient failure: the notice's succeeds, the
+prompt's does not, and the agent is handed the full raw log underneath a
+developer message insisting the older part was replaced by a summary above it —
+the exact failure the notice exists to prevent, reintroduced by reading twice.
+Successful reads are therefore memoized by `artifactId@version`. That key is
+immutable content, so a hit can never be stale and no invalidation is needed;
+only successes are kept, since memoizing "could not read" is the mistake
+`SummaryRead`'s third state exists to stop. The remaining disagreement is the
+harmless direction — a prompt that has a summary the notice did not announce.
 
 A missing artifact and an erroring read are different failures but the same
 situation _for the prompt_: the raw log is intact either way, so propagating the
@@ -395,6 +435,18 @@ The summarizer request also carries a `max_output_tokens` derived from
 `maxSummaryChars`. `capSummary` truncates only _after_ a response is generated,
 transferred and billed, so on its own it bounds the stored summary but not what
 producing it costs.
+
+That bound is **clamped to the model's own output ceiling**, which is a different
+number from its input window — 200k in and 8k out is an ordinary shape, and the
+price table carries both. The derived bound deliberately leaves headroom (one
+token per character, so a compliant CJK summary is never clipped), and that
+headroom is exactly what makes the clamp necessary: providers that validate the
+field reject an over-large request rather than trimming it, so the default 8000
+sent to a 4k-output summary model fails _every_ summarizer call. Nothing is ever
+checkpointed and the conversation reaches the agent model's input wall with
+compaction enabled and silently unable to run. An unknown ceiling means no clamp
+— the price table is best-effort, and refusing to summarize for an unlisted model
+would be the same outage by another route.
 
 ## Caching
 

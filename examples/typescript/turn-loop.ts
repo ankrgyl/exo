@@ -42,6 +42,7 @@ import {
   getTable,
   inputOccupancy,
   maxInputTokens,
+  maxOutputTokens,
 } from "@exo/model-runtime/cost";
 
 import { resolveLlmBinding } from "./shared";
@@ -173,7 +174,7 @@ async function runResponsesTurnLoop(
       policy,
       promptTokens: preflightSize.estimatedTokens(),
       maxInputTokens: maxInputTokens(preflightTable, model),
-      materializedChars: preflightSize.bytes,
+      promptSize: preflightSize,
     };
     const preflight = await compaction.consider(preflightArgs, () =>
       readLatestTurnEnded(conversation),
@@ -207,6 +208,7 @@ async function runResponsesTurnLoop(
             round,
             input,
             summarizerUsage,
+            maxOutputTokens(preflightTable, summaryModel),
           ),
       });
       await recordSummarizerUsage(context, summarizerUsage.usage);
@@ -281,7 +283,7 @@ async function runResponsesTurnLoop(
         policy,
         promptTokens: occupancy,
         maxInputTokens: modelInputLimit,
-        materializedChars: materialized.bytes,
+        promptSize: materialized,
       },
       () => readLatestTurnEnded(conversation),
     );
@@ -314,6 +316,7 @@ async function runResponsesTurnLoop(
             round,
             input,
             summarizerUsage,
+            maxOutputTokens(table, summaryModel),
           ),
       });
       await recordSummarizerUsage(context, summarizerUsage.usage);
@@ -397,6 +400,10 @@ async function summarizeWithModel(
   // Filled with what this call cost. Written on a custom event, which prompt
   // assembly ignores outright — see `COMPACTION_USAGE_EVENT`.
   usageSink: { usage: JsonObject | undefined },
+  // What this model will accept in one response, or null when the price table
+  // does not say. Threaded in rather than looked up here so the clamp has one
+  // implementation, in the module that is tested.
+  modelMaxOutputTokens: number | null,
 ): Promise<string> {
   const response = await runtime.complete(
     {
@@ -406,8 +413,13 @@ async function summarizeWithModel(
       tools: [],
       // Bound the response at request time. `capSummary` truncates only after
       // generation, so without this a runaway summary is paid for in full
-      // before being thrown away.
-      maxOutputTokens: summarizerMaxOutputTokens(input.maxChars),
+      // before being thrown away. Clamped to what this model accepts:
+      // providers that validate the field reject an over-large request
+      // outright, which would fail every summarizer call rather than one.
+      maxOutputTokens: summarizerMaxOutputTokens(
+        input.maxChars,
+        modelMaxOutputTokens,
+      ),
     },
     { parent: turnParent, roundIndex: round },
   );

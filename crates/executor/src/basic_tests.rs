@@ -630,6 +630,11 @@ struct FakeState {
     /// Makes `read_artifact` return a backend error rather than `Ok(None)`. The
     /// two are different failures and the read path must survive both.
     fail_artifact_reads: bool,
+    /// Makes only the *checkpoint* query fail, leaving the ordinary history
+    /// query working. Failing every query would prove nothing: the point is
+    /// that optional compaction metadata must not take down a materialization
+    /// whose raw messages are perfectly readable.
+    fail_checkpoint_queries: bool,
 }
 
 struct FakeConversationState {
@@ -644,6 +649,22 @@ impl FakeExoHarness {
             .lock()
             .expect("state poisoned")
             .fail_artifact_reads = true;
+    }
+
+    /// Make every later checkpoint query fail, leaving history queries intact.
+    fn fail_checkpoint_queries(&self) {
+        self.state
+            .lock()
+            .expect("state poisoned")
+            .fail_checkpoint_queries = true;
+    }
+
+    /// Let checkpoint queries succeed again, standing in for a recovered store.
+    fn allow_checkpoint_queries(&self) {
+        self.state
+            .lock()
+            .expect("state poisoned")
+            .fail_checkpoint_queries = false;
     }
 
     /// Let artifact reads succeed again, standing in for a recovered store.
@@ -684,6 +705,7 @@ impl FakeExoHarness {
                 artifacts: Vec::new(),
                 on_get_events: None,
                 fail_artifact_reads: false,
+                fail_checkpoint_queries: false,
                 conversation: FakeConversationState {
                     record: ConversationRecord {
                         id: conversation_id,
@@ -1004,6 +1026,18 @@ impl ConversationHandle for FakeConversationHandle {
         }
         let state = self.state.lock().expect("state poisoned");
         let mut events = state.conversation.events.clone();
+
+        if state.fail_checkpoint_queries
+            && query.as_ref().is_some_and(|query| {
+                query.types.as_ref().is_some_and(|types| {
+                    types
+                        .iter()
+                        .any(|ty| ty.as_str() == COMPACTION_CHECKPOINT_EVENT)
+                })
+            })
+        {
+            return Err(anyhow::anyhow!("event store unavailable"));
+        }
 
         if let Some(query) = query {
             if let Some(session_id) = query.session_id {
@@ -1877,6 +1911,123 @@ async fn an_unreadable_summary_artifact_replays_history_instead_of_failing_the_t
     assert!(text.contains("old"), "{text}");
     assert!(text.contains("recent"), "{text}");
     assert!(!text.contains("SUMMARY OF EARLIER"), "{text}");
+}
+
+#[tokio::test]
+async fn a_failed_checkpoint_query_replays_history_instead_of_failing_the_turn() {
+    // The last checkpoint read that did not follow this feature's own failure
+    // policy. Every other one falls back to the full log; this one propagated,
+    // so a backend that could serve the raw messages perfectly well would still
+    // fail the turn over optional compaction metadata — including on a
+    // conversation that has no checkpoint at all, or has compaction switched
+    // off, since the query runs before anyone knows which.
+    let (harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+
+    harness.fail_checkpoint_queries();
+    let executor = test_executor();
+    let prompt = executor
+        .materialize_prompt_history(conversation.as_ref(), &[])
+        .await
+        .expect("a failed checkpoint query must not fail materialization");
+
+    let text = prompt_text(&prompt);
+    assert!(text.contains("ancient"), "{text}");
+    assert!(text.contains("recent"), "{text}");
+}
+
+#[tokio::test]
+async fn a_failed_checkpoint_query_is_retried_rather_than_cached() {
+    // Same rule as the unreadable summary, one read earlier: a query that
+    // failed says something about right now, not about the conversation.
+    // Priming the cache from it would keep answering "no checkpoint" for the
+    // life of this executor — and the Rust cache outlives the turn — so the
+    // prompt would replay the compacted prefix long after the store recovered.
+    let (harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+
+    let turn = open_turn(conversation.as_ref()).await;
+    let outcome = run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &CompactionConfig {
+            keep_recent_turns: 1,
+            ..CompactionConfig::default()
+        },
+        "summary-model",
+        None,
+        &|_input| Box::pin(async { Ok("SUMMARY OF EARLIER".to_string()) }),
+    )
+    .await;
+    let CompactionOutcome::Compacted { .. } = outcome else {
+        panic!("expected compaction, got {outcome:?}");
+    };
+    turn.finish().await.expect("finish turn");
+
+    let executor = test_executor();
+    harness.fail_checkpoint_queries();
+    let during = prompt_text(
+        &executor
+            .materialize_prompt_history(conversation.as_ref(), &[])
+            .await
+            .expect("materialize while the store is down"),
+    );
+    assert!(during.contains("ancient"), "{during}");
+    assert!(!during.contains("SUMMARY OF EARLIER"), "{during}");
+
+    // Same executor, so the same cache. The recovery has to be visible through
+    // an entry that was primed during the outage.
+    harness.allow_checkpoint_queries();
+    let after = prompt_text(
+        &executor
+            .materialize_prompt_history(conversation.as_ref(), &[])
+            .await
+            .expect("materialize after the store recovers"),
+    );
+    assert!(after.contains("SUMMARY OF EARLIER"), "{after}");
+    assert!(!after.contains("ancient"), "{after}");
+}
+
+#[tokio::test]
+async fn a_summary_that_would_grow_the_prompt_is_not_published() {
+    // The pre-check has to guess the summary's size, and it guesses by pricing
+    // the character cap at the *span's* bytes-per-character. That is a fair
+    // heuristic — a summary is usually written in the script it summarizes —
+    // but only a heuristic: a summary that reaches for another script is 4
+    // bytes per character where the span was 1. Publishing it would enlarge the
+    // very prompt compaction was invoked to shrink, and the checkpoint would
+    // persist that until the next cut.
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+
+    let turn = open_turn(conversation.as_ref()).await;
+    // Compliant on characters, four bytes each: the cap the pre-check priced at
+    // roughly one byte per character.
+    let bloated = "😀".repeat(CompactionConfig::default().max_summary_chars as usize);
+    let outcome = run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &CompactionConfig {
+            keep_recent_turns: 1,
+            ..CompactionConfig::default()
+        },
+        "summary-model",
+        None,
+        &|_input| {
+            let bloated = bloated.clone();
+            Box::pin(async move { Ok(bloated) })
+        },
+    )
+    .await;
+
+    let CompactionOutcome::Skipped { reason } = outcome else {
+        panic!("a summary larger than the span it replaces must not be published, got {outcome:?}");
+    };
+    assert!(reason.contains("larger than the history"), "{reason}");
+    assert!(
+        checkpoint_events(conversation.as_ref()).await.is_empty(),
+        "no checkpoint should have been written"
+    );
 }
 
 #[tokio::test]

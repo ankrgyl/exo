@@ -328,6 +328,8 @@ describe("selectCutPoint", () => {
 
 describe("shouldCompact", () => {
   const policy = DEFAULT_COMPACTION_POLICY;
+  /** `bytes` of ASCII — one byte per character, so size reads as the count. */
+  const ascii = (bytes: number) => PromptSize.ofText("x".repeat(bytes));
 
   it("is disabled when the policy says so", () => {
     expect(
@@ -335,7 +337,7 @@ describe("shouldCompact", () => {
         policy: { ...policy, enabled: false },
         promptTokens: 1_000_000,
         maxInputTokens: 1_000,
-        materializedChars: 0,
+        promptSize: ascii(0),
       }),
     ).toBe(false);
   });
@@ -344,29 +346,61 @@ describe("shouldCompact", () => {
     const args = {
       policy: { ...policy, thresholdRatio: 0.7 },
       maxInputTokens: 100_000,
-      materializedChars: 0,
+      promptSize: ascii(0),
     };
     expect(shouldCompact({ ...args, promptTokens: 69_000 })).toBe(false);
     expect(shouldCompact({ ...args, promptTokens: 71_000 })).toBe(true);
   });
 
-  it("falls back to a character budget when the limit is unknown", () => {
+  it("falls back to the byte budget for ASCII when the limit is unknown", () => {
+    // The knob is a byte figure and an ASCII prompt must still fire at exactly
+    // that many bytes — the token conversion is a correction for other scripts,
+    // not a change to the documented default.
     const args = {
-      policy: { ...policy, fallbackCharBudget: 1_000 },
+      policy: { ...policy, fallbackCharBudget: 3_000 },
       promptTokens: null,
       maxInputTokens: null,
     };
-    expect(shouldCompact({ ...args, materializedChars: 999 })).toBe(false);
-    expect(shouldCompact({ ...args, materializedChars: 1_001 })).toBe(true);
+    expect(shouldCompact({ ...args, promptSize: ascii(2_997) })).toBe(false);
+    expect(shouldCompact({ ...args, promptSize: ascii(3_003) })).toBe(true);
+  });
+
+  it("fires earlier for a script that tokenizes denser than ASCII", () => {
+    // The defect this replaced: the budget was compared against raw bytes, so
+    // 3-byte Hangul filled a small context window at roughly half the byte
+    // count while the trigger still reported slack — and a prompt rejected for
+    // being too large never produces the usage that would drive the accurate
+    // trigger, so every later turn repeats it.
+    const args = {
+      policy: { ...policy, fallbackCharBudget: 3_000 },
+      promptTokens: null,
+      maxInputTokens: null,
+    };
+    // 600 Hangul syllables: 1800 bytes, well under the 3000-byte budget, but
+    // ~900 tokens against a 1000-token budget once measured properly...
+    expect(
+      shouldCompact({
+        ...args,
+        promptSize: PromptSize.ofText("가".repeat(600)),
+      }),
+    ).toBe(false);
+    // ...and 700 of them cross it, at 2100 bytes — still under the raw budget
+    // that used to gate this.
+    expect(
+      shouldCompact({
+        ...args,
+        promptSize: PromptSize.ofText("가".repeat(700)),
+      }),
+    ).toBe(true);
   });
 
   it("falls back when the provider reported no usage", () => {
     expect(
       shouldCompact({
-        policy: { ...policy, fallbackCharBudget: 1_000 },
+        policy: { ...policy, fallbackCharBudget: 3_000 },
         promptTokens: null,
         maxInputTokens: 100_000,
-        materializedChars: 1_001,
+        promptSize: ascii(3_003),
       }),
     ).toBe(true);
   });
@@ -434,17 +468,40 @@ describe("summarizerMaxOutputTokens", () => {
     // summary mid-sentence, where a character is about a token.
     const cap = DEFAULT_COMPACTION_POLICY.maxSummaryChars;
     const densestCompliantSummary = cap;
-    expect(summarizerMaxOutputTokens(cap)).toBeGreaterThanOrEqual(
+    expect(summarizerMaxOutputTokens(cap, null)).toBeGreaterThanOrEqual(
       densestCompliantSummary,
     );
     // Still a bound, or it is not doing its job.
-    expect(summarizerMaxOutputTokens(cap)).toBeLessThan(
+    expect(summarizerMaxOutputTokens(cap, null)).toBeLessThan(
       densestCompliantSummary * 4,
     );
   });
 
   it("still permits a usable response under a tiny cap", () => {
-    expect(summarizerMaxOutputTokens(1)).toBeGreaterThanOrEqual(256);
+    expect(summarizerMaxOutputTokens(1, null)).toBeGreaterThanOrEqual(256);
+  });
+
+  it("never asks a model for more output than it accepts", () => {
+    // A model's output ceiling is a different number from its input window, and
+    // providers that validate the field reject the whole request rather than
+    // trimming it. Sending the default 8000 to a 4096-output summary model
+    // would therefore fail *every* summarizer call — compaction enabled,
+    // nothing ever checkpointed, and the conversation walks into the agent
+    // model's input wall anyway.
+    const cap = DEFAULT_COMPACTION_POLICY.maxSummaryChars;
+    expect(summarizerMaxOutputTokens(cap, 4_096)).toBe(4_096);
+  });
+
+  it("does not raise the ceiling to meet a generous model", () => {
+    // The clamp is one-directional: `capSummary` is still the exact ceiling, so
+    // asking for more than the cap needs would only buy tokens to throw away.
+    expect(summarizerMaxOutputTokens(1_000, 64_000)).toBe(1_000);
+  });
+
+  it("leaves the request unclamped when the limit is unknown", () => {
+    // The price table is best-effort. Refusing to summarize because a model is
+    // unlisted would be the same outage the clamp exists to prevent.
+    expect(summarizerMaxOutputTokens(8_000, null)).toBe(8_000);
   });
 });
 
@@ -902,7 +959,7 @@ describe("CompactionGate", () => {
     policy: { ...DEFAULT_COMPACTION_POLICY, thresholdRatio: 0.7 },
     promptTokens: 90_000,
     maxInputTokens: 100_000,
-    materializedChars: 0,
+    promptSize: PromptSize.ofText(""),
   };
   const boundary = eventId(1);
 

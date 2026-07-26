@@ -14,6 +14,10 @@ export type ModelEntry = {
   // Present in the upstream litellm data and already retained by parseTable;
   // compaction reads it to size the prompt budget.
   max_input_tokens?: number;
+  // Also upstream, and a separate number from max_input_tokens — a model with a
+  // 200k window can still cap a single response at 8k. Compaction reads it so a
+  // summarizer request cannot ask for more than the model will accept.
+  max_output_tokens?: number;
 };
 
 export type PricingTable = Map<string, ModelEntry>;
@@ -67,6 +71,16 @@ export function maxInputTokens(
   model: string,
 ): number | null {
   const limit = lookup(table, model)?.max_input_tokens;
+  return typeof limit === "number" && limit > 0 ? limit : null;
+}
+
+// The model's per-response output limit, or null when unknown. A separate
+// number from maxInputTokens, resolved through the same prefix matching.
+export function maxOutputTokens(
+  table: PricingTable,
+  model: string,
+): number | null {
+  const limit = lookup(table, model)?.max_output_tokens;
   return typeof limit === "number" && limit > 0 ? limit : null;
 }
 

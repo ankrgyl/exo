@@ -4,6 +4,7 @@ import {
   COMPACTION_CHECKPOINT_EVENT,
   checkpointToPayload,
   createToolRegistry,
+  materializePromptHistory,
   type Event,
   type EventQuery,
   type TurnContext,
@@ -40,13 +41,24 @@ function event(type: string, extra: Record<string, unknown> = {}): Event {
   };
 }
 
+/**
+ * A fresh artifact id per checkpoint.
+ *
+ * Summary reads are memoized by `artifactId@version` so the notice and the
+ * prompt cannot describe different contexts. Reusing one id across tests would
+ * let a test that reads successfully prime the memo for a later test that means
+ * to exercise the failure path.
+ */
+let nextArtifact = 0;
+
 function checkpointEvent(): Event {
+  nextArtifact += 1;
   // The real custom-event envelope; see tests/fixtures/README.md.
   return event("custom", {
     event_type: COMPACTION_CHECKPOINT_EVENT,
     payload: checkpointToPayload({
       upToEventId: eventId(1),
-      artifactId: artifactId(1),
+      artifactId: artifactId(nextArtifact),
       artifactPath: "compaction/conv-1/summary.md",
       artifactVersion: 2,
       previousCheckpointId: null,
@@ -58,13 +70,27 @@ function checkpointEvent(): Event {
   });
 }
 
+/** Ordinary retained history, so the fallback has something to fall back to. */
+function turnEvents(text: string): Event[] {
+  return [
+    event("messages", { messages: [{ role: "user", content: text }] }),
+    event("turn_ended"),
+  ];
+}
+
 function makeContext(options: {
   events: Event[];
   summary?: string;
   compaction?: Record<string, unknown> | null;
   /** Makes the artifact read reject rather than return null. */
   failArtifactReads?: boolean;
+  /**
+   * Makes the artifact read succeed this many times, then reject — a store that
+   * goes down between two reads of the same summary.
+   */
+  failArtifactReadsAfter?: number;
 }): TurnContext {
+  let artifactReads = 0;
   const conversation = {
     record: { id: "conv-1", slug: "conv-1", name: "conv" },
     async getEvents(query?: EventQuery) {
@@ -86,6 +112,12 @@ function makeContext(options: {
     async readArtifactText() {
       if (options.failArtifactReads) {
         throw new Error("artifact store unavailable");
+      }
+      if (options.failArtifactReadsAfter !== undefined) {
+        if (artifactReads >= options.failArtifactReadsAfter) {
+          throw new Error("artifact store unavailable");
+        }
+        artifactReads += 1;
       }
       return options.summary ?? null;
     },
@@ -227,5 +259,31 @@ describe("compactionInstruction", () => {
     const content = String(message?.content);
     expect(content).toContain("40");
     expect(content).toContain("list_conversation_events");
+  });
+
+  it("never claims a summary the prompt built moments later does not contain", async () => {
+    // Two independent reads of the same artifact can disagree: this one
+    // succeeds, materialization's fails transiently, and the agent gets the
+    // full raw log underneath a developer message insisting the older part was
+    // replaced by a summary above it. That is the exact failure this notice was
+    // added to prevent, reintroduced by reading twice.
+    //
+    // The order is the harmful one: instructions are assembled before the
+    // prompt history, so the notice reads first and commits to the claim.
+    const context = makeContext({
+      events: [checkpointEvent(), ...turnEvents("recent")],
+      summary: "SUMMARY OF EARLIER",
+      failArtifactReadsAfter: 1,
+    });
+
+    const message = await compactionInstruction(context);
+    expect(message).not.toBeNull();
+
+    const rendered = (
+      await materializePromptHistory(context.exoharness.current.conversation)
+    )
+      .map((m) => String(m.content))
+      .join("\n");
+    expect(rendered).toContain("SUMMARY OF EARLIER");
   });
 });

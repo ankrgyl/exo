@@ -135,6 +135,17 @@ impl CompactionConfig {
         }
         self.max_summary_chars
     }
+
+    /// `fallback_char_budget` expressed in the unit the trigger compares.
+    ///
+    /// The knob stays a byte figure — it is documented, configurable and was
+    /// already re-specified once — but the comparison has to happen in tokens,
+    /// because bytes per token is the thing that varies by script. Converting
+    /// at the ASCII rate keeps an ASCII prompt firing at exactly the same size
+    /// as before while a denser script fires earlier, which is the correction.
+    pub(crate) fn fallback_token_budget(&self) -> u64 {
+        self.fallback_char_budget.div_ceil(ASCII_BYTES_PER_TOKEN)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,14 +303,24 @@ fn has_pending_tool_call(events: &[Event]) -> bool {
 
 /// Trigger predicate. Prefers the provider's own `prompt_tokens` against the
 /// model's input limit — no client-side tokenizer needed, and it reflects what
-/// the provider actually counted. Falls back to a character budget when either
+/// the provider actually counted. Falls back to the local estimate when either
 /// number is unavailable, since the price table is fetched over the network and
 /// is explicitly best-effort.
+///
+/// The fallback compares *estimated tokens*, not raw bytes. `fallback_char_budget`
+/// is a byte figure, but bytes are not what fills a context window: the same
+/// 64KB is ~21k tokens of ASCII and ~32k of Hangul or emoji, so a byte
+/// comparison lets exactly the scripts that tokenize densest sail past a small
+/// window while the trigger reports slack. That is the same unit confusion round
+/// 8 found in the preflight measurement, surviving here in the one branch that
+/// runs when nothing else can check the model's real limit — and the rejection
+/// it leads to is the self-perpetuating kind, since no response comes back to
+/// drive the accurate trigger.
 pub(crate) fn should_compact(
     config: &CompactionConfig,
     prompt_tokens: Option<u64>,
     max_input_tokens: Option<i64>,
-    materialized_chars: u64,
+    prompt_size: PromptSize,
 ) -> bool {
     if !config.enabled {
         return false;
@@ -310,7 +331,7 @@ pub(crate) fn should_compact(
         return (prompt_tokens as f64)
             > config.effective_threshold_ratio() * max_input_tokens as f64;
     }
-    materialized_chars > config.fallback_char_budget
+    prompt_size.estimated_tokens() > config.fallback_token_budget()
 }
 
 /// UTF-8 bytes per token assumed for ASCII text when estimating a prompt's size
@@ -438,7 +459,8 @@ pub(crate) async fn record_summarizer_usage(
     }
 }
 
-/// Output-token ceiling for a summarizer request sized from `max_summary_chars`.
+/// Output-token ceiling for a summarizer request sized from `max_summary_chars`
+/// and clamped to what the summary model will actually accept.
 ///
 /// `cap_summary` only truncates *after* a response has been generated,
 /// transferred and billed, so on its own it bounds the stored summary but not
@@ -450,9 +472,26 @@ pub(crate) async fn record_summarizer_usage(
 /// mid-sentence in exactly those scripts. For ASCII prose it works out at
 /// roughly four times what a compliant summary needs, which is the headroom
 /// this deliberately keeps; `cap_summary` remains the exact ceiling.
-pub(crate) fn summarizer_max_output_tokens(max_summary_chars: u32) -> i64 {
+///
+/// That headroom is what makes the clamp necessary. A model's output ceiling is
+/// a different number from its input window — 200k in and 8k out is an ordinary
+/// shape — and providers that validate the field reject the request outright
+/// rather than trimming it. Asking a 4k-output model for the default 8000 would
+/// therefore fail *every* summarizer call, so nothing is ever checkpointed and
+/// the conversation walks into the agent model's input wall with compaction
+/// enabled and silently unable to run. Unknown limit means no clamp: the price
+/// table is best-effort, and refusing to ask for a summary because a model is
+/// unlisted would be the same outage by another route.
+pub(crate) fn summarizer_max_output_tokens(
+    max_summary_chars: u32,
+    model_max_output_tokens: Option<i64>,
+) -> i64 {
     const FLOOR_TOKENS: u64 = 256;
-    u64::from(max_summary_chars).max(FLOOR_TOKENS) as i64
+    let wanted = u64::from(max_summary_chars).max(FLOOR_TOKENS) as i64;
+    match model_max_output_tokens {
+        Some(ceiling) if ceiling > 0 => wanted.min(ceiling),
+        _ => wanted,
+    }
 }
 
 /// Enforce the summary ceiling. Chained compaction feeds each summary back into
@@ -631,11 +670,14 @@ async fn compact(
         &scan.events[..=cut_index],
     );
 
+    let span_size = prompt_size(&messages);
+    let previous_summary_size = previous_summary
+        .as_ref()
+        .map(|summary| PromptSize::of_str(summary));
+
     if compaction_would_not_shrink(
-        prompt_size(&messages),
-        previous_summary
-            .as_ref()
-            .map(|summary| PromptSize::of_str(summary)),
+        span_size,
+        previous_summary_size,
         config.effective_max_summary_chars(),
     ) {
         return Ok(CompactionOutcome::Skipped {
@@ -657,6 +699,26 @@ async fn compact(
         let error = "summarizer returned an empty summary".to_string();
         record_failure(turn, &error).await;
         return Ok(CompactionOutcome::Failed { error });
+    }
+
+    // Now the summary exists, ask the question again against its real size.
+    //
+    // The check above had to guess, and it guesses by pricing the character cap
+    // at the *span's* bytes-per-character — reasonable, because a summary is
+    // usually written in the script it summarizes, but only a heuristic. A
+    // summary that reaches for another script is 4 bytes per character where the
+    // span was 1, and 8000 of those is 32KB: the estimate said "worth doing" and
+    // the result grows the prompt. Measuring the actual text costs nothing and
+    // needs no assumption, so the estimate stays a cheap filter that avoids
+    // paying for a summarizer call and this is the decision.
+    //
+    // Skipping here throws away a summary already paid for. That is the right
+    // trade: publishing it would enlarge the very prompt compaction was invoked
+    // to shrink, and the checkpoint would persist that until the next cut.
+    if summary_would_not_shrink(span_size, previous_summary_size, &summary) {
+        return Ok(CompactionOutcome::Skipped {
+            reason: "the summary came back larger than the history it would replace".to_string(),
+        });
     }
 
     let written = conversation
@@ -981,12 +1043,32 @@ fn compaction_would_not_shrink(
     previous_summary: Option<PromptSize>,
     max_summary_chars: u32,
 ) -> bool {
-    let envelope = summary_envelope_bytes();
-    // The previous summary is already wrapped where it sits in the prompt, so
-    // it costs its own envelope too.
-    let current = span.bytes() + previous_summary.map_or(0, |summary| envelope + summary.bytes());
-    let replacement = envelope + u64::from(max_summary_chars) * span.bytes_per_char();
-    current <= replacement
+    let replacement =
+        summary_envelope_bytes() + u64::from(max_summary_chars) * span.bytes_per_char();
+    replaced_bytes(span, previous_summary) <= replacement
+}
+
+/// The same question as `compaction_would_not_shrink`, asked once the summary
+/// exists and can be measured instead of predicted.
+///
+/// The cap is a character count and the prompt is charged in bytes, so the
+/// estimate has to assume a bytes-per-character rate for text that has not been
+/// written yet. This does not: the summary is right here.
+fn summary_would_not_shrink(
+    span: PromptSize,
+    previous_summary: Option<PromptSize>,
+    summary: &str,
+) -> bool {
+    let replacement = summary_envelope_bytes() + PromptSize::of_str(summary).bytes();
+    replaced_bytes(span, previous_summary) <= replacement
+}
+
+/// Bytes the prompt currently spends on everything a checkpoint would replace.
+///
+/// The previous summary is already wrapped where it sits in the prompt, so it
+/// costs its own envelope too.
+fn replaced_bytes(span: PromptSize, previous_summary: Option<PromptSize>) -> u64 {
+    span.bytes() + previous_summary.map_or(0, |summary| summary_envelope_bytes() + summary.bytes())
 }
 
 /// Serialized bytes the `summary_message` wrapper adds, summary text excluded.
@@ -1673,13 +1755,23 @@ mod tests {
         assert!(!latch.is_settled(Some(Uuid7::now())));
     }
 
+    /// `bytes` of ASCII — one byte per character, so size reads as the count.
+    fn ascii_size(bytes: usize) -> PromptSize {
+        PromptSize::of_str(&"x".repeat(bytes))
+    }
+
     #[test]
     fn should_compact_respects_the_enabled_flag() {
         let config = CompactionConfig {
             enabled: false,
             ..CompactionConfig::default()
         };
-        assert!(!should_compact(&config, Some(1_000_000), Some(1_000), 0));
+        assert!(!should_compact(
+            &config,
+            Some(1_000_000),
+            Some(1_000),
+            ascii_size(0)
+        ));
     }
 
     #[test]
@@ -1688,20 +1780,50 @@ mod tests {
             threshold_ratio: 0.7,
             ..CompactionConfig::default()
         };
-        assert!(!should_compact(&config, Some(69_000), Some(100_000), 0));
-        assert!(should_compact(&config, Some(71_000), Some(100_000), 0));
+        let empty = ascii_size(0);
+        assert!(!should_compact(&config, Some(69_000), Some(100_000), empty));
+        assert!(should_compact(&config, Some(71_000), Some(100_000), empty));
     }
 
     #[test]
-    fn should_compact_falls_back_to_a_char_budget() {
+    fn should_compact_falls_back_to_the_byte_budget_for_ascii() {
+        // The knob is a byte figure and an ASCII prompt must still fire at
+        // exactly that many bytes — the token conversion is a correction for
+        // other scripts, not a change to the documented default.
         let config = CompactionConfig {
-            fallback_char_budget: 1_000,
+            fallback_char_budget: 3_000,
             ..CompactionConfig::default()
         };
-        assert!(!should_compact(&config, None, None, 999));
-        assert!(should_compact(&config, None, None, 1_001));
+        assert!(!should_compact(&config, None, None, ascii_size(2_997)));
+        assert!(should_compact(&config, None, None, ascii_size(3_003)));
         // Usage missing but a limit known: still the fallback path.
-        assert!(should_compact(&config, None, Some(100_000), 1_001));
+        assert!(should_compact(
+            &config,
+            None,
+            Some(100_000),
+            ascii_size(3_003)
+        ));
+    }
+
+    #[test]
+    fn should_compact_fires_earlier_for_a_denser_script() {
+        // The defect this replaced: the budget was compared against raw bytes,
+        // so 3-byte Hangul filled a small context window at roughly half the
+        // byte count while the trigger still reported slack — and a prompt
+        // rejected for being too large never produces the usage that would
+        // drive the accurate trigger, so every later turn repeats it.
+        let config = CompactionConfig {
+            fallback_char_budget: 3_000,
+            ..CompactionConfig::default()
+        };
+        // 600 Hangul syllables: 1800 bytes, well under the 3000-byte budget,
+        // but ~900 tokens against a 1000-token budget once measured properly.
+        let under = PromptSize::of_str(&"가".repeat(600));
+        assert!(!should_compact(&config, None, None, under));
+        // 700 of them cross it, at 2100 bytes — still under the raw budget
+        // that used to gate this.
+        let over = PromptSize::of_str(&"가".repeat(700));
+        assert!(should_compact(&config, None, None, over));
     }
 
     #[test]
@@ -1734,7 +1856,7 @@ mod tests {
         // gets clipped mid-sentence — and the densest scripts need about one
         // token per character, so that is where the headroom has to be measured.
         let config = CompactionConfig::default();
-        let bound = summarizer_max_output_tokens(config.max_summary_chars);
+        let bound = summarizer_max_output_tokens(config.max_summary_chars, None);
         let densest_compliant_summary = i64::from(config.max_summary_chars);
         assert!(
             bound >= densest_compliant_summary,
@@ -1745,7 +1867,25 @@ mod tests {
             "not a bound at all: {bound}"
         );
         // A tiny cap must still permit a usable response.
-        assert!(summarizer_max_output_tokens(1) >= 256);
+        assert!(summarizer_max_output_tokens(1, None) >= 256);
+    }
+
+    #[test]
+    fn the_summarizer_request_never_exceeds_the_model_output_ceiling() {
+        // A model's output ceiling is a different number from its input window,
+        // and providers that validate the field reject the whole request rather
+        // than trimming it. Sending the default 8000 to a 4096-output summary
+        // model would therefore fail *every* summarizer call — compaction
+        // enabled, nothing ever checkpointed, and the conversation walks into
+        // the agent model's input wall anyway.
+        let cap = CompactionConfig::default().max_summary_chars;
+        assert_eq!(summarizer_max_output_tokens(cap, Some(4_096)), 4_096);
+        // One-directional: `cap_summary` is still the exact ceiling, so asking
+        // for more than the cap needs would only buy tokens to throw away.
+        assert_eq!(summarizer_max_output_tokens(1_000, Some(64_000)), 1_000);
+        // The price table is best-effort. Refusing to summarize because a model
+        // is unlisted would be the same outage the clamp exists to prevent.
+        assert_eq!(summarizer_max_output_tokens(8_000, None), 8_000);
     }
 
     #[test]

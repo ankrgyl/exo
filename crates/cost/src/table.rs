@@ -21,6 +21,12 @@ pub struct ModelEntry {
     /// prompt budget. Not every priced entry carries one.
     #[serde(default)]
     pub max_input_tokens: Option<i64>,
+    /// Also upstream, and a separate number from `max_input_tokens` — a model
+    /// with a 200k window can still cap a single response at 8k. Compaction
+    /// reads it so a summarizer request cannot ask for more than the model will
+    /// accept.
+    #[serde(default)]
+    pub max_output_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -92,6 +98,14 @@ impl PricingTable {
             .filter(|limit| *limit > 0)
     }
 
+    /// The model's per-response output limit, or `None` when unknown. Resolves
+    /// through the same prefix matching as pricing.
+    pub fn max_output_tokens(&self, model: &str) -> Option<i64> {
+        self.lookup(model)?
+            .max_output_tokens
+            .filter(|limit| *limit > 0)
+    }
+
     /// Total tokens occupying the model's input window for one call — the number
     /// to compare against `max_input_tokens`.
     ///
@@ -160,12 +174,12 @@ mod tests {
             "litellm_provider": "anthropic", "input_cost_per_token": 3e-06,
             "output_cost_per_token": 1.5e-05, "cache_read_input_token_cost": 3e-07,
             "cache_creation_input_token_cost": 3.75e-06,
-            "max_input_tokens": 200000
+            "max_input_tokens": 200000, "max_output_tokens": 64000
         },
         "gpt-4o-mini": {
             "litellm_provider": "openai", "input_cost_per_token": 1.5e-07,
             "output_cost_per_token": 6e-07, "cache_read_input_token_cost": 7.5e-08,
-            "max_input_tokens": 128000
+            "max_input_tokens": 128000, "max_output_tokens": 16384
         },
         "gpt-4": { "litellm_provider": "openai", "input_cost_per_token": 3e-05, "output_cost_per_token": 6e-05 },
         "us.anthropic.claude-sonnet-4-6": {
@@ -342,5 +356,20 @@ mod tests {
         // than read a missing limit as zero.
         assert_eq!(table().max_input_tokens("gpt-4"), None);
         assert_eq!(table().max_input_tokens("acme-llm-9000"), None);
+    }
+
+    #[test]
+    fn max_output_tokens_is_read_separately_from_the_input_limit() {
+        // Two different numbers on the same entry: a 200k window that still
+        // caps one response well below it. Reading the input limit in place of
+        // the output limit is exactly the mistake this guards.
+        assert_eq!(table().max_output_tokens("claude-sonnet-4-6"), Some(64_000));
+        assert_eq!(table().max_output_tokens("gpt-4o-mini"), Some(16_384));
+        assert_eq!(
+            table().max_output_tokens("claude-sonnet-4-6-20251022"),
+            Some(64_000)
+        );
+        assert_eq!(table().max_output_tokens("gpt-4"), None);
+        assert_eq!(table().max_output_tokens("acme-llm-9000"), None);
     }
 }

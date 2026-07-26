@@ -347,6 +347,25 @@ describe("runCompaction", () => {
     expect(checkpointEvents(stub)).toHaveLength(0);
   });
 
+  it("writes no checkpoint when the summary comes back larger than the span", async () => {
+    // The pre-check has to guess the summary's size, and it guesses by pricing
+    // the character cap at the *span's* bytes-per-character. That is a fair
+    // heuristic — a summary is usually written in the script it summarizes —
+    // but only a heuristic: a summary that reaches for another script is 4
+    // bytes per character where the span was 1. Publishing it would enlarge the
+    // very prompt compaction was invoked to shrink, and the checkpoint would
+    // persist that until the next cut.
+    const stub = target([...turn("a"), ...turn("b"), ...turn("c")]);
+    // Compliant on characters, four bytes each.
+    const bloated = "😀".repeat(policy.maxSummaryChars);
+    const result = await runCompaction(
+      args(stub, { summarize: (async () => bloated) satisfies SummarizeFn }),
+    );
+
+    expect(result.status).toBe("skipped");
+    expect(checkpointEvents(stub)).toHaveLength(0);
+  });
+
   it("skips when the compactable span is smaller than the summary cap", async () => {
     // A prompt can cross the threshold because of the *retained* turns — one
     // huge tool result, say. Summarizing a tiny prefix into an 8k-character

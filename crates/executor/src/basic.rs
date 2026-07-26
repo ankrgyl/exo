@@ -153,7 +153,21 @@ where
         // prefix from this instance forever. One bounded `desc limit 1` query
         // against a scan the round is doing anyway; the same check
         // `PromptHistoryCache` makes on the TypeScript side.
-        let active = read_active_checkpoint(conversation).await?;
+        //
+        // A query that *fails* is treated as "no checkpoint", not propagated.
+        // Every other checkpoint read in this feature falls back to the full
+        // log, and this one was the exception: it would fail the turn over
+        // optional metadata while the raw messages sat there perfectly
+        // readable — including on a conversation that has no checkpoint at all,
+        // or has compaction switched off. The fallback is the same one an
+        // unreadable summary takes, and it is always available.
+        let active = match read_active_checkpoint(conversation).await {
+            Ok(active) => active,
+            Err(error) => {
+                tracing::warn!(%error, "could not read the active checkpoint; using full history");
+                None
+            }
+        };
         let active_checkpoint_id = active.as_ref().map(|(event_id, _)| *event_id);
 
         // An entry built against a different checkpoint — or against none — is
@@ -165,7 +179,14 @@ where
 
         // Whether the summary answer is worth remembering. An errored read is
         // not: see `SummaryRead`.
-        let mut summary_is_conclusive = true;
+        //
+        // A failed *checkpoint* lookup needs no equivalent flag. The entry
+        // records the checkpoint id it was built against, and during an outage
+        // that id is `None`; when the query recovers and returns the real id
+        // the entry no longer matches and is rebuilt. The retry is structural,
+        // so asserting it here as well would be a second mechanism claiming
+        // credit for the first one's work.
+        let mut answer_is_conclusive = true;
         let summary = match &cached_entry {
             Some(entry) => entry.summary.clone(),
             // A checkpoint whose artifact has vanished is worse than none: it
@@ -182,7 +203,7 @@ where
             None => match active {
                 Some((_, checkpoint)) => {
                     let read = read_summary_or_fall_back(conversation, &checkpoint).await;
-                    summary_is_conclusive = read.is_conclusive();
+                    answer_is_conclusive &= read.is_conclusive();
                     read.text().map(|text| CachedSummary {
                         text: text.to_string(),
                         up_to_event_id: checkpoint.up_to_event_id,
@@ -235,8 +256,7 @@ where
             // replays full history long after the store recovered. Rebuilding
             // each round while the store is down is the cost of finding out
             // when it comes back.
-            if self.cache_generation.load(Ordering::Acquire) == generation && summary_is_conclusive
-            {
+            if self.cache_generation.load(Ordering::Acquire) == generation && answer_is_conclusive {
                 cache.insert(
                     conversation_id,
                     HistoryCacheEntry {
@@ -283,12 +303,7 @@ where
             turn_trace,
         } = trigger;
         let config = agent_config.compaction.clone().unwrap_or_default();
-        if !should_compact(
-            &config,
-            prompt_tokens,
-            max_input_tokens,
-            prompt_size.bytes(),
-        ) {
+        if !should_compact(&config, prompt_tokens, max_input_tokens, prompt_size) {
             return false;
         }
 
@@ -445,8 +460,13 @@ where
                     // Bound the response at request time. `cap_summary`
                     // truncates only after generation, so without this a
                     // runaway summary is paid for in full before being thrown
-                    // away.
-                    max_output_tokens: Some(summarizer_max_output_tokens(max_chars)),
+                    // away. Clamped to what this model accepts: providers that
+                    // validate the field reject an over-large request outright,
+                    // which would fail every summarizer call rather than one.
+                    max_output_tokens: Some(summarizer_max_output_tokens(
+                        max_chars,
+                        self.pricing.max_output_tokens(model),
+                    )),
                 },
                 round,
                 ExecutorStreamMode::Disabled,

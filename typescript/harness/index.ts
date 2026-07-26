@@ -739,21 +739,72 @@ function summaryIsConclusive(read: SummaryRead): boolean {
   return read.text !== null || read.conclusive;
 }
 
+/**
+ * Summary text already read, keyed by the artifact version it came from.
+ *
+ * Two callers read the same summary while assembling one prompt: this module,
+ * building the history, and `compactionInstruction`, deciding whether to tell
+ * the agent a summary is there. Two reads can disagree — the notice's succeeds,
+ * materialization's fails transiently, and the agent is handed a prompt with the
+ * full raw log plus a developer message insisting the older part was replaced by
+ * a summary above it. That is the exact failure the notice was added to prevent,
+ * reintroduced by reading twice.
+ *
+ * Keyed by `artifactId@version`, which is immutable content: a hit can never be
+ * stale, so this needs no invalidation. Only *successful* reads are kept —
+ * memoizing "could not read" would turn one transient failure into a permanent
+ * one, the mistake `SummaryRead`'s third state exists to stop. The cap is small
+ * because only the active checkpoint is ever asked for; older entries are dead
+ * the moment a new checkpoint lands.
+ */
+const summaryMemo = new Map<string, string>();
+const SUMMARY_MEMO_LIMIT = 4;
+
+function memoizeSummary(key: string, text: string): void {
+  if (summaryMemo.size >= SUMMARY_MEMO_LIMIT) {
+    // Insertion-ordered, so the first key is the oldest.
+    const oldest = summaryMemo.keys().next();
+    if (!oldest.done) summaryMemo.delete(oldest.value);
+  }
+  summaryMemo.set(key, text);
+}
+
 async function readCheckpointSummary(
   conversation: Conversation,
   checkpoint: CompactionCheckpoint,
 ): Promise<SummaryRead> {
+  const key = `${checkpoint.artifactId}@${checkpoint.artifactVersion}`;
+  const memoized = summaryMemo.get(key);
+  if (memoized !== undefined) {
+    return { text: memoized };
+  }
   try {
     const text = await conversation.readArtifactText({
       artifactId: checkpoint.artifactId,
       version: checkpoint.artifactVersion,
     });
-    return text === null ? { text: null, conclusive: true } : { text };
+    if (text === null) return { text: null, conclusive: true };
+    memoizeSummary(key, text);
+    return { text };
   } catch {
     // Not a failure of the turn: fall back to full history rather than die over
     // a summary that is reconstructible. But not a fact worth caching either.
     return { text: null, conclusive: false };
   }
+}
+
+/**
+ * The active checkpoint's summary text, or null when it cannot be had.
+ *
+ * The agent-facing notice reads through this rather than calling
+ * `readArtifactText` itself, so that a successful read and the prompt built
+ * moments later cannot describe different contexts. See `summaryMemo`.
+ */
+export async function readActiveCheckpointSummaryText(
+  conversation: Conversation,
+  checkpoint: CompactionCheckpoint,
+): Promise<string | null> {
+  return summaryText(await readCheckpointSummary(conversation, checkpoint));
 }
 
 /**

@@ -282,22 +282,45 @@ export interface ShouldCompactArgs {
   promptTokens: number | null;
   /** The model's input limit, if the price table knows it. */
   maxInputTokens: number | null;
-  /** Character count of the materialized prompt, for the fallback path. */
-  materializedChars: number;
+  /** Measured size of the materialized prompt, for the fallback path. */
+  promptSize: PromptSize;
+}
+
+/**
+ * `fallbackCharBudget` expressed in the unit the trigger compares.
+ *
+ * The knob stays a byte figure — it is documented, configurable and was already
+ * re-specified once — but the comparison has to happen in tokens, because bytes
+ * per token is the thing that varies by script. Converting at the ASCII rate
+ * keeps an ASCII prompt firing at exactly the same size as before while a denser
+ * script fires earlier, which is the correction.
+ */
+export function fallbackTokenBudget(policy: CompactionPolicy): number {
+  return Math.ceil(policy.fallbackCharBudget / ASCII_BYTES_PER_TOKEN);
 }
 
 /**
  * Trigger predicate. Prefers the provider's own `prompt_tokens` against the
  * model's input limit — no client-side tokenizer needed, and it accounts for
- * whatever the provider actually counted. Falls back to a character budget when
+ * whatever the provider actually counted. Falls back to the local estimate when
  * either number is unavailable, since the price table is fetched over the
  * network and is explicitly best-effort.
+ *
+ * The fallback compares *estimated tokens*, not raw bytes. `fallbackCharBudget`
+ * is a byte figure, but bytes are not what fills a context window: the same 64KB
+ * is ~21k tokens of ASCII and ~32k of Hangul or emoji, so a byte comparison lets
+ * exactly the scripts that tokenize densest sail past a small window while the
+ * trigger reports slack. That is the same unit confusion round 8 found in the
+ * preflight measurement, surviving here in the one branch that runs when nothing
+ * else can check the model's real limit — and the rejection it leads to is the
+ * self-perpetuating kind, since no response comes back to drive the accurate
+ * trigger.
  */
 export function shouldCompact({
   policy,
   promptTokens,
   maxInputTokens,
-  materializedChars,
+  promptSize,
 }: ShouldCompactArgs): boolean {
   if (!policy.enabled) {
     return false;
@@ -305,7 +328,7 @@ export function shouldCompact({
   if (promptTokens !== null && maxInputTokens !== null) {
     return promptTokens > policy.thresholdRatio * maxInputTokens;
   }
-  return materializedChars > policy.fallbackCharBudget;
+  return promptSize.estimatedTokens() > fallbackTokenBudget(policy);
 }
 
 /**
@@ -453,7 +476,8 @@ export function toolDefinitionSize(tools: unknown[]): PromptSize {
 }
 
 /**
- * Output-token ceiling for a summarizer request sized from `maxSummaryChars`.
+ * Output-token ceiling for a summarizer request sized from `maxSummaryChars`
+ * and clamped to what the summary model will actually accept.
  *
  * `capSummary` only truncates *after* a response has been generated,
  * transferred and billed, so on its own it bounds the stored summary but not
@@ -465,10 +489,29 @@ export function toolDefinitionSize(tools: unknown[]): PromptSize {
  * mid-sentence in exactly those scripts. For ASCII prose it works out at roughly
  * four times what a compliant summary needs, which is the headroom this
  * deliberately keeps; `capSummary` remains the exact ceiling.
+ *
+ * That headroom is what makes the clamp necessary. A model's output ceiling is a
+ * different number from its input window — 200k in and 8k out is an ordinary
+ * shape — and providers that validate the field reject the request outright
+ * rather than trimming it. Asking a 4k-output model for the default 8000 would
+ * therefore fail *every* summarizer call, so nothing is ever checkpointed and
+ * the conversation walks into the agent model's input wall with compaction
+ * enabled and silently unable to run. Unknown limit means no clamp: the price
+ * table is best-effort, and refusing to ask for a summary because a model is
+ * unlisted would be the same outage by another route.
  */
-export function summarizerMaxOutputTokens(maxSummaryChars: number): number {
+export function summarizerMaxOutputTokens(
+  maxSummaryChars: number,
+  // Required, not defaulted: a caller that has no limit must say so. A default
+  // would let a new call site silently skip the clamp and still typecheck.
+  modelMaxOutputTokens: number | null,
+): number {
   const floorTokens = 256;
-  return Math.max(floorTokens, maxSummaryChars);
+  const wanted = Math.max(floorTokens, maxSummaryChars);
+  if (modelMaxOutputTokens !== null && modelMaxOutputTokens > 0) {
+    return Math.min(wanted, modelMaxOutputTokens);
+  }
+  return wanted;
 }
 
 export interface ResolveSummarizerModelArgs {
@@ -1031,10 +1074,14 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
   const compactedEvents = scan.events.slice(0, cutIndex + 1);
   const compactedMessages = materializeEventsToMessages(compactedEvents);
 
+  const spanSize = promptSize(compactedMessages);
+  const previousSummarySize =
+    previousSummary === null ? null : PromptSize.ofText(previousSummary);
+
   if (
     compactionWouldNotShrink(
-      promptSize(compactedMessages),
-      previousSummary === null ? null : PromptSize.ofText(previousSummary),
+      spanSize,
+      previousSummarySize,
       policy.maxSummaryChars,
     )
   ) {
@@ -1057,6 +1104,27 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
     const error = "summarizer returned an empty summary";
     await recordFailure(turn, error);
     return { status: "failed", error };
+  }
+
+  // Now the summary exists, ask the question again against its real size.
+  //
+  // The check above had to guess, and it guesses by pricing the character cap at
+  // the *span's* bytes-per-character — reasonable, because a summary is usually
+  // written in the script it summarizes, but only a heuristic. A summary that
+  // reaches for another script is 4 bytes per character where the span was 1,
+  // and 8000 of those is 32KB: the estimate said "worth doing" and the result
+  // grows the prompt. Measuring the actual text costs nothing and needs no
+  // assumption, so the estimate stays a cheap filter that avoids paying for a
+  // summarizer call and this is the decision.
+  //
+  // Skipping here throws away a summary already paid for. That is the right
+  // trade: publishing it would enlarge the very prompt compaction was invoked to
+  // shrink, and the checkpoint would persist that until the next cut.
+  if (summaryWouldNotShrink(spanSize, previousSummarySize, summary)) {
+    return {
+      status: "skipped",
+      reason: "the summary came back larger than the history it would replace",
+    };
   }
 
   const written: ArtifactVersion = await conversation.writeArtifactText({
@@ -1140,14 +1208,44 @@ export function compactionWouldNotShrink(
   previousSummary: PromptSize | null,
   maxSummaryChars: number,
 ): boolean {
-  const envelope = summaryEnvelopeBytes();
-  // The previous summary is already wrapped where it sits in the prompt, so it
-  // costs its own envelope too.
-  const current =
+  const replacement =
+    summaryEnvelopeBytes() + maxSummaryChars * span.bytesPerChar();
+  return replacedBytes(span, previousSummary) <= replacement;
+}
+
+/**
+ * The same question as `compactionWouldNotShrink`, asked once the summary exists
+ * and can be measured instead of predicted.
+ *
+ * The cap is a character count and the prompt is charged in bytes, so the
+ * estimate has to assume a bytes-per-character rate for text that has not been
+ * written yet. This does not: the summary is right here.
+ */
+export function summaryWouldNotShrink(
+  span: PromptSize,
+  previousSummary: PromptSize | null,
+  summary: string,
+): boolean {
+  const replacement = summaryEnvelopeBytes() + PromptSize.ofText(summary).bytes;
+  return replacedBytes(span, previousSummary) <= replacement;
+}
+
+/**
+ * Bytes the prompt currently spends on everything a checkpoint would replace.
+ *
+ * The previous summary is already wrapped where it sits in the prompt, so it
+ * costs its own envelope too.
+ */
+function replacedBytes(
+  span: PromptSize,
+  previousSummary: PromptSize | null,
+): number {
+  return (
     span.bytes +
-    (previousSummary === null ? 0 : envelope + previousSummary.bytes);
-  const replacement = envelope + maxSummaryChars * span.bytesPerChar();
-  return current <= replacement;
+    (previousSummary === null
+      ? 0
+      : summaryEnvelopeBytes() + previousSummary.bytes)
+  );
 }
 
 /**

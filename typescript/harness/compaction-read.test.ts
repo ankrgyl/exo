@@ -119,6 +119,22 @@ function artifactId(n: number): string {
   return `01920000-0000-7000-9000-${String(n).padStart(12, "0")}`;
 }
 
+/**
+ * An artifact id no other test has used.
+ *
+ * Summary reads are memoized by `artifactId@version` so the agent-facing notice
+ * and the prompt cannot describe different contexts (see `summaryMemo`). The
+ * memo is process-wide and its key is immutable content, which is sound where
+ * ids are UUIDv7 — but these fixtures mint ids by hand and reuse them, so a test
+ * that means to exercise the *failure* path has to ask for an artifact nobody
+ * has successfully read.
+ */
+let nextFreshArtifact = 100;
+function unreadArtifactId(): string {
+  nextFreshArtifact += 1;
+  return artifactId(nextFreshArtifact);
+}
+
 let nextId = 0;
 function event(type: string, extra: Record<string, unknown> = {}): Event {
   nextId += 1;
@@ -326,16 +342,17 @@ describe("materializePromptHistory with a checkpoint", () => {
     // consults the same checkpoint. Same handling as the Rust executor's
     // `read_summary_or_fall_back`.
     const older = turn("ancient");
+    const summaryArtifact = unreadArtifactId();
     const stub = new StubConversation({
       events: [
         ...older,
         checkpointEvent({
           upToEventId: older.at(-1)!.id,
-          artifactId: artifactId(1),
+          artifactId: summaryArtifact,
         }),
         ...turn("recent"),
       ],
-      artifacts: new Map([[artifactId(1), "SUMMARY OF EARLIER"]]),
+      artifacts: new Map([[summaryArtifact, "SUMMARY OF EARLIER"]]),
     });
     stub.failArtifactReads = true;
 
@@ -483,16 +500,17 @@ describe("PromptHistoryCache", () => {
     // the cache against the latter means never retrying it for the life of the
     // cache, so a blip in the store outlasts the blip.
     const older = turn("ancient");
+    const summaryArtifact = unreadArtifactId();
     const stub = new StubConversation({
       events: [
         ...older,
         checkpointEvent({
           upToEventId: older.at(-1)!.id,
-          artifactId: artifactId(1),
+          artifactId: summaryArtifact,
         }),
         ...turn("recent"),
       ],
-      artifacts: new Map([[artifactId(1), "SUMMARY OF EARLIER"]]),
+      artifacts: new Map([[summaryArtifact, "SUMMARY OF EARLIER"]]),
     });
     const cache = new PromptHistoryCache();
 
