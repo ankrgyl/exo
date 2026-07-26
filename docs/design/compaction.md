@@ -119,12 +119,27 @@ Both share a once-per-turn latch. No new `turn_ended` appears mid-turn, so the
 cut point cannot change within a turn; a second attempt would re-scan the log and
 re-run the summarizer for the same answer.
 
-### RLM
+### RLM does not compact, on purpose
 
-The RLM executor materializes the whole conversation once and bakes it into a
-single root prompt, then loops over tool rounds without re-reading the log. There
-is no between-rounds moment where a smaller prompt would help, so it compacts in
-one place only: before that context is captured.
+The RLM executor is the exception, and it is worth being precise about why —
+"both executors compact" is the intuitive answer and it is wrong.
+
+RLM's transcript is **out-of-band**. `build_rlm_root_prompt` embeds only a
+character count and a ~400-character preview; the full text goes into the JS
+REPL's `context` variable, which the model reaches through `repl_execute` rather
+than by reading it in the prompt. So the transcript never occupies the context
+window, and its size does not move the root prompt's size.
+
+Compacting it would therefore reclaim nothing and cost the thing this executor
+exists for: precise access to a large external context without spending the
+window on it. `AgentConfig::compaction` documents itself as basic-executor-only,
+and `rlm_does_not_compact_its_out_of_band_transcript` pins the behaviour.
+
+For the same reason `materialize_conversation_messages` — used by RLM and by
+`HarnessConversation::messages()` — deliberately returns the **full** log and
+ignores checkpoints. It is not a prompt builder. Making it checkpoint-aware would
+also quietly break the "history stays queryable" guarantee that justifies never
+mutating the log.
 
 ## Summaries
 
@@ -135,6 +150,20 @@ accumulating one paragraph per compaction.
 
 `maxSummaryChars` is enforced in code, not by asking the model nicely.
 Unbounded recursive summarization is the standard way this design rots.
+
+### The summary is not an instruction
+
+A summary is presented as a **user** message, wrapped in `<conversation_summary>`
+— not as a system or developer message.
+
+The compacted span is user turns, assistant turns and tool output: content an
+outside party can write, including text shaped like an instruction. Rendering the
+summary at system priority would give that content more authority _after_
+compaction than it had before, turning routine housekeeping into a privilege
+escalation — and one that only manifests on long conversations, where it is
+hardest to notice. `user` is the ceiling of what went into the summary, since
+instructions are rebuilt every round and never sourced from events. The envelope
+tells the model it is reading a record rather than a request.
 
 ## What survives compaction
 

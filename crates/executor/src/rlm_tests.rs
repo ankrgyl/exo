@@ -659,15 +659,16 @@ async fn register_test_model(exoharness: &dyn ExoHarness) {
         .expect("test model should register");
 }
 
-/// RLM must compact, not just read checkpoints someone else wrote.
+/// RLM leaves its transcript alone, even with compaction enabled.
 ///
-/// Its shape differs from the basic executor's: the whole conversation is
-/// materialized once and baked into a single root prompt, so there is no
-/// between-rounds moment where a smaller prompt would help. The only useful
-/// place to compact is before that context is captured. Without it an RLM
-/// conversation grows unbounded while its config reports compaction as enabled.
+/// Its context is *out-of-band*: `build_rlm_root_prompt` embeds only a short
+/// preview and a character count, while the full text goes into the JS REPL's
+/// `context` variable. So the transcript never occupies the model window, and
+/// summarizing it would give up the precise access this executor exists to
+/// provide in exchange for reclaiming nothing. The policy is documented as
+/// basic-executor-only on `AgentConfig::compaction`.
 #[tokio::test(flavor = "current_thread")]
-async fn rlm_compacts_its_own_history_before_building_the_root_prompt() {
+async fn rlm_does_not_compact_its_out_of_band_transcript() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let exoharness = Arc::new(
         BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
@@ -675,8 +676,6 @@ async fn rlm_compacts_its_own_history_before_building_the_root_prompt() {
             .expect("basic exoharness should initialize"),
     ) as Arc<dyn ExoHarness>;
 
-    // Every call answers immediately: the root prompts finish their turn, and
-    // the compaction pass takes whichever one it draws as its summary text.
     let model = Arc::new(FakeModelClient::new(
         (0..8)
             .map(|_| ModelResponse {
@@ -691,7 +690,7 @@ async fn rlm_compacts_its_own_history_before_building_the_root_prompt() {
             })
             .collect(),
     ));
-    let harness = RlmHarness::new(exoharness, model);
+    let harness = RlmHarness::new(exoharness, Arc::clone(&model));
     register_test_model(harness.exoharness_handle().as_ref()).await;
 
     let agent = harness
@@ -708,18 +707,14 @@ async fn rlm_compacts_its_own_history_before_building_the_root_prompt() {
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
             max_tool_round_trips: None,
+            // Aggressively on. RLM must ignore it anyway.
             compaction: Some(crate::compaction::CompactionConfig {
                 enabled: true,
                 keep_recent_turns: 1,
-                // The fake model has no known input limit, so drive the trigger
-                // through the character-budget fallback.
-                fallback_char_budget: 2_000,
-                // Must stay well under the compactable span, or compaction
-                // correctly declines to "shrink" a prefix into something bigger.
-                max_summary_chars: 500,
+                fallback_char_budget: 0,
+                max_summary_chars: 100,
                 ..crate::compaction::CompactionConfig::default()
             }),
-
             braintrust: None,
         })
         .await
@@ -729,7 +724,6 @@ async fn rlm_compacts_its_own_history_before_building_the_root_prompt() {
         .await
         .expect("conversation should be created");
 
-    // Three turns, each large enough that the transcript clears the budget.
     for index in 0..3 {
         conversation
             .send(SendRequest {
@@ -750,11 +744,24 @@ async fn rlm_compacts_its_own_history_before_building_the_root_prompt() {
         .expect("events should load")
         .events;
     assert!(
-        events.iter().any(|event| matches!(
+        !events.iter().any(|event| matches!(
             &event.data,
             EventData::Custom { event_type, .. }
                 if event_type == crate::compaction::COMPACTION_CHECKPOINT_EVENT
         )),
-        "RLM should have written a compaction checkpoint"
+        "RLM must not write compaction checkpoints"
+    );
+
+    // And the earliest turn is still reachable in full, which is the property a
+    // summary would have destroyed.
+    let messages = conversation.messages().await.expect("messages should load");
+    let transcript = messages
+        .iter()
+        .map(|message| format!("{message:?}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        transcript.contains("question 0"),
+        "the oldest turn must survive verbatim in RLM's context"
     );
 }

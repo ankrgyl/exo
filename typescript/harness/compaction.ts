@@ -172,6 +172,29 @@ export function shouldCompact({
 }
 
 /**
+ * Characters per token assumed when estimating a prompt's size without a
+ * tokenizer.
+ *
+ * Deliberately low. English averages nearer four, but agent prompts are dense
+ * with JSON and code, and the two errors are not symmetric: over-estimating
+ * compacts a little earlier than strictly necessary, while under-estimating lets
+ * a prompt reach the provider's hard limit — and that failure is
+ * self-perpetuating, because the rejection happens before anything can shrink
+ * the history that caused it.
+ */
+const ESTIMATED_CHARS_PER_TOKEN = 3;
+
+/**
+ * Rough token count for a prompt of `chars` characters.
+ *
+ * Only for the pre-request trigger, which has no provider-reported count to work
+ * from. Once a response comes back, its usage is exact and preferred.
+ */
+export function estimatedTokensFromChars(chars: number): number {
+  return Math.ceil(chars / ESTIMATED_CHARS_PER_TOKEN);
+}
+
+/**
  * At-most-once-per-turn gate around `shouldCompact`.
  *
  * Compaction can only cut at a `turn_ended` boundary, and no new one appears
@@ -259,15 +282,28 @@ export function checkpointFromEvent(
   if (payload === null) {
     return null;
   }
+  // Every required field, not just the ones needed to locate the summary.
+  // Rust's `CompactionCheckpoint` declares these non-optional, so serde refuses
+  // a payload missing any of them; inventing a fallback here would let the two
+  // runtimes disagree about whether the same event is even valid. It also
+  // corrupts quietly: a defaulted `compacted_event_count` restarts the chain's
+  // cumulative total at zero, and the agent is shown that number to judge how
+  // much history it is missing.
   const upToEventId = payload.up_to_event_id;
   const artifactId = payload.artifact_id;
   const artifactPath = payload.artifact_path;
   const artifactVersion = payload.artifact_version;
+  const compactedEventCount = payload.compacted_event_count;
+  const summaryChars = payload.summary_chars;
+  const model = payload.model;
   if (
     typeof upToEventId !== "string" ||
     typeof artifactId !== "string" ||
     typeof artifactPath !== "string" ||
-    typeof artifactVersion !== "number"
+    typeof artifactVersion !== "number" ||
+    typeof compactedEventCount !== "number" ||
+    typeof summaryChars !== "number" ||
+    typeof model !== "string"
   ) {
     return null;
   }
@@ -276,22 +312,20 @@ export function checkpointFromEvent(
     artifactId,
     artifactPath,
     artifactVersion,
+    compactedEventCount,
+    summaryChars,
+    model,
+    // Genuinely optional on both sides: absent on the first checkpoint of a
+    // chain, and `null` when the provider reported no usage.
     previousCheckpointId:
       typeof payload.previous_checkpoint_id === "string"
         ? payload.previous_checkpoint_id
         : null,
-    compactedEventCount: numberOr(payload.compacted_event_count, 0),
-    summaryChars: numberOr(payload.summary_chars, 0),
     promptTokensBefore:
       typeof payload.prompt_tokens_before === "number"
         ? payload.prompt_tokens_before
         : null,
-    model: typeof payload.model === "string" ? payload.model : "",
   };
-}
-
-function numberOr(value: unknown, fallback: number): number {
-  return typeof value === "number" ? value : fallback;
 }
 
 /** Raw config shape as it arrives from the exoharness agent config. */

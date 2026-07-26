@@ -6,6 +6,7 @@ import {
   registerBuiltInTools,
   registerLibraryToolModulePath,
   CompactionGate,
+  estimatedTokensFromChars,
   resolveCompactionPolicy,
   runCompaction,
   turnMetadata,
@@ -135,10 +136,50 @@ async function runResponsesTurnLoop(
     const instructions = options.instructions
       ? await options.instructions(context)
       : basicHarnessInstructions(context);
-    const messages = [
+    let messages = [
       ...instructions,
       ...(await history.materialize(conversation)),
     ];
+
+    // Compact *before* sending when the prompt already looks too large.
+    //
+    // The post-response trigger below is more accurate — it uses the provider's
+    // own counts — but it only ever runs after a successful call. A prompt
+    // already past the model's hard limit is rejected outright, and that error
+    // leaves the turn before anything can shrink the history responsible for it;
+    // every later turn then replays the same oversized log and fails the same
+    // way. This check is what makes that state recoverable. Mirrors the Rust
+    // executor's pre-request trigger.
+    const preflightChars = promptChars(messages);
+    if (
+      compaction.shouldAttempt({
+        policy,
+        promptTokens: estimatedTokensFromChars(preflightChars),
+        maxInputTokens: maxInputTokens(getTable() ?? new Map(), model),
+        materializedChars: preflightChars,
+      })
+    ) {
+      compaction.markAttempted();
+      const result = await runCompaction({
+        conversation,
+        turn: context.exoharness.current.turn,
+        policy,
+        model: policy.summaryModel ?? model,
+        promptTokensBefore: null,
+        summarize: (input) =>
+          summarizeWithModel(runtime, policy, model, turnParent, round, input),
+      });
+      if (result.status === "compacted") {
+        // The checkpoint just written replaces the prefix this prompt was built
+        // from, so rebuild it before sending.
+        history.invalidate();
+        messages = [
+          ...instructions,
+          ...(await history.materialize(conversation)),
+        ];
+      }
+    }
+
     const request: NativeResponsesRequest = {
       model,
       messages,

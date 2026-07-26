@@ -9,7 +9,6 @@ use crate::{
     ModelRequest, ModelResponse, ToolDefinition,
 };
 use anyhow::{Context as AnyhowContext, anyhow, bail};
-use cost::PricingTable;
 use exoharness::{
     AgentHandle, BasicExoHarness, BasicExoHarnessConfig, ConversationHandle, EventData, EventId,
     ExoHarness, FileSystemMountMode, Result, ToolCallId, ToolRequest, ToolResult, TurnHandle,
@@ -20,11 +19,6 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::basic::build_usage_record;
-use crate::compaction::{
-    CompactionOutcome, SummarizeInput, estimated_tokens_from_chars, prompt_chars,
-    record_summarizer_usage, run_compaction, should_compact, summarizer_instruction,
-};
 use crate::execution_tracing::{LlmExecutionTrace, TurnExecutionTrace};
 use crate::harness_executor::{ExecutorHarnessRuntime, ExecutorStreamMode, HarnessExecutor};
 use crate::harness_facade::{SharedHarness, SharedHarnessBacked};
@@ -43,27 +37,19 @@ const RLM_CONTEXT_PREVIEW_CHARS: usize = 400;
 
 pub struct RlmExecutor<M> {
     model: Arc<M>,
-    pricing: Arc<PricingTable>,
 }
 
 impl<M> Clone for RlmExecutor<M> {
     fn clone(&self) -> Self {
         Self {
             model: Arc::clone(&self.model),
-            pricing: Arc::clone(&self.pricing),
         }
     }
 }
 
 impl<M> RlmExecutor<M> {
     pub fn new(model: Arc<M>) -> Self {
-        Self::with_pricing(model, Arc::new(PricingTable::empty()))
-    }
-
-    /// Compaction sizes its trigger from `pricing`; an empty table falls back to
-    /// the policy's character budget.
-    pub fn with_pricing(model: Arc<M>, pricing: Arc<PricingTable>) -> Self {
-        Self { model, pricing }
+        Self { model }
     }
 }
 
@@ -71,104 +57,6 @@ impl<M> RlmExecutor<M>
 where
     M: ModelClient + 'static,
 {
-    /// Compact the conversation if its transcript has outgrown the model's
-    /// input window. Infallible by design, like the basic executor's: a
-    /// summarizer outage should leave an oversized prompt, not kill the turn.
-    ///
-    /// There is no provider-reported token count to work from here — the
-    /// context is measured before any call is made — so the trigger runs off a
-    /// character estimate of the materialized transcript.
-    async fn maybe_compact(
-        &self,
-        conversation: &dyn ConversationHandle,
-        turn: &dyn TurnHandle,
-        agent_config: &AgentConfig,
-        model_binding: &ResolvedModelBinding,
-    ) {
-        let config = agent_config.compaction.clone().unwrap_or_default();
-        if !config.enabled {
-            return;
-        }
-        let context_messages = match materialize_conversation_messages(conversation).await {
-            Ok(messages) => messages,
-            Err(error) => {
-                tracing::warn!(%error, "compaction could not materialize RLM context");
-                return;
-            }
-        };
-        let chars = prompt_chars(&context_messages);
-        let max_input_tokens = self.pricing.max_input_tokens(&model_binding.model);
-        if !should_compact(
-            &config,
-            Some(estimated_tokens_from_chars(chars)),
-            max_input_tokens,
-            chars,
-        ) {
-            return;
-        }
-
-        // `summary_model` overrides the model id within the agent's existing
-        // binding, so a cheaper model from the same provider needs no extra
-        // configuration.
-        let summary_model = config
-            .summary_model
-            .clone()
-            .unwrap_or_else(|| model_binding.model.clone());
-        let outcome = run_compaction(
-            conversation,
-            turn,
-            &config,
-            &summary_model,
-            None,
-            &|input| Box::pin(self.summarize(input, turn, model_binding, &summary_model)),
-        )
-        .await;
-
-        let conversation_id = conversation.record().id;
-        match outcome {
-            CompactionOutcome::Compacted { checkpoint } => tracing::info!(
-                %conversation_id,
-                compacted_events = checkpoint.compacted_event_count,
-                summary_chars = checkpoint.summary_chars,
-                "compacted RLM conversation history"
-            ),
-            CompactionOutcome::Skipped { reason } => {
-                tracing::debug!(%conversation_id, %reason, "RLM compaction skipped");
-            }
-            CompactionOutcome::Failed { error } => {
-                tracing::warn!(%conversation_id, %error, "RLM compaction failed");
-            }
-        }
-    }
-
-    /// Summarize a compacted span with a tool-less model call, reusing the
-    /// agent's resolved binding so credentials and base URL carry over.
-    async fn summarize(
-        &self,
-        input: SummarizeInput,
-        turn: &dyn TurnHandle,
-        model_binding: &ResolvedModelBinding,
-        model: &str,
-    ) -> anyhow::Result<String> {
-        let mut messages = vec![system_message(&summarizer_instruction(&input))];
-        messages.extend(input.messages);
-        let response = self
-            .model
-            .complete(ModelRequest {
-                model: model.to_string(),
-                api_key: model_binding.api_key.clone(),
-                base_url: model_binding.base_url.clone(),
-                messages,
-                // No tools: the summarizer reads, it does not act.
-                tools: Vec::new(),
-                max_output_tokens: None,
-            })
-            .await?;
-        let text = assistant_messages_text(&response.messages);
-        record_summarizer_usage(turn, build_usage_record(&response, &self.pricing)).await;
-        Ok(text)
-    }
-
     async fn run_turn_loop(
         &self,
         conversation: &dyn ConversationHandle,
@@ -181,18 +69,13 @@ where
     ) -> Result<()> {
         let model_binding = resolve_model_binding(conversation, &agent_config.model).await?;
 
-        // Bound the context before it is baked into the root prompt.
-        //
-        // RLM differs from the basic executor in shape: it materializes the
-        // whole conversation once, embeds it in a single root prompt, and then
-        // loops over tool rounds without re-reading the log. There is no
-        // between-rounds moment where a smaller prompt would help, so the only
-        // useful place to compact is here, before the context is captured.
-        // Without this an RLM conversation grows unbounded while reporting
-        // compaction as enabled.
-        self.maybe_compact(conversation, turn, agent_config, &model_binding)
-            .await;
-
+        // Deliberately the full log, not a compacted view. RLM's transcript is
+        // *out-of-band*: the root prompt carries only a short preview and a
+        // character count, while the text itself lives in the JS REPL's
+        // `context` variable. Summarizing it would give up precision — the one
+        // thing this executor exists to provide — in exchange for shrinking a
+        // model window it never occupied. See `compaction_policy_is_unsupported`
+        // below.
         let context_messages = materialize_conversation_messages(conversation)
             .await
             .context("failed to materialize conversation messages for RLM context")?;
@@ -899,11 +782,9 @@ impl RlmHarness<RouterModelClient> {
         exoharness: Arc<dyn ExoHarness>,
         runtime_config: Option<BraintrustRuntimeConfig>,
         env: HashMap<String, String>,
-        pricing: Arc<PricingTable>,
     ) -> Self {
         let model = Arc::new(RouterModelClient::new(env));
-        let runtime =
-            ExecutorHarnessRuntime::new(RlmExecutor::with_pricing(model, pricing), runtime_config);
+        let runtime = ExecutorHarnessRuntime::new(RlmExecutor::new(model), runtime_config);
 
         Self {
             inner: SharedHarness::new(exoharness, runtime),
@@ -919,7 +800,6 @@ impl RlmHarness<RouterModelClient> {
             Arc::new(BasicExoHarness::new(exo_config).await?),
             runtime_config,
             env,
-            Arc::new(PricingTable::empty()),
         ))
     }
 }

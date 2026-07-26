@@ -14,7 +14,6 @@ use lingua::universal::{
 use serde::{Deserialize, Serialize};
 
 use crate::ConversationModelConfig;
-use crate::compaction::{read_active_checkpoint, read_summary, summary_message};
 
 pub(crate) const CONVERSATION_MODEL_CONFIG_EVENT_TYPE: &str = "conversation_model_config";
 
@@ -78,24 +77,27 @@ pub(crate) async fn resolve_conversation_handle(
         .find(|conversation| conversation.record().slug == conversation_ref))
 }
 
-/// Conversation history as prompt messages, honouring any compaction
-/// checkpoint. Used by executors that assemble history directly rather than
-/// through `BasicExecutor`'s incremental cache.
+/// Conversation history as messages: the **full** log, deliberately ignoring
+/// compaction checkpoints.
+///
+/// Compaction bounds a *prompt*. This helper does not build one. Its two callers
+/// both want the real history:
+///
+/// - `HarnessConversation::messages()` answers "what is in this conversation",
+///   and the whole point of never mutating the log is that this stays complete.
+/// - The RLM executor loads it into the JS REPL's out-of-band `context`, which
+///   never enters the model input (the root prompt carries only a short
+///   preview), so summarizing it would trade away precision for no saving in the
+///   window it is not occupying.
+///
+/// `BasicExecutor::materialize_prompt_history` is the checkpoint-aware path, and
+/// it is the one that assembles prompts.
 pub(crate) async fn materialize_conversation_messages(
     conversation: &dyn ConversationHandle,
 ) -> Result<Vec<Message>> {
-    // A checkpoint whose artifact has vanished falls back to full history:
-    // a large prompt beats one with a hole where the summary should be.
-    let summary = match read_active_checkpoint(conversation).await? {
-        Some((_, checkpoint)) => read_summary(conversation, &checkpoint)
-            .await?
-            .map(|text| (text, checkpoint.up_to_event_id)),
-        None => None,
-    };
-
     let events = conversation
         .get_events(Some(EventQuery {
-            cursor: summary.as_ref().map(|(_, cursor)| *cursor),
+            cursor: None,
             direction: Some(EventQueryDirection::Asc),
             limit: None,
             session_id: None,
@@ -106,9 +108,6 @@ pub(crate) async fn materialize_conversation_messages(
         .events;
 
     let mut messages = Vec::new();
-    if let Some((summary, _)) = &summary {
-        messages.push(summary_message(summary));
-    }
     let mut tool_call_names = HashMap::<ToolCallId, String>::new();
 
     for event in events {

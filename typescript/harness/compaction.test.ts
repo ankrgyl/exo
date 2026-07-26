@@ -6,6 +6,7 @@ import {
   DEFAULT_COMPACTION_POLICY,
   capSummary,
   checkpointFromEvent,
+  estimatedTokensFromChars,
   resolveCompactionPolicy,
   selectCutPoint,
   shouldCompact,
@@ -220,6 +221,26 @@ describe("shouldCompact", () => {
   });
 });
 
+describe("estimatedTokensFromChars", () => {
+  // The pre-request trigger has no provider count to work from, so it estimates.
+  // The estimate must lean high: compacting slightly early costs one summarizer
+  // call, while under-estimating lets a prompt reach the hard limit — and that
+  // failure is self-perpetuating, since the rejection happens before anything
+  // can shrink the history that caused it.
+  it("over-estimates rather than under-estimates", () => {
+    // Real prompts run ~3.5-4 chars/token; this must not sit above that.
+    expect(estimatedTokensFromChars(4_000)).toBeGreaterThan(1_000);
+  });
+
+  it("is monotonic and never rounds a non-empty prompt to zero", () => {
+    expect(estimatedTokensFromChars(0)).toBe(0);
+    expect(estimatedTokensFromChars(1)).toBe(1);
+    expect(estimatedTokensFromChars(10_000)).toBeGreaterThan(
+      estimatedTokensFromChars(9_999),
+    );
+  });
+});
+
 describe("capSummary", () => {
   it("leaves a summary within the cap untouched", () => {
     expect(capSummary("short", 100)).toBe("short");
@@ -259,6 +280,29 @@ describe("checkpoint events", () => {
     };
     const parsed = checkpointFromEvent(checkpointEvent(toPayload(checkpoint)));
     expect(parsed).toEqual(checkpoint);
+  });
+
+  it("rejects a payload missing any required field", () => {
+    // Rust declares these non-optional, so serde refuses a payload without
+    // them. Defaulting here would let the two runtimes disagree about whether
+    // the same event is valid — and a defaulted `compacted_event_count`
+    // restarts the chain's cumulative total at zero, which is the number the
+    // agent is shown to judge how much history it is missing.
+    const complete = {
+      up_to_event_id: "evt-1",
+      artifact_id: "art-1",
+      artifact_path: "compaction/1.md",
+      artifact_version: 1,
+      compacted_event_count: 4,
+      summary_chars: 20,
+      model: "m",
+    };
+    expect(checkpointFromEvent(checkpointEvent(complete))).not.toBeNull();
+    for (const field of Object.keys(complete)) {
+      const partial: Record<string, unknown> = { ...complete };
+      delete partial[field];
+      expect(checkpointFromEvent(checkpointEvent(partial))).toBeNull();
+    }
   });
 
   it("rejects a malformed payload rather than half-reading it", () => {

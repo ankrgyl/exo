@@ -396,6 +396,34 @@ describe("PromptHistoryCache", () => {
     expect(rendered).toContain("recent");
   });
 
+  it("notices a checkpoint written by another turn, without invalidation", async () => {
+    // `invalidate()` only reaches the cache belonging to the turn that
+    // compacted. Turns on one conversation are not serialized, so a cache primed
+    // before someone else's compaction must still notice it — otherwise this
+    // turn extends from its old cursor, never sees the checkpoint, and replays
+    // the compacted prefix for the rest of its tool rounds.
+    const older = turn("ancient");
+    const stub = new StubConversation({
+      events: [...older],
+      artifacts: new Map([["art-1", "SUMMARY"]]),
+    });
+    const cache = new PromptHistoryCache();
+    expect(texts(await cache.materialize(asConversation(stub)))).toEqual([
+      "ancient",
+    ]);
+
+    // Another turn compacts. This cache is never told.
+    stub.append(
+      checkpointEvent({ upToEventId: older.at(-1)!.id, artifactId: "art-1" }),
+    );
+    stub.append(...turn("recent"));
+
+    const rendered = texts(await cache.materialize(asConversation(stub)));
+    expect(rendered.some((t) => t.includes("SUMMARY"))).toBe(true);
+    expect(rendered).not.toContain("ancient");
+    expect(rendered).toContain("recent");
+  });
+
   it("keeps a tool round intact when its result lands in a later round", async () => {
     // The incremental path must not treat a batch boundary as a turn boundary:
     // a request fetched in one round and its result in the next still has to
