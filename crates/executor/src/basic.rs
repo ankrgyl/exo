@@ -101,11 +101,14 @@ pub(crate) struct CompactionTrigger<'a> {
 }
 
 /// Where a summarizer request is sent, and where it is recorded.
+///
+/// The model id is *not* here: it rides on `SummarizeInput`, because the choice
+/// is not final until `compact` knows the span — a rebuild from the start of the
+/// log reverts to the agent's model. Carrying it here would let the call site
+/// pin the cheaper one while the checkpoint recorded the other.
 struct SummarizerCall<'a> {
     /// Model binding name, for credentials and base URL.
     binding: &'a str,
-    /// Already-resolved model id, which may be the summary model or the agent's.
-    model: &'a str,
     round: usize,
     turn_trace: Option<&'a dyn TurnExecutionTrace>,
 }
@@ -368,7 +371,6 @@ where
                     &summarizer_usage,
                     SummarizerCall {
                         binding: &agent_config.model,
-                        model: &summary_model,
                         round,
                         turn_trace,
                     },
@@ -439,7 +441,6 @@ where
     ) -> Result<String> {
         let SummarizerCall {
             binding,
-            model,
             round,
             turn_trace,
         } = call;
@@ -449,6 +450,7 @@ where
             messages: span,
             previous_summary,
             max_chars,
+            model,
         } = input;
         let mut messages = vec![system_message(&instruction)];
         // Ahead of the span, delimited, at user priority — deliberately not
@@ -468,7 +470,7 @@ where
         let response = self
             .complete_model_round(
                 ModelRequest {
-                    model: model.to_string(),
+                    model: model.clone(),
                     api_key: model_binding.api_key,
                     base_url: model_binding.base_url,
                     messages,
@@ -482,7 +484,7 @@ where
                     // which would fail every summarizer call rather than one.
                     max_output_tokens: Some(summarizer_max_output_tokens(
                         max_chars,
-                        self.pricing.max_output_tokens(model),
+                        self.pricing.max_output_tokens(&model),
                     )),
                 },
                 round,

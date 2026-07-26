@@ -984,6 +984,16 @@ export interface SummarizeInput {
   /** Summary from the previous checkpoint, to be merged rather than replaced. */
   previousSummary: string | null;
   maxChars: number;
+  /**
+   * The model this span should actually be sent to.
+   *
+   * Carried on the input rather than captured by the caller's closure, because
+   * the choice is not final until the span is known: a rebuild from the start
+   * of the log reverts to the agent's model. A closure bound to the
+   * *configured* model would send the oversized span to the cheaper one anyway
+   * and the checkpoint would name a model that never saw it.
+   */
+  model: string;
 }
 
 /**
@@ -1051,8 +1061,22 @@ export interface RunCompactionArgs {
   conversation: Conversation;
   turn: Turn;
   policy: CompactionPolicy;
-  /** Model recorded on the checkpoint — the summarizer, not the agent model. */
+  /**
+   * The summary model resolved against the *materialized prompt* — summary plus
+   * retained tail, the only size available before a cut point exists.
+   */
   model: string;
+  /**
+   * The agent's own model, used instead when a broken previous checkpoint
+   * forces a rebuild from the start of the log.
+   *
+   * That span is the whole history, which can be far larger than the prompt
+   * `model` was chosen against, so a cheaper model that comfortably fit the
+   * prompt may not fit this — and the repair would be rejected while the
+   * agent's model had room. Reverting is the conservative direction: it costs
+   * more per token and cannot be the reason the repair fails.
+   */
+  agentModel: string;
   promptTokensBefore: number | null;
   summarize: SummarizeFn;
 }
@@ -1084,7 +1108,7 @@ export async function runCompaction(
 }
 
 async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
-  const { conversation, turn, policy, model, promptTokensBefore } = args;
+  const { conversation, turn, policy, promptTokensBefore } = args;
 
   const existing = await readActiveCheckpointEvent(conversation);
   const previousSummary = existing
@@ -1097,8 +1121,18 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
   // safety net, where a missing artifact falls back to replaying the full log.
   // Everything before the broken checkpoint would then be gone from the prompt
   // for good. Rebuilding from the start costs one larger call and loses nothing.
-  const previous =
-    existing !== null && previousSummary === null ? null : existing;
+  const rebuildingFromStart = existing !== null && previousSummary === null;
+  const previous = rebuildingFromStart ? null : existing;
+
+  // The model was chosen against the materialized prompt. Rebuilding from the
+  // start of the log replaces that with the *whole* history, which can be far
+  // larger — so a cheaper summary model that comfortably fit the prompt may not
+  // fit this span, and the repair would be rejected while the agent's own model
+  // had room.
+  const model =
+    rebuildingFromStart && args.model !== args.agentModel
+      ? args.agentModel
+      : args.model;
 
   // Only look at events after the last checkpoint: everything before it is
   // already represented by `previousSummary`.
@@ -1139,6 +1173,7 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
     messages: compactedMessages,
     previousSummary,
     maxChars: policy.maxSummaryChars,
+    model,
   });
 
   const summary = capSummary(summarized, policy.maxSummaryChars);

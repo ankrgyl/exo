@@ -154,6 +154,7 @@ function args(stub: StubTarget, overrides: Record<string, unknown> = {}) {
     turn: stub as never,
     policy,
     model: "test-model",
+    agentModel: "test-model",
     promptTokensBefore: 123,
     summarize,
     ...overrides,
@@ -334,6 +335,42 @@ describe("runCompaction", () => {
 
     expect(result.status).toBe("failed");
     expect(checkpointEvents(stub)).toHaveLength(0);
+  });
+
+  it("routes a rebuild from the start of the log through the agent model", async () => {
+    // The summary model is chosen against the materialized prompt — summary
+    // plus retained tail — because that is the only size available before a cut
+    // point exists. A broken previous checkpoint forces a rebuild from the
+    // whole history, which can be far larger, so a cheaper model that fit the
+    // prompt may not fit this and the repair would be rejected while the
+    // agent's model had room.
+    const stub = target([...turn("a"), ...turn("b"), ...turn("c")]);
+    await runCompaction(args(stub, { model: "cheap", agentModel: "agent" }));
+
+    // Break the artifact so the next pass has to rebuild.
+    stub.failArtifactReads = true;
+    stub.appended.length = 0;
+    stub.events.push(...turn("d"), ...turn("e"));
+
+    // The model the summarizer is *asked* for, not just the one recorded:
+    // asserting only on the checkpoint would pass while the request still went
+    // to the cheaper model, and a checkpoint naming a model that never saw the
+    // span is worse than the bug it claims to have fixed.
+    let requested: string | null = null;
+    const result = await runCompaction(
+      args(stub, {
+        model: "cheap",
+        agentModel: "agent",
+        summarize: (async (input) => {
+          requested = input.model;
+          return "REBUILT SUMMARY";
+        }) satisfies SummarizeFn,
+      }),
+    );
+
+    expect(result.status).toBe("compacted");
+    expect(requested).toBe("agent");
+    expect(checkpointPayload(checkpointEvents(stub)[0]).model).toBe("agent");
   });
 
   it("writes no checkpoint when the summary comes back empty", async () => {

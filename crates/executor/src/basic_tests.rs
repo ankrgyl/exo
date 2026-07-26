@@ -2042,6 +2042,11 @@ async fn rebuilding_from_the_start_of_the_log_uses_the_agent_model() {
     seed_completed_turns(conversation.as_ref(), &["newer", "newest"]).await;
 
     let turn = open_turn(conversation.as_ref()).await;
+    // The model the summarizer was actually *asked* for, not just the one the
+    // checkpoint records. Asserting only on the metadata would pass while the
+    // request still went to the cheaper model — a checkpoint naming a model
+    // that never saw the span is worse than the bug it claims to have fixed.
+    let requested: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     let outcome = run_compaction(
         conversation.as_ref(),
         turn.as_ref(),
@@ -2051,16 +2056,24 @@ async fn rebuilding_from_the_start_of_the_log_uses_the_agent_model() {
             agent: "agent-model",
         },
         None,
-        &|_input| Box::pin(async { Ok("REBUILT SUMMARY".to_string()) }),
+        &|input| {
+            *requested.lock().expect("poisoned") = Some(input.model.clone());
+            Box::pin(async { Ok("REBUILT SUMMARY".to_string()) })
+        },
     )
     .await;
     let CompactionOutcome::Compacted { checkpoint } = outcome else {
         panic!("expected a rebuild, got {outcome:?}");
     };
     assert_eq!(
+        requested.lock().expect("poisoned").as_deref(),
+        Some("agent-model"),
+        "a rebuild from the whole log must not be *sent* to the cheaper model \
+         that was sized against the much smaller prompt"
+    );
+    assert_eq!(
         checkpoint.model, "agent-model",
-        "a rebuild from the whole log must not be attempted on the cheaper \
-         model that was sized against the much smaller prompt"
+        "and the checkpoint must record the model that actually ran"
     );
 }
 

@@ -198,11 +198,11 @@ async function runResponsesTurnLoop(
         turn: context.exoharness.current.turn,
         policy,
         model: summaryModel,
+        agentModel: model,
         promptTokensBefore: null,
         summarize: (input) =>
           summarizeWithModel(
             runtime,
-            summaryModel,
             turnParent,
             round,
             input,
@@ -306,11 +306,11 @@ async function runResponsesTurnLoop(
         turn: context.exoharness.current.turn,
         policy,
         model: summaryModel,
+        agentModel: model,
         promptTokensBefore: occupancy,
         summarize: (input) =>
           summarizeWithModel(
             runtime,
-            summaryModel,
             turnParent,
             round,
             input,
@@ -393,7 +393,9 @@ async function recordSummarizerUsage(
  */
 async function summarizeWithModel(
   runtime: ResponsesRuntimeLike,
-  model: string,
+  // From `input.model`, not the caller's choice: `runCompaction` reverts to the
+  // agent's model when it rebuilds from the start of the log, and that decision
+  // has to reach the request, not just the checkpoint metadata.
   turnParent: TraceParent,
   round: number,
   input: SummarizeInput,
@@ -407,7 +409,7 @@ async function summarizeWithModel(
 ): Promise<string> {
   const response = await runtime.complete(
     {
-      model,
+      model: input.model,
       messages: summarizerMessages(input),
       // No tools: the summarizer reads, it does not act.
       tools: [],
