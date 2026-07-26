@@ -417,12 +417,18 @@ oversized log: an absorbing state.
 An **older checkpoint in the chain** is the way out. Its summary already stands
 in for everything up to its own boundary, so rebuilding from there covers
 exactly the same history for the price of the span since that boundary. So the
-repair walks the chain newest-first — bounded, because each step costs an
-artifact read — and rebuilds from the first ancestor whose summary still reads.
-The new checkpoint links to that ancestor, not to the checkpoint that could not
-be read; the broken one is unreachable from what the new summary contains. Only
-when no ancestor reads either is the whole log the span, and then it is the last
-resort rather than the first.
+repair walks the chain newest-first and rebuilds from the first ancestor whose
+summary still reads. The new checkpoint links to that ancestor, not to the
+checkpoint that could not be read; the broken one is unreachable from what the
+new summary contains. Only when no ancestor reads either is the whole log the
+span, and then it is the last resort rather than the first.
+
+**The walk is not bounded**, and the first version of it was. A fixed window is
+the obvious way to cap the artifact reads, and it recreates this same absorbing
+state in miniature: the newest N summaries unreadable and an older one intact
+means giving up on a chain that had an answer in it. Walking further costs one
+failed artifact read per checkpoint, on a path that only runs when a summary has
+already been lost, and it stops at the first one that reads.
 
 Either way the span is wider than the prompt the summary model was chosen
 against, so a widened rebuild goes to the **agent's** model: it costs more per
@@ -554,6 +560,20 @@ Compaction also does nothing when the compactable span is already smaller than
 `maxSummaryChars`. A prompt can cross the threshold because of the turns being
 _kept_ — one enormous tool result, say — and replacing a smaller prefix with a
 summary that could be larger would grow the prompt, not shrink it.
+
+**Unless it is a rescue.** That guard prices the summary at the configured
+ceiling, which is the right question while compaction is housekeeping: a cut
+reclaiming less than a summary's worth should wait and batch rather than pay per
+turn for a sliver. It is the wrong question once the prompt is past the model's
+hard input limit. The ceiling is a cap, not a forecast — a concise summary of a
+small prefix can be a fraction of it — and the alternative to a small shrink
+there is a rejected request. That produces no usage, so the accurate trigger
+never runs; no turn completes, so the prefix cannot grow; and the skip would
+hold forever. So the trigger tells compaction which of the two it is
+(`PromptPressure::over_input_limit`, `RunCompactionArgs.overInputLimit`), and
+only the pre-request trigger can set it — a response that came back proves its
+prompt fit. The measured no-growth check still guards the outcome, so the worst
+case is one summarizer call whose result is discarded.
 
 Within a turn, further attempts are suppressed only while the newest completed
 turn boundary is unchanged. Cuts land only on `turn_ended`, so an unchanged
