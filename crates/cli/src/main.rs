@@ -16,11 +16,12 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use executor::{
     AgentHarnessKind, BasicExoHarness, BasicExoHarnessConfig, BasicHarness, BasicToolRuntime,
@@ -399,6 +400,11 @@ enum Commands {
         #[command(subcommand)]
         command: SecretCommands,
     },
+    /// Manage the ChatGPT account used by Codex harnesses.
+    Codex {
+        #[command(subcommand)]
+        command: CodexCommands,
+    },
     /// Start an interactive REPL, creating a default agent and conversation when needed.
     Repl {
         /// Model binding to use (defaults to the first registered model).
@@ -637,14 +643,31 @@ enum SecretCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum CodexCommands {
+    /// Sign in with ChatGPT using an Exo-isolated Codex credential store.
+    Login {
+        /// Use the device-code flow instead of opening a local browser callback.
+        #[arg(long)]
+        device_auth: bool,
+    },
+    /// Show the active Exo Codex authentication method.
+    Status,
+    /// Sign out of the Exo Codex session.
+    Logout,
+}
+
+#[derive(Debug, Subcommand)]
 enum ModelCommands {
     List,
     Register {
         name: String,
+        /// Upstream provider model id when it differs from the binding name.
         #[arg(long)]
         model: Option<String>,
+        /// API-key secret. Omit for Codex ChatGPT subscription authentication.
         #[arg(long)]
-        secret: String,
+        secret: Option<String>,
+        /// Custom OpenAI-compatible endpoint. Codex subscription auth does not support this.
         #[arg(long)]
         base_url: Option<String>,
     },
@@ -813,8 +836,23 @@ async fn main() -> Result<()> {
         cli.braintrust_app_url,
         cli.braintrust_api_url,
     );
-    let env_vars = env.into_vars();
+    let mut env_vars = env.into_vars();
+    let codex_home = exo_codex_home(&env_vars)?;
+    env_vars.insert(
+        "EXO_CODEX_HOME".to_string(),
+        codex_home.to_string_lossy().into_owned(),
+    );
+    if let Some(codex_bin) = find_host_codex_bin(&env_vars) {
+        env_vars.insert(
+            "EXO_HOST_CODEX_BIN".to_string(),
+            codex_bin.to_string_lossy().into_owned(),
+        );
+    }
     let harness_selection = cli.harness.clone();
+    if let Commands::Codex { command } = &cli.command {
+        handle_codex_command(command, &codex_home, &env_vars).await?;
+        return Ok(());
+    }
     if let Some(config) = serve_config(&cli.command) {
         serve_exoharness_http(&exo_config, config).await?;
         return Ok(());
@@ -840,6 +878,7 @@ async fn main() -> Result<()> {
         &exo_config,
         exoharness,
         harness_kind,
+        harness_selection.as_ref(),
         runtime_config.clone(),
         env_vars.clone(),
         pricing,
@@ -1903,9 +1942,14 @@ async fn main() -> Result<()> {
                 secret,
                 base_url,
             } => {
-                let secret_id = find_secret_id(harness.exoharness_handle().as_ref(), &secret)
-                    .await?
-                    .ok_or_else(|| anyhow!("secret not found: {secret}"))?;
+                let secret_id = match secret {
+                    Some(secret) => Some(
+                        find_secret_id(harness.exoharness_handle().as_ref(), &secret)
+                            .await?
+                            .ok_or_else(|| anyhow!("secret not found: {secret}"))?,
+                    ),
+                    None => None,
+                };
                 let upstream_model = model.unwrap_or_else(|| name.clone());
                 let id = harness
                     .exoharness_handle()
@@ -1913,7 +1957,7 @@ async fn main() -> Result<()> {
                         name: name.clone(),
                         model: upstream_model,
                         base_url,
-                        secret_id: Some(secret_id),
+                        secret_id,
                     })
                     .await?;
                 println!("registered model {} ({})", name, id);
@@ -2053,6 +2097,9 @@ async fn main() -> Result<()> {
         Commands::Serve { .. } => {
             unreachable!("serve commands are handled before harness instantiation")
         }
+        Commands::Codex { .. } => {
+            unreachable!("codex auth commands are handled before harness instantiation")
+        }
     }
 
     harness.flush_tracing().await?;
@@ -2109,6 +2156,7 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
         },
         Commands::Repl { agent, .. } => Some(agent.as_deref().unwrap_or(DEFAULT_REPL_SLUG)),
         Commands::Secret { .. }
+        | Commands::Codex { .. }
         | Commands::Model { .. }
         | Commands::Provider { .. }
         | Commands::Adapters { .. }
@@ -2159,6 +2207,157 @@ async fn serve_exoharness_http(
         },
     )
     .await?;
+    Ok(())
+}
+
+const CODEX_FILE_AUTH_OVERRIDE: &str = "cli_auth_credentials_store=\"file\"";
+
+fn exo_codex_home(env: &HashMap<String, String>) -> Result<PathBuf> {
+    if let Some(path) = env
+        .get("EXO_CODEX_HOME")
+        .cloned()
+        .or_else(|| std::env::var("EXO_CODEX_HOME").ok())
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(PathBuf::from(path));
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(home) = env
+        .get("HOME")
+        .cloned()
+        .or_else(|| std::env::var("HOME").ok())
+    {
+        return Ok(PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("exo")
+            .join("codex"));
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(local_app_data) = env
+        .get("LOCALAPPDATA")
+        .cloned()
+        .or_else(|| std::env::var("LOCALAPPDATA").ok())
+    {
+        return Ok(PathBuf::from(local_app_data).join("exo").join("codex"));
+    }
+
+    if let Some(data_home) = env
+        .get("XDG_DATA_HOME")
+        .cloned()
+        .or_else(|| std::env::var("XDG_DATA_HOME").ok())
+    {
+        return Ok(PathBuf::from(data_home).join("exo").join("codex"));
+    }
+    if let Some(home) = env
+        .get("HOME")
+        .cloned()
+        .or_else(|| std::env::var("HOME").ok())
+    {
+        return Ok(PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("exo")
+            .join("codex"));
+    }
+    bail!("could not determine Exo Codex auth directory; set EXO_CODEX_HOME")
+}
+
+fn find_host_codex_bin(env: &HashMap<String, String>) -> Option<PathBuf> {
+    if let Some(path) = env
+        .get("CODEX_BIN")
+        .cloned()
+        .or_else(|| std::env::var("CODEX_BIN").ok())
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Some(PathBuf::from(path));
+    }
+    let workspace_bin = std::env::current_dir()
+        .ok()?
+        .join("node_modules")
+        .join(".bin")
+        .join(if cfg!(windows) { "codex.cmd" } else { "codex" });
+    if workspace_bin.is_file() {
+        return Some(workspace_bin);
+    }
+    Some(PathBuf::from("codex"))
+}
+
+async fn handle_codex_command(
+    command: &CodexCommands,
+    codex_home: &Path,
+    env: &HashMap<String, String>,
+) -> Result<()> {
+    std::fs::create_dir_all(codex_home)
+        .with_context(|| format!("creating Exo Codex home {}", codex_home.display()))?;
+    set_owner_only_directory_permissions(codex_home)?;
+
+    let executable =
+        find_host_codex_bin(env).ok_or_else(|| anyhow!("could not resolve Codex executable"))?;
+    let mut process = tokio::process::Command::new(&executable);
+    process
+        .arg("-c")
+        .arg(CODEX_FILE_AUTH_OVERRIDE)
+        .env("CODEX_HOME", codex_home)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    match command {
+        CodexCommands::Login { device_auth } => {
+            process.arg("login");
+            if *device_auth {
+                process.arg("--device-auth");
+            }
+        }
+        CodexCommands::Status => {
+            process.args(["login", "status"]);
+        }
+        CodexCommands::Logout => {
+            process.arg("logout");
+        }
+    }
+    let status = process.status().await.with_context(|| {
+        format!(
+            "starting Codex executable {}; install dependencies with `pnpm install` or set CODEX_BIN",
+            executable.display()
+        )
+    })?;
+    if !status.success() {
+        bail!("Codex authentication command exited with {status}");
+    }
+    set_owner_only_auth_file_permissions(codex_home)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_owner_only_directory_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("setting permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_directory_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_owner_only_auth_file_permissions(codex_home: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let auth_file = codex_home.join("auth.json");
+    if auth_file.is_file() {
+        std::fs::set_permissions(&auth_file, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting permissions on {}", auth_file.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_auth_file_permissions(_codex_home: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -2228,6 +2427,7 @@ async fn instantiate_harness(
     exo_config: &BasicExoHarnessConfig,
     exoharness: Arc<dyn ExoHarness>,
     kind: HarnessKind,
+    selection: Option<&HarnessSelection>,
     runtime_config: Option<BraintrustRuntimeConfig>,
     env_vars: HashMap<String, String>,
     pricing: Arc<cost::PricingTable>,
@@ -2253,6 +2453,21 @@ async fn instantiate_harness(
             )
             .await?,
         ),
+        HarnessKind::TypeScript
+            if matches!(
+                selection,
+                Some(HarnessSelection::TypeScriptPreset(
+                    TypeScriptHarnessPreset::Codex
+                ))
+            ) =>
+        {
+            Arc::new(TypeScriptHarness::<ExoToolRuntime>::exo_from_exoharness(
+                root,
+                exoharness,
+                runtime_config,
+                env_vars,
+            )?)
+        }
         HarnessKind::TypeScript => Arc::new(TypeScriptHarness::from_exoharness(
             exoharness,
             runtime_config,
@@ -2968,6 +3183,48 @@ mod create_tests {
             cli.command,
             super::Commands::Repl { model: Some(model), .. } if model == "gpt-5.4"
         ));
+    }
+
+    #[test]
+    fn codex_login_accepts_device_auth() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from(["exo", "codex", "login", "--device-auth"])
+            .expect("codex device login parses");
+        assert!(matches!(
+            cli.command,
+            super::Commands::Codex {
+                command: super::CodexCommands::Login { device_auth: true }
+            }
+        ));
+    }
+
+    #[test]
+    fn model_register_allows_subscription_auth_without_secret() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from(["exo", "model", "register", "gpt-5.5"])
+            .expect("secretless model registration parses");
+        assert!(matches!(
+            cli.command,
+            super::Commands::Model {
+                command: super::ModelCommands::Register {
+                    name,
+                    secret: None,
+                    ..
+                }
+            } if name == "gpt-5.5"
+        ));
+    }
+
+    #[test]
+    fn codex_home_honors_explicit_override() {
+        let env = std::collections::HashMap::from([(
+            "EXO_CODEX_HOME".to_string(),
+            "/tmp/exo-test-codex-home".to_string(),
+        )]);
+        assert_eq!(
+            super::exo_codex_home(&env).expect("codex home"),
+            std::path::PathBuf::from("/tmp/exo-test-codex-home")
+        );
     }
 
     #[test]

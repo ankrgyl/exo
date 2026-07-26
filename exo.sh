@@ -16,15 +16,15 @@ fi
 EXO_BIN="${EXO_BIN:-$ROOT_DIR/target/debug/exo}"
 SCHEDULER_BIN="${EXO_SCHEDULER_BIN:-$ROOT_DIR/target/debug/exo-scheduler-runner}"
 ENV_FILE="${EXO_ENV_FILE:-$ROOT_DIR/.env}"
-MODEL="${EXO_MODEL:-gpt-5.6-terra}"
-AGENT="${EXO_AGENT:-exo-agent}"
-AGENT_NAME="${EXO_AGENT_NAME:-Exo Agent}"
-CONVERSATION="${EXO_CONVERSATION:-dev}"
-CONVERSATION_NAME="${EXO_CONVERSATION_NAME:-Dev}"
-MODULE="${EXO_MODULE:-examples/exo/harness.ts}"
-HARNESS="exo"
+HARNESS="${EXO_HARNESS:-exo}"
+MODEL="${EXO_MODEL:-}"
+AGENT="${EXO_AGENT:-}"
+AGENT_NAME="${EXO_AGENT_NAME:-}"
+CONVERSATION="${EXO_CONVERSATION:-}"
+CONVERSATION_NAME="${EXO_CONVERSATION_NAME:-}"
+MODULE="${EXO_MODULE:-}"
 LOCAL_PROMPT_FILE="${EXO_LOCAL_PROMPT_FILE:-$ROOT_DIR/.exo/exo-profile.md}"
-SANDBOX_IMAGE="${EXO_SANDBOX_IMAGE:-ubuntu:24.04}"
+SANDBOX_IMAGE="${EXO_SANDBOX_IMAGE:-}"
 SANDBOX_PROVIDER="${EXO_SANDBOX_PROVIDER:-}"
 SANDBOX_BACKEND="${EXO_SANDBOX_BACKEND:-}"
 SELF_REPO_MOUNT_PATH="${EXO_REPO:-/workspace/exo}"
@@ -98,18 +98,21 @@ Subcommands:
                    image) without starting anything
 
 Options:
-  --model <model>              Model binding name (default: gpt-5.6-terra)
+  --harness <harness>          Agent harness: exo or codex (default: exo).
+                                Codex uses ChatGPT subscription auth.
+  --model <model>              Model binding name (default: gpt-5.6-terra for
+                                exo, gpt-5.5 for codex)
   --upstream-model <model>     Upstream model id for register-model (default: --model)
   --secret-name <name>         Secret name for register-model (e.g. openai)
   --secret-env <env-var>       Environment variable holding the API key for register-model
   --base-url <url>             Optional API base URL for register-model
   --user-name <name>           User name for write-profile (default: none)
-  --agent <slug>               Agent slug (default: exo-agent)
+  --agent <slug>               Agent slug (default: exo-agent or codex-agent)
   --conversation <slug>        Conversation slug (default: dev)
   --convo <slug>               Alias for --conversation
-  --agent-name <name>          Agent display name (default: Exo Agent)
+  --agent-name <name>          Agent display name (default: Exo Agent or Codex Agent)
   --conversation-name <name>   Conversation display name (default: Dev)
-  --module <path>              Exo TypeScript harness module
+  --module <path>              TypeScript module used by the exo harness
   --template <name>            Launch template (default: canonical):
                                  canonical  Docker sandbox, repo self-map mount, ExoChat
                                             setup, control logs, and guardian config
@@ -117,7 +120,8 @@ Options:
                                             instead of ExoChat
                                  minimal    No Docker defaults, adapter setup prompts,
                                             control console, or guardian config
-  --sandbox-image <image>      Sandbox image (default: ubuntu:24.04)
+  --sandbox-image <image>      Sandbox image (default: ubuntu:24.04 for exo,
+                                exo-codex-sandbox:latest for codex)
   --sandbox-provider <provider>
                                 Sandbox provider: daytona, apple-container, docker, or local-process
   --sandbox-backend <backend>   Local sandbox backend: apple-container, docker, or local-process.
@@ -155,7 +159,7 @@ Options:
   --help                       Show this help
 
 Environment overrides:
-  EXO_MODEL, EXO_AGENT, EXO_CONVERSATION, EXO_AGENT_NAME,
+  EXO_HARNESS, EXO_MODEL, EXO_AGENT, EXO_CONVERSATION, EXO_AGENT_NAME,
   EXO_CONVERSATION_NAME, EXO_MODULE, EXO_SANDBOX_IMAGE,
   EXO_SANDBOX_PROVIDER, EXO_SANDBOX_BACKEND, EXO_NETWORKING,
   EXO_SHELL_PROGRAM, EXO_SANDBOX_SCOPE, EXO_ENV_FILE, EXO_LOCAL_PROMPT_FILE,
@@ -258,6 +262,30 @@ add_setup_adapter() {
   SETUP_ADAPTERS+=("$adapter")
 }
 
+apply_harness_defaults() {
+  case "$HARNESS" in
+    exo)
+      MODEL="${MODEL:-gpt-5.6-terra}"
+      AGENT="${AGENT:-exo-agent}"
+      AGENT_NAME="${AGENT_NAME:-Exo Agent}"
+      MODULE="${MODULE:-examples/exo/harness.ts}"
+      SANDBOX_IMAGE="${SANDBOX_IMAGE:-ubuntu:24.04}"
+      ;;
+    codex)
+      MODEL="${MODEL:-gpt-5.5}"
+      AGENT="${AGENT:-codex-agent}"
+      AGENT_NAME="${AGENT_NAME:-Codex Agent}"
+      MODULE="${MODULE:-examples/typescript/codex-harness.ts}"
+      SANDBOX_IMAGE="${SANDBOX_IMAGE:-exo-codex-sandbox:latest}"
+      ;;
+    *)
+      die "--harness must be exo or codex"
+      ;;
+  esac
+  CONVERSATION="${CONVERSATION:-dev}"
+  CONVERSATION_NAME="${CONVERSATION_NAME:-Dev}"
+}
+
 apply_template_defaults() {
   if [[ "$TEMPLATE" == "minimal" ]]; then
     return
@@ -294,6 +322,7 @@ configure_guardian_for_current_launch() {
   fi
 
   "$ROOT_DIR/examples/exo/scripts/exo-service-guardian" configure \
+    --harness "$HARNESS" \
     --env-file "$ENV_FILE" \
     --exo-bin "$EXO_BIN" \
     --scheduler-bin "$SCHEDULER_BIN" \
@@ -389,7 +418,7 @@ append_exo_global_args() {
 exo() {
   EXO_GLOBAL_ARGS=()
   append_exo_global_args
-  "$EXO_BIN" "${EXO_GLOBAL_ARGS[@]}" "$@"
+  "$EXO_BIN" "${EXO_GLOBAL_ARGS[@]}" --harness "$HARNESS" "$@"
 }
 
 scheduler_pid_file() {
@@ -462,7 +491,12 @@ adapters_process_running() {
     return 1
   fi
   command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-  [[ "$command_line" == *"adapters run"* ]]
+  if [[ "$command_line" != *"--harness $HARNESS"*"adapters run"* ]]; then
+    echo "Restarting adapter runner for $HARNESS harness..."
+    terminate_process_tree "$pid"
+    return 1
+  fi
+  return 0
 }
 
 adapter_source_newer_than() {
@@ -607,12 +641,13 @@ ensure_agent() {
 
   echo "Creating agent $AGENT..."
   local args=(
-    --harness "$HARNESS"
     agent create "$AGENT_NAME"
     --slug "$AGENT"
-    --module "$MODULE"
     --model "$MODEL"
   )
+  if [[ "$HARNESS" == "exo" ]]; then
+    args+=(--module "$MODULE")
+  fi
   if [[ "$USE_SANDBOX" == true ]]; then
     args+=(--sandbox-image "$SANDBOX_IMAGE" --networking "$NETWORKING")
     if [[ -n "$SANDBOX_PROVIDER" ]]; then
@@ -918,6 +953,7 @@ run_repl() {
     EXO_GLOBAL_ARGS=()
     append_exo_global_args
     exec "$EXO_BIN" "${EXO_GLOBAL_ARGS[@]}" repl \
+      --harness "$HARNESS" \
       --agent "$AGENT" \
       --conversation "$CONVERSATION"
   fi
@@ -979,6 +1015,7 @@ run_control_repl() {
 
     local repl_exit
     if "$EXO_BIN" "${EXO_GLOBAL_ARGS[@]}" repl \
+      --harness "$HARNESS" \
       --agent "$AGENT" \
       --conversation "$CONVERSATION"; then
       repl_exit=0
@@ -1308,6 +1345,14 @@ while [[ $# -gt 0 ]]; do
       shift
       COMMAND="write-profile"
       ;;
+    --harness)
+      HARNESS="${2:-}"
+      case "$HARNESS" in
+        exo|codex) ;;
+        *) die "--harness must be exo or codex" ;;
+      esac
+      shift 2
+      ;;
     --model)
       MODEL="${2:-}"
       [[ -n "$MODEL" ]] || die "--model requires a value"
@@ -1525,6 +1570,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+apply_harness_defaults
 apply_template_defaults
 
 export EXO_LOCAL_PROMPT_FILE="$LOCAL_PROMPT_FILE"

@@ -30,6 +30,7 @@
     "@cursor/sdk": "^1.0.12",
     "@discordjs/voice": "^0.19.0",
     "@mozilla/readability": "^0.6.0",
+    "@openai/codex": "0.144.6",
     "@shadcn/react": "^0.1.0",
     "@whiskeysockets/baileys": "7.0.0-rc13",
     "braintrust": "3.7.0",

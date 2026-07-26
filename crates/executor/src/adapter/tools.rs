@@ -33,21 +33,26 @@ const DEFAULT_EXOCHAT_BASE_URL: &str = "https://exoharness.ai";
 #[derive(Debug, Clone)]
 pub struct AdapterCreationOptions {
     worker_root: PathBuf,
+    tsx_cli_path: PathBuf,
     default_irc_nick_prefix: String,
     default_irc_username: String,
 }
 
 impl AdapterCreationOptions {
-    pub fn new(worker_root: impl Into<PathBuf>) -> Self {
+    pub fn new(worker_root: impl Into<PathBuf>, tsx_cli_path: impl Into<PathBuf>) -> Self {
         Self {
             worker_root: worker_root.into(),
+            tsx_cli_path: tsx_cli_path.into(),
             default_irc_nick_prefix: "exo".to_string(),
             default_irc_username: "exo".to_string(),
         }
     }
 
     fn worker_command(&self, adapter_type: &str) -> Vec<String> {
-        worker_command(self.worker_root.join(adapter_type).join("worker.ts"))
+        worker_command(
+            &self.tsx_cli_path,
+            self.worker_root.join(adapter_type).join("worker.ts"),
+        )
     }
 }
 
@@ -602,11 +607,11 @@ fn exochat_secret() -> String {
     URL_SAFE_NO_PAD.encode(format!("{}:{}", Uuid7::now(), Uuid7::now()))
 }
 
-fn worker_command(path: PathBuf) -> Vec<String> {
+fn worker_command(tsx_cli_path: &Path, worker_path: PathBuf) -> Vec<String> {
     vec![
-        "pnpm".to_string(),
-        "tsx".to_string(),
-        path.to_string_lossy().into_owned(),
+        "node".to_string(),
+        tsx_cli_path.to_string_lossy().into_owned(),
+        worker_path.to_string_lossy().into_owned(),
     ]
 }
 
@@ -1219,7 +1224,7 @@ mod tests {
     use crate::{AgentConfig, AgentHarnessKind, ConversationConfig};
 
     fn test_creation_options() -> AdapterCreationOptions {
-        AdapterCreationOptions::new("/tmp/exo-adapters")
+        AdapterCreationOptions::new("/tmp/exo-adapters", "/tmp/node_modules/tsx/dist/cli.mjs")
     }
 
     #[test]
@@ -1337,8 +1342,11 @@ mod tests {
             adapter.conversation_id,
             conversation.record().id.to_string()
         );
-        assert_eq!(adapter.config.worker_command[0], "pnpm");
-        assert_eq!(adapter.config.worker_command[1], "tsx");
+        assert_eq!(adapter.config.worker_command[0], "node");
+        assert_eq!(
+            adapter.config.worker_command[1],
+            "/tmp/node_modules/tsx/dist/cli.mjs"
+        );
         assert!(adapter.config.worker_command[2].ends_with("/tmp/exo-adapters/irc/worker.ts"));
 
         let list_result = execute_list_adapters_tool(

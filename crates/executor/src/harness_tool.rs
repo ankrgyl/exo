@@ -46,11 +46,15 @@ impl ExoToolRuntime {
         scheduler_root: impl Into<PathBuf>,
         adapter_root: impl Into<PathBuf>,
         adapter_worker_root: impl Into<PathBuf>,
+        tsx_cli_path: impl Into<PathBuf>,
     ) -> Self {
         Self {
             scheduler_store: SchedulerStore::new(scheduler_root),
             adapter_store: AdapterStore::new(adapter_root),
-            adapter_creation_options: AdapterCreationOptions::new(adapter_worker_root),
+            adapter_creation_options: AdapterCreationOptions::new(
+                adapter_worker_root,
+                tsx_cli_path,
+            ),
         }
     }
 }
