@@ -181,18 +181,23 @@ where
         turn: &dyn TurnHandle,
         agent_config: &AgentConfig,
         model: &str,
+        max_input_tokens: Option<i64>,
         prompt_tokens: Option<u64>,
         prompt_chars: u64,
+        attempted: &mut bool,
     ) {
-        let config = agent_config.compaction.clone().unwrap_or_default();
-        if !should_compact(
-            &config,
-            prompt_tokens,
-            self.pricing.max_input_tokens(model),
-            prompt_chars,
-        ) {
+        // At most one attempt per turn: compaction can only cut at a
+        // `turn_ended` boundary, and none appears while a turn is in flight, so
+        // a second attempt re-scans the log and re-runs the summarizer to reach
+        // the same answer. On a long tool loop that is a real, silent cost.
+        if *attempted {
             return;
         }
+        let config = agent_config.compaction.clone().unwrap_or_default();
+        if !should_compact(&config, prompt_tokens, max_input_tokens, prompt_chars) {
+            return;
+        }
+        *attempted = true;
 
         // `summary_model` overrides the model id within the agent's existing
         // binding, so a cheaper model from the same provider costs no extra
@@ -280,6 +285,7 @@ where
         stream_mode: ExecutorStreamMode<'_>,
         turn_trace: Option<&dyn TurnExecutionTrace>,
     ) -> Result<()> {
+        let mut compaction_attempted = false;
         for round in 0u32.. {
             if agent_config
                 .max_tool_round_trips
@@ -291,11 +297,18 @@ where
             let messages = self
                 .materialize_prompt_history(conversation, &agent_config.instructions)
                 .await?;
-            let prompt_chars = prompt_chars(&messages);
             let request =
                 build_model_request(conversation, agent_config, conversation_config, messages)
                     .await?;
             let model = request.model.clone();
+            // Only the fallback trigger needs a character count, so skip
+            // serializing the whole prompt when the price table knows this
+            // model's input limit.
+            let max_input_tokens = self.pricing.max_input_tokens(&model);
+            let prompt_chars = match max_input_tokens {
+                Some(_) => 0,
+                None => prompt_chars(&request.messages),
+            };
             let response = self
                 .complete_model_round(request, round as usize, stream_mode, turn_trace)
                 .await?;
@@ -316,8 +329,10 @@ where
                 turn.as_ref(),
                 agent_config,
                 &model,
+                max_input_tokens,
                 prompt_tokens,
                 prompt_chars,
+                &mut compaction_attempted,
             )
             .await;
 

@@ -171,6 +171,28 @@ export function shouldCompact({
 }
 
 /**
+ * At-most-once-per-turn gate around `shouldCompact`.
+ *
+ * Compaction can only cut at a `turn_ended` boundary, and no new one appears
+ * while a turn is in flight — so within a turn the cut point cannot change. A
+ * second attempt would re-scan the log and re-run the summarizer to reach the
+ * same answer. Without this, a turn that crosses the threshold and then fails
+ * (or skips) compaction retries on every subsequent round, which on a long tool
+ * loop is a real and silent cost.
+ */
+export class CompactionGate {
+  private attempted = false;
+
+  shouldAttempt(args: ShouldCompactArgs): boolean {
+    return !this.attempted && shouldCompact(args);
+  }
+
+  markAttempted(): void {
+    this.attempted = true;
+  }
+}
+
+/**
  * Enforce the summary ceiling. Chained compaction feeds each summary back into
  * the next one, so without a hard cap the summary itself grows without bound —
  * the classic way this design rots. Truncation is deliberately blunt: the model

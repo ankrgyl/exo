@@ -5,9 +5,9 @@ import {
   registerAgentToolsFromDirectoryIfExists,
   registerBuiltInTools,
   registerLibraryToolModulePath,
+  CompactionGate,
   resolveCompactionPolicy,
   runCompaction,
-  shouldCompact,
   turnMetadata,
   type BuiltInToolName,
   type CompactionPolicy,
@@ -109,6 +109,7 @@ async function runResponsesTurnLoop(
   // One cache per turn: the loop materializes every round, so re-reading the
   // whole event log each time makes a turn cost O(rounds x events).
   const history = new PromptHistoryCache();
+  const compaction = new CompactionGate();
   let latestEventId: string | null = null;
 
   for (let round = 0; ; round += 1) {
@@ -166,14 +167,18 @@ async function runResponsesTurnLoop(
     // Compact between rounds, using the token count the provider just reported.
     // Doing it here rather than at turn start means a single runaway turn can
     // still bring its own prompt back under the limit.
+    const modelInputLimit = maxInputTokens(getTable() ?? new Map(), model);
     if (
-      shouldCompact({
+      compaction.shouldAttempt({
         policy,
         promptTokens: response.usage?.input_tokens ?? null,
-        maxInputTokens: maxInputTokens(getTable() ?? new Map(), model),
-        materializedChars: promptChars(messages),
+        maxInputTokens: modelInputLimit,
+        // Only the fallback trigger reads this, so skip walking the whole
+        // prompt when the price table knows the model's limit.
+        materializedChars: modelInputLimit === null ? promptChars(messages) : 0,
       })
     ) {
+      compaction.markAttempted();
       const result = await runCompaction({
         conversation,
         turn: context.exoharness.current.turn,

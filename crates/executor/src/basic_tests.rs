@@ -1739,7 +1739,9 @@ async fn the_summarizer_call_carries_model_credentials() {
             },
             "test-model",
             None,
+            None,
             1_000,
+            &mut false,
         )
         .await;
 
@@ -1749,5 +1751,50 @@ async fn the_summarizer_call_carries_model_credentials() {
     assert!(
         requests[0].tools.is_empty(),
         "the summarizer reads, it does not act"
+    );
+}
+
+#[tokio::test]
+async fn compaction_is_attempted_at_most_once_per_turn() {
+    // No new turn_ended event appears while a turn is in flight, so the cut
+    // point cannot change within it. Retrying on every round of a long tool
+    // loop would re-scan the log and re-run the summarizer for the same answer
+    // — real money, spent silently.
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+
+    // Every summarizer call fails, so nothing latches via a successful cut.
+    let model = Arc::new(FakeModelClient::new(Vec::new()));
+    let executor = BasicExecutor::new(Arc::clone(&model), Arc::new(FakeToolRuntime::default()));
+    let turn = open_turn(conversation.as_ref()).await;
+    let agent_config = AgentConfig {
+        compaction: Some(CompactionConfig {
+            keep_recent_turns: 1,
+            fallback_char_budget: 0,
+            ..CompactionConfig::default()
+        }),
+        ..default_agent_config()
+    };
+
+    let mut attempted = false;
+    for _ in 0..5 {
+        executor
+            .maybe_compact(
+                conversation.as_ref(),
+                turn.as_ref(),
+                &agent_config,
+                "test-model",
+                None,
+                None,
+                1_000,
+                &mut attempted,
+            )
+            .await;
+    }
+
+    assert_eq!(
+        model.observed_requests().len(),
+        1,
+        "summarizer should be called once per turn, not once per round"
     );
 }

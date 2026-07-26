@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   COMPACTION_CHECKPOINT_EVENT,
+  CompactionGate,
   DEFAULT_COMPACTION_POLICY,
   capSummary,
   checkpointFromEvent,
@@ -331,5 +332,34 @@ describe("resolveCompactionPolicy", () => {
     expect(resolveCompactionPolicy({ threshold_ratio: 5 }).thresholdRatio).toBe(
       1,
     );
+  });
+});
+
+describe("CompactionGate", () => {
+  const args = {
+    policy: { ...DEFAULT_COMPACTION_POLICY, thresholdRatio: 0.7 },
+    promptTokens: 90_000,
+    maxInputTokens: 100_000,
+    materializedChars: 0,
+  };
+
+  it("allows the first attempt when the threshold is crossed", () => {
+    expect(new CompactionGate().shouldAttempt(args)).toBe(true);
+  });
+
+  it("allows nothing once an attempt has been made", () => {
+    // Within one turn no new turn_ended event appears, so the cut point cannot
+    // change: a second attempt would re-scan and re-summarize for the same
+    // answer. Retrying every round of a long tool loop is real money.
+    const gate = new CompactionGate();
+    expect(gate.shouldAttempt(args)).toBe(true);
+    gate.markAttempted();
+    expect(gate.shouldAttempt(args)).toBe(false);
+    expect(gate.shouldAttempt(args)).toBe(false);
+  });
+
+  it("still respects the threshold before the first attempt", () => {
+    const gate = new CompactionGate();
+    expect(gate.shouldAttempt({ ...args, promptTokens: 10_000 })).toBe(false);
   });
 });
