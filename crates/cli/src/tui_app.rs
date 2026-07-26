@@ -34,39 +34,131 @@ const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
 // live in this clap tree. `multicall` makes the first token the command name,
 // and clap's built-in `help` subcommand serves `/help`.
 #[derive(Debug, clap::Parser)]
-#[command(name = "repl", multicall = true, about = "repl slash commands")]
+#[command(
+    name = "repl",
+    multicall = true,
+    disable_help_flag = true,
+    about = "repl slash commands"
+)]
 struct ReplCli {
     #[command(subcommand)]
     command: ReplCommand,
 }
 
+// `override_usage` keeps generated usage in slash form; `disable_help_flag`
+// drops the `-h, --help` flag noise (per-command help stays available via
+// `/help <command>`).
 #[derive(Debug, PartialEq, clap::Subcommand)]
 enum ReplCommand {
     /// Exit the repl
-    #[command(alias = "exit")]
+    #[command(
+        visible_alias = "exit",
+        override_usage = "/quit",
+        disable_help_flag = true
+    )]
     Quit,
     /// Summarize token usage and dollar cost
-    #[command(alias = "usage")]
+    #[command(
+        visible_alias = "usage",
+        override_usage = "/cost",
+        disable_help_flag = true
+    )]
     Cost,
     /// Show or set how much tool detail is printed
+    #[command(
+        override_usage = "/verbosity [minimal|compact|full]",
+        disable_help_flag = true
+    )]
     Verbosity {
         #[arg(value_enum)]
         level: Option<Verbosity>,
     },
     /// Run a command in the conversation's sandbox
-    #[command(alias = "sandbox")]
+    #[command(
+        visible_alias = "sandbox",
+        override_usage = "/shell <command>",
+        disable_help_flag = true
+    )]
     Shell {
         /// Shell source, passed to the sandbox verbatim
         command: String,
     },
     /// Snapshot a sandbox in this conversation (defaults to the latest one)
+    #[command(override_usage = "/snapshot [<sandbox-id>]", disable_help_flag = true)]
     Snapshot { sandbox_id: Option<String> },
     /// List snapshots taken in this conversation
+    #[command(override_usage = "/snapshots", disable_help_flag = true)]
     Snapshots,
     /// Restore the sandbox to a previous snapshot
+    #[command(override_usage = "/rewind <snapshot-id>", disable_help_flag = true)]
     Rewind { snapshot_id: String },
     /// Move the live sandbox to another provider (e.g. daytona: snapshot + restore there)
+    #[command(override_usage = "/teleport <provider>", disable_help_flag = true)]
     Teleport { provider: String },
+}
+
+/// `/help` listing, generated from the clap tree but formatted for the
+/// transcript instead of clap's CLI-shaped help screen.
+fn command_help_lines() -> Vec<String> {
+    use clap::CommandFactory;
+
+    let mut cmd = ReplCli::command();
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for sub in cmd
+        .get_subcommands_mut()
+        .filter(|sub| sub.get_name() != "help")
+    {
+        let aliases: Vec<String> = sub
+            .get_visible_aliases()
+            .map(|alias| format!("/{alias}"))
+            .collect();
+        let mut about = sub.get_about().map(ToString::to_string).unwrap_or_default();
+        if !aliases.is_empty() {
+            about = format!("{about} (alias {})", aliases.join(", "));
+        }
+        let synopsis = sub
+            .render_usage()
+            .to_string()
+            .trim_start_matches("Usage:")
+            .trim()
+            .to_string();
+        entries.push((synopsis, about));
+    }
+    entries.push((
+        "/help [<command>]".to_string(),
+        "show this message".to_string(),
+    ));
+
+    let width = entries
+        .iter()
+        .map(|(synopsis, _)| synopsis.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut lines = vec!["commands:".to_string()];
+    for (synopsis, about) in entries {
+        lines.push(format!("  {synopsis:<width$}  {about}"));
+    }
+    lines
+}
+
+/// clap's error text is written for a shell CLI; trim the parts that make no
+/// sense inside the repl (help-flag hints and the bare top-level usage line).
+fn clap_error_lines(error: &clap::Error) -> Vec<String> {
+    let rendered = error.to_string();
+    let mut lines: Vec<String> = rendered
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("For more information"))
+        .filter(|line| line.trim() != "Usage: <COMMAND>")
+        .map(str::to_string)
+        .collect();
+    lines.dedup_by(|a, b| a.trim().is_empty() && b.trim().is_empty());
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    while lines.first().is_some_and(|line| line.trim().is_empty()) {
+        lines.remove(0);
+    }
+    lines
 }
 
 /// What a line of repl input means.
@@ -333,6 +425,13 @@ impl TuiApp {
     async fn submit_input(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) -> Result<bool> {
         let line = std::mem::take(&mut self.input);
         self.history_pos = None;
+        // The bare help listing is ours, not clap's CLI-shaped help screen.
+        if matches!(line.trim(), "/" | "/help") {
+            for rendered in command_help_lines() {
+                self.push_notice(&rendered);
+            }
+            return Ok(false);
+        }
         match parse_repl_input(&line) {
             Ok(ReplInput::Empty) => {}
             Ok(ReplInput::Chat(text)) => {
@@ -350,8 +449,8 @@ impl TuiApp {
                 return self.execute_command(command, tx).await;
             }
             Err(error) => {
-                for rendered in error.to_string().lines() {
-                    self.push_notice(rendered);
+                for rendered in clap_error_lines(&error) {
+                    self.push_notice(&rendered);
                 }
             }
         }
