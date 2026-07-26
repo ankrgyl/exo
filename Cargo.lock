@@ -2408,6 +2408,7 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
+ "shlex",
  "tabwriter",
  "tempfile",
  "tokio",
