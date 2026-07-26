@@ -31,6 +31,13 @@ class StubConversation {
   private readonly events: Event[];
   private readonly artifacts: Map<string, string>;
 
+  /**
+   * Makes `readArtifactText` throw rather than return null. The two are
+   * different failures — a vanished artifact and a store that will not answer —
+   * and the read path has to survive both.
+   */
+  failArtifactReads = false;
+
   constructor(options: StubOptions) {
     this.events = options.events;
     this.artifacts = options.artifacts ?? new Map();
@@ -67,6 +74,9 @@ class StubConversation {
     version?: number;
   }): Promise<string | null> {
     this.artifactReads.push(args.artifactId);
+    if (this.failArtifactReads) {
+      throw new Error("artifact store unavailable");
+    }
     return this.artifacts.get(args.artifactId) ?? null;
   }
 
@@ -279,6 +289,34 @@ describe("materializeConversationMessages with a checkpoint", () => {
     );
     expect(rendered).toContain("ancient");
     expect(rendered).toContain("recent");
+  });
+
+  it("falls back to full history when the artifact store refuses the read", async () => {
+    // Distinct from a missing artifact: the store errors. The raw log is
+    // equally intact either way, so failing here would take a working
+    // conversation down — and keep taking it down, since every later turn
+    // consults the same checkpoint. Same handling as the Rust executor's
+    // `read_summary_or_fall_back`.
+    const older = turn("ancient");
+    const stub = new StubConversation({
+      events: [
+        ...older,
+        checkpointEvent({
+          upToEventId: older.at(-1)!.id,
+          artifactId: artifactId(1),
+        }),
+        ...turn("recent"),
+      ],
+      artifacts: new Map([[artifactId(1), "SUMMARY OF EARLIER"]]),
+    });
+    stub.failArtifactReads = true;
+
+    const rendered = texts(
+      await materializeConversationMessages(asConversation(stub)),
+    );
+    expect(rendered).toContain("ancient");
+    expect(rendered).toContain("recent");
+    expect(rendered).not.toContain("SUMMARY OF EARLIER");
   });
 
   it("uses the newest checkpoint when several exist", async () => {

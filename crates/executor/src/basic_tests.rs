@@ -28,7 +28,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::compaction::{
     COMPACTION_CHECKPOINT_EVENT, COMPACTION_FAILED_EVENT, CompactionCheckpoint, CompactionConfig,
-    CompactionOutcome, SummarizeInput, prompt_chars, run_compaction,
+    CompactionOutcome, PromptSize, SummarizeInput, prompt_size, run_compaction,
 };
 use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor};
 use crate::*;
@@ -627,6 +627,9 @@ struct FakeState {
     /// Runs once, inside `get_events`, to stand in for another turn acting while
     /// this read is in flight.
     on_get_events: Option<GetEventsHook>,
+    /// Makes `read_artifact` return a backend error rather than `Ok(None)`. The
+    /// two are different failures and the read path must survive both.
+    fail_artifact_reads: bool,
 }
 
 struct FakeConversationState {
@@ -635,6 +638,14 @@ struct FakeConversationState {
 }
 
 impl FakeExoHarness {
+    /// Make every later `read_artifact` fail with a backend error.
+    fn fail_artifact_reads(&self) {
+        self.state
+            .lock()
+            .expect("state poisoned")
+            .fail_artifact_reads = true;
+    }
+
     /// Arrange for `hook` to run once inside the next `get_events`, standing in
     /// for another turn acting while a read is in flight.
     fn on_next_get_events(&self, hook: GetEventsHook) {
@@ -664,6 +675,7 @@ impl FakeExoHarness {
                 },
                 artifacts: Vec::new(),
                 on_get_events: None,
+                fail_artifact_reads: false,
                 conversation: FakeConversationState {
                     record: ConversationRecord {
                         id: conversation_id,
@@ -1091,6 +1103,9 @@ impl ConversationHandle for FakeConversationHandle {
 
     async fn read_artifact(&self, request: ReadArtifactRequest) -> Result<Option<Artifact>> {
         let state = self.state.lock().expect("state poisoned");
+        if state.fail_artifact_reads {
+            return Err(anyhow!("artifact store unavailable"));
+        }
         let found = state
             .artifacts
             .iter()
@@ -1812,6 +1827,50 @@ async fn a_slow_compaction_does_not_replace_a_newer_checkpoint() {
     assert!(!text.contains("LOSER"), "{text}");
 }
 
+#[tokio::test]
+async fn an_unreadable_summary_artifact_replays_history_instead_of_failing_the_turn() {
+    // A checkpoint whose artifact the store *refuses* — a permission problem, a
+    // transport blip — is not the same as a corrupt log. The events are all
+    // still there. Propagating the error would take the conversation down and
+    // keep taking it down, because every later turn consults the same
+    // checkpoint. `readCheckpointSummary` already degrades this way in the
+    // TypeScript harness.
+    let (harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+
+    let turn = open_turn(conversation.as_ref()).await;
+    let outcome = run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &CompactionConfig {
+            keep_recent_turns: 1,
+            ..CompactionConfig::default()
+        },
+        "summary-model",
+        None,
+        &|_input| Box::pin(async { Ok("SUMMARY OF EARLIER".to_string()) }),
+    )
+    .await;
+    let CompactionOutcome::Compacted { .. } = outcome else {
+        panic!("expected compaction, got {outcome:?}");
+    };
+    turn.finish().await.expect("finish turn");
+
+    harness.fail_artifact_reads();
+    let executor = test_executor();
+    let prompt = executor
+        .materialize_prompt_history(conversation.as_ref(), &[])
+        .await
+        .expect("an unreadable summary must not fail materialization");
+
+    // Full history, not a hole where the summary should have been.
+    let text = prompt_text(&prompt);
+    assert!(text.contains("ancient"), "{text}");
+    assert!(text.contains("old"), "{text}");
+    assert!(text.contains("recent"), "{text}");
+    assert!(!text.contains("SUMMARY OF EARLIER"), "{text}");
+}
+
 /// Checkpoint events on a conversation, newest last.
 async fn checkpoint_events(conversation: &dyn ConversationHandle) -> Vec<EventData> {
     conversation
@@ -1917,7 +1976,10 @@ async fn the_summarizer_call_carries_model_credentials() {
                 model: "test-model",
                 max_input_tokens: None,
                 prompt_tokens: None,
-                prompt_chars: 1_000,
+                prompt_size: PromptSize {
+                    ascii_bytes: 1_000,
+                    other_bytes: 0,
+                },
             },
             &mut false,
         )
@@ -1965,7 +2027,10 @@ async fn compaction_is_attempted_at_most_once_per_turn() {
                     model: "test-model",
                     max_input_tokens: None,
                     prompt_tokens: None,
-                    prompt_chars: 1_000,
+                    prompt_size: PromptSize {
+                        ascii_bytes: 1_000,
+                        other_bytes: 0,
+                    },
                 },
                 &mut attempted,
             )
@@ -2150,12 +2215,13 @@ async fn an_over_limit_conversation_is_compacted_before_the_request_goes_out() {
         run_one_turn(&builder, agent.as_ref(), conversation.as_ref(), &off, index).await;
     }
 
-    let oversized = prompt_chars(
+    let oversized = prompt_size(
         &builder
             .materialize_prompt_history(conversation.as_ref(), &[])
             .await
             .expect("materialize"),
-    );
+    )
+    .bytes();
 
     // A fresh client so `observed_requests` covers only the turn under test.
     // Its first entry is the summarizer call (compaction runs first), and the
@@ -2253,7 +2319,7 @@ async fn an_over_limit_conversation_is_compacted_before_the_request_goes_out() {
         "the turn's prompt should carry the summary that replaced the old history"
     );
     assert!(
-        prompt_chars(&turn_prompt.messages) < oversized,
+        prompt_size(&turn_prompt.messages).bytes() < oversized,
         "the prompt sent should be smaller than the history it replaced"
     );
 }
@@ -2511,7 +2577,8 @@ async fn summarizer_usage_is_recorded_without_entering_the_prompt() {
                 model: "summary-model",
                 max_input_tokens: None,
                 prompt_tokens: None,
-                prompt_chars: u64::MAX,
+                // Far past any budget, so the fallback trigger fires.
+                prompt_size: prompt_size(&[user_message(&"x".repeat(1_000_000))]),
             },
             &mut attempted,
         )

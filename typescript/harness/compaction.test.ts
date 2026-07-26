@@ -7,11 +7,13 @@ import {
   capSummary,
   checkpointFromEvent,
   compactionWouldNotShrink,
-  estimatedTokensFromChars,
+  PromptSize,
+  promptSize,
   resolveCompactionPolicy,
   resolveSummarizerModel,
   selectCutPoint,
   shouldCompact,
+  summarizerMaxOutputTokens,
   summarizerMessages,
   type CompactionCheckpoint,
 } from "./compaction";
@@ -264,31 +266,88 @@ describe("shouldCompact", () => {
   });
 });
 
-describe("estimatedTokensFromChars", () => {
+describe("PromptSize", () => {
   // The pre-request trigger has no provider count to work from, so it estimates.
   // The estimate must lean high: compacting slightly early costs one summarizer
   // call, while under-estimating lets a prompt reach the hard limit — and that
   // failure is self-perpetuating, since the rejection happens before anything
   // can shrink the history that caused it.
-  it("over-estimates rather than under-estimates", () => {
-    // Real prompts run ~3.5-4 chars/token; this must not sit above that.
-    expect(estimatedTokensFromChars(4_000)).toBeGreaterThan(1_000);
+  it("over-estimates rather than under-estimates ASCII prose", () => {
+    // Real prompts run ~3.5-4 bytes/token; this must not sit above that.
+    expect(
+      PromptSize.ofText("x".repeat(4_000)).estimatedTokens(),
+    ).toBeGreaterThan(1_000);
   });
 
   it("is monotonic and never rounds a non-empty prompt to zero", () => {
-    expect(estimatedTokensFromChars(0)).toBe(0);
-    expect(estimatedTokensFromChars(1)).toBe(1);
-    expect(estimatedTokensFromChars(10_000)).toBeGreaterThan(
-      estimatedTokensFromChars(9_999),
+    expect(new PromptSize().estimatedTokens()).toBe(0);
+    expect(PromptSize.ofText("x").estimatedTokens()).toBe(1);
+    expect(
+      PromptSize.ofText("x".repeat(10_000)).estimatedTokens(),
+    ).toBeGreaterThan(PromptSize.ofText("x".repeat(9_999)).estimatedTokens());
+  });
+
+  it("measures UTF-8 bytes, not UTF-16 code units", () => {
+    // `.length` reports 1 for a CJK ideograph and 2 for an emoji; the wire
+    // carries 3 and 4. Counting code units is what made a CJK-heavy prompt
+    // report a third of its true size.
+    expect(PromptSize.ofText("漢").bytes).toBe(3);
+    expect(PromptSize.ofText("é").bytes).toBe(2);
+    expect(PromptSize.ofText("🙂").bytes).toBe(4);
+    expect(PromptSize.ofText("a").bytes).toBe(1);
+    // A lone surrogate is what an encoder would emit for it: U+FFFD, 3 bytes.
+    expect(PromptSize.ofText("\ud800").bytes).toBe(3);
+  });
+
+  it("charges non-ASCII at a denser token rate than ASCII", () => {
+    // 1000 ideographs are ~1000 tokens, not ~333. Charging them at the ASCII
+    // rate is the whole defect: a prompt already over the hard limit reports
+    // comfortably under the threshold, the request is rejected, and no response
+    // ever arrives for the accurate trigger to use.
+    const cjk = PromptSize.ofText("漢".repeat(1_000));
+    expect(cjk.estimatedTokens()).toBeGreaterThanOrEqual(1_000);
+    // ASCII of the same byte length must stay at the looser rate, so the common
+    // case does not start compacting three times too eagerly.
+    const ascii = PromptSize.ofText("x".repeat(cjk.bytes));
+    expect(ascii.estimatedTokens()).toBeLessThan(cjk.estimatedTokens());
+  });
+
+  it("adds without losing the split", () => {
+    const total = PromptSize.ofText("abc").plus(PromptSize.ofText("漢"));
+    expect(total.asciiBytes).toBe(3);
+    expect(total.otherBytes).toBe(3);
+    expect(total.bytes).toBe(6);
+  });
+});
+
+describe("summarizerMaxOutputTokens", () => {
+  it("never clips a summary that respects the character cap", () => {
+    // `capSummary` truncates only after the response is generated, transferred
+    // and billed, so the request needs its own ceiling — but a ceiling sized
+    // from the *average* bytes-per-token clips a compliant CJK or Hangul
+    // summary mid-sentence, where a character is about a token.
+    const cap = DEFAULT_COMPACTION_POLICY.maxSummaryChars;
+    const densestCompliantSummary = cap;
+    expect(summarizerMaxOutputTokens(cap)).toBeGreaterThanOrEqual(
+      densestCompliantSummary,
     );
+    // Still a bound, or it is not doing its job.
+    expect(summarizerMaxOutputTokens(cap)).toBeLessThan(
+      densestCompliantSummary * 4,
+    );
+  });
+
+  it("still permits a usable response under a tiny cap", () => {
+    expect(summarizerMaxOutputTokens(1)).toBeGreaterThanOrEqual(256);
   });
 });
 
 describe("compactionWouldNotShrink", () => {
   const cap = 1_000;
-  // Read off the wrapper itself rather than pinned as a constant, so editing
-  // the wrapper text cannot quietly invalidate the test.
-  const envelope = String(summaryMessage("").content).length;
+  // Measured off the wrapper itself rather than pinned as a constant, and
+  // measured the way the guard measures a span, so neither editing the wrapper
+  // text nor changing the size unit can quietly invalidate the test.
+  const envelope = promptSize([summaryMessage("")]).bytes;
 
   it("counts the wrapper the summary is delivered in", () => {
     expect(envelope).toBeGreaterThan(100);

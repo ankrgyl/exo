@@ -8,12 +8,14 @@ import {
   appendCustomEvent,
   COMPACTION_USAGE_EVENT,
   CompactionGate,
-  estimatedTokensFromChars,
   resolveCompactionPolicy,
+  PromptSize,
+  promptSize,
   resolveSummarizerModel,
   runCompaction,
   summarizerMaxOutputTokens,
   summarizerMessages,
+  toolDefinitionSize,
   turnMetadata,
   type BuiltInToolName,
   type EventData,
@@ -162,15 +164,16 @@ async function runResponsesTurnLoop(
     // way. This check is what makes that state recoverable. Mirrors the Rust
     // executor's pre-request trigger.
     const toolDefinitions = tools.definitions();
-    const preflightChars =
-      promptChars(messages) + toolDefinitionChars(toolDefinitions);
+    const preflightSize = promptSize(messages).plus(
+      toolDefinitionSize(toolDefinitions),
+    );
     const preflightTable = getTable() ?? new Map();
     if (
       compaction.shouldAttempt({
         policy,
-        promptTokens: estimatedTokensFromChars(preflightChars),
+        promptTokens: preflightSize.estimatedTokens(),
         maxInputTokens: maxInputTokens(preflightTable, model),
-        materializedChars: preflightChars,
+        materializedChars: preflightSize.bytes,
       })
     ) {
       compaction.markAttempted();
@@ -185,7 +188,7 @@ async function runResponsesTurnLoop(
           policy.summaryModel ?? model,
         ),
         agentModelInputLimit: maxInputTokens(preflightTable, model),
-        promptTokens: estimatedTokensFromChars(preflightChars),
+        promptTokens: preflightSize.estimatedTokens(),
       });
       const result = await runCompaction({
         conversation,
@@ -266,16 +269,16 @@ async function runResponsesTurnLoop(
     // to work from — either the price table does not know the model's limit
     // (the trigger's fallback path) or the response carried no usage (the
     // summary-model fit check below).
-    const materializedChars =
+    const materialized =
       modelInputLimit === null || occupancy === null
-        ? promptChars(messages)
-        : 0;
+        ? promptSize(messages)
+        : new PromptSize();
     if (
       compaction.shouldAttempt({
         policy,
         promptTokens: occupancy,
         maxInputTokens: modelInputLimit,
-        materializedChars,
+        materializedChars: materialized.bytes,
       })
     ) {
       compaction.markAttempted();
@@ -290,7 +293,7 @@ async function runResponsesTurnLoop(
           policy.summaryModel ?? model,
         ),
         agentModelInputLimit: modelInputLimit,
-        promptTokens: occupancy ?? estimatedTokensFromChars(materializedChars),
+        promptTokens: occupancy ?? materialized.estimatedTokens(),
       });
       const result = await runCompaction({
         conversation,
@@ -372,34 +375,6 @@ async function recordSummarizerUsage(
   } catch {
     // Accounting is not worth failing a turn over.
   }
-}
-
-function promptChars(messages: Message[]): number {
-  let total = 0;
-  for (const message of messages) {
-    total +=
-      typeof message.content === "string"
-        ? message.content.length
-        : JSON.stringify(message.content).length;
-  }
-  return total;
-}
-
-/**
- * Serialized size of the tool schemas sent with a request.
- *
- * Tools go into the same input window as the messages, and this harness
- * registers a lot of them. Sizing a request by its messages alone lets a
- * conversation sit under the compaction threshold on message text while the
- * request that actually goes out is over the model's hard limit — which is the
- * unrecoverable failure the preflight exists to prevent.
- */
-function toolDefinitionChars(tools: unknown[]): number {
-  let total = 0;
-  for (const tool of tools) {
-    total += JSON.stringify(tool)?.length ?? 0;
-  }
-  return total;
 }
 
 /**

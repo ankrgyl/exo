@@ -90,6 +90,8 @@ export interface CompactionPolicy {
    * accurate post-response trigger never runs: every later turn replays the same
    * oversized history and fails the same way. Guessing low just compacts earlier
    * than strictly necessary.
+   *
+   * Measured in UTF-8 bytes, the same unit `PromptSize` reports.
    */
   fallbackCharBudget: number;
 }
@@ -234,26 +236,132 @@ export function shouldCompact({
 }
 
 /**
- * Characters per token assumed when estimating a prompt's size without a
- * tokenizer.
+ * UTF-8 bytes per token assumed for ASCII text when estimating a prompt's size
+ * without a tokenizer.
  *
- * Deliberately low. English averages nearer four, but agent prompts are dense
- * with JSON and code, and the two errors are not symmetric: over-estimating
- * compacts a little earlier than strictly necessary, while under-estimating lets
- * a prompt reach the provider's hard limit — and that failure is
- * self-perpetuating, because the rejection happens before anything can shrink
- * the history that caused it.
+ * Deliberately low. ASCII prose averages nearer four, but agent prompts are
+ * dense with JSON and code, and the two errors are not symmetric:
+ * over-estimating compacts a little earlier than strictly necessary, while
+ * under-estimating lets a prompt reach the provider's hard limit — and that
+ * failure is self-perpetuating, because the rejection happens before anything
+ * can shrink the history that caused it.
  */
-const ESTIMATED_CHARS_PER_TOKEN = 3;
+const ASCII_BYTES_PER_TOKEN = 3;
 
 /**
- * Rough token count for a prompt of `chars` characters.
+ * UTF-8 bytes per token assumed for everything outside ASCII.
  *
- * Only for the pre-request trigger, which has no provider-reported count to work
- * from. Once a response comes back, its usage is exact and preferred.
+ * Outside ASCII a character is two to four bytes and rarely cheaper than a
+ * token: a CJK ideograph is three bytes and usually tokenizes to one, a Hangul
+ * syllable is three bytes and often to two, an emoji is four bytes and can be
+ * several. Charging these at the ASCII rate is what makes a character-based
+ * estimate dangerous rather than merely rough — the same three bytes are one
+ * token here and a third of a token there.
  */
-export function estimatedTokensFromChars(chars: number): number {
-  return Math.ceil(chars / ESTIMATED_CHARS_PER_TOKEN);
+const OTHER_BYTES_PER_TOKEN = 2;
+
+/**
+ * Serialized size of a prompt, split by how densely each half tokenizes.
+ *
+ * Two numbers rather than one, because no single ratio works. A token is much
+ * closer to a fixed number of UTF-8 *bytes* than to a fixed number of
+ * characters — and `String.length` is neither, it counts UTF-16 code units, so
+ * a CJK ideograph reads as 1 where the wire carries 3. Even on bytes the rate
+ * differs by script, and the direction of the error matters: a prompt of CJK or
+ * Hangul measured at the ASCII rate reports a fraction of its true size, and
+ * reporting a fraction of true size is exactly how a request sails past the hard
+ * limit with the trigger reporting slack.
+ */
+export class PromptSize {
+  constructor(
+    /** UTF-8 bytes inside ASCII. */
+    readonly asciiBytes = 0,
+    /** UTF-8 bytes outside ASCII. */
+    readonly otherBytes = 0,
+  ) {}
+
+  /** Size of a string as UTF-8, without allocating an encoded copy of it. */
+  static ofText(text: string): PromptSize {
+    let ascii = 0;
+    let other = 0;
+    for (let i = 0; i < text.length; i += 1) {
+      const unit = text.charCodeAt(i);
+      if (unit < 0x80) {
+        ascii += 1;
+      } else if (unit < 0x800) {
+        other += 2;
+      } else if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < text.length) {
+        const low = text.charCodeAt(i + 1);
+        if (low >= 0xdc00 && low <= 0xdfff) {
+          // A surrogate pair is one code point in four UTF-8 bytes.
+          other += 4;
+          i += 1;
+        } else {
+          // Lone surrogate: encoders emit U+FFFD, which is three bytes.
+          other += 3;
+        }
+      } else {
+        other += 3;
+      }
+    }
+    return new PromptSize(ascii, other);
+  }
+
+  /** Size of a value as the JSON that will actually be sent. */
+  static ofJson(value: unknown): PromptSize {
+    return PromptSize.ofText(JSON.stringify(value) ?? "");
+  }
+
+  static sum(sizes: PromptSize[]): PromptSize {
+    let ascii = 0;
+    let other = 0;
+    for (const size of sizes) {
+      ascii += size.asciiBytes;
+      other += size.otherBytes;
+    }
+    return new PromptSize(ascii, other);
+  }
+
+  plus(other: PromptSize): PromptSize {
+    return new PromptSize(
+      this.asciiBytes + other.asciiBytes,
+      this.otherBytes + other.otherBytes,
+    );
+  }
+
+  /**
+   * Total serialized size in bytes, for the character-budget fallback and the
+   * no-growth guard — both of which want a size, not a token count.
+   */
+  get bytes(): number {
+    return this.asciiBytes + this.otherBytes;
+  }
+
+  /** Conservative token estimate, for the pre-request trigger. */
+  estimatedTokens(): number {
+    return (
+      Math.ceil(this.asciiBytes / ASCII_BYTES_PER_TOKEN) +
+      Math.ceil(this.otherBytes / OTHER_BYTES_PER_TOKEN)
+    );
+  }
+}
+
+/** Serialized size of a prompt, as it goes on the wire. */
+export function promptSize(messages: Message[]): PromptSize {
+  return PromptSize.sum(messages.map((message) => PromptSize.ofJson(message)));
+}
+
+/**
+ * Serialized size of the tool schemas sent with a request.
+ *
+ * Tools go into the same input window as the messages, and a harness can
+ * register a lot of them. Sizing a request by its messages alone lets a
+ * conversation sit under the compaction threshold on message text while the
+ * request that actually goes out is over the model's hard limit — which is the
+ * unrecoverable failure the preflight exists to prevent.
+ */
+export function toolDefinitionSize(tools: unknown[]): PromptSize {
+  return PromptSize.sum(tools.map((tool) => PromptSize.ofJson(tool)));
 }
 
 /**
@@ -263,17 +371,16 @@ export function estimatedTokensFromChars(chars: number): number {
  * transferred and billed, so on its own it bounds the stored summary but not
  * the latency, memory or cost of producing it. This bounds the request itself.
  *
- * Generous on purpose: the multiplier leaves room so a model that respects the
- * character instruction is never clipped mid-sentence, and `capSummary` remains
- * the exact ceiling.
+ * One token per character, which is the *densest* realistic encoding — a CJK or
+ * Hangul summary that respects the character cap needs about that many tokens.
+ * Sizing this from the average instead would clip a compliant summary
+ * mid-sentence in exactly those scripts. For ASCII prose it works out at roughly
+ * four times what a compliant summary needs, which is the headroom this
+ * deliberately keeps; `capSummary` remains the exact ceiling.
  */
 export function summarizerMaxOutputTokens(maxSummaryChars: number): number {
-  const headroom = 2;
   const floorTokens = 256;
-  return Math.max(
-    floorTokens,
-    estimatedTokensFromChars(maxSummaryChars) * headroom,
-  );
+  return Math.max(floorTokens, maxSummaryChars);
 }
 
 export interface ResolveSummarizerModelArgs {
@@ -786,7 +893,7 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
 
   if (
     compactionWouldNotShrink(
-      messagesChars(compactedMessages),
+      promptSize(compactedMessages).bytes,
       previousSummary === null ? null : codePointCount(previousSummary),
       policy.maxSummaryChars,
     )
@@ -866,17 +973,6 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
   return { status: "compacted", checkpoint };
 }
 
-function messagesChars(messages: Message[]): number {
-  let total = 0;
-  for (const message of messages) {
-    total +=
-      typeof message.content === "string"
-        ? message.content.length
-        : JSON.stringify(message.content).length;
-  }
-  return total;
-}
-
 /**
  * True when compaction cannot make the prompt smaller, so it is not worth
  * paying a summarizer call to find out.
@@ -914,7 +1010,7 @@ export function compactionWouldNotShrink(
  * running at all, and a stale constant would quietly bias that decision.
  */
 function summaryEnvelopeChars(): number {
-  return messagesChars([summaryMessage("")]);
+  return promptSize([summaryMessage("")]).bytes;
 }
 
 function summaryArtifactPath(conversation: Conversation): string {

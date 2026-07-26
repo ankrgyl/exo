@@ -92,9 +92,10 @@ pub struct CompactionConfig {
     /// later turn replays the same oversized history and fails the same way.
     /// Guessing low just compacts earlier than strictly necessary.
     ///
-    /// The default assumes roughly a 32k-token window at the estimator's
-    /// 3 chars/token, at about two thirds full. Raise it if every model you run
-    /// has a large window.
+    /// Measured in UTF-8 bytes, the same unit `PromptSize` reports. The default
+    /// assumes roughly a 32k-token window at the estimator's 3 bytes/token for
+    /// ASCII, at about two thirds full. Raise it if every model you run has a
+    /// large window.
     pub fallback_char_budget: u64,
 }
 
@@ -248,16 +249,82 @@ pub(crate) fn should_compact(
     materialized_chars > config.fallback_char_budget
 }
 
-/// Characters per token assumed when estimating a prompt's size without a
-/// tokenizer.
+/// UTF-8 bytes per token assumed for ASCII text when estimating a prompt's size
+/// without a tokenizer.
 ///
-/// Deliberately low. English averages nearer four, but agent prompts are dense
-/// with JSON and code, and the two errors are not symmetric: over-estimating
-/// compacts a little earlier than strictly necessary, while under-estimating
-/// lets a prompt reach the provider's hard limit — and that failure is
-/// self-perpetuating, because the rejection happens before anything can shrink
-/// the history that caused it.
-const ESTIMATED_CHARS_PER_TOKEN: u64 = 3;
+/// Deliberately low. ASCII prose averages nearer four, but agent prompts are
+/// dense with JSON and code, and the two errors are not symmetric:
+/// over-estimating compacts a little earlier than strictly necessary, while
+/// under-estimating lets a prompt reach the provider's hard limit — and that
+/// failure is self-perpetuating, because the rejection happens before anything
+/// can shrink the history that caused it.
+const ASCII_BYTES_PER_TOKEN: u64 = 3;
+
+/// UTF-8 bytes per token assumed for everything outside ASCII.
+///
+/// Outside ASCII a character is two to four bytes and rarely cheaper than a
+/// token: a CJK ideograph is three bytes and usually tokenizes to one, a Hangul
+/// syllable is three bytes and often to two, an emoji is four bytes and can be
+/// several. Charging these at the ASCII rate is what makes a character-based
+/// estimate dangerous rather than merely rough — the same three bytes are one
+/// token here and a third of a token there.
+const OTHER_BYTES_PER_TOKEN: u64 = 2;
+
+/// Serialized size of a prompt, split by how densely each half tokenizes.
+///
+/// Two numbers rather than one, because no single ratio works. A token is much
+/// closer to a fixed number of UTF-8 *bytes* than to a fixed number of
+/// characters — which is why this counts bytes — but the byte-per-token rate
+/// still differs by script, and the direction of the error matters: a prompt of
+/// CJK or Hangul measured at the ASCII rate reports a third of its true size,
+/// and reporting a third of true size is exactly how a request sails past the
+/// hard limit with the trigger reporting slack.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PromptSize {
+    /// UTF-8 bytes inside ASCII.
+    pub ascii_bytes: u64,
+    /// UTF-8 bytes outside ASCII.
+    pub other_bytes: u64,
+}
+
+impl PromptSize {
+    fn of_str(text: &str) -> Self {
+        let ascii_bytes = text.bytes().filter(|byte| byte.is_ascii()).count() as u64;
+        Self {
+            ascii_bytes,
+            other_bytes: text.len() as u64 - ascii_bytes,
+        }
+    }
+
+    /// Total serialized size in bytes, for the character-budget fallback and the
+    /// no-growth guard — both of which want a size, not a token count.
+    pub fn bytes(self) -> u64 {
+        self.ascii_bytes + self.other_bytes
+    }
+
+    /// Conservative token estimate, for the pre-request trigger.
+    pub fn estimated_tokens(self) -> u64 {
+        self.ascii_bytes.div_ceil(ASCII_BYTES_PER_TOKEN)
+            + self.other_bytes.div_ceil(OTHER_BYTES_PER_TOKEN)
+    }
+}
+
+impl std::ops::Add for PromptSize {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            ascii_bytes: self.ascii_bytes + other.ascii_bytes,
+            other_bytes: self.other_bytes + other.other_bytes,
+        }
+    }
+}
+
+impl std::iter::Sum for PromptSize {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), |total, size| total + size)
+    }
+}
 
 /// Record what a summarizer call cost, without putting its text in the prompt.
 ///
@@ -303,22 +370,15 @@ pub(crate) async fn record_summarizer_usage(
 /// transferred and billed, so on its own it bounds the stored summary but not
 /// the latency, memory or cost of producing it. This bounds the request itself.
 ///
-/// Generous on purpose: the multiplier leaves room so a model that respects the
-/// character instruction is never clipped mid-sentence, and `cap_summary`
-/// remains the exact ceiling.
+/// One token per character, which is the *densest* realistic encoding — a CJK
+/// or Hangul summary that respects the character cap needs about that many
+/// tokens. Sizing this from the average instead would clip a compliant summary
+/// mid-sentence in exactly those scripts. For ASCII prose it works out at
+/// roughly four times what a compliant summary needs, which is the headroom
+/// this deliberately keeps; `cap_summary` remains the exact ceiling.
 pub(crate) fn summarizer_max_output_tokens(max_summary_chars: u32) -> i64 {
-    const HEADROOM: u64 = 2;
     const FLOOR_TOKENS: u64 = 256;
-    let from_cap = estimated_tokens_from_chars(u64::from(max_summary_chars)) * HEADROOM;
-    from_cap.max(FLOOR_TOKENS) as i64
-}
-
-/// Rough token count for a prompt of `chars` characters.
-///
-/// Only for the pre-request trigger, which has no provider-reported count to
-/// work from. Once a response comes back, its usage is exact and preferred.
-pub(crate) fn estimated_tokens_from_chars(chars: u64) -> u64 {
-    chars.div_ceil(ESTIMATED_CHARS_PER_TOKEN)
+    u64::from(max_summary_chars).max(FLOOR_TOKENS) as i64
 }
 
 /// Enforce the summary ceiling. Chained compaction feeds each summary back into
@@ -420,7 +480,11 @@ async fn compact(
 ) -> Result<CompactionOutcome> {
     let existing = read_active_checkpoint(conversation).await?;
     let previous_summary = match &existing {
-        Some((_, checkpoint)) => read_summary(conversation, checkpoint).await?,
+        // Errors fold into `None` here too, which the guard below turns into
+        // "rebuild from the start of the log" — the same handling a missing
+        // artifact gets, and strictly better than failing the compaction over a
+        // read the next pass may well succeed at.
+        Some((_, checkpoint)) => read_summary_or_fall_back(conversation, checkpoint).await,
         None => None,
     };
 
@@ -491,7 +555,7 @@ async fn compact(
     );
 
     if compaction_would_not_shrink(
-        prompt_chars(&messages),
+        prompt_size(&messages).bytes(),
         previous_summary
             .as_ref()
             .map(|summary| summary.chars().count() as u64),
@@ -611,6 +675,33 @@ pub(crate) async fn read_active_checkpoint(
     Ok(serde_json::from_value(payload)
         .ok()
         .map(|checkpoint| (event_id, checkpoint)))
+}
+
+/// Summary text for a checkpoint, or `None` if it cannot be had — whether the
+/// artifact is missing or the store refused to hand it over.
+///
+/// Callers on the read path must not distinguish the two. A missing artifact
+/// already means "replay the full log", and the raw log is equally intact when
+/// the store returns a permission or transport error, so propagating that error
+/// would take a working conversation down over something recoverable — and take
+/// it down repeatedly, since every later turn consults the same checkpoint.
+/// Losing the summary costs prompt space; losing the turn costs the agent.
+pub(crate) async fn read_summary_or_fall_back(
+    conversation: &dyn ConversationHandle,
+    checkpoint: &CompactionCheckpoint,
+) -> Option<String> {
+    match read_summary(conversation, checkpoint).await {
+        Ok(summary) => summary,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                conversation_id = %conversation.record().id,
+                artifact_id = %checkpoint.artifact_id,
+                "compaction: summary artifact could not be read; replaying full history"
+            );
+            None
+        }
+    }
 }
 
 /// Summary text for a checkpoint, or `None` if the artifact has gone missing.
@@ -733,7 +824,7 @@ fn compaction_would_not_shrink(
 /// wrapper text: the guard that uses it decides whether compaction is worth
 /// running at all, and a stale constant would quietly bias that decision.
 fn summary_envelope_chars() -> u64 {
-    prompt_chars(std::slice::from_ref(&summary_message("")))
+    prompt_size(std::slice::from_ref(&summary_message(""))).bytes()
 }
 
 fn summary_artifact_path(conversation: &dyn ConversationHandle) -> String {
@@ -808,12 +899,17 @@ usually loses and what is most expensive to lose.\n\
     )
 }
 
-/// Character size of a prompt, for the fallback trigger when the price table
-/// has no input limit for the model.
-pub(crate) fn prompt_chars(messages: &[Message]) -> u64 {
+/// Serialized size of a prompt, as it goes on the wire.
+///
+/// Measured on the JSON encoding rather than the message text, because that is
+/// what the request actually carries — role tags, keys and escaping included.
+pub(crate) fn prompt_size(messages: &[Message]) -> PromptSize {
     messages
         .iter()
-        .map(|message| serde_json::to_string(message).map(|s| s.len()).unwrap_or(0) as u64)
+        .map(|message| match serde_json::to_string(message) {
+            Ok(encoded) => PromptSize::of_str(&encoded),
+            Err(_) => PromptSize::default(),
+        })
         .sum()
 }
 
@@ -824,10 +920,13 @@ pub(crate) fn prompt_chars(messages: &[Message]) -> u64 {
 /// conversation sit under the compaction threshold on message text while the
 /// request that actually goes out is over the model's hard limit — which is the
 /// unrecoverable failure the pre-request trigger exists to prevent.
-pub(crate) fn tool_definition_chars(tools: &[crate::ToolDefinition]) -> u64 {
+pub(crate) fn tool_definition_size(tools: &[crate::ToolDefinition]) -> PromptSize {
     tools
         .iter()
-        .map(|tool| serde_json::to_string(tool).map(|s| s.len()).unwrap_or(0) as u64)
+        .map(|tool| match serde_json::to_string(tool) {
+            Ok(encoded) => PromptSize::of_str(&encoded),
+            Err(_) => PromptSize::default(),
+        })
         .sum()
 }
 
@@ -1170,6 +1269,50 @@ mod tests {
     }
 
     #[test]
+    fn prompt_size_over_estimates_rather_than_under_estimates_ascii() {
+        // The pre-request trigger has no provider count to work from, so it
+        // estimates. The estimate must lean high: compacting slightly early
+        // costs one summarizer call, while under-estimating lets a prompt reach
+        // the hard limit — and that failure is self-perpetuating, since the
+        // rejection happens before anything can shrink the history behind it.
+        //
+        // Real prompts run ~3.5-4 bytes/token; this must not sit above that.
+        let size = PromptSize::of_str(&"x".repeat(4_000));
+        assert!(size.estimated_tokens() > 1_000);
+        assert_eq!(PromptSize::default().estimated_tokens(), 0);
+        assert_eq!(PromptSize::of_str("x").estimated_tokens(), 1);
+    }
+
+    #[test]
+    fn prompt_size_charges_non_ascii_at_a_denser_token_rate() {
+        // A thousand ideographs are about a thousand tokens, not a third of
+        // that. Charging them at the ASCII rate is what lets a prompt already
+        // over the hard limit report comfortably under the threshold — and once
+        // the request is rejected, no response arrives for the accurate trigger
+        // to use, so every later turn repeats it.
+        let cjk = PromptSize::of_str(&"漢".repeat(1_000));
+        assert_eq!(cjk.bytes(), 3_000, "three UTF-8 bytes each");
+        assert!(
+            cjk.estimated_tokens() >= 1_000,
+            "{} tokens for 1000 ideographs",
+            cjk.estimated_tokens()
+        );
+
+        // ASCII of the same byte length stays at the looser rate, so the common
+        // case does not start compacting three times too eagerly.
+        let ascii = PromptSize::of_str(&"x".repeat(cjk.bytes() as usize));
+        assert!(ascii.estimated_tokens() < cjk.estimated_tokens());
+    }
+
+    #[test]
+    fn prompt_size_adds_without_losing_the_split() {
+        let total = PromptSize::of_str("abc") + PromptSize::of_str("漢");
+        assert_eq!(total.ascii_bytes, 3);
+        assert_eq!(total.other_bytes, 3);
+        assert_eq!(total.bytes(), 6);
+    }
+
+    #[test]
     fn should_compact_respects_the_enabled_flag() {
         let config = CompactionConfig {
             enabled: false,
@@ -1227,12 +1370,19 @@ mod tests {
         // `cap_summary` truncates only after the response is generated,
         // transferred and billed, so the request needs its own ceiling. It must
         // leave headroom, or a model that respects the character instruction
-        // gets clipped mid-sentence.
+        // gets clipped mid-sentence — and the densest scripts need about one
+        // token per character, so that is where the headroom has to be measured.
         let config = CompactionConfig::default();
         let bound = summarizer_max_output_tokens(config.max_summary_chars);
-        let needed = estimated_tokens_from_chars(u64::from(config.max_summary_chars)) as i64;
-        assert!(bound > needed, "no headroom: {bound} vs {needed}");
-        assert!(bound < needed * 10, "not a bound at all: {bound}");
+        let densest_compliant_summary = i64::from(config.max_summary_chars);
+        assert!(
+            bound >= densest_compliant_summary,
+            "a compliant CJK summary would be clipped: {bound} vs {densest_compliant_summary}"
+        );
+        assert!(
+            bound < densest_compliant_summary * 4,
+            "not a bound at all: {bound}"
+        );
         // A tiny cap must still permit a usable response.
         assert!(summarizer_max_output_tokens(1) >= 256);
     }
@@ -1245,7 +1395,9 @@ mod tests {
         // accurate post-response trigger never runs — the conversation is stuck.
         let config = CompactionConfig::default();
         let smallest_supported_window_tokens = 32_000u64;
-        let budget_in_tokens = estimated_tokens_from_chars(config.fallback_char_budget);
+        let budget_in_tokens =
+            PromptSize::of_str(&"x".repeat(config.fallback_char_budget as usize))
+                .estimated_tokens();
         assert!(
             budget_in_tokens < smallest_supported_window_tokens,
             "fallback budget estimates {budget_in_tokens} tokens, which a \

@@ -14,10 +14,10 @@ use lingua::universal::{ToolContentPart, ToolResultContentPart};
 use serde_json::json;
 
 use crate::compaction::{
-    CompactionOutcome, SummarizeInput, estimated_tokens_from_chars, previous_summary_message,
-    prompt_chars, read_active_checkpoint, read_summary, record_summarizer_usage,
+    CompactionOutcome, PromptSize, SummarizeInput, previous_summary_message, prompt_size,
+    read_active_checkpoint, read_summary_or_fall_back, record_summarizer_usage,
     resolve_summarizer_model, run_compaction, should_compact, summarizer_instruction,
-    summarizer_max_output_tokens, summary_message, tool_definition_chars,
+    summarizer_max_output_tokens, summary_message, tool_definition_size,
 };
 use crate::execution_tracing::TurnExecutionTrace;
 use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor};
@@ -91,7 +91,7 @@ pub(crate) struct CompactionTrigger<'a> {
     /// Provider-reported input occupancy, when a response has come back.
     pub(crate) prompt_tokens: Option<u64>,
     /// Serialized size of the request, messages and tool schemas together.
-    pub(crate) prompt_chars: u64,
+    pub(crate) prompt_size: PromptSize,
 }
 
 struct ToolRoundContext<'a> {
@@ -153,15 +153,21 @@ where
             // A checkpoint whose artifact has vanished is worse than none: it
             // would cut history out with nothing standing in for it. Fall back
             // to the full replay instead.
+            //
+            // A read that *errors* is treated identically, not propagated. The
+            // raw log is intact and materializing from it is always possible, so
+            // failing the turn over an unreadable summary would take a working
+            // conversation down over a recoverable artifact-store problem — and
+            // every later turn would consult the same checkpoint and fail the
+            // same way. This is what `readCheckpointSummary` already does in the
+            // TypeScript harness.
             None => match active {
-                Some((_, checkpoint)) => {
-                    read_summary(conversation, &checkpoint)
-                        .await?
-                        .map(|summary| CachedSummary {
-                            text: summary,
-                            up_to_event_id: checkpoint.up_to_event_id,
-                        })
-                }
+                Some((_, checkpoint)) => read_summary_or_fall_back(conversation, &checkpoint)
+                    .await
+                    .map(|summary| CachedSummary {
+                        text: summary,
+                        up_to_event_id: checkpoint.up_to_event_id,
+                    }),
                 None => None,
             },
         };
@@ -242,7 +248,7 @@ where
             model,
             max_input_tokens,
             prompt_tokens,
-            prompt_chars,
+            prompt_size,
         } = trigger;
         // At most one attempt per turn: compaction can only cut at a
         // `turn_ended` boundary, and none appears while a turn is in flight, so
@@ -252,7 +258,12 @@ where
             return false;
         }
         let config = agent_config.compaction.clone().unwrap_or_default();
-        if !should_compact(&config, prompt_tokens, max_input_tokens, prompt_chars) {
+        if !should_compact(
+            &config,
+            prompt_tokens,
+            max_input_tokens,
+            prompt_size.bytes(),
+        ) {
             return false;
         }
         *attempted = true;
@@ -275,7 +286,7 @@ where
             max_input_tokens,
             // Provider counts when a response has come back; the pessimistic
             // char estimate otherwise, the same input the trigger just used.
-            prompt_tokens.unwrap_or_else(|| estimated_tokens_from_chars(prompt_chars)),
+            prompt_tokens.unwrap_or_else(|| prompt_size.estimated_tokens()),
         );
         // Collected during the summarizer call and written below. Safe to write
         // right here, mid-round: it goes on a custom event, which prompt
@@ -412,8 +423,7 @@ where
             let max_input_tokens = self.pricing.max_input_tokens(&model);
             // Tools count too: they ride in the same request and consume the
             // same window, and a harness can register a lot of them.
-            let prompt_chars =
-                prompt_chars(&request.messages) + tool_definition_chars(&request.tools);
+            let prompt_size = prompt_size(&request.messages) + tool_definition_size(&request.tools);
 
             // Compact *before* sending when the prompt already looks too large.
             //
@@ -434,8 +444,8 @@ where
                     CompactionTrigger {
                         model: &model,
                         max_input_tokens,
-                        prompt_tokens: Some(estimated_tokens_from_chars(prompt_chars)),
-                        prompt_chars,
+                        prompt_tokens: Some(prompt_size.estimated_tokens()),
+                        prompt_size,
                     },
                     &mut compaction_attempted,
                 )
@@ -486,7 +496,7 @@ where
                     model: &model,
                     max_input_tokens,
                     prompt_tokens,
-                    prompt_chars,
+                    prompt_size,
                 },
                 &mut compaction_attempted,
             )

@@ -138,20 +138,43 @@ compacts earlier than necessary.
 and it runs between rounds rather than at turn start so a single runaway turn can
 bring its own prompt back under the limit.
 
-**Before each request**, from a character estimate of the assembled prompt. This
-one exists because the post-response trigger cannot fire on the case that matters
+**Before each request**, from a size estimate of the assembled prompt. This one
+exists because the post-response trigger cannot fire on the case that matters
 most: a prompt already past the hard limit is _rejected_, and that error leaves
 the turn before any compaction runs. The next turn replays the same oversized
-history and fails identically — an absorbing state that no retry escapes. The
-character estimate is deliberately pessimistic (3 chars/token) because the two
-errors are asymmetric: compacting slightly early costs one summarizer call, while
-failing to fire costs the conversation.
+history and fails identically — an absorbing state that no retry escapes.
 
 The estimate covers **messages and tool schemas**. Tools ride in the same request
 and consume the same window, and a harness can register a lot of them — sizing by
 messages alone lets a conversation sit under the threshold on message text while
 the request that actually goes out is over the limit, which is the very failure
 this trigger exists to catch.
+
+#### Measuring a prompt without a tokenizer
+
+`PromptSize` counts **UTF-8 bytes, split at ASCII**, and that shape is
+load-bearing twice over.
+
+Bytes, not characters, because a token is far closer to a fixed number of bytes
+than to a fixed number of characters. `String.length` in JavaScript is not even
+characters — it is UTF-16 code units, so a CJK ideograph reads as 1 where the
+wire carries 3. Measuring that way reported a third of true size for CJK-heavy
+prompts, and reporting a third of true size is exactly how a request sails past
+the hard limit with the trigger showing slack.
+
+Split at ASCII, because one byte-per-token ratio does not fit every script. ASCII
+prose runs about four bytes to the token and is charged at three — deliberately
+pessimistic, since the two errors are asymmetric: compacting slightly early costs
+one summarizer call, while failing to fire costs the conversation. Outside ASCII
+a character is two to four bytes and rarely cheaper than a token (a CJK ideograph
+is three bytes and usually one token, a Hangul syllable three bytes and often
+two, an emoji four bytes and sometimes several), so those bytes are charged at
+two.
+
+This is an estimate with a known error bound, not a tokenizer. It over-charges
+CJK by roughly half and can still under-charge the densest Hangul. The accurate
+provider count remains the real mechanism; this only has to be right enough to
+keep a prompt away from the wall.
 
 Both share a once-per-turn latch. No new `turn_ended` appears mid-turn, so the
 cut point cannot change within a turn; a second attempt would re-scan the log and
@@ -259,7 +282,12 @@ stopped shrinking.
 An empty summary is refused outright: checkpointing one would drop real history
 and put nothing in its place, which is strictly worse than a large prompt. A
 checkpoint whose artifact has vanished falls back to full history for the same
-reason.
+reason — and so does one whose artifact the store _refuses_. A missing artifact
+and an erroring read are different failures but the same situation: the raw log
+is intact either way, so propagating the error would take a working conversation
+down over something recoverable, and take it down repeatedly, since every later
+turn consults the same checkpoint. Losing the summary costs prompt space; losing
+the turn costs the agent.
 
 That fallback is also why an unreadable summary **stops the chain**. Compacting
 from a broken checkpoint's boundary would summarize only the tail and then write
@@ -403,6 +431,9 @@ summarizer for the same result.
 - Two compactions racing on one conversation resolve by the later one standing
   down, but only because it re-reads the head just before writing. Without a
   compare-and-append primitive there is still a window where both publish.
+- The prompt-size estimate is not a tokenizer. It is deliberately conservative
+  and script-aware, but a fixed byte-per-token ratio cannot be right for every
+  script at once; the provider's own count is the accurate mechanism.
 - Summaries are flat, not hierarchical. If a flat summary proves lossy in
   practice, tiered summaries are the next step.
 - Summary _quality_ is not covered by the test suite — the deterministic tests
