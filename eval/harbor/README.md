@@ -6,6 +6,20 @@ container, attaches it to an Exo conversation, and sends `task_started` through
 the Harbor adapter. When Exo sends `task_complete`, the agent detaches the
 container and returns from `run()`, allowing Harbor to run its verifier.
 
+## Lifecycle
+
+1. Harbor starts the task's Docker environment.
+2. `ExoAgent.setup()` creates or selects an Exo conversation and attaches
+   Harbor's running `main` container as its sandbox.
+3. `ExoAgent.run()` sends `task_started`; Exo works in that container and
+   replies with `task_complete`.
+4. `ExoAgent` detaches the container and returns, so Harbor can run its
+   verifier.
+5. `ContinualExoPlugin` sends the verification result back; Exo reflects and
+   replies with `feedback_processed` before Harbor advances to the next task.
+
+## Running Harbor x Exo
+
 Install the package in the same Python environment as Harbor:
 
 ```bash
