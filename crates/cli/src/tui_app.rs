@@ -860,7 +860,7 @@ impl TuiApp {
             "mouse released: select text freely, Ctrl+T to restore scrolling"
         };
         let status = Line::from(format!(
-            " {state} · verbosity {} · wheel/PgUp scroll · ↑↓ history · Esc follow · {mouse} · Ctrl+C quit",
+            " {state} · verbosity {} · {mouse} · Ctrl+C quit",
             self.verbosity
         ))
         .style(Style::new().dim());
