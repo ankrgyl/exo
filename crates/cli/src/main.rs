@@ -12,6 +12,7 @@ mod repl_tests;
 #[cfg(test)]
 mod secret_tests;
 mod tui;
+mod tui_app;
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -412,6 +413,9 @@ enum Commands {
         /// How much tool detail to print: minimal, compact, or full.
         #[arg(long, value_enum, default_value_t = Verbosity::default())]
         verbosity: Verbosity,
+        /// Prototype full-screen TUI instead of the line-mode repl.
+        #[arg(long)]
+        tui: bool,
     },
     Adapters {
         #[command(subcommand)]
@@ -857,6 +861,7 @@ async fn main() -> Result<()> {
             agent,
             conversation,
             verbosity,
+            tui,
         } => {
             let agent_slug =
                 agent.unwrap_or_else(|| default_repl_agent_slug(harness_selection.as_ref()));
@@ -930,7 +935,11 @@ async fn main() -> Result<()> {
                 }
             };
 
-            run_chat_repl(Arc::clone(&agent), conversation, verbosity).await?;
+            if tui {
+                tui_app::run_chat_tui(Arc::clone(&agent), conversation, verbosity).await?;
+            } else {
+                run_chat_repl(Arc::clone(&agent), conversation, verbosity).await?;
+            }
         }
         Commands::Agent { command } => match command {
             AgentCommands::List => {
@@ -2884,6 +2893,7 @@ mod create_tests {
                 agent: None,
                 conversation: None,
                 verbosity: crate::render::Verbosity::Compact,
+                tui: false,
             }
         ));
     }

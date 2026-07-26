@@ -1,0 +1,654 @@
+//! Prototype full-screen TUI for the chat repl (`exo repl --tui`).
+//!
+//! Unlike the line-mode repl, the transcript is app state we own, so streamed
+//! text, tool-call lines, and their `✓`/`✗` receipts are just mutations of a
+//! line buffer — no terminal tricks, and typing never interleaves with output.
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::Result;
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
+use executor::{
+    EventId, EventQuery, EventQueryDirection, ExecutionStreamEvent, HarnessAgent,
+    HarnessConversation, SendRequest, SessionId,
+};
+use lingua::Message;
+use lingua::universal::UserContent;
+use ratatui::prelude::*;
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use tokio::sync::mpsc;
+use tokio_stream::StreamExt;
+
+use crate::render::{
+    Verbosity, compact_result_status, compact_timestamp, render_tool_call, render_tool_result,
+    render_transcript_lines,
+};
+use crate::tui::{
+    ReplCommand, ReplInput, chunk_text, cost_lines, parse_repl_input, render_external_event,
+    rewind_lines, shell_lines, snapshot_lines, snapshots_lines, teleport_lines,
+};
+
+const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
+
+/// The input box grows with wrapped content up to this many text rows, then
+/// scrolls vertically.
+const MAX_INPUT_ROWS: u16 = 8;
+
+/// Wrap input at exact character boundaries so the cursor position stays a
+/// simple row/column computation (word-wrap would make it unpredictable).
+/// The cursor sits at the end, so a line that exactly fills the width rolls
+/// over to a fresh empty line.
+fn wrap_input_chars(input: &str, width: usize) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    let mut column = 0;
+    for ch in input.chars() {
+        if column == width {
+            lines.push(String::new());
+            column = 0;
+        }
+        lines.last_mut().expect("lines never empty").push(ch);
+        column += 1;
+    }
+    if column == width {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Everything the UI task can be woken by besides key presses.
+enum AppEvent {
+    Stream(ExecutionStreamEvent),
+    StreamError(String),
+    /// A send or background command finished; clear the busy state.
+    StreamDone,
+    /// Finished output of a background slash command.
+    CommandOutput(Vec<String>),
+    External(Vec<String>),
+}
+
+pub async fn run_chat_tui(
+    agent: Arc<dyn HarnessAgent>,
+    conversation: Arc<dyn HarnessConversation>,
+    verbosity: Verbosity,
+) -> Result<()> {
+    let terminal = ratatui::init();
+    // Capture the mouse so wheel motion reaches us as scroll events; without
+    // this the terminal fakes arrow keys, which would page the input history.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    let result = TuiApp::new(agent, conversation, verbosity)
+        .run(terminal)
+        .await;
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    ratatui::restore();
+    result
+}
+
+struct TuiApp {
+    agent: Arc<dyn HarnessAgent>,
+    conversation: Arc<dyn HarnessConversation>,
+    verbosity: Verbosity,
+    transcript: Vec<Line<'static>>,
+    input: String,
+    input_history: Vec<String>,
+    history_pos: Option<usize>,
+    /// Lines scrolled up from the bottom; 0 means follow new output.
+    scrollback: u16,
+    busy: bool,
+    spinner_frame: usize,
+    session_id: Option<SessionId>,
+    watch_after: Arc<Mutex<Option<EventId>>>,
+    /// Transcript index of the assistant line currently streaming.
+    open_assistant: Option<usize>,
+    /// Whether the streaming assistant message already got its prefix line.
+    assistant_prefixed: bool,
+    /// Transcript index of each unresolved tool-call line, by call id.
+    open_calls: HashMap<String, usize>,
+    /// Tool names by call id, for full-mode results and fallbacks.
+    pending_tool_names: HashMap<String, String>,
+}
+
+impl TuiApp {
+    fn new(
+        agent: Arc<dyn HarnessAgent>,
+        conversation: Arc<dyn HarnessConversation>,
+        verbosity: Verbosity,
+    ) -> Self {
+        let watch_after = Arc::new(Mutex::new(conversation.record().latest_event_id));
+        Self {
+            agent,
+            conversation,
+            verbosity,
+            transcript: Vec::new(),
+            input: String::new(),
+            input_history: Vec::new(),
+            history_pos: None,
+            scrollback: 0,
+            busy: false,
+            spinner_frame: 0,
+            session_id: None,
+            watch_after,
+            open_assistant: None,
+            assistant_prefixed: false,
+            open_calls: HashMap::new(),
+            pending_tool_names: HashMap::new(),
+        }
+    }
+
+    async fn run(mut self, mut terminal: ratatui::DefaultTerminal) -> Result<()> {
+        self.load_transcript().await?;
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let watcher = self.spawn_event_watcher(tx.clone());
+        let mut keys = EventStream::new();
+        let mut tick = tokio::time::interval(Duration::from_millis(120));
+
+        let outcome = loop {
+            terminal.draw(|frame| self.draw(frame))?;
+            tokio::select! {
+                key = keys.next() => match key {
+                    Some(Ok(event)) => {
+                        if self.handle_terminal_event(event, &tx).await? {
+                            break Ok(());
+                        }
+                    }
+                    Some(Err(error)) => break Err(error.into()),
+                    None => break Ok(()),
+                },
+                app_event = rx.recv() => {
+                    if let Some(app_event) = app_event {
+                        self.handle_app_event(app_event);
+                    }
+                }
+                _ = tick.tick() => {
+                    if self.busy {
+                        self.spinner_frame = self.spinner_frame.wrapping_add(1);
+                    }
+                }
+            }
+        };
+
+        watcher.abort();
+        if let Some(session_id) = self.session_id.take() {
+            self.conversation.close_session(session_id).await?;
+        }
+        outcome
+    }
+
+    async fn load_transcript(&mut self) -> Result<()> {
+        let messages = self.conversation.messages().await?;
+        self.transcript = render_transcript_lines(&messages, self.verbosity)
+            .iter()
+            .flat_map(|rendered| rendered.split('\n'))
+            .map(|line| style_transcript_line(line.to_string()))
+            .collect();
+        Ok(())
+    }
+
+    /// Returns true when the app should exit.
+    async fn handle_terminal_event(
+        &mut self,
+        event: Event,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) -> Result<bool> {
+        if let Event::Mouse(mouse) = event {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.scrollback = self.scrollback.saturating_add(3),
+                MouseEventKind::ScrollDown => self.scrollback = self.scrollback.saturating_sub(3),
+                _ => {}
+            }
+            return Ok(false);
+        }
+        let Event::Key(key) = event else {
+            return Ok(false);
+        };
+        if key.kind != KeyEventKind::Press {
+            return Ok(false);
+        }
+        match (key.modifiers, key.code) {
+            (KeyModifiers::CONTROL, KeyCode::Char('c') | KeyCode::Char('d')) => return Ok(true),
+            (KeyModifiers::CONTROL, KeyCode::Char('u')) => self.input.clear(),
+            (_, KeyCode::Enter) => return self.submit_input(tx).await,
+            (_, KeyCode::Backspace) => {
+                self.input.pop();
+            }
+            (_, KeyCode::Up) => self.history_step(-1),
+            (_, KeyCode::Down) => self.history_step(1),
+            (_, KeyCode::PageUp) => {
+                self.scrollback = self.scrollback.saturating_add(10);
+            }
+            (_, KeyCode::PageDown) => {
+                self.scrollback = self.scrollback.saturating_sub(10);
+            }
+            (_, KeyCode::Esc) => self.scrollback = 0,
+            (_, KeyCode::Char(ch)) => self.input.push(ch),
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    /// Returns true when the app should exit.
+    async fn submit_input(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) -> Result<bool> {
+        let line = std::mem::take(&mut self.input);
+        self.history_pos = None;
+        match parse_repl_input(&line) {
+            Ok(ReplInput::Empty) => {}
+            Ok(ReplInput::Chat(text)) => {
+                if self.busy {
+                    self.push_notice("still waiting on the previous turn");
+                    self.input = line;
+                    return Ok(false);
+                }
+                self.input_history.push(line);
+                self.push_user_line(&text);
+                self.start_send(text, tx.clone());
+            }
+            Ok(ReplInput::Command(command)) => {
+                self.input_history.push(line);
+                return self.execute_command(command, tx).await;
+            }
+            Err(error) => {
+                for rendered in error.to_string().lines() {
+                    self.push_notice(rendered);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Returns true when the app should exit.
+    async fn execute_command(
+        &mut self,
+        command: ReplCommand,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) -> Result<bool> {
+        // Sandbox and model operations run on a worker task so the UI keeps
+        // drawing; one at a time keeps their output readable.
+        if self.busy && !matches!(command, ReplCommand::Quit) {
+            self.push_notice("still waiting on the previous operation");
+            return Ok(false);
+        }
+        let conversation = Arc::clone(&self.conversation);
+        match command {
+            ReplCommand::Quit => return Ok(true),
+            ReplCommand::History => self.load_transcript().await?,
+            ReplCommand::Verbosity { level } => match level {
+                Some(verbosity) => {
+                    self.verbosity = verbosity;
+                    self.push_notice(&format!("verbosity set to {verbosity}"));
+                    self.load_transcript().await?;
+                }
+                None => {
+                    let verbosity = self.verbosity;
+                    self.push_notice(&format!("verbosity: {verbosity}"));
+                }
+            },
+            ReplCommand::Cost => {
+                self.spawn_command(tx, async move { cost_lines(conversation.as_ref()).await })
+            }
+            ReplCommand::Shell { command } => {
+                let agent = Arc::clone(&self.agent);
+                self.spawn_command(tx, async move {
+                    shell_lines(agent.as_ref(), conversation.as_ref(), command).await
+                });
+            }
+            ReplCommand::Snapshot { sandbox_id } => self.spawn_command(tx, async move {
+                snapshot_lines(conversation.as_ref(), sandbox_id).await
+            }),
+            ReplCommand::Snapshots => {
+                self.spawn_command(
+                    tx,
+                    async move { snapshots_lines(conversation.as_ref()).await },
+                )
+            }
+            ReplCommand::Rewind { snapshot_id } => self.spawn_command(tx, async move {
+                rewind_lines(conversation.as_ref(), &snapshot_id).await
+            }),
+            ReplCommand::Teleport { provider } => self.spawn_command(tx, async move {
+                teleport_lines(conversation.as_ref(), &provider).await
+            }),
+        }
+        Ok(false)
+    }
+
+    /// Run a slash command on a worker task, feeding its finished output back
+    /// through the app-event channel.
+    fn spawn_command(
+        &mut self,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+        work: impl Future<Output = Vec<String>> + Send + 'static,
+    ) {
+        self.busy = true;
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let lines = work.await;
+            let _ = tx.send(AppEvent::CommandOutput(lines));
+            let _ = tx.send(AppEvent::StreamDone);
+        });
+    }
+
+    fn start_send(&mut self, text: String, tx: mpsc::UnboundedSender<AppEvent>) {
+        self.busy = true;
+        self.open_assistant = None;
+        self.assistant_prefixed = false;
+        self.open_calls.clear();
+        let conversation = Arc::clone(&self.conversation);
+        let session_id = self.session_id;
+        tokio::spawn(async move {
+            let request = SendRequest {
+                input: vec![Message::User {
+                    content: UserContent::String(text),
+                }],
+                session_id,
+            };
+            match conversation.send_stream(request).await {
+                Ok(mut stream) => {
+                    while let Some(event) = stream.next().await {
+                        let app_event = match event {
+                            Ok(event) => AppEvent::Stream(event),
+                            Err(error) => AppEvent::StreamError(format!("{error:#}")),
+                        };
+                        if tx.send(app_event).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(AppEvent::StreamError(format!("{error:#}")));
+                }
+            }
+            let _ = tx.send(AppEvent::StreamDone);
+        });
+    }
+
+    fn handle_app_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::Stream(event) => self.handle_stream_event(event),
+            AppEvent::StreamError(error) => self.push_notice(&format!("stream error: {error}")),
+            AppEvent::StreamDone => {
+                self.busy = false;
+                self.open_assistant = None;
+                self.assistant_prefixed = false;
+            }
+            AppEvent::CommandOutput(lines) => {
+                for line in lines {
+                    // Tabs come from table-shaped output; ratatui renders
+                    // them poorly.
+                    self.transcript
+                        .push(style_transcript_line(line.replace('\t', "    ")));
+                }
+            }
+            AppEvent::External(lines) => {
+                for rendered in lines {
+                    for line in rendered.split('\n') {
+                        self.transcript
+                            .push(style_transcript_line(line.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_stream_event(&mut self, event: ExecutionStreamEvent) {
+        match event {
+            ExecutionStreamEvent::FirstChunk { .. } => {}
+            ExecutionStreamEvent::Chunk(chunk) => {
+                let text = chunk_text(&chunk);
+                if !text.is_empty() {
+                    self.append_assistant_text(&text);
+                }
+            }
+            ExecutionStreamEvent::ToolCall {
+                tool_call_id,
+                tool_name,
+                arguments,
+            } => {
+                self.open_assistant = None;
+                self.assistant_prefixed = false;
+                if let Some(rendered) = render_tool_call(&tool_name, &arguments, self.verbosity) {
+                    for (index, line) in rendered.lines().enumerate() {
+                        self.transcript
+                            .push(style_transcript_line(line.to_string()));
+                        if index == 0 && self.verbosity == Verbosity::Compact {
+                            self.open_calls
+                                .insert(tool_call_id.clone(), self.transcript.len() - 1);
+                        }
+                    }
+                }
+                self.pending_tool_names.insert(tool_call_id, tool_name);
+            }
+            ExecutionStreamEvent::ToolResult {
+                tool_call_id,
+                result,
+            } => {
+                let tool_name = self
+                    .pending_tool_names
+                    .remove(&tool_call_id)
+                    .unwrap_or_else(|| "tool".to_string());
+                if let Some(index) = self.open_calls.remove(&tool_call_id) {
+                    let status = compact_result_status(&result);
+                    self.transcript[index]
+                        .spans
+                        .push(Span::styled(format!(" {status}"), status_style(&status)));
+                } else if let Some(rendered) =
+                    render_tool_result(&tool_name, &result, self.verbosity)
+                {
+                    for line in rendered.lines() {
+                        self.transcript
+                            .push(style_transcript_line(line.to_string()));
+                    }
+                }
+            }
+            ExecutionStreamEvent::Completed(result) => {
+                self.session_id = Some(result.session_id);
+                *self.watch_after.lock().expect("watch cursor poisoned") =
+                    Some(result.latest_event_id);
+            }
+        }
+    }
+
+    fn append_assistant_text(&mut self, text: &str) {
+        for (index, piece) in text.split('\n').enumerate() {
+            if index > 0 {
+                self.open_assistant = None;
+            }
+            if piece.is_empty() {
+                continue;
+            }
+            let line_index = match self.open_assistant {
+                Some(line_index) => line_index,
+                None => {
+                    // Only the first line of a message carries the prefix;
+                    // continuation lines stay bare.
+                    let prefix = if self.assistant_prefixed {
+                        String::new()
+                    } else {
+                        self.assistant_prefixed = true;
+                        format!("{} assistant: ", compact_timestamp())
+                    };
+                    self.transcript.push(Line::from(vec![
+                        Span::styled(prefix, Style::new().dim()),
+                        Span::raw(String::new()),
+                    ]));
+                    let line_index = self.transcript.len() - 1;
+                    self.open_assistant = Some(line_index);
+                    line_index
+                }
+            };
+            if let Some(span) = self.transcript[line_index].spans.last_mut() {
+                span.content.to_mut().push_str(piece);
+            }
+        }
+    }
+
+    fn push_user_line(&mut self, text: &str) {
+        self.transcript.push(Line::from(vec![
+            Span::styled(
+                format!("{} user: ", compact_timestamp()),
+                Style::new().dim(),
+            ),
+            Span::styled(text.to_string(), Style::new().bold()),
+        ]));
+        self.scrollback = 0;
+    }
+
+    fn push_notice(&mut self, text: &str) {
+        self.transcript
+            .push(Line::styled(text.to_string(), Style::new().dim().italic()));
+    }
+
+    fn history_step(&mut self, direction: isize) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let last = self.input_history.len() - 1;
+        let next = match (self.history_pos, direction) {
+            (None, -1) => Some(last),
+            (None, _) => None,
+            (Some(0), -1) => Some(0),
+            (Some(pos), -1) => Some(pos - 1),
+            (Some(pos), 1) if pos < last => Some(pos + 1),
+            (Some(_), 1) => {
+                self.history_pos = None;
+                self.input.clear();
+                return;
+            }
+            (pos, _) => pos,
+        };
+        if let Some(pos) = next {
+            self.history_pos = Some(pos);
+            self.input = self.input_history[pos].clone();
+        }
+    }
+
+    fn spawn_event_watcher(
+        &self,
+        tx: mpsc::UnboundedSender<AppEvent>,
+    ) -> tokio::task::JoinHandle<()> {
+        let conversation = self.conversation.exoharness_handle();
+        let watch_after = Arc::clone(&self.watch_after);
+        let verbosity = self.verbosity;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let cursor = *watch_after.lock().expect("watch cursor poisoned");
+                let Ok(result) = conversation
+                    .get_events(Some(EventQuery {
+                        cursor,
+                        direction: Some(EventQueryDirection::Asc),
+                        limit: Some(100),
+                        session_id: None,
+                        turn_id: None,
+                        types: None,
+                    }))
+                    .await
+                else {
+                    return;
+                };
+                for event in result.events {
+                    *watch_after.lock().expect("watch cursor poisoned") = Some(event.id);
+                    let lines = render_external_event(&event.data, verbosity);
+                    if !lines.is_empty() && tx.send(AppEvent::External(lines)).is_err() {
+                        return;
+                    }
+                }
+            }
+        })
+    }
+
+    fn draw(&mut self, frame: &mut Frame) {
+        // The input box wraps and grows with its content (bounded), so its
+        // height must be known before the layout is split.
+        let input_width = usize::from(frame.area().width.saturating_sub(2)).max(1);
+        let input_lines = wrap_input_chars(&self.input, input_width);
+        let input_height = (input_lines.len() as u16).min(MAX_INPUT_ROWS) + 2;
+
+        let [transcript_area, input_area, status_area] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(input_height),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+
+        let title = format!(
+            " {} · {} ",
+            self.agent.record().slug,
+            self.conversation.record().slug
+        );
+        // Count lines before attaching the block: line_count includes the
+        // block's border rows, which would over-scroll by two.
+        let transcript =
+            Paragraph::new(Text::from(self.transcript.clone())).wrap(Wrap { trim: false });
+        let inner_width = transcript_area.width.saturating_sub(2);
+        let inner_height = transcript_area.height.saturating_sub(2);
+        let total = transcript.line_count(inner_width) as u16;
+        let bottom = total.saturating_sub(inner_height);
+        self.scrollback = self.scrollback.min(bottom);
+        let scroll = bottom - self.scrollback;
+        frame.render_widget(
+            transcript
+                .scroll((scroll, 0))
+                .block(Block::new().borders(Borders::ALL).title(title)),
+            transcript_area,
+        );
+
+        // Once the input outgrows its bounded height, scroll vertically so
+        // the cursor row (always the last line) stays visible.
+        let cursor_col = input_lines.last().map_or(0, |line| line.chars().count()) as u16;
+        let total_rows = input_lines.len() as u16;
+        let input_scroll = total_rows.saturating_sub(MAX_INPUT_ROWS);
+        let input = Paragraph::new(Text::from(
+            input_lines.into_iter().map(Line::from).collect::<Vec<_>>(),
+        ))
+        .scroll((input_scroll, 0))
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" message or /command "),
+        );
+        frame.render_widget(input, input_area);
+        frame.set_cursor_position(Position::new(
+            input_area.x + 1 + cursor_col,
+            input_area.y + 1 + (total_rows - 1 - input_scroll),
+        ));
+
+        let state = if self.busy {
+            format!("{} thinking…", SPINNER[self.spinner_frame % SPINNER.len()])
+        } else {
+            "idle".to_string()
+        };
+        let status = Line::from(format!(
+            " {state} · verbosity {} · wheel/PgUp scroll · ↑↓ history · Esc follow · Ctrl+C quit",
+            self.verbosity
+        ))
+        .style(Style::new().dim());
+        frame.render_widget(Paragraph::new(status), status_area);
+    }
+}
+
+/// Basic styling for pre-rendered transcript strings, keyed off the line
+/// shape the render module produces.
+fn style_transcript_line(line: String) -> Line<'static> {
+    let style = if line.starts_with('→') || line.starts_with('←') {
+        Style::new().cyan()
+    } else if line.contains("] user: ") {
+        Style::new().bold()
+    } else {
+        Style::new()
+    };
+    Line::styled(line, style)
+}
+
+fn status_style(status: &str) -> Style {
+    if status.starts_with('✓') {
+        Style::new().green()
+    } else {
+        Style::new().red()
+    }
+}

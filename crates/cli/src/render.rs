@@ -67,12 +67,18 @@ pub(crate) fn print_message(message: &Message, verbosity: Verbosity) {
 /// Print a whole transcript. In compact mode, each tool result is folded into
 /// its originating call line (`→ shell: ls ✓`) instead of printing separately.
 pub(crate) fn print_transcript(messages: &[Message], verbosity: Verbosity) {
-    let fold = (verbosity == Verbosity::Compact).then(|| TranscriptFold::new(messages));
-    for message in messages {
-        for line in render_message_lines(message, verbosity, fold.as_ref()) {
-            println!("{line}");
-        }
+    for line in render_transcript_lines(messages, verbosity) {
+        println!("{line}");
     }
+}
+
+/// A whole transcript as display lines, with compact-mode result folding.
+pub(crate) fn render_transcript_lines(messages: &[Message], verbosity: Verbosity) -> Vec<String> {
+    let fold = (verbosity == Verbosity::Compact).then(|| TranscriptFold::new(messages));
+    messages
+        .iter()
+        .flat_map(|message| render_message_lines(message, verbosity, fold.as_ref()))
+        .collect()
 }
 
 /// Result statuses collected across a transcript so compact call lines can

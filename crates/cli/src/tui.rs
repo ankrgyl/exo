@@ -36,13 +36,13 @@ const REMOTE_HISTORY_PAGE_SIZE: u32 = 32;
 // clap's built-in `help` subcommand serves `/help`.
 #[derive(Debug, clap::Parser)]
 #[command(name = "repl", multicall = true, about = "repl slash commands")]
-struct ReplCli {
+pub(crate) struct ReplCli {
     #[command(subcommand)]
     command: ReplCommand,
 }
 
 #[derive(Debug, PartialEq, clap::Subcommand)]
-enum ReplCommand {
+pub(crate) enum ReplCommand {
     /// Exit the repl
     #[command(alias = "exit")]
     Quit,
@@ -74,7 +74,7 @@ enum ReplCommand {
 
 /// What a line of repl input means.
 #[derive(Debug, PartialEq)]
-enum ReplInput {
+pub(crate) enum ReplInput {
     Empty,
     /// Plain chat text for the model.
     Chat(String),
@@ -87,7 +87,7 @@ enum ReplFlow {
     Quit,
 }
 
-fn parse_repl_input(line: &str) -> Result<ReplInput, clap::Error> {
+pub(crate) fn parse_repl_input(line: &str) -> Result<ReplInput, clap::Error> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Ok(ReplInput::Empty);
@@ -476,90 +476,6 @@ impl ChatRepl {
         Ok(())
     }
 
-    /// Summarize token usage and dollar cost for this conversation from the
-    /// `usage` records on its `messages` events. Paginates so it covers the
-    /// whole conversation, not just one page.
-    async fn print_cost(&self) -> Result<()> {
-        let handle = self.conversation.exoharness_handle();
-        let mut cursor: Option<EventId> = None;
-        let mut per_model: BTreeMap<String, ModelCost> = BTreeMap::new();
-        let mut unpriced = 0usize;
-        loop {
-            let result = handle
-                .get_events(Some(EventQuery {
-                    cursor,
-                    direction: Some(EventQueryDirection::Desc),
-                    limit: Some(REMOTE_HISTORY_PAGE_SIZE),
-                    session_id: None,
-                    turn_id: None,
-                    types: Some(vec![EventKind::MESSAGES]),
-                }))
-                .await?;
-            for event in &result.events {
-                if let EventData::Messages {
-                    usage: Some(usage), ..
-                } = &event.data
-                {
-                    let entry = per_model.entry(usage.model.clone()).or_default();
-                    entry.calls += 1;
-                    entry.prompt += usage.prompt_tokens.unwrap_or(0);
-                    entry.cached += usage.prompt_cached_tokens.unwrap_or(0);
-                    entry.completion += usage.completion_tokens.unwrap_or(0);
-                    match usage.cost_usd {
-                        Some(cost) => entry.cost += cost,
-                        None => unpriced += 1,
-                    }
-                }
-            }
-            match result.cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
-
-        if per_model.is_empty() {
-            println!("no recorded model usage in this conversation yet");
-            return Ok(());
-        }
-
-        let mut total = ModelCost::default();
-        println!(
-            "{:<28} {:>6} {:>10} {:>10} {:>10} {:>12}",
-            "MODEL", "CALLS", "PROMPT", "CACHED", "OUT", "COST"
-        );
-        for (model, c) in &per_model {
-            println!(
-                "{:<28} {:>6} {:>10} {:>10} {:>10} {:>12}",
-                truncate(model, 28),
-                c.calls,
-                c.prompt,
-                c.cached,
-                c.completion,
-                fmt_usd(c.cost),
-            );
-            total.calls += c.calls;
-            total.prompt += c.prompt;
-            total.cached += c.cached;
-            total.completion += c.completion;
-            total.cost += c.cost;
-        }
-        println!(
-            "{:<28} {:>6} {:>10} {:>10} {:>10} {:>12}",
-            "TOTAL",
-            total.calls,
-            total.prompt,
-            total.cached,
-            total.completion,
-            fmt_usd(total.cost),
-        );
-        if unpriced > 0 {
-            println!(
-                "note: {unpriced} call(s) had no price (model not in the price table); cost excludes them"
-            );
-        }
-        Ok(())
-    }
-
     async fn run(&mut self) -> Result<()> {
         loop {
             let prompt = format!("{}> ", self.conversation.record().slug);
@@ -608,14 +524,11 @@ impl ChatRepl {
     }
 
     async fn execute_command(&mut self, command: ReplCommand) -> Result<ReplFlow> {
+        let conversation = self.conversation.as_ref();
         match command {
             ReplCommand::Quit => return Ok(ReplFlow::Quit),
             ReplCommand::History => self.print_transcript().await?,
-            ReplCommand::Cost => {
-                if let Err(error) = self.print_cost().await {
-                    println!("cost summary failed: {error:#}");
-                }
-            }
+            ReplCommand::Cost => print_lines(cost_lines(conversation).await),
             ReplCommand::Verbosity { level } => match level {
                 Some(verbosity) => {
                     self.verbosity = verbosity;
@@ -624,119 +537,18 @@ impl ChatRepl {
                 None => println!("verbosity: {}", self.verbosity),
             },
             ReplCommand::Shell { command } => self.run_shell(&command).await?,
-            ReplCommand::Snapshot { sandbox_id } => match self.snapshot_sandbox(sandbox_id).await {
-                Ok(snapshot_id) => println!("snapshot {snapshot_id}"),
-                Err(error) => println!("snapshot failed: {error:#}"),
-            },
-            ReplCommand::Snapshots => match self.list_snapshots().await {
-                Ok(snapshots) if snapshots.is_empty() => {
-                    println!("no snapshots yet for this conversation");
-                }
-                Ok(snapshots) => {
-                    println!("SNAPSHOT\tTAKEN\tSANDBOX");
-                    for (snapshot_id, sandbox_id) in snapshots {
-                        // Snapshot ids are uuid7, so creation time is embedded
-                        // in the id itself.
-                        let taken = snapshot_id
-                            .timestamp()
-                            .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                            .unwrap_or_else(|| "-".to_string());
-                        println!("{snapshot_id}\t{taken}\t{sandbox_id}");
-                    }
-                }
-                Err(error) => println!("listing snapshots failed: {error:#}"),
-            },
-            ReplCommand::Rewind { snapshot_id } => {
-                match self.rewind_to_snapshot(&snapshot_id).await {
-                    Ok(()) => println!("rewound to snapshot {snapshot_id}"),
-                    Err(error) => println!("rewind failed: {error:#}"),
-                }
+            ReplCommand::Snapshot { sandbox_id } => {
+                print_lines(snapshot_lines(conversation, sandbox_id).await);
             }
-            ReplCommand::Teleport { provider } => match self.teleport_sandbox(&provider).await {
-                Ok((sandbox_id, provider)) => {
-                    println!("sandbox {sandbox_id} teleported to {provider}");
-                }
-                Err(error) => println!("teleport failed: {error:#}"),
-            },
+            ReplCommand::Snapshots => print_lines(snapshots_lines(conversation).await),
+            ReplCommand::Rewind { snapshot_id } => {
+                print_lines(rewind_lines(conversation, &snapshot_id).await);
+            }
+            ReplCommand::Teleport { provider } => {
+                print_lines(teleport_lines(conversation, &provider).await);
+            }
         }
         Ok(ReplFlow::Continue)
-    }
-
-    async fn snapshot_sandbox(&self, explicit_id: Option<SandboxId>) -> Result<SnapshotId> {
-        let sandbox_id = match explicit_id {
-            Some(id) => id,
-            None => latest_sandbox_id(self.conversation.as_ref())
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("no sandbox has been created in this conversation yet")
-                })?,
-        };
-        let id = self
-            .conversation
-            .exoharness_handle()
-            .snapshot_sandbox(sandbox_id)
-            .await?;
-        Ok(id)
-    }
-
-    async fn list_snapshots(&self) -> Result<Vec<(SnapshotId, SandboxId)>> {
-        list_snapshots(self.conversation.as_ref()).await
-    }
-
-    /// Teleport the conversation's live sandbox to another provider: snapshot
-    /// it where it runs now, then restore that snapshot under the target
-    /// provider. The sandbox id is stable across the move; only the backend
-    /// (and the machine actually running the container) changes.
-    async fn teleport_sandbox(&self, provider_str: &str) -> Result<(SandboxId, SandboxProvider)> {
-        let provider = provider_str
-            .parse::<SandboxProvider>()
-            .map_err(|error| anyhow::anyhow!("invalid provider `{provider_str}`: {error}"))?;
-        let sandbox_id = latest_sandbox_id(self.conversation.as_ref())
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!("no sandbox has been created in this conversation yet")
-            })?;
-        println!("snapshotting sandbox {sandbox_id}...");
-        let snapshot_id = self
-            .conversation
-            .exoharness_handle()
-            .snapshot_sandbox(sandbox_id.clone())
-            .await?;
-        println!("snapshot {snapshot_id} captured; restoring on {provider}...");
-        self.conversation
-            .exoharness_handle()
-            .start_sandbox(StartSandboxRequest {
-                id: sandbox_id.clone(),
-                snapshot_id,
-                idle_seconds: None,
-                provider: Some(provider),
-            })
-            .await?;
-        Ok((sandbox_id, provider))
-    }
-
-    /// Restore the conversation's sandbox to a previously-taken snapshot.
-    /// Stops the current container, decodes the snapshot payload, and starts
-    /// a fresh container from that state.
-    async fn rewind_to_snapshot(&self, snapshot_id_str: &str) -> Result<()> {
-        let snapshot_id = snapshot_id_str
-            .parse::<SnapshotId>()
-            .map_err(|error| anyhow::anyhow!("invalid snapshot id `{snapshot_id_str}`: {error}"))?;
-        let sandbox_id = sandbox_id_for_snapshot(self.conversation.as_ref(), snapshot_id)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!("snapshot {snapshot_id} not found in this conversation")
-            })?;
-        self.conversation
-            .exoharness_handle()
-            .start_sandbox(StartSandboxRequest {
-                id: sandbox_id,
-                snapshot_id,
-                idle_seconds: None,
-                provider: None,
-            })
-            .await?;
-        Ok(())
     }
 
     async fn send(&mut self, input: &str) -> Result<()> {
@@ -894,12 +706,7 @@ impl ChatRepl {
     }
 
     async fn run_shell(&self, command: &str) -> Result<()> {
-        let mut config = self.conversation.config().await?;
-        if config.shell_program.is_none() {
-            config.shell_program = Some(DEFAULT_SHELL_PROGRAM.to_string());
-            self.conversation.put_config(config).await?;
-        }
-        let output = run_sandbox_shell_command(
+        let output = shell_output(
             self.agent.as_ref(),
             self.conversation.as_ref(),
             command.to_string(),
@@ -914,7 +721,7 @@ impl ChatRepl {
     }
 }
 
-fn chunk_text(chunk: &UniversalStreamChunk) -> String {
+pub(crate) fn chunk_text(chunk: &UniversalStreamChunk) -> String {
     let mut text = String::new();
     for choice in &chunk.choices {
         if let Some(delta) = choice.delta_view()
@@ -935,7 +742,7 @@ fn print_ttft(ttft: Duration) {
     }
 }
 
-fn render_external_event(data: &EventData, verbosity: Verbosity) -> Vec<String> {
+pub(crate) fn render_external_event(data: &EventData, verbosity: Verbosity) -> Vec<String> {
     let EventData::Messages { messages, .. } = data else {
         return Vec::new();
     };
@@ -1005,6 +812,272 @@ fn truncate(value: &str, max: usize) -> String {
     } else {
         format!("{}…", &value[..max.saturating_sub(1)])
     }
+}
+
+fn print_lines(lines: Vec<String>) {
+    for line in lines {
+        println!("{line}");
+    }
+}
+
+/// `/cost` output: summarize token usage and dollar cost for the conversation
+/// from the `usage` records on its `messages` events. Paginates so it covers
+/// the whole conversation, not just one page.
+pub(crate) async fn cost_lines(conversation: &dyn HarnessConversation) -> Vec<String> {
+    match cost_summary(conversation).await {
+        Ok(lines) => lines,
+        Err(error) => vec![format!("cost summary failed: {error:#}")],
+    }
+}
+
+async fn cost_summary(conversation: &dyn HarnessConversation) -> Result<Vec<String>> {
+    let handle = conversation.exoharness_handle();
+    let mut cursor: Option<EventId> = None;
+    let mut per_model: BTreeMap<String, ModelCost> = BTreeMap::new();
+    let mut unpriced = 0usize;
+    loop {
+        let result = handle
+            .get_events(Some(EventQuery {
+                cursor,
+                direction: Some(EventQueryDirection::Desc),
+                limit: Some(REMOTE_HISTORY_PAGE_SIZE),
+                session_id: None,
+                turn_id: None,
+                types: Some(vec![EventKind::MESSAGES]),
+            }))
+            .await?;
+        for event in &result.events {
+            if let EventData::Messages {
+                usage: Some(usage), ..
+            } = &event.data
+            {
+                let entry = per_model.entry(usage.model.clone()).or_default();
+                entry.calls += 1;
+                entry.prompt += usage.prompt_tokens.unwrap_or(0);
+                entry.cached += usage.prompt_cached_tokens.unwrap_or(0);
+                entry.completion += usage.completion_tokens.unwrap_or(0);
+                match usage.cost_usd {
+                    Some(cost) => entry.cost += cost,
+                    None => unpriced += 1,
+                }
+            }
+        }
+        match result.cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    if per_model.is_empty() {
+        return Ok(vec![
+            "no recorded model usage in this conversation yet".to_string(),
+        ]);
+    }
+
+    let mut lines = Vec::new();
+    let mut total = ModelCost::default();
+    lines.push(format!(
+        "{:<28} {:>6} {:>10} {:>10} {:>10} {:>12}",
+        "MODEL", "CALLS", "PROMPT", "CACHED", "OUT", "COST"
+    ));
+    for (model, c) in &per_model {
+        lines.push(format!(
+            "{:<28} {:>6} {:>10} {:>10} {:>10} {:>12}",
+            truncate(model, 28),
+            c.calls,
+            c.prompt,
+            c.cached,
+            c.completion,
+            fmt_usd(c.cost),
+        ));
+        total.calls += c.calls;
+        total.prompt += c.prompt;
+        total.cached += c.cached;
+        total.completion += c.completion;
+        total.cost += c.cost;
+    }
+    lines.push(format!(
+        "{:<28} {:>6} {:>10} {:>10} {:>10} {:>12}",
+        "TOTAL",
+        total.calls,
+        total.prompt,
+        total.cached,
+        total.completion,
+        fmt_usd(total.cost),
+    ));
+    if unpriced > 0 {
+        lines.push(format!(
+            "note: {unpriced} call(s) had no price (model not in the price table); cost excludes them"
+        ));
+    }
+    Ok(lines)
+}
+
+/// `/snapshot` output: snapshot the given sandbox, or the conversation's
+/// latest one when no id is given.
+pub(crate) async fn snapshot_lines(
+    conversation: &dyn HarnessConversation,
+    explicit_id: Option<SandboxId>,
+) -> Vec<String> {
+    match snapshot_sandbox(conversation, explicit_id).await {
+        Ok(snapshot_id) => vec![format!("snapshot {snapshot_id}")],
+        Err(error) => vec![format!("snapshot failed: {error:#}")],
+    }
+}
+
+async fn snapshot_sandbox(
+    conversation: &dyn HarnessConversation,
+    explicit_id: Option<SandboxId>,
+) -> Result<SnapshotId> {
+    let sandbox_id = match explicit_id {
+        Some(id) => id,
+        None => latest_sandbox_id(conversation).await?.ok_or_else(|| {
+            anyhow::anyhow!("no sandbox has been created in this conversation yet")
+        })?,
+    };
+    let id = conversation
+        .exoharness_handle()
+        .snapshot_sandbox(sandbox_id)
+        .await?;
+    Ok(id)
+}
+
+/// `/snapshots` output: every snapshot taken in the conversation.
+pub(crate) async fn snapshots_lines(conversation: &dyn HarnessConversation) -> Vec<String> {
+    match list_snapshots(conversation).await {
+        Ok(snapshots) if snapshots.is_empty() => {
+            vec!["no snapshots yet for this conversation".to_string()]
+        }
+        Ok(snapshots) => {
+            let mut lines = vec!["SNAPSHOT\tTAKEN\tSANDBOX".to_string()];
+            for (snapshot_id, sandbox_id) in snapshots {
+                // Snapshot ids are uuid7, so creation time is embedded in the
+                // id itself.
+                let taken = snapshot_id
+                    .timestamp()
+                    .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                lines.push(format!("{snapshot_id}\t{taken}\t{sandbox_id}"));
+            }
+            lines
+        }
+        Err(error) => vec![format!("listing snapshots failed: {error:#}")],
+    }
+}
+
+/// `/rewind` output: restore the conversation's sandbox to a previous
+/// snapshot. Stops the current container, decodes the snapshot payload, and
+/// starts a fresh container from that state.
+pub(crate) async fn rewind_lines(
+    conversation: &dyn HarnessConversation,
+    snapshot_id: &str,
+) -> Vec<String> {
+    match rewind_to_snapshot(conversation, snapshot_id).await {
+        Ok(()) => vec![format!("rewound to snapshot {snapshot_id}")],
+        Err(error) => vec![format!("rewind failed: {error:#}")],
+    }
+}
+
+async fn rewind_to_snapshot(
+    conversation: &dyn HarnessConversation,
+    snapshot_id_str: &str,
+) -> Result<()> {
+    let snapshot_id = snapshot_id_str
+        .parse::<SnapshotId>()
+        .map_err(|error| anyhow::anyhow!("invalid snapshot id `{snapshot_id_str}`: {error}"))?;
+    let sandbox_id = sandbox_id_for_snapshot(conversation, snapshot_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("snapshot {snapshot_id} not found in this conversation"))?;
+    conversation
+        .exoharness_handle()
+        .start_sandbox(StartSandboxRequest {
+            id: sandbox_id,
+            snapshot_id,
+            idle_seconds: None,
+            provider: None,
+        })
+        .await?;
+    Ok(())
+}
+
+/// `/teleport` output: move the conversation's live sandbox to another
+/// provider by snapshotting it where it runs now, then restoring that
+/// snapshot under the target provider. The sandbox id is stable across the
+/// move; only the backend (and the machine actually running the container)
+/// changes.
+pub(crate) async fn teleport_lines(
+    conversation: &dyn HarnessConversation,
+    provider: &str,
+) -> Vec<String> {
+    match teleport_sandbox(conversation, provider).await {
+        Ok((sandbox_id, provider)) => {
+            vec![format!("sandbox {sandbox_id} teleported to {provider}")]
+        }
+        Err(error) => vec![format!("teleport failed: {error:#}")],
+    }
+}
+
+async fn teleport_sandbox(
+    conversation: &dyn HarnessConversation,
+    provider_str: &str,
+) -> Result<(SandboxId, SandboxProvider)> {
+    let provider = provider_str
+        .parse::<SandboxProvider>()
+        .map_err(|error| anyhow::anyhow!("invalid provider `{provider_str}`: {error}"))?;
+    let sandbox_id = latest_sandbox_id(conversation)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no sandbox has been created in this conversation yet"))?;
+    let snapshot_id = conversation
+        .exoharness_handle()
+        .snapshot_sandbox(sandbox_id.clone())
+        .await?;
+    conversation
+        .exoharness_handle()
+        .start_sandbox(StartSandboxRequest {
+            id: sandbox_id.clone(),
+            snapshot_id,
+            idle_seconds: None,
+            provider: Some(provider),
+        })
+        .await?;
+    Ok((sandbox_id, provider))
+}
+
+/// `/shell` output as display lines. The line-mode repl streams raw bytes to
+/// stdout/stderr instead; this is for UIs that own the screen.
+pub(crate) async fn shell_lines(
+    agent: &dyn HarnessAgent,
+    conversation: &dyn HarnessConversation,
+    command: String,
+) -> Vec<String> {
+    match shell_output(agent, conversation, command).await {
+        Ok(output) => {
+            let mut lines: Vec<String> = output
+                .stdout
+                .lines()
+                .chain(output.stderr.lines())
+                .map(str::to_string)
+                .collect();
+            if output.exit_code != 0 {
+                lines.push(format!("[exit {}]", output.exit_code));
+            }
+            lines
+        }
+        Err(error) => vec![format!("shell failed: {error:#}")],
+    }
+}
+
+async fn shell_output(
+    agent: &dyn HarnessAgent,
+    conversation: &dyn HarnessConversation,
+    command: String,
+) -> Result<crate::SandboxShellOutput> {
+    let mut config = conversation.config().await?;
+    if config.shell_program.is_none() {
+        config.shell_program = Some(DEFAULT_SHELL_PROGRAM.to_string());
+        conversation.put_config(config).await?;
+    }
+    run_sandbox_shell_command(agent, conversation, command).await
 }
 
 /// Walk the conversation's event log to find the latest `SandboxCreated`
