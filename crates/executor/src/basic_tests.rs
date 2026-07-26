@@ -2109,10 +2109,15 @@ async fn a_summary_that_would_grow_the_prompt_is_not_published() {
     )
     .await;
 
-    let CompactionOutcome::Skipped { reason } = outcome else {
+    let CompactionOutcome::Skipped { reason, retryable } = outcome else {
         panic!("a summary larger than the span it replaces must not be published, got {outcome:?}");
     };
     assert!(reason.contains("larger than the history"), "{reason}");
+    assert!(
+        retryable,
+        "a summary that came back too large is model output, not a property of \
+         the log — another attempt at this boundary can shrink it"
+    );
     assert!(
         checkpoint_events(conversation.as_ref()).await.is_empty(),
         "no checkpoint should have been written"
@@ -2158,10 +2163,15 @@ async fn a_summary_that_shrinks_bytes_but_grows_tokens_is_not_published() {
     )
     .await;
 
-    let CompactionOutcome::Skipped { reason } = outcome else {
+    let CompactionOutcome::Skipped { reason, retryable } = outcome else {
         panic!("a summary that grows the token count must not be published, got {outcome:?}");
     };
     assert!(reason.contains("larger than the history"), "{reason}");
+    assert!(
+        retryable,
+        "a summary that came back too large is model output, not a property of \
+         the log — another attempt at this boundary can shrink it"
+    );
     assert!(
         checkpoint_events(conversation.as_ref()).await.is_empty(),
         "no checkpoint should have been written"
@@ -2467,6 +2477,82 @@ async fn a_transient_compaction_failure_is_retried_within_the_turn() {
         5,
         "a failed attempt must not settle the latch: the store may recover \
          mid-turn, and the prompt is still over the threshold"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_summary_is_retried_within_the_turn() {
+    // "The summary came back larger than the history it would replace" is a
+    // fact about *this* model output, not about the log. Settling on it would
+    // let one unusually verbose or token-dense summary suppress every later
+    // attempt in the turn while the prompt kept growing toward the wall.
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(
+        conversation.as_ref(),
+        &["ancient", "older", "old", "recent"],
+    )
+    .await;
+
+    // Every summary comes back compliant on characters and far too dense in
+    // bytes and tokens, so the post-summarization check refuses to publish.
+    let bloated = "😀".repeat(5_000);
+    let responses: Vec<ModelResponse> = (0..5)
+        .map(|_| ModelResponse {
+            provider_cost_usd: None,
+            response_id: Some(Uuid7::now()),
+            messages: vec![assistant_message(&bloated)],
+            tool_calls: vec![],
+            usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
+        })
+        .collect();
+    let model = Arc::new(FakeModelClient::new(responses));
+    let executor = BasicExecutor::new(Arc::clone(&model), Arc::new(FakeToolRuntime::default()));
+    let turn = open_turn(conversation.as_ref()).await;
+    let agent_config = AgentConfig {
+        compaction: Some(CompactionConfig {
+            keep_recent_turns: 1,
+            fallback_char_budget: 0,
+            ..CompactionConfig::default()
+        }),
+        ..default_agent_config()
+    };
+
+    let mut latch = CompactionLatch::default();
+    for _ in 0..5 {
+        executor
+            .maybe_compact(
+                conversation.as_ref(),
+                turn.as_ref(),
+                &agent_config,
+                crate::basic::CompactionTrigger {
+                    model: "test-model",
+                    max_input_tokens: None,
+                    prompt_tokens: None,
+                    prompt_size: PromptSize {
+                        ascii_bytes: 1_000,
+                        other_bytes: 0,
+                        chars: 1_000,
+                    },
+                    round: 0,
+                    turn_trace: None,
+                },
+                &mut latch,
+            )
+            .await;
+    }
+
+    assert_eq!(
+        model.observed_requests().len(),
+        5,
+        "a summary that happened to come back too large must not settle the \
+         latch: the next call can produce one that fits"
+    );
+    assert!(
+        checkpoint_events(conversation.as_ref()).await.is_empty(),
+        "and none of them should have been published"
     );
 }
 

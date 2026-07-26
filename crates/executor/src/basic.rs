@@ -394,7 +394,12 @@ where
         // next attempt, and marking before the attempt (as this did) let one
         // blip suppress every later check in the turn while the prompt kept
         // growing toward the wall the feature exists to avoid.
-        if !matches!(outcome, CompactionOutcome::Failed { .. }) {
+        let settles = match &outcome {
+            CompactionOutcome::Failed { .. } => false,
+            CompactionOutcome::Skipped { retryable, .. } => !retryable,
+            CompactionOutcome::Compacted { .. } => true,
+        };
+        if settles {
             latch.mark_attempted(latest_turn_ended);
         }
 
@@ -414,7 +419,7 @@ where
             // The prompt crossed the threshold but nothing was compacted, so it
             // will cross again next round. Both cases are worth seeing in logs:
             // they are why a conversation's context stops shrinking.
-            CompactionOutcome::Skipped { reason } => {
+            CompactionOutcome::Skipped { reason, .. } => {
                 tracing::debug!(%conversation_id, %reason, "compaction skipped");
                 false
             }

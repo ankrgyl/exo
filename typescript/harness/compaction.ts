@@ -637,11 +637,11 @@ export class CompactionGate {
    * in `turn-loop.ts` cannot be mutation-checked, because nothing tests that
    * file.
    */
-  settle(
-    latestTurnEnded: string | null,
-    status: CompactionResult["status"],
-  ): void {
-    if (status === "failed") {
+  settle(latestTurnEnded: string | null, result: CompactionResult): void {
+    if (result.status === "failed") {
+      return;
+    }
+    if (result.status === "skipped" && result.retryable) {
       return;
     }
     this.markAttempted(latestTurnEnded);
@@ -1083,7 +1083,20 @@ export interface RunCompactionArgs {
 
 export type CompactionResult =
   | { status: "compacted"; checkpoint: CompactionCheckpoint }
-  | { status: "skipped"; reason: string }
+  | {
+      status: "skipped";
+      reason: string;
+      /**
+       * Whether the same boundary could produce a different answer later.
+       *
+       * Most skips are settled facts about the log: not enough completed turns,
+       * a span already smaller than the cap. One is not — a summary that came
+       * back too large is a fact about *this* model output, and the next call
+       * can differ. Treating that as deterministic lets one unusually verbose
+       * summary suppress every later attempt in the turn.
+       */
+      retryable: boolean;
+    }
   | { status: "failed"; error: string };
 
 /**
@@ -1145,7 +1158,11 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
   });
   const cut = selectCutPoint(scan.events, policy.keepRecentTurns);
   if (cut === null) {
-    return { status: "skipped", reason: "not enough completed turns to cut" };
+    return {
+      status: "skipped",
+      reason: "not enough completed turns to cut",
+      retryable: false,
+    };
   }
 
   const cutIndex = scan.events.findIndex((e) => e.id === cut.upToEventId);
@@ -1166,6 +1183,7 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
     return {
       status: "skipped",
       reason: "compactable history is already smaller than the summary cap",
+      retryable: false,
     };
   }
 
@@ -1203,6 +1221,9 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
     return {
       status: "skipped",
       reason: "the summary came back larger than the history it would replace",
+      // Model output, not a property of the log: another attempt at this same
+      // boundary can produce a summary that does shrink it.
+      retryable: true,
     };
   }
 
@@ -1249,6 +1270,9 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
       status: "skipped",
       reason:
         "another compaction published a checkpoint while this one was summarizing",
+      // The other pass shrank the prompt; the threshold check decides whether
+      // anything more is needed, and it will see the new size.
+      retryable: false,
     };
   }
 

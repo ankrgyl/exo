@@ -43,6 +43,7 @@ import {
   inputOccupancy,
   maxInputTokens,
   maxOutputTokens,
+  type PricingTable,
 } from "@exo/model-runtime/cost";
 
 import { resolveLlmBinding } from "./shared";
@@ -207,12 +208,12 @@ async function runResponsesTurnLoop(
             round,
             input,
             summarizerUsage,
-            maxOutputTokens(preflightTable, summaryModel),
+            preflightTable,
           ),
       });
       await recordSummarizerUsage(context, summarizerUsage.usage);
       summarizerUsage.usage = undefined;
-      compaction.settle(preflight.latestTurnEnded, result.status);
+      compaction.settle(preflight.latestTurnEnded, result);
       if (result.status === "compacted") {
         // The checkpoint just written replaces the prefix this prompt was built
         // from, so rebuild it before sending.
@@ -315,12 +316,12 @@ async function runResponsesTurnLoop(
             round,
             input,
             summarizerUsage,
-            maxOutputTokens(table, summaryModel),
+            table,
           ),
       });
       await recordSummarizerUsage(context, summarizerUsage.usage);
       summarizerUsage.usage = undefined;
-      compaction.settle(roundAttempt.latestTurnEnded, result.status);
+      compaction.settle(roundAttempt.latestTurnEnded, result);
       if (result.status === "compacted") {
         // The cache holds exactly the prefix that was just replaced.
         history.invalidate();
@@ -402,10 +403,11 @@ async function summarizeWithModel(
   // Filled with what this call cost. Written on a custom event, which prompt
   // assembly ignores outright — see `COMPACTION_USAGE_EVENT`.
   usageSink: { usage: JsonObject | undefined },
-  // What this model will accept in one response, or null when the price table
-  // does not say. Threaded in rather than looked up here so the clamp has one
-  // implementation, in the module that is tested.
-  modelMaxOutputTokens: number | null,
+  // The price table, not a precomputed ceiling: the model is not settled until
+  // `runCompaction` has seen the span — a rebuild from the start of the log
+  // switches to the agent's model — so a ceiling derived from the *configured*
+  // summary model can be one the model actually used will reject.
+  pricing: PricingTable,
 ): Promise<string> {
   const response = await runtime.complete(
     {
@@ -420,7 +422,7 @@ async function summarizeWithModel(
       // outright, which would fail every summarizer call rather than one.
       maxOutputTokens: summarizerMaxOutputTokens(
         input.maxChars,
-        modelMaxOutputTokens,
+        maxOutputTokens(pricing, input.model),
       ),
     },
     { parent: turnParent, roundIndex: round },

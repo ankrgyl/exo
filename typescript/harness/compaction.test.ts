@@ -1022,7 +1022,21 @@ describe("CompactionGate", () => {
     // failure path.
     const gate = new CompactionGate();
     expect(gate.shouldAttempt(args, boundary)).toBe(true);
-    gate.settle(boundary, "failed");
+    gate.settle(boundary, { status: "failed", error: "summarizer down" });
+    expect(gate.shouldAttempt(args, boundary)).toBe(true);
+  });
+
+  it("does not settle on a skip that another attempt could answer differently", () => {
+    // "The summary came back larger than the history it would replace" is a
+    // fact about *this* model output, not about the log. Settling on it lets
+    // one unusually verbose or token-dense summary suppress every later attempt
+    // in the turn while the prompt keeps growing.
+    const gate = new CompactionGate();
+    gate.settle(boundary, {
+      status: "skipped",
+      reason: "the summary came back larger than the history it would replace",
+      retryable: true,
+    });
     expect(gate.shouldAttempt(args, boundary)).toBe(true);
   });
 
@@ -1031,11 +1045,18 @@ describe("CompactionGate", () => {
     // completed turns, a span smaller than the cap — and re-scanning the log
     // every round for it is the cost the gate exists to avoid.
     const gate = new CompactionGate();
-    gate.settle(boundary, "skipped");
+    gate.settle(boundary, {
+      status: "skipped",
+      reason: "not enough completed turns to cut",
+      retryable: false,
+    });
     expect(gate.shouldAttempt(args, boundary)).toBe(false);
 
     const succeeded = new CompactionGate();
-    succeeded.settle(boundary, "compacted");
+    succeeded.settle(boundary, {
+      status: "compacted",
+      checkpoint: {} as CompactionCheckpoint,
+    });
     expect(succeeded.shouldAttempt(args, boundary)).toBe(false);
   });
 

@@ -563,6 +563,14 @@ pub(crate) enum CompactionOutcome {
     },
     Skipped {
         reason: String,
+        /// Whether the same boundary could produce a different answer later.
+        ///
+        /// Most skips are settled facts about the log: not enough completed
+        /// turns, a span already smaller than the cap. One is not — a summary
+        /// that came back too large is a fact about *this* model output, and
+        /// the next call can differ. Treating that as deterministic lets one
+        /// unusually verbose summary suppress every later attempt in the turn.
+        retryable: bool,
     },
     Failed {
         error: String,
@@ -713,6 +721,7 @@ async fn compact(
     let Some(cut) = select_cut_point(&scan.events, config.keep_recent_turns) else {
         return Ok(CompactionOutcome::Skipped {
             reason: "not enough completed turns to cut".to_string(),
+            retryable: false,
         });
     };
 
@@ -741,6 +750,7 @@ async fn compact(
     ) {
         return Ok(CompactionOutcome::Skipped {
             reason: "compactable history is already smaller than the summary cap".to_string(),
+            retryable: false,
         });
     }
 
@@ -778,6 +788,9 @@ async fn compact(
     if summary_would_not_shrink(span_size, previous_summary_size, &summary) {
         return Ok(CompactionOutcome::Skipped {
             reason: "the summary came back larger than the history it would replace".to_string(),
+            // Model output, not a property of the log: another attempt at this
+            // same boundary can produce a summary that does shrink it.
+            retryable: true,
         });
     }
 
@@ -829,6 +842,9 @@ async fn compact(
         return Ok(CompactionOutcome::Skipped {
             reason: "another compaction published a checkpoint while this one was summarizing"
                 .to_string(),
+            // The other pass shrank the prompt; the threshold check decides
+            // whether anything more is needed, and it will see the new size.
+            retryable: false,
         });
     }
 
