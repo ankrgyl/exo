@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -282,7 +283,13 @@ struct TuiApp {
     history_pos: Option<usize>,
     /// Lines scrolled up from the bottom; 0 means follow new output.
     scrollback: u16,
-    busy: bool,
+    /// A turn or command is in flight. Shared with the event watcher, which
+    /// pauses while set so it never re-renders messages the streaming path
+    /// already displayed.
+    busy: Arc<AtomicBool>,
+    /// Whether the terminal reports mouse events to us (wheel scrolling).
+    /// Toggled off to let the terminal's native text selection work.
+    mouse_captured: bool,
     spinner_frame: usize,
     session_id: Option<SessionId>,
     watch_after: Arc<Mutex<Option<EventId>>>,
@@ -312,7 +319,8 @@ impl TuiApp {
             input_history: Vec::new(),
             history_pos: None,
             scrollback: 0,
-            busy: false,
+            busy: Arc::new(AtomicBool::new(false)),
+            mouse_captured: true,
             spinner_frame: 0,
             session_id: None,
             watch_after,
@@ -349,7 +357,7 @@ impl TuiApp {
                     }
                 }
                 _ = tick.tick() => {
-                    if self.busy {
+                    if self.is_busy() {
                         self.spinner_frame = self.spinner_frame.wrapping_add(1);
                     }
                 }
@@ -401,6 +409,16 @@ impl TuiApp {
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c') | KeyCode::Char('d')) => return Ok(true),
             (KeyModifiers::CONTROL, KeyCode::Char('u')) => self.input.clear(),
+            // Release the mouse so the terminal's native text selection works,
+            // at the cost of wheel scrolling; toggle back when done.
+            (KeyModifiers::CONTROL, KeyCode::Char('t')) => {
+                self.mouse_captured = !self.mouse_captured;
+                let _ = if self.mouse_captured {
+                    crossterm::execute!(std::io::stdout(), EnableMouseCapture)
+                } else {
+                    crossterm::execute!(std::io::stdout(), DisableMouseCapture)
+                };
+            }
             (KeyModifiers::ALT, KeyCode::Enter) => self.input.push('\n'),
             (_, KeyCode::Enter) => return self.submit_input(tx).await,
             (_, KeyCode::Backspace) => {
@@ -435,7 +453,7 @@ impl TuiApp {
         match parse_repl_input(&line) {
             Ok(ReplInput::Empty) => {}
             Ok(ReplInput::Chat(text)) => {
-                if self.busy {
+                if self.is_busy() {
                     self.push_notice("still waiting on the previous turn");
                     self.input = line;
                     return Ok(false);
@@ -465,7 +483,7 @@ impl TuiApp {
     ) -> Result<bool> {
         // Sandbox and model operations run on a worker task so the UI keeps
         // drawing; one at a time keeps their output readable.
-        if self.busy && !matches!(command, ReplCommand::Quit) {
+        if self.is_busy() && !matches!(command, ReplCommand::Quit) {
             self.push_notice("still waiting on the previous operation");
             return Ok(false);
         }
@@ -518,7 +536,7 @@ impl TuiApp {
         tx: &mpsc::UnboundedSender<AppEvent>,
         work: impl Future<Output = Vec<String>> + Send + 'static,
     ) {
-        self.busy = true;
+        self.busy.store(true, Ordering::Relaxed);
         let tx = tx.clone();
         tokio::spawn(async move {
             let lines = work.await;
@@ -528,7 +546,7 @@ impl TuiApp {
     }
 
     fn start_send(&mut self, text: String, tx: mpsc::UnboundedSender<AppEvent>) {
-        self.busy = true;
+        self.busy.store(true, Ordering::Relaxed);
         self.open_assistant = None;
         self.assistant_prefixed = false;
         self.open_calls.clear();
@@ -566,7 +584,7 @@ impl TuiApp {
             AppEvent::Stream(event) => self.handle_stream_event(event),
             AppEvent::StreamError(error) => self.push_notice(&format!("stream error: {error}")),
             AppEvent::StreamDone => {
-                self.busy = false;
+                self.busy.store(false, Ordering::Relaxed);
                 self.open_assistant = None;
                 self.assistant_prefixed = false;
             }
@@ -697,6 +715,10 @@ impl TuiApp {
             .push(Line::styled(text.to_string(), Style::new().dim().italic()));
     }
 
+    fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::Relaxed)
+    }
+
     fn history_step(&mut self, direction: isize) {
         if self.input_history.is_empty() {
             return;
@@ -727,11 +749,19 @@ impl TuiApp {
     ) -> tokio::task::JoinHandle<()> {
         let conversation = self.conversation.exoharness_handle();
         let watch_after = Arc::clone(&self.watch_after);
+        let busy = Arc::clone(&self.busy);
         let verbosity = self.verbosity;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
                 interval.tick().await;
+                // While a turn streams, the watcher's cursor lags the events
+                // being written; polling now would replay messages the
+                // streaming path already rendered. `Completed` advances the
+                // cursor before busy clears.
+                if busy.load(Ordering::Relaxed) {
+                    continue;
+                }
                 let cursor = *watch_after.lock().expect("watch cursor poisoned");
                 let Ok(result) = conversation
                     .get_events(Some(EventQuery {
@@ -813,13 +843,18 @@ impl TuiApp {
             input_area.y + 1 + (total_rows - 1 - input_scroll),
         ));
 
-        let state = if self.busy {
+        let state = if self.is_busy() {
             format!("{} thinking…", SPINNER[self.spinner_frame % SPINNER.len()])
         } else {
             "idle".to_string()
         };
+        let mouse = if self.mouse_captured {
+            "Ctrl+T to select text"
+        } else {
+            "mouse released: select text freely, Ctrl+T to restore scrolling"
+        };
         let status = Line::from(format!(
-            " {state} · verbosity {} · wheel/PgUp scroll · ↑↓ history · Esc follow · Ctrl+C quit",
+            " {state} · verbosity {} · wheel/PgUp scroll · ↑↓ history · Esc follow · {mouse} · Ctrl+C quit",
             self.verbosity
         ))
         .style(Style::new().dim());
