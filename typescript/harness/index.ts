@@ -1,4 +1,15 @@
 import type { ToolModuleExport } from "./tool-modules";
+import {
+  COMPACTION_CHECKPOINT_EVENT,
+  checkpointFromEvent,
+  type CompactionCheckpoint,
+  type RawCompactionConfig,
+} from "./compaction";
+
+// Compaction is part of the harness's public surface: executors trigger it and
+// agent tools inspect it. `compaction.ts` imports only types from here, so the
+// cycle is erased at compile time.
+export * from "./compaction";
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
@@ -37,6 +48,8 @@ export interface AgentConfig {
   model: string;
   maxOutputTokens?: number | null;
   maxToolRoundTrips?: number | null;
+  /** Raw shape from the exoharness; resolve with `resolveCompactionPolicy`. */
+  compaction?: RawCompactionConfig | null;
   braintrust?: unknown;
 }
 
@@ -584,14 +597,156 @@ export async function getMessages(
   return messages;
 }
 
+/** Event kinds that carry prompt content. */
+export const HISTORY_EVENT_TYPES = [
+  "messages",
+  "tool_requested",
+  "tool_result",
+] as const;
+
+/**
+ * The newest compaction checkpoint, or null if this conversation has never been
+ * compacted. One bounded `desc` query — the same shape the codex harness uses to
+ * find its warm-session marker.
+ */
+export async function readActiveCheckpoint(
+  conversation: Conversation,
+): Promise<CompactionCheckpoint | null> {
+  const result = await conversation.getEvents({
+    direction: "desc",
+    limit: 1,
+    types: [COMPACTION_CHECKPOINT_EVENT],
+  });
+  const event = result.events[0];
+  return event ? checkpointFromEvent(event.data) : null;
+}
+
+/**
+ * Prompt history for a conversation.
+ *
+ * With no checkpoint this replays the whole log, exactly as it always has. With
+ * one, the compacted prefix is replaced by its summary and only events after the
+ * checkpoint are scanned. The raw log is never touched, so anything the summary
+ * loses is still recoverable through `getEvents`.
+ */
 export async function materializeConversationMessages(
   conversation: Conversation,
 ): Promise<Message[]> {
+  const checkpoint = await readActiveCheckpoint(conversation);
+  const summary = checkpoint
+    ? await readCheckpointSummary(conversation, checkpoint)
+    : null;
+
+  // A checkpoint whose artifact has vanished is worse than no checkpoint: it
+  // would silently cut history out of the prompt with nothing standing in for
+  // it. Fall back to the full replay instead — a big prompt beats a holed one.
+  const cursor = summary === null ? null : checkpoint?.upToEventId;
+
   const result = await conversation.getEvents({
     direction: "asc",
-    types: ["messages", "tool_requested", "tool_result"],
+    cursor,
+    types: [...HISTORY_EVENT_TYPES],
   });
-  return materializeEventsToMessages(result.events);
+  const history = materializeEventsToMessages(result.events);
+  return summary === null ? history : [summaryMessage(summary), ...history];
+}
+
+async function readCheckpointSummary(
+  conversation: Conversation,
+  checkpoint: CompactionCheckpoint,
+): Promise<string | null> {
+  try {
+    return await conversation.readArtifactText({
+      artifactId: checkpoint.artifactId,
+      version: checkpoint.artifactVersion,
+    });
+  } catch {
+    // Treated the same as a missing artifact: fall back to full history rather
+    // than fail the turn over a summary we can reconstruct next time.
+    return null;
+  }
+}
+
+/**
+ * Incremental prompt history for one turn.
+ *
+ * The turn loop materializes on every model round, and re-reading the whole
+ * event log each time makes a turn cost O(rounds x events). This holds the
+ * events already fetched and extends them with a cursor query per round, so the
+ * full scan happens once.
+ *
+ * It caches raw *events*, not derived messages, and re-folds them each round.
+ * The fold is in-memory and cheap; the fetch is what hurts. Keeping the fold
+ * whole also means the output is identical to an uncached materialization by
+ * construction — including tool rounds that span a batch boundary, which a
+ * cache over derived messages would get wrong.
+ */
+export class PromptHistoryCache {
+  private primed = false;
+  private cursor: string | null = null;
+  private events: Event[] = [];
+  private summary: string | null = null;
+
+  async materialize(conversation: Conversation): Promise<Message[]> {
+    if (!this.primed) {
+      await this.prime(conversation);
+    } else {
+      const result = await conversation.getEvents({
+        direction: "asc",
+        cursor: this.cursor,
+        types: [...HISTORY_EVENT_TYPES],
+      });
+      if (result.events.length > 0) {
+        this.events.push(...result.events);
+        this.cursor = result.events.at(-1)?.id ?? this.cursor;
+      }
+    }
+    const history = materializeEventsToMessages(this.events);
+    return this.summary === null
+      ? history
+      : [summaryMessage(this.summary), ...history];
+  }
+
+  /**
+   * Drop everything and rebuild on the next call. Compaction replaces exactly
+   * the prefix this cache holds, so failing to invalidate would silently
+   * resurrect the history that was just compacted away.
+   */
+  invalidate(): void {
+    this.primed = false;
+    this.cursor = null;
+    this.events = [];
+    this.summary = null;
+  }
+
+  private async prime(conversation: Conversation): Promise<void> {
+    const checkpoint = await readActiveCheckpoint(conversation);
+    this.summary = checkpoint
+      ? await readCheckpointSummary(conversation, checkpoint)
+      : null;
+    const start = this.summary === null ? null : checkpoint?.upToEventId;
+    const result = await conversation.getEvents({
+      direction: "asc",
+      cursor: start,
+      types: [...HISTORY_EVENT_TYPES],
+    });
+    this.events = result.events;
+    // Fall back to the checkpoint id on an empty page so the next round still
+    // reads incrementally instead of re-scanning from the top.
+    this.cursor = result.events.at(-1)?.id ?? start ?? null;
+    this.primed = true;
+  }
+}
+
+/**
+ * How a summary is presented to the model. `developer` rather than `user` so it
+ * reads as context the harness supplied, not as something the user said.
+ */
+export function summaryMessage(summary: string): Message {
+  return {
+    role: "developer",
+    content: `Summary of earlier conversation history that has been compacted out of this prompt. Treat it as an accurate record of what happened before. The full raw history is still available through the conversation event log if you need detail this summary omits.\n\n${summary}`,
+  };
 }
 
 export function materializeEventsToMessages(events: Event[]): Message[] {

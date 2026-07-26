@@ -1,0 +1,447 @@
+import { describe, expect, it } from "vitest";
+
+import { COMPACTION_CHECKPOINT_EVENT, checkpointToPayload } from "./compaction";
+import {
+  PromptHistoryCache,
+  materializeConversationMessages,
+  materializePromptMessages,
+  readActiveCheckpoint,
+  type ArtifactVersion,
+  type Conversation,
+  type Event,
+  type EventQuery,
+  type GetEventsResult,
+  type Message,
+} from "./index";
+
+// --- a Conversation stub that records how it was queried ---------------------
+//
+// Recording the queries matters as much as the messages: compaction is only
+// worth anything if the read path actually narrows the event scan, and a stub
+// that ignores `cursor` would let a broken implementation pass.
+
+interface StubOptions {
+  events: Event[];
+  artifacts?: Map<string, string>;
+}
+
+class StubConversation {
+  readonly queries: EventQuery[] = [];
+  readonly artifactReads: string[] = [];
+  private readonly events: Event[];
+  private readonly artifacts: Map<string, string>;
+
+  constructor(options: StubOptions) {
+    this.events = options.events;
+    this.artifacts = options.artifacts ?? new Map();
+  }
+
+  append(...events: Event[]): void {
+    this.events.push(...events);
+  }
+
+  async getEvents(query?: EventQuery): Promise<GetEventsResult> {
+    this.queries.push(query ?? {});
+    let events = [...this.events];
+    if (query?.types) {
+      const types = new Set(query.types);
+      events = events.filter((event) => types.has(event.data.type));
+    }
+    if (query?.direction === "desc") {
+      events.reverse();
+      if (query.cursor) {
+        events = events.filter((event) => event.id < query.cursor!);
+      }
+    } else if (query?.cursor) {
+      // Matches the exoharness contract: the cursor is exclusive.
+      events = events.filter((event) => event.id > query.cursor!);
+    }
+    if (query?.limit != null) {
+      events = events.slice(0, query.limit);
+    }
+    return { events, cursor: events.at(-1)?.id };
+  }
+
+  async readArtifactText(args: {
+    artifactId: string;
+    version?: number;
+  }): Promise<string | null> {
+    this.artifactReads.push(args.artifactId);
+    return this.artifacts.get(args.artifactId) ?? null;
+  }
+
+  async listArtifacts(): Promise<ArtifactVersion[]> {
+    throw new Error(
+      "listArtifacts must not be called: the checkpoint carries the artifact id",
+    );
+  }
+}
+
+function asConversation(stub: StubConversation): Conversation {
+  return stub as unknown as Conversation;
+}
+
+// --- event builders ----------------------------------------------------------
+
+let nextId = 0;
+function event(type: string, extra: Record<string, unknown> = {}): Event {
+  nextId += 1;
+  return {
+    id: `evt-${String(nextId).padStart(6, "0")}`,
+    conversationId: "conv-1",
+    createdAt: new Date(0).toISOString(),
+    data: { type, ...extra },
+  };
+}
+
+function userMessage(text: string): Event {
+  return event("messages", { messages: [{ role: "user", content: text }] });
+}
+
+function turn(text: string): Event[] {
+  return [userMessage(text), event("turn_ended")];
+}
+
+function checkpointEvent(args: {
+  upToEventId: string;
+  artifactId: string;
+}): Event {
+  return event(COMPACTION_CHECKPOINT_EVENT, {
+    ...checkpointToPayload({
+      upToEventId: args.upToEventId,
+      artifactId: args.artifactId,
+      artifactPath: "compaction/conv-1/1.md",
+      artifactVersion: 1,
+      previousCheckpointId: null,
+      compactedEventCount: 4,
+      summaryChars: 20,
+      promptTokensBefore: 100,
+      model: "test-model",
+    }),
+  });
+}
+
+function texts(messages: Message[]): string[] {
+  return messages.map((message) =>
+    typeof message.content === "string"
+      ? message.content
+      : JSON.stringify(message.content),
+  );
+}
+
+// --- tests -------------------------------------------------------------------
+
+describe("materializeConversationMessages without a checkpoint", () => {
+  it("returns the full history, exactly as before", async () => {
+    const events = [...turn("one"), ...turn("two")];
+    const stub = new StubConversation({ events });
+    const messages = await materializeConversationMessages(
+      asConversation(stub),
+    );
+    expect(texts(messages)).toEqual(["one", "two"]);
+  });
+});
+
+describe("materializeConversationMessages with a checkpoint", () => {
+  it("replaces compacted history with the summary and keeps the tail", async () => {
+    const older = [...turn("ancient"), ...turn("old")];
+    const cut = older.at(-1)!;
+    const checkpoint = checkpointEvent({
+      upToEventId: cut.id,
+      artifactId: "art-1",
+    });
+    const recent = turn("recent");
+    const stub = new StubConversation({
+      events: [...older, checkpoint, ...recent],
+      artifacts: new Map([["art-1", "SUMMARY: the user likes tea"]]),
+    });
+
+    const messages = await materializeConversationMessages(
+      asConversation(stub),
+    );
+    const rendered = texts(messages);
+
+    expect(
+      rendered.some((t) => t.includes("SUMMARY: the user likes tea")),
+    ).toBe(true);
+    expect(rendered).toContain("recent");
+    expect(rendered).not.toContain("ancient");
+    expect(rendered).not.toContain("old");
+  });
+
+  it("puts the summary before the retained tail", async () => {
+    const older = turn("ancient");
+    const checkpoint = checkpointEvent({
+      upToEventId: older.at(-1)!.id,
+      artifactId: "art-1",
+    });
+    const stub = new StubConversation({
+      events: [...older, checkpoint, ...turn("recent")],
+      artifacts: new Map([["art-1", "SUMMARY"]]),
+    });
+
+    const rendered = texts(
+      await materializeConversationMessages(asConversation(stub)),
+    );
+    const summaryIndex = rendered.findIndex((t) => t.includes("SUMMARY"));
+    const tailIndex = rendered.indexOf("recent");
+    expect(summaryIndex).toBeGreaterThanOrEqual(0);
+    expect(summaryIndex).toBeLessThan(tailIndex);
+  });
+
+  it("scans only events after the checkpoint", async () => {
+    const older = [...turn("a"), ...turn("b"), ...turn("c")];
+    const checkpoint = checkpointEvent({
+      upToEventId: older.at(-1)!.id,
+      artifactId: "art-1",
+    });
+    const stub = new StubConversation({
+      events: [...older, checkpoint, ...turn("recent")],
+      artifacts: new Map([["art-1", "SUMMARY"]]),
+    });
+
+    await materializeConversationMessages(asConversation(stub));
+
+    // The history scan must carry the checkpoint's cursor. Without it the
+    // prompt would shrink but the read would still be O(whole log).
+    const historyQuery = stub.queries.find((q) =>
+      q.types?.includes("messages"),
+    );
+    expect(historyQuery?.cursor).toBe(checkpoint.data.up_to_event_id);
+  });
+
+  it("resolves the summary by artifact id, not by listing artifacts", async () => {
+    const older = turn("ancient");
+    const stub = new StubConversation({
+      events: [
+        ...older,
+        checkpointEvent({
+          upToEventId: older.at(-1)!.id,
+          artifactId: "art-7",
+        }),
+        ...turn("recent"),
+      ],
+      artifacts: new Map([["art-7", "SUMMARY"]]),
+    });
+
+    // listArtifacts() throws in the stub; reaching it is the failure.
+    await materializeConversationMessages(asConversation(stub));
+    expect(stub.artifactReads).toEqual(["art-7"]);
+  });
+
+  it("falls back to full history when the summary artifact is missing", async () => {
+    // A checkpoint pointing at a vanished artifact must not silently erase
+    // history — better a large prompt than a prompt with a hole in it.
+    const older = turn("ancient");
+    const stub = new StubConversation({
+      events: [
+        ...older,
+        checkpointEvent({
+          upToEventId: older.at(-1)!.id,
+          artifactId: "gone",
+        }),
+        ...turn("recent"),
+      ],
+      artifacts: new Map(),
+    });
+
+    const rendered = texts(
+      await materializeConversationMessages(asConversation(stub)),
+    );
+    expect(rendered).toContain("ancient");
+    expect(rendered).toContain("recent");
+  });
+
+  it("uses the newest checkpoint when several exist", async () => {
+    const first = turn("ancient");
+    const firstCheckpoint = checkpointEvent({
+      upToEventId: first.at(-1)!.id,
+      artifactId: "art-1",
+    });
+    const middle = turn("middle");
+    const secondCheckpoint = checkpointEvent({
+      upToEventId: middle.at(-1)!.id,
+      artifactId: "art-2",
+    });
+    const stub = new StubConversation({
+      events: [
+        ...first,
+        firstCheckpoint,
+        ...middle,
+        secondCheckpoint,
+        ...turn("recent"),
+      ],
+      artifacts: new Map([
+        ["art-1", "OLD SUMMARY"],
+        ["art-2", "NEW SUMMARY"],
+      ]),
+    });
+
+    const rendered = texts(
+      await materializeConversationMessages(asConversation(stub)),
+    );
+    expect(rendered.some((t) => t.includes("NEW SUMMARY"))).toBe(true);
+    expect(rendered.some((t) => t.includes("OLD SUMMARY"))).toBe(false);
+    expect(rendered).not.toContain("middle");
+    expect(rendered).toContain("recent");
+  });
+});
+
+describe("readActiveCheckpoint", () => {
+  it("returns null when the conversation has never been compacted", async () => {
+    const stub = new StubConversation({ events: turn("one") });
+    expect(await readActiveCheckpoint(asConversation(stub))).toBeNull();
+  });
+
+  it("returns the newest checkpoint", async () => {
+    const older = turn("ancient");
+    const checkpoint = checkpointEvent({
+      upToEventId: older.at(-1)!.id,
+      artifactId: "art-1",
+    });
+    const stub = new StubConversation({
+      events: [...older, checkpoint, ...turn("recent")],
+    });
+    const active = await readActiveCheckpoint(asConversation(stub));
+    expect(active?.artifactId).toBe("art-1");
+  });
+});
+
+describe("PromptHistoryCache", () => {
+  it("re-fetches the whole log only once, then reads incrementally", async () => {
+    const events = [...turn("one"), ...turn("two")];
+    const stub = new StubConversation({ events });
+    const cache = new PromptHistoryCache();
+
+    await cache.materialize(asConversation(stub));
+    const afterFirst = stub.queries.length;
+    await cache.materialize(asConversation(stub));
+    await cache.materialize(asConversation(stub));
+
+    const historyQueries = stub.queries.filter((q) =>
+      q.types?.includes("messages"),
+    );
+    // The priming read has no cursor; every later one must, or the cache is
+    // not actually saving the scan it exists to save.
+    expect(historyQueries[0].cursor ?? null).toBeNull();
+    expect(historyQueries.slice(1).every((q) => q.cursor != null)).toBe(true);
+    expect(stub.queries.length).toBeGreaterThan(afterFirst);
+  });
+
+  it("produces the same messages as an uncached materialization", async () => {
+    const events = [...turn("one"), ...turn("two")];
+    const cached = new PromptHistoryCache();
+    const cachedMessages = await cached.materialize(
+      asConversation(new StubConversation({ events })),
+    );
+    const direct = await materializeConversationMessages(
+      asConversation(new StubConversation({ events })),
+    );
+    expect(cachedMessages).toEqual(direct);
+  });
+
+  it("picks up events appended between rounds", async () => {
+    const events = [...turn("one")];
+    const stub = new StubConversation({ events });
+    const cache = new PromptHistoryCache();
+
+    expect(texts(await cache.materialize(asConversation(stub)))).toEqual([
+      "one",
+    ]);
+    events.push(...turn("two"));
+    expect(texts(await cache.materialize(asConversation(stub)))).toEqual([
+      "one",
+      "two",
+    ]);
+  });
+
+  it("rebuilds from the checkpoint after invalidation", async () => {
+    // Compaction replaces exactly the prefix the cache is holding, so a stale
+    // cache would silently resurrect the history that was just compacted away.
+    const older = turn("ancient");
+    const stub = new StubConversation({
+      events: [...older],
+      artifacts: new Map([["art-1", "SUMMARY"]]),
+    });
+    const cache = new PromptHistoryCache();
+    expect(texts(await cache.materialize(asConversation(stub)))).toEqual([
+      "ancient",
+    ]);
+
+    stub.append(
+      checkpointEvent({ upToEventId: older.at(-1)!.id, artifactId: "art-1" }),
+    );
+    stub.append(...turn("recent"));
+
+    cache.invalidate();
+    const rendered = texts(await cache.materialize(asConversation(stub)));
+    expect(rendered.some((t) => t.includes("SUMMARY"))).toBe(true);
+    expect(rendered).not.toContain("ancient");
+    expect(rendered).toContain("recent");
+  });
+
+  it("keeps a tool round intact when its result lands in a later round", async () => {
+    // The incremental path must not treat a batch boundary as a turn boundary:
+    // a request fetched in one round and its result in the next still has to
+    // materialize as a completed call, not a fabricated failure.
+    const stub = new StubConversation({ events: [] });
+    stub.append(
+      event("messages", {
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_call",
+                tool_call_id: "call_1",
+                tool_name: "shell",
+                arguments: {},
+              },
+            ],
+          },
+        ],
+      }),
+      event("tool_requested", {
+        tool_call_id: "call_1",
+        request: { function_name: "shell", arguments: {} },
+      }),
+    );
+    const cache = new PromptHistoryCache();
+    await cache.materialize(asConversation(stub));
+
+    stub.append(
+      event("tool_result", { tool_call_id: "call_1", result: { ok: true } }),
+    );
+    const messages = await cache.materialize(asConversation(stub));
+
+    const rendered = JSON.stringify(messages);
+    expect(rendered).not.toContain("did not complete");
+    expect(rendered).toContain('"ok":true');
+  });
+});
+
+describe("materializePromptMessages", () => {
+  it("keeps instructions ahead of the summary and history", async () => {
+    const older = turn("ancient");
+    const stub = new StubConversation({
+      events: [
+        ...older,
+        checkpointEvent({
+          upToEventId: older.at(-1)!.id,
+          artifactId: "art-1",
+        }),
+        ...turn("recent"),
+      ],
+      artifacts: new Map([["art-1", "SUMMARY"]]),
+    });
+
+    const rendered = texts(
+      await materializePromptMessages(asConversation(stub), [
+        { role: "developer", content: "INSTRUCTIONS" },
+      ]),
+    );
+    expect(rendered[0]).toBe("INSTRUCTIONS");
+    expect(rendered[1]).toContain("SUMMARY");
+    expect(rendered.at(-1)).toBe("recent");
+  });
+});

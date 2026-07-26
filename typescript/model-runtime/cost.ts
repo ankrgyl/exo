@@ -11,6 +11,9 @@ export type ModelEntry = {
   output_cost_per_token?: number;
   cache_read_input_token_cost?: number;
   cache_creation_input_token_cost?: number;
+  // Present in the upstream litellm data and already retained by parseTable;
+  // compaction reads it to size the prompt budget.
+  max_input_tokens?: number;
 };
 
 export type PricingTable = Map<string, ModelEntry>;
@@ -55,6 +58,16 @@ export function lookup(
     }
   }
   return best;
+}
+
+// The model's input-token limit, or null when unknown. Not every priced entry
+// carries one, so callers must have a fallback rather than assume a limit.
+export function maxInputTokens(
+  table: PricingTable,
+  model: string,
+): number | null {
+  const limit = lookup(table, model)?.max_input_tokens;
+  return typeof limit === "number" && limit > 0 ? limit : null;
 }
 
 export function computeCostUsd(

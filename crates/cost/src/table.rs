@@ -17,6 +17,10 @@ pub struct ModelEntry {
     pub cache_read_input_token_cost: Option<f64>,
     #[serde(default)]
     pub cache_creation_input_token_cost: Option<f64>,
+    /// Present in the upstream LiteLLM data; compaction reads it to size the
+    /// prompt budget. Not every priced entry carries one.
+    #[serde(default)]
+    pub max_input_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -80,6 +84,14 @@ impl PricingTable {
             .map(|(_, entry)| entry)
     }
 
+    /// The model's input-token limit, or `None` when unknown. Resolves through
+    /// the same prefix matching as pricing, so dated revisions inherit it.
+    pub fn max_input_tokens(&self, model: &str) -> Option<i64> {
+        self.lookup(model)?
+            .max_input_tokens
+            .filter(|limit| *limit > 0)
+    }
+
     /// USD cost for one call, or `None` if the model is unknown or unpriced.
     pub fn compute_cost_usd(&self, model: &str, tokens: TokenCounts) -> Option<f64> {
         let entry = self.lookup(model)?;
@@ -122,11 +134,13 @@ mod tests {
         "claude-sonnet-4-6": {
             "litellm_provider": "anthropic", "input_cost_per_token": 3e-06,
             "output_cost_per_token": 1.5e-05, "cache_read_input_token_cost": 3e-07,
-            "cache_creation_input_token_cost": 3.75e-06
+            "cache_creation_input_token_cost": 3.75e-06,
+            "max_input_tokens": 200000
         },
         "gpt-4o-mini": {
             "litellm_provider": "openai", "input_cost_per_token": 1.5e-07,
-            "output_cost_per_token": 6e-07, "cache_read_input_token_cost": 7.5e-08
+            "output_cost_per_token": 6e-07, "cache_read_input_token_cost": 7.5e-08,
+            "max_input_tokens": 128000
         },
         "gpt-4": { "litellm_provider": "openai", "input_cost_per_token": 3e-05, "output_cost_per_token": 6e-05 },
         "us.anthropic.claude-sonnet-4-6": {
@@ -239,5 +253,27 @@ mod tests {
                 .compute_cost_usd("acme-llm-9000", counts(100, 50, 0, 0))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn max_input_tokens_reads_the_model_limit() {
+        assert_eq!(table().max_input_tokens("claude-sonnet-4-6"), Some(200_000));
+        assert_eq!(table().max_input_tokens("gpt-4o-mini"), Some(128_000));
+    }
+
+    #[test]
+    fn max_input_tokens_resolves_dated_revisions() {
+        assert_eq!(
+            table().max_input_tokens("claude-sonnet-4-6-20251022"),
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn max_input_tokens_is_none_when_absent_or_unknown() {
+        // Priced entries need not carry a limit; callers must fall back rather
+        // than read a missing limit as zero.
+        assert_eq!(table().max_input_tokens("gpt-4"), None);
+        assert_eq!(table().max_input_tokens("acme-llm-9000"), None);
     }
 }

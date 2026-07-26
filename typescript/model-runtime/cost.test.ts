@@ -1,17 +1,19 @@
 import { describe, expect, it } from "vitest";
 
-import { computeCostUsd, lookup, parseTable } from "./cost";
+import { computeCostUsd, lookup, maxInputTokens, parseTable } from "./cost";
 
 const FIXTURE = `{
   "sample_spec": { "comment": "ignored" },
   "claude-sonnet-4-6": {
     "litellm_provider": "anthropic", "input_cost_per_token": 3e-06,
     "output_cost_per_token": 1.5e-05, "cache_read_input_token_cost": 3e-07,
-    "cache_creation_input_token_cost": 3.75e-06
+    "cache_creation_input_token_cost": 3.75e-06,
+    "max_input_tokens": 200000
   },
   "gpt-4o-mini": {
     "litellm_provider": "openai", "input_cost_per_token": 1.5e-07,
-    "output_cost_per_token": 6e-07, "cache_read_input_token_cost": 7.5e-08
+    "output_cost_per_token": 6e-07, "cache_read_input_token_cost": 7.5e-08,
+    "max_input_tokens": 128000
   },
   "gpt-4": { "litellm_provider": "openai", "input_cost_per_token": 3e-05 },
   "us.anthropic.claude-sonnet-4-6": {
@@ -71,5 +73,27 @@ describe("cost", () => {
     expect(
       computeCostUsd(table, "acme-llm-9000", { prompt: 100, completion: 50 }),
     ).toBeNull();
+  });
+});
+
+describe("maxInputTokens", () => {
+  it("reads the model's input limit", () => {
+    expect(maxInputTokens(table, "claude-sonnet-4-6")).toBe(200_000);
+    expect(maxInputTokens(table, "gpt-4o-mini")).toBe(128_000);
+  });
+
+  it("resolves through the same prefix matching as pricing", () => {
+    expect(maxInputTokens(table, "claude-sonnet-4-6-20251022")).toBe(200_000);
+  });
+
+  it("returns null when the model is unknown", () => {
+    expect(maxInputTokens(table, "acme-llm-9000")).toBeNull();
+  });
+
+  it("returns null when the entry omits the limit", () => {
+    // `gpt-4` and the bedrock entry are priced but carry no max_input_tokens.
+    // Callers must fall back rather than treat a missing limit as zero.
+    expect(maxInputTokens(table, "gpt-4")).toBeNull();
+    expect(maxInputTokens(table, "us.anthropic.claude-sonnet-4-6")).toBeNull();
   });
 });

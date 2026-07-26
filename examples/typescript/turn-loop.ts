@@ -1,17 +1,24 @@
 import {
+  PromptHistoryCache,
+  assistantMessagesText,
   createToolRegistry,
-  materializePromptMessages,
   registerAgentToolsFromDirectoryIfExists,
   registerBuiltInTools,
   registerLibraryToolModulePath,
+  resolveCompactionPolicy,
+  runCompaction,
+  shouldCompact,
   turnMetadata,
   type BuiltInToolName,
+  type CompactionPolicy,
   type EventData,
   type HarnessToolRegistry,
   type Message,
+  type SummarizeInput,
   type TurnContext,
 } from "@exo/harness";
 import {
+  responseMessages,
   responseToLinguaEvents,
   responseToolCalls,
   runtimeFromModelBinding,
@@ -19,7 +26,7 @@ import {
   type ResponsesRuntimeLike,
   type TraceParent,
 } from "@exo/model-runtime/responses";
-import { ensureTable } from "@exo/model-runtime/cost";
+import { ensureTable, getTable, maxInputTokens } from "@exo/model-runtime/cost";
 
 import { resolveLlmBinding } from "./shared";
 
@@ -98,6 +105,10 @@ async function runResponsesTurnLoop(
 ): Promise<string | null> {
   const { conversation } = context.exoharness.current;
   const maxToolRoundTrips = context.agentConfig.maxToolRoundTrips;
+  const policy = resolveCompactionPolicy(context.agentConfig.compaction);
+  // One cache per turn: the loop materializes every round, so re-reading the
+  // whole event log each time makes a turn cost O(rounds x events).
+  const history = new PromptHistoryCache();
   let latestEventId: string | null = null;
 
   for (let round = 0; ; round += 1) {
@@ -115,12 +126,13 @@ async function runResponsesTurnLoop(
     if (options.registerTools) {
       await options.registerTools(tools, context);
     }
-    const messages = await materializePromptMessages(
-      conversation,
-      options.instructions
-        ? await options.instructions(context)
-        : basicHarnessInstructions(context),
-    );
+    const instructions = options.instructions
+      ? await options.instructions(context)
+      : basicHarnessInstructions(context);
+    const messages = [
+      ...instructions,
+      ...(await history.materialize(conversation)),
+    ];
     const request: NativeResponsesRequest = {
       model,
       messages,
@@ -149,6 +161,32 @@ async function runResponsesTurnLoop(
     const events = responseToLinguaEvents(response);
     if (events.length > 0) {
       latestEventId = await appendTurnEvents(context, events);
+    }
+
+    // Compact between rounds, using the token count the provider just reported.
+    // Doing it here rather than at turn start means a single runaway turn can
+    // still bring its own prompt back under the limit.
+    if (
+      shouldCompact({
+        policy,
+        promptTokens: response.usage?.input_tokens ?? null,
+        maxInputTokens: maxInputTokens(getTable() ?? new Map(), model),
+        materializedChars: promptChars(messages),
+      })
+    ) {
+      const result = await runCompaction({
+        conversation,
+        turn: context.exoharness.current.turn,
+        policy,
+        model: policy.summaryModel ?? model,
+        promptTokensBefore: response.usage?.input_tokens ?? null,
+        summarize: (input) =>
+          summarizeWithModel(runtime, policy, model, turnParent, round, input),
+      });
+      if (result.status === "compacted") {
+        // The cache holds exactly the prefix that was just replaced.
+        history.invalidate();
+      }
     }
 
     const toolCalls = responseToolCalls(response);
@@ -182,4 +220,67 @@ async function appendTurnEvents(
   data: EventData[],
 ): Promise<string> {
   return (await context.exoharness.current.turn.addEvents(data)).latestEventId;
+}
+
+function promptChars(messages: Message[]): number {
+  let total = 0;
+  for (const message of messages) {
+    total +=
+      typeof message.content === "string"
+        ? message.content.length
+        : JSON.stringify(message.content).length;
+  }
+  return total;
+}
+
+const SUMMARIZER_INSTRUCTION = `You are compacting the earlier portion of an agent conversation so it can be dropped from the prompt while remaining usable.
+
+Write a dense factual summary of what happened. Prioritise, in order:
+1. Decisions made and conclusions reached, with the reasoning that led to them.
+2. Durable facts about the user, the task, and the environment.
+3. Work completed, files or resources changed, and commands that mattered.
+4. Open threads: what was in progress, what failed, what was agreed for later.
+
+Rules:
+- Write in the third person about what "the user" and "the agent" did.
+- Preserve specifics: names, paths, ids, numbers, error messages. Those are what a summary usually loses and what is most expensive to lose.
+- Do not speculate or add anything not present in the material.
+- Do not address the reader or describe the summary itself. Output only the summary.`;
+
+/**
+ * Summarize a compacted span with a model call carrying no tools.
+ *
+ * When a previous summary exists it is merged rather than appended, so a long
+ * conversation converges on a fixed-size summary instead of accumulating one
+ * paragraph per compaction.
+ */
+async function summarizeWithModel(
+  runtime: ResponsesRuntimeLike,
+  policy: CompactionPolicy,
+  model: string,
+  turnParent: TraceParent,
+  round: number,
+  input: SummarizeInput,
+): Promise<string> {
+  const merge =
+    input.previousSummary === null
+      ? ""
+      : `\n\nA summary of even earlier history is provided first. Merge it with the new material into a single summary that covers both — do not simply append, and do not drop facts from the earlier summary.\n\n<earlier_summary>\n${input.previousSummary}\n</earlier_summary>`;
+
+  const response = await runtime.complete(
+    {
+      model: policy.summaryModel ?? model,
+      messages: [
+        {
+          role: "developer",
+          content: `${SUMMARIZER_INSTRUCTION}${merge}\n\nKeep the summary under ${input.maxChars} characters.`,
+        },
+        ...input.messages,
+      ],
+      // No tools: the summarizer reads, it does not act.
+      tools: [],
+    },
+    { parent: turnParent, roundIndex: round },
+  );
+  return assistantMessagesText(responseMessages(response));
 }

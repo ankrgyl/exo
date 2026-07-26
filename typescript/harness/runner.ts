@@ -38,6 +38,7 @@ import {
   type Turn,
   type TurnContext,
   type TurnRecord,
+  type RawCompactionConfig,
   type TypeScriptHarness,
 } from "./index";
 
@@ -59,6 +60,7 @@ interface RawAgentConfig {
   model: string;
   max_output_tokens?: number | null;
   max_tool_round_trips?: number | null;
+  compaction?: RawCompactionConfig | null;
   braintrust?: unknown;
 }
 
@@ -847,6 +849,7 @@ function toAgentConfig(raw: RawAgentConfig): AgentConfig {
     model: raw.model,
     maxOutputTokens: raw.max_output_tokens ?? null,
     maxToolRoundTrips: raw.max_tool_round_trips ?? null,
+    compaction: raw.compaction ?? null,
     braintrust: raw.braintrust,
   };
 }
