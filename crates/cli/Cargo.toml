@@ -32,6 +32,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 bytes.workspace = true
 exoharness = { path = "../exoharness", features = [
   "basic-backend",

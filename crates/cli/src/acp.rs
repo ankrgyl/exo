@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1 as acp;
-use agent_client_protocol::{Agent, ConnectionTo, Responder, Stdio};
+use agent_client_protocol::{Agent, ConnectTo, ConnectionTo, Responder, Stdio};
 use anyhow::Result;
 use executor::{
     ExecutionCancellation, ExecutionStreamEvent, HarnessConversation, SendRequest, SessionId,
@@ -91,6 +91,13 @@ impl SessionState {
 
 /// Serve the conversation until the ACP stdio transport closes.
 pub async fn serve(conversation: Arc<dyn HarnessConversation>) -> Result<()> {
+    serve_transport(conversation, Stdio::new()).await
+}
+
+async fn serve_transport(
+    conversation: Arc<dyn HarnessConversation>,
+    transport: impl ConnectTo<Agent>,
+) -> Result<()> {
     let state = SessionState::new(conversation);
     let new_state = state.clone();
     let prompt_state = state.clone();
@@ -180,7 +187,7 @@ pub async fn serve(conversation: Arc<dyn HarnessConversation>) -> Result<()> {
             },
             agent_client_protocol::on_receive_notification!(),
         )
-        .connect_to(Stdio::new())
+        .connect_to(transport)
         .await?;
     Ok(())
 }
@@ -319,6 +326,97 @@ fn chunk_text(chunk: &lingua::UniversalStreamChunk) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::{Channel, Client};
+    use executor::{
+        ConversationConfig, ConversationHandle, ConversationModelConfig, ExecutionStreamHandle,
+        SendResult, Uuid7,
+    };
+    use exoharness::ConversationRecord;
+    use tokio_stream::wrappers::UnboundedReceiverStream;
+
+    struct FakeConversation {
+        record: ConversationRecord,
+    }
+
+    #[async_trait::async_trait]
+    impl HarnessConversation for FakeConversation {
+        fn record(&self) -> &ConversationRecord {
+            &self.record
+        }
+
+        fn exoharness_handle(&self) -> Arc<dyn ConversationHandle> {
+            panic!("the ACP transport does not ask for the raw conversation handle")
+        }
+
+        async fn config(&self) -> Result<ConversationConfig> {
+            Ok(ConversationConfig::default())
+        }
+
+        async fn put_config(&self, _config: ConversationConfig) -> Result<()> {
+            anyhow::bail!("not used")
+        }
+
+        async fn model_override(&self) -> Result<Option<ConversationModelConfig>> {
+            Ok(None)
+        }
+
+        async fn put_model_override(&self, _config: Option<ConversationModelConfig>) -> Result<()> {
+            anyhow::bail!("not used")
+        }
+
+        async fn messages(&self) -> Result<Vec<Message>> {
+            Ok(Vec::new())
+        }
+
+        async fn close_session(&self, _session_id: SessionId) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send(&self, _request: SendRequest) -> Result<SendResult> {
+            anyhow::bail!("ACP uses the streaming send")
+        }
+
+        async fn send_stream(&self, request: SendRequest) -> Result<ExecutionStreamHandle> {
+            self.send_stream_with_cancellation(request, ExecutionCancellation::new())
+                .await
+        }
+
+        async fn send_stream_with_cancellation(
+            &self,
+            request: SendRequest,
+            _cancellation: ExecutionCancellation,
+        ) -> Result<ExecutionStreamHandle> {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let session_id = request.session_id.unwrap_or_else(Uuid7::now);
+            let turn_id = Uuid7::now();
+            let latest_event_id = Uuid7::now();
+            tx.send(Ok(ExecutionStreamEvent::Chunk(
+                lingua::UniversalStreamChunk::text_delta(0, "hello"),
+            )))
+            .map_err(|_| anyhow::anyhow!("test stream closed"))?;
+            tx.send(Ok(ExecutionStreamEvent::ToolCall {
+                tool_call_id: "call-1".into(),
+                tool_name: "shell".into(),
+                arguments: serde_json::Map::from_iter([(
+                    "command".into(),
+                    Value::String("printf ok".into()),
+                )]),
+            }))
+            .map_err(|_| anyhow::anyhow!("test stream closed"))?;
+            tx.send(Ok(ExecutionStreamEvent::ToolResult {
+                tool_call_id: "call-1".into(),
+                result: serde_json::json!({"stdout": "ok"}),
+            }))
+            .map_err(|_| anyhow::anyhow!("test stream closed"))?;
+            tx.send(Ok(ExecutionStreamEvent::Completed(SendResult {
+                session_id,
+                turn_id,
+                latest_event_id,
+            })))
+            .map_err(|_| anyhow::anyhow!("test stream closed"))?;
+            Ok(ExecutionStreamHandle::new(UnboundedReceiverStream::new(rx)))
+        }
+    }
 
     #[test]
     fn prompt_text_preserves_text_block_order() {
@@ -348,6 +446,78 @@ mod tests {
         assert_eq!(
             meta.get("exo.latest_event_id").and_then(Value::as_str),
             Some(result.latest_event_id.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_carries_text_tool_call_tool_result_and_completion() {
+        let conversation: Arc<dyn HarnessConversation> = Arc::new(FakeConversation {
+            record: ConversationRecord {
+                id: Uuid7::now(),
+                slug: "acp".into(),
+                name: "ACP".into(),
+                latest_event_id: None,
+            },
+        });
+        let updates = Arc::new(Mutex::new(Vec::<acp::SessionUpdate>::new()));
+        let notification_updates = Arc::clone(&updates);
+        let (agent_transport, client_transport) = Channel::duplex();
+        let server = tokio::spawn(serve_transport(conversation, agent_transport));
+
+        Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: acp::SessionNotification,
+                            _connection: ConnectionTo<Agent>| {
+                    notification_updates
+                        .lock()
+                        .expect("updates")
+                        .push(notification.update);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client_transport, async move |connection| {
+                connection
+                    .send_request(acp::InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = connection
+                    .send_request(acp::NewSessionRequest::new(
+                        std::env::current_dir().map_err(anyhow::Error::from)?,
+                    ))
+                    .block_task()
+                    .await?;
+                let response = connection
+                    .send_request(acp::PromptRequest::new(
+                        session.session_id,
+                        vec![acp::ContentBlock::Text(acp::TextContent::new("run"))],
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+                assert!(response.meta.is_some());
+                Ok(())
+            })
+            .await
+            .expect("ACP client");
+        server.await.expect("server task").expect("ACP server");
+
+        let updates = updates.lock().expect("updates");
+        assert!(
+            updates
+                .iter()
+                .any(|update| { matches!(update, acp::SessionUpdate::AgentMessageChunk(_)) })
+        );
+        assert!(
+            updates
+                .iter()
+                .any(|update| { matches!(update, acp::SessionUpdate::ToolCall(_)) })
+        );
+        assert!(
+            updates
+                .iter()
+                .any(|update| { matches!(update, acp::SessionUpdate::ToolCallUpdate(_)) })
         );
     }
 }
