@@ -670,19 +670,49 @@ export class CompactionGate {
   async consider(
     args: ShouldCompactArgs,
     readLatestTurnEnded: () => Promise<string | null>,
-  ): Promise<{ latestTurnEnded: string | null } | null> {
+  ): Promise<{
+    latestTurnEnded: string | null;
+    overInputLimit: boolean;
+  } | null> {
     if (!shouldCompact(args)) {
       return null;
     }
     try {
       const latestTurnEnded = await readLatestTurnEnded();
       return this.shouldAttempt(args, latestTurnEnded)
-        ? { latestTurnEnded }
+        ? { latestTurnEnded, overInputLimit: overHardInputLimit(args) }
         : null;
     } catch {
       return null;
     }
   }
+}
+
+/**
+ * Whether the prompt already meets or exceeds the model's hard input limit.
+ *
+ * Not the same question as `shouldCompact`, which fires at a *fraction* of the
+ * limit so there is room to act. This one says the request cannot be sent at
+ * all, which is what makes a rescue different from housekeeping: a rejected
+ * request produces no usage, so the accurate post-response trigger never runs
+ * and every later turn replays the same history.
+ *
+ * Answered only when a real limit is known. The fallback budget is a threshold,
+ * not a wall, so an unknown limit means no rescue — the same conservative
+ * default as before, rather than a guess that would bypass the cost heuristics
+ * on every over-threshold prompt.
+ *
+ * Computed inside the gate rather than at the call site so the turn loop cannot
+ * get it wrong, and so it is covered by tests. Mirrors
+ * `PromptPressure::over_input_limit` in the Rust executor.
+ */
+export function overHardInputLimit(args: ShouldCompactArgs): boolean {
+  const limit = args.maxInputTokens;
+  if (limit === null || limit === undefined || limit <= 0) {
+    return false;
+  }
+  const observed = args.promptTokens ?? args.promptSize.estimatedTokens();
+  return observed >= limit;
 }
 
 /**
@@ -1078,6 +1108,20 @@ export interface RunCompactionArgs {
    */
   agentModel: string;
   promptTokensBefore: number | null;
+  /**
+   * Whether the prompt already meets or exceeds the model's hard input limit.
+   *
+   * Separates *housekeeping* — the prompt crossed the configured threshold and
+   * compaction is keeping ahead of the wall — from a *rescue*, where the request
+   * cannot be sent at all. Cost heuristics that are right for the first are
+   * wrong for the second, where any shrink beats a rejected request.
+   *
+   * Required rather than optional: a call site that has not thought about which
+   * of the two it is should not silently get the cheap answer. Only ever true
+   * from the pre-request trigger — a response that came back proves its prompt
+   * fit. Mirrors `PromptPressure::over_input_limit` in the Rust executor.
+   */
+  overInputLimit: boolean;
   summarize: SummarizeFn;
 }
 
@@ -1188,7 +1232,20 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
   const previousSummarySize =
     summaryToChain === null ? null : PromptSize.ofText(summaryToChain);
 
+  // Prices the summary at the configured ceiling, which is the right question
+  // for housekeeping: a cut that reclaims less than a summary's worth is not
+  // worth a summarizer call, and waiting batches the work instead of paying per
+  // turn for a sliver.
+  //
+  // It is the wrong question during a rescue. The ceiling is a cap, not a
+  // forecast, and when the prompt is already past the hard input limit the
+  // alternative to a small shrink is a rejected request — which produces no
+  // response, so the accurate trigger never runs and every later turn replays
+  // the same history. The prefix cannot grow while nothing completes, so the
+  // skip would hold forever. `summaryWouldNotShrink` still guards the outcome,
+  // on the measured summary rather than the ceiling.
   if (
+    !args.overInputLimit &&
     compactionWouldNotShrink(
       spanSize,
       previousSummarySize,
@@ -1433,16 +1490,6 @@ async function readSummaryOrFallBack(
 }
 
 /**
- * How far back to look for a checkpoint whose summary still reads.
- *
- * Bounded because each step costs an artifact read. A chain where this many
- * consecutive summaries are all unreadable is a store in trouble rather than a
- * case worth walking to the end of, and the full-log rebuild is still there as
- * the last resort.
- */
-const RECOVERY_CHAIN_LIMIT = 8;
-
-/**
  * The newest checkpoint *below the head* whose summary can still be read.
  *
  * Used only to repair a head whose own summary has gone: an ancestor's summary
@@ -1454,6 +1501,15 @@ const RECOVERY_CHAIN_LIMIT = 8;
  * links. The two agree — publication is guarded by a head check, so a checkpoint
  * later in the log is always a descendant — and log order costs one query
  * instead of one per link, and cannot be derailed by a broken link.
+ *
+ * **The walk is not bounded**, and that is deliberate. A fixed window was the
+ * obvious way to cap the artifact reads, and it quietly recreated the failure
+ * this function exists to remove: with the newest N summaries unreadable and an
+ * older one intact, the walk would give up on a chain that had an answer in it
+ * and fall back to summarizing the whole log — the request a long conversation
+ * cannot make. The cost of walking further is one failed artifact read per
+ * checkpoint, on a path that only runs when a summary has already been lost,
+ * and it stops at the first one that reads.
  *
  * Never throws: this is a recovery path, and a store that will not answer here
  * leaves the caller exactly where it already was. Mirrors
@@ -1468,8 +1524,6 @@ async function readRecoverableAncestor(conversation: Conversation): Promise<{
   try {
     const result = await conversation.getEvents({
       direction: "desc",
-      // The head itself, plus the ancestors worth trying.
-      limit: RECOVERY_CHAIN_LIMIT + 1,
       types: [COMPACTION_CHECKPOINT_EVENT],
     });
     events = result.events;

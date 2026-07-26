@@ -103,6 +103,16 @@ class StubTarget {
     this.artifacts.delete(artifactId(this.artifactSeq));
   }
 
+  /**
+   * Keep only the first artifact ever written — the case where the readable
+   * ancestor is far back in the chain.
+   */
+  retainOldestArtifact() {
+    for (const id of this.artifacts.keys()) {
+      if (id !== artifactId(1)) this.artifacts.delete(id);
+    }
+  }
+
   async readArtifactText(args: { artifactId: string }): Promise<string | null> {
     if (this.failArtifactReads) {
       throw new Error("artifact store unavailable");
@@ -165,6 +175,7 @@ function args(stub: StubTarget, overrides: Record<string, unknown> = {}) {
     model: "test-model",
     agentModel: "test-model",
     promptTokensBefore: 123,
+    overInputLimit: false,
     summarize,
     ...overrides,
   } as Parameters<typeof runCompaction>[0];
@@ -358,6 +369,84 @@ describe("runCompaction", () => {
     expect(
       checkpointPayload(checkpointEvents(stub)[0]).previous_checkpoint_id,
     ).toBe(chain[0].id);
+  });
+
+  it("compacts a prefix under the cap when the prompt cannot be sent", async () => {
+    // The pre-filter prices the summary at the configured ceiling, which is the
+    // right question while compaction is housekeeping and the wrong one during a
+    // rescue: the ceiling is a cap, not a forecast, and a rejected request
+    // produces no response, so nothing completes, the prefix cannot grow, and
+    // the skip would hold forever.
+    const short = (text: string): Event[] => [
+      event("messages", {
+        messages: [{ role: "user", content: `${text} ${"x".repeat(2_000)}` }],
+      }),
+      event("turn_ended"),
+    ];
+
+    const housekeeping = target([...short("a"), ...short("b"), ...short("c")]);
+    expect((await runCompaction(args(housekeeping))).status).toBe("skipped");
+
+    const rescue = target([...short("a"), ...short("b"), ...short("c")]);
+    const result = await runCompaction(args(rescue, { overInputLimit: true }));
+    expect(result.status).toBe("compacted");
+  });
+
+  it("still refuses a rescue summary that would grow the prompt", async () => {
+    // The bypass is not a licence to publish something worse: the measured
+    // check runs on the summary that actually came back.
+    const short = (text: string): Event[] => [
+      event("messages", {
+        messages: [{ role: "user", content: `${text} ${"x".repeat(2_000)}` }],
+      }),
+      event("turn_ended"),
+    ];
+    const stub = target([...short("a"), ...short("b"), ...short("c")]);
+    const result = await runCompaction(
+      args(stub, {
+        overInputLimit: true,
+        summarize: (async () => "😀".repeat(5_000)) satisfies SummarizeFn,
+      }),
+    );
+
+    expect(result.status).toBe("skipped");
+    expect(checkpointEvents(stub)).toHaveLength(0);
+  });
+
+  it("walks past any fixed window to reach a readable ancestor", async () => {
+    // A fixed recovery window is the obvious way to cap the artifact reads, and
+    // it quietly recreates the failure the walk exists to remove: the newest N
+    // summaries unreadable and an older one intact means giving up on a chain
+    // that had an answer in it, and falling back to the whole log.
+    const stub = target([...turn("a"), ...turn("b"), ...turn("c")]);
+    for (let round = 0; round < 12; round += 1) {
+      await runCompaction(
+        args(stub, {
+          summarize: (async () =>
+            "OLDEST READABLE SUMMARY") satisfies SummarizeFn,
+        }),
+      );
+      stub.events.push(...turn(`p${round}`), ...turn(`q${round}`));
+    }
+    expect(checkpointEvents(stub).length).toBeGreaterThanOrEqual(10);
+
+    stub.retainOldestArtifact();
+    stub.appended.length = 0;
+
+    let previous: string | null = null;
+    let span = "";
+    await runCompaction(
+      args(stub, {
+        summarize: (async (input) => {
+          previous = input.previousSummary;
+          span = JSON.stringify(input.messages);
+          return "REPAIRED";
+        }) satisfies SummarizeFn,
+      }),
+    );
+
+    expect(previous).toBe("OLDEST READABLE SUMMARY");
+    expect(span).not.toContain("a x");
   });
 
   it("caps an oversized summary rather than trusting the model", async () => {

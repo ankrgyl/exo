@@ -8,6 +8,7 @@ import {
   capSummary,
   checkpointFromEvent,
   compactionWouldNotShrink,
+  overHardInputLimit,
   PromptSize,
   promptSize,
   resolveCompactionPolicy,
@@ -967,6 +968,78 @@ describe("resolveCompactionPolicy", () => {
   });
 });
 
+describe("overHardInputLimit", () => {
+  // Not the same question as `shouldCompact`, which fires at a *fraction* of the
+  // limit so there is room to act. This one says the request cannot be sent at
+  // all, and it is what lets a rescue bypass the cost heuristics.
+  const base = {
+    policy: DEFAULT_COMPACTION_POLICY,
+    promptSize: PromptSize.ofText("x".repeat(30_000)),
+  };
+
+  it("is false while the prompt still fits", () => {
+    expect(
+      overHardInputLimit({
+        ...base,
+        promptTokens: 9_999,
+        maxInputTokens: 10_000,
+      }),
+    ).toBe(false);
+  });
+
+  it("is true at the limit, not only past it", () => {
+    // A prompt exactly at the limit leaves no room for the response, and the
+    // provider counts the two against one window.
+    expect(
+      overHardInputLimit({
+        ...base,
+        promptTokens: 10_000,
+        maxInputTokens: 10_000,
+      }),
+    ).toBe(true);
+    expect(
+      overHardInputLimit({
+        ...base,
+        promptTokens: 10_001,
+        maxInputTokens: 10_000,
+      }),
+    ).toBe(true);
+  });
+
+  it("falls back to the local estimate when the provider has not counted", () => {
+    // 30k ASCII bytes at three bytes per token.
+    expect(
+      overHardInputLimit({
+        ...base,
+        promptTokens: null,
+        maxInputTokens: 10_000,
+      }),
+    ).toBe(true);
+    expect(
+      overHardInputLimit({
+        ...base,
+        promptTokens: null,
+        maxInputTokens: 50_000,
+      }),
+    ).toBe(false);
+  });
+
+  it("is false when no real limit is known", () => {
+    // The fallback budget is a threshold, not a wall. Guessing here would
+    // bypass the cost heuristics on every over-threshold prompt.
+    expect(
+      overHardInputLimit({
+        ...base,
+        promptTokens: 10_000,
+        maxInputTokens: null,
+      }),
+    ).toBe(false);
+    expect(
+      overHardInputLimit({ ...base, promptTokens: 10_000, maxInputTokens: 0 }),
+    ).toBe(false);
+  });
+});
+
 describe("CompactionGate", () => {
   const args = {
     policy: { ...DEFAULT_COMPACTION_POLICY, thresholdRatio: 0.7 },
@@ -1078,6 +1151,7 @@ describe("CompactionGate", () => {
 
     expect(await gate.consider(args, read)).toEqual({
       latestTurnEnded: boundary,
+      overInputLimit: false,
     });
     expect(reads).toBe(1);
   });

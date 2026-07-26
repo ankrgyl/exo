@@ -201,6 +201,9 @@ async function runResponsesTurnLoop(
         model: summaryModel,
         agentModel: model,
         promptTokensBefore: null,
+        // Decided by the gate, not here: the turn loop is the one file with no
+        // tests, so the rule lives where it can be mutation-checked.
+        overInputLimit: preflight.overInputLimit,
         summarize: (input) =>
           summarizeWithModel(
             runtime,
@@ -309,6 +312,9 @@ async function runResponsesTurnLoop(
         model: summaryModel,
         agentModel: model,
         promptTokensBefore: occupancy,
+        // Never a rescue: this runs on a response that came back, which proves
+        // its prompt fit.
+        overInputLimit: false,
         summarize: (input) =>
           summarizeWithModel(
             runtime,

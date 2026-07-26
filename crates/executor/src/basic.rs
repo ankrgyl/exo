@@ -14,11 +14,11 @@ use lingua::universal::{ToolContentPart, ToolResultContentPart};
 use serde_json::json;
 
 use crate::compaction::{
-    CompactionLatch, CompactionOutcome, PromptSize, SummarizeInput, SummarizerModels,
-    previous_summary_message, prompt_size, read_active_checkpoint, read_latest_turn_ended,
-    read_summary_or_fall_back, record_summarizer_usage, resolve_summarizer_model, run_compaction,
-    should_compact, summarizer_instruction, summarizer_max_output_tokens, summary_message,
-    tool_definition_size,
+    CompactionLatch, CompactionOutcome, PromptPressure, PromptSize, SummarizeInput,
+    SummarizerModels, previous_summary_message, prompt_size, read_active_checkpoint,
+    read_latest_turn_ended, read_summary_or_fall_back, record_summarizer_usage,
+    resolve_summarizer_model, run_compaction, should_compact, summarizer_instruction,
+    summarizer_max_output_tokens, summary_message, tool_definition_size,
 };
 use crate::execution_tracing::TurnExecutionTrace;
 use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor};
@@ -310,6 +310,9 @@ where
         if !should_compact(&config, prompt_tokens, max_input_tokens, prompt_size) {
             return false;
         }
+        // Provider counts when a response has come back; the pessimistic local
+        // estimate otherwise — the same input the trigger just used.
+        let observed_tokens = prompt_tokens.unwrap_or_else(|| prompt_size.estimated_tokens());
 
         // Re-attempting within a turn costs a log scan and possibly a
         // summarizer call, so it needs a reason. The reason is a turn boundary
@@ -346,9 +349,7 @@ where
             model,
             summary_model_input_limit,
             max_input_tokens,
-            // Provider counts when a response has come back; the pessimistic
-            // char estimate otherwise, the same input the trigger just used.
-            prompt_tokens.unwrap_or_else(|| prompt_size.estimated_tokens()),
+            observed_tokens,
         );
         // Collected during the summarizer call and written below. Safe to write
         // right here, mid-round: it goes on a custom event, which prompt
@@ -363,7 +364,17 @@ where
                 chosen: &summary_model,
                 agent: model,
             },
-            prompt_tokens,
+            PromptPressure {
+                prompt_tokens,
+                // A response that came back proves its prompt fit, so this can
+                // only be true from the pre-request trigger — which is exactly
+                // the case where the cheaper heuristics must give way, because
+                // the alternative to compacting is a rejected request that
+                // produces no usage and so never reaches the accurate one.
+                over_input_limit: max_input_tokens
+                    .filter(|limit| *limit > 0)
+                    .is_some_and(|limit| observed_tokens >= limit as u64),
+            },
             &|input| {
                 Box::pin(self.summarize(
                     input,

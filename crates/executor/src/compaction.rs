@@ -602,24 +602,42 @@ pub(crate) struct SummarizerModels<'a> {
 /// write, the right outcome is an oversized prompt (today's behaviour) rather
 /// than a dead conversation. Failures are recorded as an event so the agent can
 /// see why its context never shrank.
+/// What the trigger knew about the prompt when it fired.
+///
+/// The token count is recorded on the checkpoint. `over_input_limit` is the
+/// interesting field: it separates *housekeeping* — the prompt crossed the
+/// configured threshold and compaction is keeping ahead of the wall — from a
+/// *rescue*, where the prompt is already past the model's hard input limit and
+/// the request cannot be sent at all. The cost heuristics that are right for the
+/// first are wrong for the second, where any shrink beats a rejected request.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PromptPressure {
+    /// Provider-reported occupancy, or the local estimate before a response.
+    pub prompt_tokens: Option<u64>,
+    /// The prompt meets or exceeds the model's hard input limit.
+    ///
+    /// Only ever true from the pre-request trigger: a response that came back
+    /// proves its prompt fit.
+    pub over_input_limit: bool,
+}
+
+impl PromptPressure {
+    /// Over the threshold, not over the wall.
+    #[cfg(test)]
+    pub(crate) fn housekeeping() -> Self {
+        Self::default()
+    }
+}
+
 pub(crate) async fn run_compaction(
     conversation: &dyn ConversationHandle,
     turn: &dyn TurnHandle,
     config: &CompactionConfig,
     model: SummarizerModels<'_>,
-    prompt_tokens_before: Option<u64>,
+    pressure: PromptPressure,
     summarize: &Summarizer<'_>,
 ) -> CompactionOutcome {
-    match compact(
-        conversation,
-        turn,
-        config,
-        model,
-        prompt_tokens_before,
-        summarize,
-    )
-    .await
-    {
+    match compact(conversation, turn, config, model, pressure, summarize).await {
         Ok(outcome) => outcome,
         Err(error) => {
             let error = error.to_string();
@@ -634,7 +652,7 @@ async fn compact(
     turn: &dyn TurnHandle,
     config: &CompactionConfig,
     models: SummarizerModels<'_>,
-    prompt_tokens_before: Option<u64>,
+    pressure: PromptPressure,
     summarize: &Summarizer<'_>,
 ) -> Result<CompactionOutcome> {
     let existing = read_active_checkpoint(conversation).await?;
@@ -773,11 +791,27 @@ async fn compact(
         .as_ref()
         .map(|summary| PromptSize::of_str(summary));
 
-    if compaction_would_not_shrink(
-        span_size,
-        previous_summary_size,
-        config.effective_max_summary_chars(),
-    ) {
+    // Prices the summary at the configured ceiling, which is the right question
+    // for housekeeping: a cut that reclaims less than a summary's worth is not
+    // worth a summarizer call, and waiting batches the work instead of paying
+    // per turn for a sliver.
+    //
+    // It is the wrong question during a rescue. The ceiling is a cap, not a
+    // forecast — a concise summary of a small prefix can be a fraction of it —
+    // and when the prompt is already past the hard input limit the alternative
+    // to a small shrink is a rejected request, which produces no response, so
+    // the accurate trigger never runs and every later turn replays the same
+    // history. The prefix cannot grow while nothing completes, so the skip would
+    // hold forever. `summary_would_not_shrink` still guards the outcome, on the
+    // measured summary rather than the ceiling, so the worst case here is one
+    // summarizer call whose result is discarded.
+    if !pressure.over_input_limit
+        && compaction_would_not_shrink(
+            span_size,
+            previous_summary_size,
+            config.effective_max_summary_chars(),
+        )
+    {
         return Ok(CompactionOutcome::Skipped {
             reason: "compactable history is already smaller than the summary cap".to_string(),
             retryable: false,
@@ -848,7 +882,7 @@ async fn compact(
         // makes the chain untraversable from the second compaction onward.
         previous_checkpoint_id: previous.map(|(event_id, _)| event_id),
         summary_chars: summary.chars().count() as u64,
-        prompt_tokens_before,
+        prompt_tokens_before: pressure.prompt_tokens,
         model: model.to_string(),
     };
     // Turns on one conversation are not serialized, and a summarizer call is
@@ -888,14 +922,6 @@ async fn compact(
     })
 }
 
-/// How far back to look for a checkpoint whose summary still reads.
-///
-/// Bounded because each step costs an artifact read. A chain where this many
-/// consecutive summaries are all unreadable is a store in trouble rather than a
-/// case worth walking to the end of, and the full-log rebuild is still there as
-/// the last resort.
-const RECOVERY_CHAIN_LIMIT: u32 = 8;
-
 /// The newest checkpoint *below the head* whose summary can still be read.
 ///
 /// Used only to repair a head whose own summary has gone: an ancestor's summary
@@ -908,6 +934,16 @@ const RECOVERY_CHAIN_LIMIT: u32 = 8;
 /// checkpoint later in the log is always a descendant — and log order costs one
 /// query instead of one per link, and cannot be derailed by a broken link.
 ///
+/// **The walk is not bounded**, and that is deliberate. A fixed window was the
+/// obvious way to cap the artifact reads, and it quietly recreated the failure
+/// this function exists to remove: with the newest N summaries unreadable and an
+/// older one intact, the walk would give up on a chain that had an answer in it
+/// and fall back to summarizing the whole log — the request a long conversation
+/// cannot make. The cost of walking further is one failed artifact read per
+/// checkpoint, on a path that only runs when a summary has already been lost,
+/// and it stops at the first one that reads. Checkpoint events are one per
+/// compaction and carry no bulk, so the query itself is cheap.
+///
 /// Never fails: this is a recovery path, and a store that will not answer here
 /// leaves the caller exactly where it already was.
 async fn read_recoverable_ancestor(
@@ -917,8 +953,7 @@ async fn read_recoverable_ancestor(
         .get_events(Some(EventQuery {
             cursor: None,
             direction: Some(EventQueryDirection::Desc),
-            // The head itself, plus the ancestors worth trying.
-            limit: Some(RECOVERY_CHAIN_LIMIT + 1),
+            limit: None,
             session_id: None,
             turn_id: None,
             types: Some(vec![EventKind::custom(COMPACTION_CHECKPOINT_EVENT)]),
