@@ -15,7 +15,7 @@ mod tui;
 mod tui_app;
 
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -413,9 +413,9 @@ enum Commands {
         /// How much tool detail to print: minimal, compact, or full.
         #[arg(long, value_enum, default_value_t = Verbosity::default())]
         verbosity: Verbosity,
-        /// Prototype full-screen TUI instead of the line-mode repl.
+        /// Use the legacy line-mode repl instead of the full-screen TUI.
         #[arg(long)]
-        tui: bool,
+        legacy_tui: bool,
     },
     Adapters {
         #[command(subcommand)]
@@ -861,7 +861,7 @@ async fn main() -> Result<()> {
             agent,
             conversation,
             verbosity,
-            tui,
+            legacy_tui,
         } => {
             let agent_slug =
                 agent.unwrap_or_else(|| default_repl_agent_slug(harness_selection.as_ref()));
@@ -935,10 +935,13 @@ async fn main() -> Result<()> {
                 }
             };
 
-            if tui {
-                tui_app::run_chat_tui(Arc::clone(&agent), conversation, verbosity).await?;
-            } else {
+            // Non-interactive stdin/stdout (pipes, CI) can't host the
+            // full-screen TUI; fall back to line mode automatically.
+            let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+            if legacy_tui || !interactive {
                 run_chat_repl(Arc::clone(&agent), conversation, verbosity).await?;
+            } else {
+                tui_app::run_chat_tui(Arc::clone(&agent), conversation, verbosity).await?;
             }
         }
         Commands::Agent { command } => match command {
@@ -2893,7 +2896,7 @@ mod create_tests {
                 agent: None,
                 conversation: None,
                 verbosity: crate::render::Verbosity::Compact,
-                tui: false,
+                legacy_tui: false,
             }
         ));
     }
