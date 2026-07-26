@@ -813,7 +813,12 @@ async function readCheckpointSummary(
   conversation: Conversation,
   checkpoint: CompactionCheckpoint,
 ): Promise<SummaryRead> {
-  const key = `${checkpoint.artifactId}@${checkpoint.artifactVersion}`;
+  // Scoped to the conversation, not just the artifact. Forking copies artifact
+  // ids and versions, so a fork and its source can both hold
+  // `artifactId@version` pointing at *different* summaries once each has
+  // compacted again — and whichever materialized second would be handed the
+  // other branch's history. The id makes the key immutable content again.
+  const key = `${conversation.record.id}:${checkpoint.artifactId}@${checkpoint.artifactVersion}`;
   const memoized = summaryMemo.get(key);
   if (memoized !== undefined) {
     return { text: memoized };

@@ -139,7 +139,7 @@ export async function compactionInstruction(
   // text this sees is the text materialization will use. Two independent reads
   // can disagree — this one succeeds, materialization's fails transiently, and
   // the agent gets the full raw log underneath a notice insisting the older part
-  // was replaced by a summary above it, which is the failure this notice exists
+  // was replaced by a summary, which is the failure this notice exists
   // to prevent.
   //
   // A read that cannot be had comes back null rather than throwing. This runs
@@ -157,7 +157,7 @@ export async function compactionInstruction(
     role: "developer",
     content: `## Compacted history
 
-The earlier part of this conversation no longer appears verbatim in your prompt. ${checkpoint.compactedEventCount} events were replaced by the summary shown above (${checkpoint.summaryChars} characters).
+The earlier part of this conversation no longer appears verbatim in your prompt. ${checkpoint.compactedEventCount} events were replaced by the summary that opens the conversation history below (${checkpoint.summaryChars} characters).
 
 The raw history was not deleted. If you need detail the summary omits — an exact command, a full error, something the user said verbatim — query it with list_conversation_events rather than guessing or telling the user it is gone. read_compaction_summary returns the summary text in full, and describe_compaction reports the policy that produced it.`,
   };

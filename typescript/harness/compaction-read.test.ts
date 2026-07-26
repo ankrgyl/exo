@@ -26,7 +26,16 @@ interface StubOptions {
   artifacts?: Map<string, string>;
 }
 
+let nextConversation = 0;
+
 class StubConversation {
+  // Real conversations differ, and the summary memo is keyed on this — a shared
+  // id here would let one case's cached summary answer another's read.
+  readonly record = {
+    id: `conv-${(nextConversation += 1)}`,
+    slug: "conv",
+    name: "conv",
+  };
   readonly queries: EventQuery[] = [];
   readonly artifactReads: string[] = [];
   private readonly events: Event[];
@@ -406,6 +415,41 @@ describe("materializePromptHistory with a checkpoint", () => {
     );
     expect(rendered).toContain("ancient");
     expect(rendered).toContain("recent");
+  });
+
+  it("does not serve one conversation's summary to another", async () => {
+    // Forking copies artifact ids and versions. Once the fork and its source
+    // have each compacted again, both hold the same `artifactId@version`
+    // pointing at *different* summaries — so a memo keyed on the artifact alone
+    // hands whichever materialized second the other branch's history.
+    const shared = artifactId(7);
+    const build = (summary: string) => {
+      const history = turn("shared history");
+      return new StubConversation({
+        events: [
+          ...history,
+          checkpointEvent({
+            upToEventId: history.at(-1)!.id,
+            artifactId: shared,
+          }),
+          ...turn("tail"),
+        ],
+        artifacts: new Map([[shared, summary]]),
+      });
+    };
+
+    const source = build("SOURCE SUMMARY");
+    const fork = build("FORK SUMMARY");
+    const sourceText = JSON.stringify(
+      await materializePromptHistory(source as never),
+    );
+    const forkText = JSON.stringify(
+      await materializePromptHistory(fork as never),
+    );
+
+    expect(sourceText).toContain("SOURCE SUMMARY");
+    expect(forkText).toContain("FORK SUMMARY");
+    expect(forkText).not.toContain("SOURCE SUMMARY");
   });
 
   it("uses the newest checkpoint when several exist", async () => {
