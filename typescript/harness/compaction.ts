@@ -1133,19 +1133,34 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
   // checkpoint would be perfectly readable — which disarms the read path's
   // safety net, where a missing artifact falls back to replaying the full log.
   // Everything before the broken checkpoint would then be gone from the prompt
-  // for good. Rebuilding from the start costs one larger call and loses nothing.
-  const rebuildingFromStart = existing !== null && previousSummary === null;
-  const previous = rebuildingFromStart ? null : existing;
+  // for good.
+  //
+  // So the span widens. How far is the question: rebuilding from the *start* of
+  // the log loses nothing, but it demands that the entire raw history fit one
+  // summarizer request — and compaction exists precisely because histories
+  // outgrow that. On a long conversation the repair is then rejected on every
+  // attempt while materialization keeps replaying the same oversized log.
+  //
+  // An older checkpoint in the chain is the way out: its summary already stands
+  // in for everything up to its own boundary, so rebuilding from there covers
+  // the same history for the price of the span since that boundary. The full
+  // log is the last resort, not the first.
+  const widened = existing !== null && previousSummary === null;
+  const recovered = widened
+    ? await readRecoverableAncestor(conversation)
+    : null;
+  const previous = widened ? recovered : existing;
+  const summaryToChain = widened
+    ? (recovered?.summary ?? null)
+    : previousSummary;
 
-  // The model was chosen against the materialized prompt. Rebuilding from the
-  // start of the log replaces that with the *whole* history, which can be far
-  // larger — so a cheaper summary model that comfortably fit the prompt may not
-  // fit this span, and the repair would be rejected while the agent's own model
-  // had room.
+  // The model was chosen against the materialized prompt. Widening the span
+  // replaces that with everything back to an older boundary — or the whole
+  // history — which can be far larger, so a cheaper summary model that
+  // comfortably fit the prompt may not fit this span, and the repair would be
+  // rejected while the agent's own model had room.
   const model =
-    rebuildingFromStart && args.model !== args.agentModel
-      ? args.agentModel
-      : args.model;
+    widened && args.model !== args.agentModel ? args.agentModel : args.model;
 
   // Only look at events after the last checkpoint: everything before it is
   // already represented by `previousSummary`.
@@ -1171,7 +1186,7 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
 
   const spanSize = promptSize(compactedMessages);
   const previousSummarySize =
-    previousSummary === null ? null : PromptSize.ofText(previousSummary);
+    summaryToChain === null ? null : PromptSize.ofText(summaryToChain);
 
   if (
     compactionWouldNotShrink(
@@ -1189,7 +1204,7 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
 
   const summarized = await args.summarize({
     messages: compactedMessages,
-    previousSummary,
+    previousSummary: summaryToChain,
     maxChars: policy.maxSummaryChars,
     model,
   });
@@ -1415,6 +1430,64 @@ async function readSummaryOrFallBack(
   } catch {
     return null;
   }
+}
+
+/**
+ * How far back to look for a checkpoint whose summary still reads.
+ *
+ * Bounded because each step costs an artifact read. A chain where this many
+ * consecutive summaries are all unreadable is a store in trouble rather than a
+ * case worth walking to the end of, and the full-log rebuild is still there as
+ * the last resort.
+ */
+const RECOVERY_CHAIN_LIMIT = 8;
+
+/**
+ * The newest checkpoint *below the head* whose summary can still be read.
+ *
+ * Used only to repair a head whose own summary has gone: an ancestor's summary
+ * already covers everything up to that ancestor's boundary, so rebuilding from
+ * there reproduces the same coverage without requiring the whole raw log to fit
+ * one summarizer request.
+ *
+ * Walks the log in `desc` order rather than hopping `previousCheckpointId`
+ * links. The two agree — publication is guarded by a head check, so a checkpoint
+ * later in the log is always a descendant — and log order costs one query
+ * instead of one per link, and cannot be derailed by a broken link.
+ *
+ * Never throws: this is a recovery path, and a store that will not answer here
+ * leaves the caller exactly where it already was. Mirrors
+ * `read_recoverable_ancestor` in the Rust executor.
+ */
+async function readRecoverableAncestor(conversation: Conversation): Promise<{
+  eventId: string;
+  checkpoint: CompactionCheckpoint;
+  summary: string;
+} | null> {
+  let events: Event[];
+  try {
+    const result = await conversation.getEvents({
+      direction: "desc",
+      // The head itself, plus the ancestors worth trying.
+      limit: RECOVERY_CHAIN_LIMIT + 1,
+      types: [COMPACTION_CHECKPOINT_EVENT],
+    });
+    events = result.events;
+  } catch (error) {
+    console.warn("compaction: could not read the checkpoint chain", error);
+    return null;
+  }
+
+  // `slice(1)`: the head is the checkpoint that just failed to read.
+  for (const event of events.slice(1)) {
+    const checkpoint = checkpointFromEvent(event.data);
+    if (checkpoint === null) continue;
+    const summary = await readSummaryOrFallBack(conversation, checkpoint);
+    if (summary !== null) {
+      return { eventId: event.id, checkpoint, summary };
+    }
+  }
+  return null;
 }
 
 function summaryArtifactPath(conversation: Conversation): string {

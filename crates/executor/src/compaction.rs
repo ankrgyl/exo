@@ -661,34 +661,64 @@ async fn compact(
     // checkpoint would be perfectly readable — which disarms the read path's
     // safety net, where a missing artifact currently falls back to replaying the
     // full log. Everything before the broken checkpoint would then be gone from
-    // the prompt for good. Rebuilding from the start of the log costs one larger
-    // summarizer call and loses nothing.
-    let mut rebuilding_from_start = false;
+    // the prompt for good.
+    //
+    // So the span widens. How far it has to widen is the question: rebuilding
+    // from the *start* of the log loses nothing, but it also demands that the
+    // entire raw history fit one summarizer request — and compaction exists
+    // precisely because histories outgrow that. On a long conversation the
+    // repair is then rejected on every attempt while materialization keeps
+    // replaying the same oversized log: an absorbing state, and one that gets
+    // more likely the longer the conversation runs.
+    //
+    // An older checkpoint in the chain is a way out. Its summary already stands
+    // in for everything up to its own boundary, so rebuilding from there covers
+    // exactly the same history for the price of the span since that boundary.
+    // Only when no ancestor's summary reads either is the full log the last
+    // resort.
+    let mut previous_summary = previous_summary;
+    let mut widened = false;
     let previous = match (&existing, &previous_summary) {
         (Some(_), None) => {
-            tracing::warn!(
-                conversation_id = %conversation.record().id,
-                "compaction: previous summary is unreadable; rebuilding from the start of the log"
-            );
-            rebuilding_from_start = true;
-            None
+            widened = true;
+            match read_recoverable_ancestor(conversation).await {
+                Some((event_id, ancestor, summary)) => {
+                    tracing::warn!(
+                        conversation_id = %conversation.record().id,
+                        %event_id,
+                        "compaction: the active summary is unreadable; rebuilding from the \
+                         newest ancestor whose summary still reads"
+                    );
+                    previous_summary = Some(summary);
+                    Some((event_id, ancestor))
+                }
+                None => {
+                    tracing::warn!(
+                        conversation_id = %conversation.record().id,
+                        "compaction: no checkpoint in the chain has a readable summary; \
+                         rebuilding from the start of the log"
+                    );
+                    None
+                }
+            }
         }
         _ => existing,
     };
 
     // The model was chosen against the materialized prompt, which is the
-    // summary plus the retained tail. Rebuilding from the start of the log
-    // replaces that with the *whole* history, which can be far larger — so a
-    // cheaper summary model that comfortably fit the prompt may not fit this
-    // span, and the repair would be rejected while the agent's own model had
-    // room. Reverting to the agent's model is the conservative direction: it
-    // costs more per token and cannot be the reason the repair fails.
-    let model = if rebuilding_from_start && models.chosen != models.agent {
+    // summary plus the retained tail. Widening the span replaces that with
+    // everything back to an older boundary — or the whole history — which can be
+    // far larger, so a cheaper summary model that comfortably fit the prompt may
+    // not fit this span, and the repair would be rejected while the agent's own
+    // model had room. Reverting to the agent's model is the conservative
+    // direction: it costs more per token and cannot be the reason the repair
+    // fails.
+    let model = if widened && models.chosen != models.agent {
         tracing::info!(
             conversation_id = %conversation.record().id,
             summary_model = %models.chosen,
             agent_model = %models.agent,
-            "compaction: rebuilding from the start of the log; using the agent's model"
+            "compaction: rebuilding a lost checkpoint; using the agent's model"
         );
         models.agent
     } else {
@@ -856,6 +886,70 @@ async fn compact(
     Ok(CompactionOutcome::Compacted {
         checkpoint: Box::new(checkpoint),
     })
+}
+
+/// How far back to look for a checkpoint whose summary still reads.
+///
+/// Bounded because each step costs an artifact read. A chain where this many
+/// consecutive summaries are all unreadable is a store in trouble rather than a
+/// case worth walking to the end of, and the full-log rebuild is still there as
+/// the last resort.
+const RECOVERY_CHAIN_LIMIT: u32 = 8;
+
+/// The newest checkpoint *below the head* whose summary can still be read.
+///
+/// Used only to repair a head whose own summary has gone: an ancestor's summary
+/// already covers everything up to that ancestor's boundary, so rebuilding from
+/// there reproduces the same coverage without requiring the whole raw log to fit
+/// one summarizer request.
+///
+/// Walks the log in `desc` order rather than hopping `previous_checkpoint_id`
+/// links. The two agree — publication is guarded by a head check, so a
+/// checkpoint later in the log is always a descendant — and log order costs one
+/// query instead of one per link, and cannot be derailed by a broken link.
+///
+/// Never fails: this is a recovery path, and a store that will not answer here
+/// leaves the caller exactly where it already was.
+async fn read_recoverable_ancestor(
+    conversation: &dyn ConversationHandle,
+) -> Option<(EventId, CompactionCheckpoint, String)> {
+    let result = conversation
+        .get_events(Some(EventQuery {
+            cursor: None,
+            direction: Some(EventQueryDirection::Desc),
+            // The head itself, plus the ancestors worth trying.
+            limit: Some(RECOVERY_CHAIN_LIMIT + 1),
+            session_id: None,
+            turn_id: None,
+            types: Some(vec![EventKind::custom(COMPACTION_CHECKPOINT_EVENT)]),
+        }))
+        .await
+        .inspect_err(|error| {
+            tracing::warn!(
+                %error,
+                conversation_id = %conversation.record().id,
+                "compaction: could not read the checkpoint chain"
+            );
+        })
+        .ok()?;
+
+    // `skip(1)`: the head is the checkpoint that just failed to read.
+    for event in result.events.into_iter().skip(1) {
+        let event_id = event.id;
+        let EventData::Custom { payload, .. } = event.data else {
+            continue;
+        };
+        let Ok(checkpoint) = serde_json::from_value::<CompactionCheckpoint>(payload) else {
+            continue;
+        };
+        if let Some(summary) = read_summary_or_fall_back(conversation, &checkpoint)
+            .await
+            .text()
+        {
+            return Some((event_id, checkpoint, summary.to_string()));
+        }
+    }
+    None
 }
 
 /// The newest checkpoint and the id of the event carrying it, or `None` if this

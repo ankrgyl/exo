@@ -94,6 +94,15 @@ class StubTarget {
     return { events, cursor: events.at(-1)?.id };
   }
 
+  /**
+   * Drop only the most recently written artifact, leaving its predecessors
+   * intact — the shape of a partial write, and the case where an older
+   * checkpoint in the chain is still usable.
+   */
+  dropNewestArtifact() {
+    this.artifacts.delete(artifactId(this.artifactSeq));
+  }
+
   async readArtifactText(args: { artifactId: string }): Promise<string | null> {
     if (this.failArtifactReads) {
       throw new Error("artifact store unavailable");
@@ -293,6 +302,62 @@ describe("runCompaction", () => {
     expect(seen[0]).toBeNull();
     const payload = checkpointPayload(checkpointEvents(stub)[0]);
     expect(payload.previous_checkpoint_id).toBeNull();
+  });
+
+  it("rebuilds a lost checkpoint from the newest readable ancestor", async () => {
+    // Rebuilding from the start of the log loses nothing, but it is exactly the
+    // request a long conversation cannot make — and a conversation long enough
+    // to have compacted repeatedly is the one most likely to lose an artifact.
+    // An older checkpoint's summary already stands in for everything up to its
+    // own boundary, so the repair can start there and cover the same history for
+    // the price of the span since.
+    const stub = target([...turn("a"), ...turn("b"), ...turn("c")]);
+    await runCompaction(args(stub));
+    stub.events.push(...turn("d"), ...turn("e"));
+    await runCompaction(
+      args(stub, {
+        summarize: (async () => "SECOND SUMMARY") satisfies SummarizeFn,
+      }),
+    );
+    expect(checkpointEvents(stub)).toHaveLength(2);
+
+    // Lose only the newest summary, as a partial write would.
+    stub.dropNewestArtifact();
+    stub.appended.length = 0;
+    stub.events.push(...turn("f"), ...turn("g"));
+
+    let previous: string | null = null;
+    let span = "";
+    const result = await runCompaction(
+      args(stub, {
+        summarize: (async (input) => {
+          previous = input.previousSummary;
+          span = JSON.stringify(input.messages);
+          return "REPAIRED";
+        }) satisfies SummarizeFn,
+      }),
+    );
+
+    expect(result.status).toBe("compacted");
+    // Coverage is unchanged — the first summary still accounts for everything
+    // before its boundary — but the span the model reads starts at that
+    // boundary rather than at the start of the log.
+    expect(previous).toBe("SUMMARY OF EVERYTHING");
+    expect(span).not.toContain("a x");
+    expect(span).toContain("d x");
+    expect(span).toContain("f x");
+
+    // The chain link names the ancestor, not the checkpoint that could not be
+    // read: the broken one is unreachable from the new summary's content.
+    const chain = stub.events.filter(
+      (e) =>
+        e.data.type === "custom" &&
+        e.data.event_type === COMPACTION_CHECKPOINT_EVENT,
+    );
+    expect(chain).toHaveLength(3);
+    expect(
+      checkpointPayload(checkpointEvents(stub)[0]).previous_checkpoint_id,
+    ).toBe(chain[0].id);
   });
 
   it("caps an oversized summary rather than trusting the model", async () => {

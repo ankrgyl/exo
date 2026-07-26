@@ -404,8 +404,29 @@ only on a conclusive one.
 That fallback is also why an unreadable summary **stops the chain**. Compacting
 from a broken checkpoint's boundary would summarize only the tail and then write
 a perfectly readable checkpoint over it — disarming the fallback and dropping
-everything before the break from the prompt for good. Instead, compaction
-rebuilds from the start of the log: one larger summarizer call, nothing lost.
+everything before the break from the prompt for good. So the span has to widen.
+
+How far it widens is a separate question, and "back to the start of the log" is
+the wrong default. It loses nothing, but it demands that the entire raw history
+fit one summarizer request — which is the request compaction exists because a
+conversation cannot make, and the conversations most likely to lose an artifact
+are the long ones that have already compacted several times. The repair would
+then be rejected on every attempt while materialization kept replaying the same
+oversized log: an absorbing state.
+
+An **older checkpoint in the chain** is the way out. Its summary already stands
+in for everything up to its own boundary, so rebuilding from there covers
+exactly the same history for the price of the span since that boundary. So the
+repair walks the chain newest-first — bounded, because each step costs an
+artifact read — and rebuilds from the first ancestor whose summary still reads.
+The new checkpoint links to that ancestor, not to the checkpoint that could not
+be read; the broken one is unreachable from what the new summary contains. Only
+when no ancestor reads either is the whole log the span, and then it is the last
+resort rather than the first.
+
+Either way the span is wider than the prompt the summary model was chosen
+against, so a widened rebuild goes to the **agent's** model: it costs more per
+token and cannot be the reason the repair fails.
 
 A compaction that finishes summarizing only to find a **newer checkpoint** at
 the head stands down without publishing. Everything in its payload — the chain

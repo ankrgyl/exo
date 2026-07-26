@@ -483,10 +483,20 @@ async fn send_stream_emits_chunks_and_persists_final_response() {
     }));
 }
 
+/// Something that happens on the model's thread while a request is in flight.
+///
+/// The only way to express "another turn finished *during* this call" — which
+/// several compaction properties turn on, since turns on one conversation are
+/// not serialized.
+type InFlightHook = Arc<
+    dyn Fn(usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+
 struct FakeModelClient {
     responses: Mutex<VecDeque<ModelResponse>>,
     streams: Mutex<VecDeque<FakeStreamResponse>>,
     observed_requests: Mutex<Vec<ModelRequest>>,
+    in_flight: Mutex<Option<InFlightHook>>,
 }
 
 impl FakeModelClient {
@@ -495,6 +505,7 @@ impl FakeModelClient {
             responses: Mutex::new(VecDeque::from(responses)),
             streams: Mutex::new(VecDeque::new()),
             observed_requests: Mutex::new(Vec::new()),
+            in_flight: Mutex::new(None),
         }
     }
 
@@ -503,7 +514,13 @@ impl FakeModelClient {
             responses: Mutex::new(VecDeque::new()),
             streams: Mutex::new(VecDeque::from(streams)),
             observed_requests: Mutex::new(Vec::new()),
+            in_flight: Mutex::new(None),
         }
+    }
+
+    /// Run `hook` while each request is in flight, passing its zero-based index.
+    fn on_request(&self, hook: InFlightHook) {
+        *self.in_flight.lock().expect("model client poisoned") = Some(hook);
     }
 
     fn observed_requests(&self) -> Vec<ModelRequest> {
@@ -512,15 +529,33 @@ impl FakeModelClient {
             .expect("model client poisoned")
             .clone()
     }
+
+    /// Records the request and runs the in-flight hook, returning its index.
+    async fn accept(&self, request: ModelRequest) -> usize {
+        let index = {
+            let mut observed = self
+                .observed_requests
+                .lock()
+                .expect("model client poisoned");
+            observed.push(request);
+            observed.len() - 1
+        };
+        let hook = self
+            .in_flight
+            .lock()
+            .expect("model client poisoned")
+            .clone();
+        if let Some(hook) = hook {
+            hook(index).await;
+        }
+        index
+    }
 }
 
 #[async_trait]
 impl ModelClient for FakeModelClient {
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
-        self.observed_requests
-            .lock()
-            .expect("model client poisoned")
-            .push(request);
+        self.accept(request).await;
         let mut responses = self.responses.lock().expect("model client poisoned");
         responses
             .pop_front()
@@ -528,10 +563,7 @@ impl ModelClient for FakeModelClient {
     }
 
     async fn complete_stream(&self, request: ModelRequest) -> Result<Box<dyn ModelResponseStream>> {
-        self.observed_requests
-            .lock()
-            .expect("model client poisoned")
-            .push(request);
+        self.accept(request).await;
         let mut streams = self.streams.lock().expect("model client poisoned");
         let stream = streams
             .pop_front()
@@ -700,6 +732,17 @@ impl FakeExoHarness {
             .expect("fake harness poisoned")
             .artifacts
             .clear();
+    }
+
+    /// Drop only the most recently written artifact, leaving its predecessors
+    /// intact — the shape of a partial write, and the case where an older
+    /// checkpoint in the chain is still usable.
+    fn drop_newest_artifact(&self) {
+        self.state
+            .lock()
+            .expect("fake harness poisoned")
+            .artifacts
+            .pop();
     }
 
     fn new(agent_id: AgentId, conversation_id: ConversationId) -> Self {
@@ -2252,6 +2295,35 @@ async fn checkpoint_events(conversation: &dyn ConversationHandle) -> Vec<EventDa
         .collect()
 }
 
+/// Every checkpoint on the conversation, oldest first, with the id of the event
+/// carrying it — the id `previous_checkpoint_id` has to name.
+async fn checkpoint_chain(
+    conversation: &dyn ConversationHandle,
+) -> Vec<(Uuid7, CompactionCheckpoint)> {
+    conversation
+        .get_events(Some(EventQuery {
+            cursor: None,
+            direction: Some(EventQueryDirection::Asc),
+            limit: None,
+            session_id: None,
+            turn_id: None,
+            types: Some(vec![EventKind::custom(
+                crate::compaction::COMPACTION_CHECKPOINT_EVENT,
+            )]),
+        }))
+        .await
+        .expect("get events")
+        .events
+        .into_iter()
+        .filter_map(|event| match event.data {
+            EventData::Custom { payload, .. } => serde_json::from_value(payload)
+                .ok()
+                .map(|checkpoint| (event.id, checkpoint)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The shared materialize helper returns the **whole** log, checkpoint or not.
 ///
 /// It is not a prompt builder. Its callers are
@@ -2891,6 +2963,165 @@ async fn an_over_limit_conversation_is_compacted_before_the_request_goes_out() {
     );
 }
 
+/// After a preflight compaction rebuilds the request, the post-response trigger
+/// must weigh the *rebuilt* prompt — not the oversized one that compaction just
+/// fixed.
+///
+/// Reachable only when the latch reopens between the two checks, which needs
+/// another turn to finish mid-round; turns on one conversation are not
+/// serialized, so the hook below appends a `TurnEnded` while this turn's own
+/// request is in flight. Weighing the stale size there fires a second trigger on
+/// a prompt already well under the threshold: another summary paid for, and more
+/// verbatim history discarded, in the same round.
+#[tokio::test]
+async fn a_preflight_rebuild_leaves_no_stale_size_for_the_post_response_trigger() {
+    let agent_id = Uuid7::now();
+    let conversation_id = Uuid7::now();
+    let exoharness = Arc::new(FakeExoHarness::new(agent_id, conversation_id));
+    let agent = exoharness
+        .get_agent(&agent_id)
+        .await
+        .expect("get agent")
+        .expect("agent exists");
+    let conversation = agent
+        .get_conversation(&conversation_id)
+        .await
+        .expect("get conversation")
+        .expect("conversation exists");
+    seed_completed_turns(
+        conversation.as_ref(),
+        &["ancient", "older", "old", "recent"],
+    )
+    .await;
+
+    let builder = test_executor();
+    let oversized = prompt_size(
+        &builder
+            .materialize_prompt_history(conversation.as_ref(), &[])
+            .await
+            .expect("materialize"),
+    )
+    .bytes();
+
+    // Three responses: the preflight summary, the turn's own reply, and one
+    // spare so that a second compaction — the regression — completes rather than
+    // erroring, keeping the assertion about the count and not about a panic.
+    let model = Arc::new(FakeModelClient::new(vec![
+        ModelResponse {
+            provider_cost_usd: None,
+            response_id: None,
+            messages: vec![assistant_message("a summary of the earlier turns")],
+            tool_calls: vec![],
+            usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
+        },
+        ModelResponse {
+            provider_cost_usd: None,
+            response_id: None,
+            // No usage, so the post-response trigger falls back to `prompt_size`
+            // — the value under test.
+            messages: vec![assistant_message("ok")],
+            tool_calls: vec![],
+            usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
+        },
+        ModelResponse {
+            provider_cost_usd: None,
+            response_id: None,
+            messages: vec![assistant_message("a second, unnecessary summary")],
+            tool_calls: vec![],
+            usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
+        },
+    ]));
+
+    // The concurrent turn: it lands between the preflight compaction and the
+    // post-response check, which is what reopens the latch.
+    let concurrent = Arc::clone(&conversation);
+    model.on_request(Arc::new(move |index| {
+        let conversation = Arc::clone(&concurrent);
+        Box::pin(async move {
+            if index != 1 {
+                return;
+            }
+            conversation
+                .add_events(AddEventsRequest {
+                    session_id: None,
+                    turn_id: None,
+                    data: vec![EventData::TurnEnded],
+                })
+                .await
+                .expect("another turn finishes mid-round");
+        })
+    }));
+
+    let executor = BasicExecutor::new(Arc::clone(&model), Arc::new(FakeToolRuntime::default()));
+    let agent_config = AgentConfig {
+        compaction: Some(CompactionConfig {
+            enabled: true,
+            keep_recent_turns: 1,
+            // The fake model has no known input limit, so drive the trigger
+            // through the character-budget fallback. Half the uncompacted size:
+            // above it before compaction, comfortably below it after.
+            fallback_char_budget: oversized / 2,
+            ..CompactionConfig::default()
+        }),
+        ..default_agent_config()
+    };
+
+    let turn = conversation
+        .begin_turn(BeginTurnRequest {
+            session_id: None,
+            input: vec![user_message("one more question")],
+        })
+        .await
+        .expect("begin turn");
+    HarnessExecutor::execute_turn(
+        &executor,
+        agent.as_ref(),
+        conversation.as_ref(),
+        Arc::clone(&turn),
+        &agent_config,
+        &ConversationConfig::default(),
+        &(),
+        ExecutorStreamMode::Disabled,
+        None,
+    )
+    .await
+    .expect("execute turn");
+    turn.finish().await.expect("finish turn");
+
+    let requests = model.observed_requests();
+    // The premise: request 0 was the preflight summarizer call and request 1 was
+    // the turn's own prompt, so the hook fired where the comment says it did.
+    assert!(
+        !prompt_text(&requests[0].messages).contains("one more question"),
+        "request 0 should be the preflight summarizer call"
+    );
+    assert!(
+        prompt_text(&requests[1].messages).contains("one more question"),
+        "request 1 should be the turn's own prompt"
+    );
+    assert_eq!(
+        requests.len(),
+        2,
+        "the rebuilt prompt is under the threshold, so the reopened latch must \
+         not buy a second summary: {} requests",
+        requests.len()
+    );
+    assert_eq!(
+        compaction_usage_records(conversation.as_ref()).await.len(),
+        1,
+        "and only the preflight compaction should have been billed"
+    );
+}
+
 async fn run_one_turn(
     executor: &BasicExecutor<FakeModelClient, FakeToolRuntime>,
     agent: &dyn AgentHandle,
@@ -3079,6 +3310,178 @@ async fn compaction_rebuilds_from_the_start_when_the_previous_summary_is_gone() 
     assert!(
         summarized.contains("ancient"),
         "rebuild should cover history from before the unreadable checkpoint: {summarized}"
+    );
+}
+
+/// Repairing a lost checkpoint must not require the whole raw log to fit one
+/// summarizer request.
+///
+/// Rebuilding from the start loses nothing, but it is exactly the request a long
+/// conversation cannot make — and a conversation long enough to have compacted
+/// repeatedly is the one most likely to lose an artifact. An older checkpoint's
+/// summary already stands in for everything up to its own boundary, so the
+/// repair can start there and cover the same history for the price of the span
+/// since. The full log stays the last resort, not the first.
+#[tokio::test]
+async fn a_lost_checkpoint_is_rebuilt_from_the_newest_readable_ancestor() {
+    let (harness, conversation) = compaction_fixture().await;
+    let config = CompactionConfig {
+        keep_recent_turns: 1,
+        ..CompactionConfig::default()
+    };
+
+    // First checkpoint, over the oldest turns. Its artifact survives.
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+    let turn = open_turn(conversation.as_ref()).await;
+    run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &config,
+        summarizer_models("summary-model"),
+        None,
+        &|_input| Box::pin(async { Ok("FIRST SUMMARY".to_string()) }),
+    )
+    .await;
+    turn.finish().await.expect("finish turn");
+
+    // Second checkpoint, chained off the first.
+    seed_completed_turns(conversation.as_ref(), &["newer", "newest"]).await;
+    let turn = open_turn(conversation.as_ref()).await;
+    run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &config,
+        summarizer_models("summary-model"),
+        None,
+        &|_input| Box::pin(async { Ok("SECOND SUMMARY".to_string()) }),
+    )
+    .await;
+    turn.finish().await.expect("finish turn");
+    assert_eq!(
+        checkpoint_events(conversation.as_ref()).await.len(),
+        2,
+        "the fixture needs two checkpoints for there to be an ancestor"
+    );
+
+    // Lose only the newest summary, as a partial write would.
+    harness.drop_newest_artifact();
+
+    seed_completed_turns(conversation.as_ref(), &["later", "latest"]).await;
+    let seen = Arc::new(Mutex::new(None));
+    let captured = Arc::clone(&seen);
+    let turn = open_turn(conversation.as_ref()).await;
+    let outcome = run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &config,
+        summarizer_models("summary-model"),
+        None,
+        &move |input: SummarizeInput| {
+            *captured.lock().expect("seen poisoned") =
+                Some((prompt_text(&input.messages), input.previous_summary.clone()));
+            Box::pin(async { Ok("REPAIRED".to_string()) })
+        },
+    )
+    .await;
+    assert!(
+        matches!(outcome, CompactionOutcome::Compacted { .. }),
+        "the repair should have published: {outcome:?}"
+    );
+
+    let seen = seen.lock().expect("seen poisoned").clone();
+    let (span, previous) = seen.expect("the summarizer should have been called");
+
+    // The load-bearing pair. Coverage is unchanged — the first summary still
+    // accounts for everything before its boundary — but the span the model is
+    // asked to read starts at that boundary rather than at the start of the log.
+    assert_eq!(
+        previous.as_deref(),
+        Some("FIRST SUMMARY"),
+        "the repair should chain off the newest ancestor whose summary reads"
+    );
+    assert!(
+        !span.contains("ancient"),
+        "and must not re-read the history that summary already covers: {span}"
+    );
+    assert!(
+        span.contains("newer") && span.contains("later"),
+        "everything after that boundary does have to be re-read: {span}"
+    );
+
+    // The chain link names the ancestor, not the checkpoint that could not be
+    // read — the broken one is unreachable from the new summary's content.
+    let chain = checkpoint_chain(conversation.as_ref()).await;
+    assert_eq!(chain.len(), 3, "three checkpoints by now");
+    assert_eq!(
+        chain[2].1.previous_checkpoint_id,
+        Some(chain[0].0),
+        "the new checkpoint should link to the ancestor it was built from"
+    );
+}
+
+/// The other half: when *no* checkpoint in the chain has a readable summary,
+/// there is no ancestor to stand on and the full log is the only correct span.
+#[tokio::test]
+async fn a_chain_with_no_readable_summary_still_rebuilds_from_the_start() {
+    let (harness, conversation) = compaction_fixture().await;
+    let config = CompactionConfig {
+        keep_recent_turns: 1,
+        ..CompactionConfig::default()
+    };
+
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+    let turn = open_turn(conversation.as_ref()).await;
+    run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &config,
+        summarizer_models("summary-model"),
+        None,
+        &|_input| Box::pin(async { Ok("FIRST SUMMARY".to_string()) }),
+    )
+    .await;
+    turn.finish().await.expect("finish turn");
+
+    seed_completed_turns(conversation.as_ref(), &["newer", "newest"]).await;
+    let turn = open_turn(conversation.as_ref()).await;
+    run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &config,
+        summarizer_models("summary-model"),
+        None,
+        &|_input| Box::pin(async { Ok("SECOND SUMMARY".to_string()) }),
+    )
+    .await;
+    turn.finish().await.expect("finish turn");
+
+    // Every summary gone, not just the newest.
+    harness.clear_artifacts();
+
+    seed_completed_turns(conversation.as_ref(), &["later", "latest"]).await;
+    let seen = Arc::new(Mutex::new(None));
+    let captured = Arc::clone(&seen);
+    let turn = open_turn(conversation.as_ref()).await;
+    run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &config,
+        summarizer_models("summary-model"),
+        None,
+        &move |input: SummarizeInput| {
+            *captured.lock().expect("seen poisoned") =
+                Some((prompt_text(&input.messages), input.previous_summary.clone()));
+            Box::pin(async { Ok("REBUILT".to_string()) })
+        },
+    )
+    .await;
+
+    let seen = seen.lock().expect("seen poisoned").clone();
+    let (span, previous) = seen.expect("the summarizer should have been called");
+    assert_eq!(previous, None, "there is no readable summary to chain off");
+    assert!(
+        span.contains("ancient"),
+        "so the span has to reach the start of the log: {span}"
     );
 }
 
