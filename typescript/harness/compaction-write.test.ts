@@ -366,6 +366,27 @@ describe("runCompaction", () => {
     expect(checkpointEvents(stub)).toHaveLength(0);
   });
 
+  it("writes no checkpoint when the summary shrinks bytes but grows tokens", async () => {
+    // Bytes and tokens do not move together, and the context window is
+    // denominated in tokens. 3 turns of ~8KB ASCII is ~24KB and ~8k estimated
+    // tokens; 5000 emoji is 20KB — a clear win on bytes — but ~10k tokens, so
+    // it takes *more* of the window than the history it replaces. Only the
+    // token clause catches this; the byte comparison alone would publish it.
+    const stub = target([
+      ...turn("a"),
+      ...turn("b"),
+      ...turn("c"),
+      ...turn("d"),
+    ]);
+    const dense = "\u{1F600}".repeat(5_000);
+    const result = await runCompaction(
+      args(stub, { summarize: (async () => dense) satisfies SummarizeFn }),
+    );
+
+    expect(result.status).toBe("skipped");
+    expect(checkpointEvents(stub)).toHaveLength(0);
+  });
+
   it("skips when the compactable span is smaller than the summary cap", async () => {
     // A prompt can cross the threshold because of the *retained* turns — one
     // huge tool result, say. Summarizing a tiny prefix into an 8k-character

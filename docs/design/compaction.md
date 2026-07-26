@@ -336,6 +336,13 @@ that came back larger than the history it would replace is discarded, already
 paid for, rather than published: a checkpoint would persist the enlarged prompt
 until the next cut.
 
+That measurement compares **bytes and estimated tokens**, not bytes alone.
+Shrinking one does not imply shrinking the other, and the context window is
+denominated in tokens: a 24KB ASCII span is ~8k tokens, while a 5000-emoji
+summary is only 20KB but ~10k tokens — smaller on the wire and larger in the
+window. Bytes still govern what is stored and transferred, so the replacement
+has to win on both rather than trade one against the other.
+
 ## What survives compaction
 
 - **Instructions** — rebuilt every round, never sourced from events.
@@ -527,10 +534,18 @@ Compaction also does nothing when the compactable span is already smaller than
 _kept_ — one enormous tool result, say — and replacing a smaller prefix with a
 summary that could be larger would grow the prompt, not shrink it.
 
-Each turn attempts compaction at most once. Cuts land only on `turn_ended`
-boundaries and none appears mid-turn, so the answer provably cannot change
-within a turn; retrying every round would re-scan the log and re-run the
-summarizer for the same result.
+Within a turn, further attempts are suppressed only while the newest completed
+turn boundary is unchanged. Cuts land only on `turn_ended`, so an unchanged
+boundary means a re-scan reaches the same answer, and retrying every round would
+re-scan the log and possibly re-run the summarizer for it.
+
+The earlier version of this rule latched permanently on the first attempt,
+justified by "no new `turn_ended` appears mid-turn". Turns on one conversation
+are not serialized, so that is false: other turns finish while this one loops,
+and an attempt that skipped for want of completed turns would otherwise suppress
+every later check while the prompt kept growing. The latch therefore records the
+boundary it last saw rather than a boolean — it stores _why_ re-attempting would
+be pointless instead of asserting that it is.
 
 ## Known limits
 

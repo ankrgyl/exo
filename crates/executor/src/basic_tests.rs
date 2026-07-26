@@ -2031,6 +2031,55 @@ async fn a_summary_that_would_grow_the_prompt_is_not_published() {
 }
 
 #[tokio::test]
+async fn a_summary_that_shrinks_bytes_but_grows_tokens_is_not_published() {
+    // Bytes and tokens do not move together, and the context window is
+    // denominated in tokens. A summary can be smaller on the wire and still
+    // take more of the window than the history it replaced — an ASCII span at
+    // ~3 bytes per token replaced by emoji at ~2. Checking bytes alone waves
+    // that through and the prompt gets *closer* to the limit after compacting.
+    let (_harness, conversation) = compaction_fixture().await;
+    // Four turns, one kept: a span of roughly 24KB of ASCII, which the
+    // estimator prices at ~8k tokens (3 bytes/token).
+    seed_completed_turns(
+        conversation.as_ref(),
+        &["ancient", "older", "old", "recent"],
+    )
+    .await;
+
+    let turn = open_turn(conversation.as_ref()).await;
+    // 5000 emoji: 20KB — a clear win on bytes against a 24KB span — but 4 bytes
+    // and ~2 estimated tokens per character puts it at ~10k tokens, more of the
+    // window than the history it replaces. Only the token clause catches this;
+    // the byte comparison alone would publish it.
+    let dense = "😀".repeat(5_000);
+    let outcome = run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &CompactionConfig {
+            keep_recent_turns: 1,
+            max_summary_chars: 8_000,
+            ..CompactionConfig::default()
+        },
+        "summary-model",
+        None,
+        &|_input| {
+            let dense = dense.clone();
+            Box::pin(async move { Ok(dense) })
+        },
+    )
+    .await;
+
+    let CompactionOutcome::Skipped { reason } = outcome else {
+        panic!("a summary that grows the token count must not be published, got {outcome:?}");
+    };
+    assert!(reason.contains("larger than the history"), "{reason}");
+    assert!(
+        checkpoint_events(conversation.as_ref()).await.is_empty(),
+        "no checkpoint should have been written"
+    );
+}
+
+#[tokio::test]
 async fn a_failed_summary_read_is_retried_rather_than_cached() {
     // The history cache outlives the turn. Priming it against a checkpoint
     // whose artifact merely *failed to read* would make one transient storage

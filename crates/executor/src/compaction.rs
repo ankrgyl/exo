@@ -1054,13 +1054,23 @@ fn compaction_would_not_shrink(
 /// The cap is a character count and the prompt is charged in bytes, so the
 /// estimate has to assume a bytes-per-character rate for text that has not been
 /// written yet. This does not: the summary is right here.
+///
+/// Measured in bytes **and** in estimated tokens, because shrinking one does not
+/// imply shrinking the other and the context window is denominated in tokens. A
+/// 24KB ASCII span estimates at ~8k tokens; a 5000-emoji summary is only 20KB —
+/// a win on bytes — but ~10k tokens, so it takes *more* of the window than the
+/// history it replaced. Bytes still matter for what is stored and transferred,
+/// so the replacement has to win on both rather than trade one for the other.
 fn summary_would_not_shrink(
     span: PromptSize,
     previous_summary: Option<PromptSize>,
     summary: &str,
 ) -> bool {
-    let replacement = summary_envelope_bytes() + PromptSize::of_str(summary).bytes();
-    replaced_bytes(span, previous_summary) <= replacement
+    // The replacement is the summary *and* the wrapper it is delivered in.
+    let replacement = summary_envelope_size() + PromptSize::of_str(summary);
+    let current = replaced_size(span, previous_summary);
+    current.bytes() <= replacement.bytes()
+        || current.estimated_tokens() <= replacement.estimated_tokens()
 }
 
 /// Bytes the prompt currently spends on everything a checkpoint would replace.
@@ -1068,7 +1078,25 @@ fn summary_would_not_shrink(
 /// The previous summary is already wrapped where it sits in the prompt, so it
 /// costs its own envelope too.
 fn replaced_bytes(span: PromptSize, previous_summary: Option<PromptSize>) -> u64 {
-    span.bytes() + previous_summary.map_or(0, |summary| summary_envelope_bytes() + summary.bytes())
+    replaced_size(span, previous_summary).bytes()
+}
+
+/// `span` plus the enveloped previous summary, as a measurable size rather than
+/// a single number — so callers can ask about bytes or tokens without the
+/// envelope arithmetic drifting between them.
+///
+/// The span carries no envelope of its own: it sits in the prompt as ordinary
+/// messages. Only a summary is wrapped.
+fn replaced_size(span: PromptSize, previous_summary: Option<PromptSize>) -> PromptSize {
+    match previous_summary {
+        Some(summary) => span + summary_envelope_size() + summary,
+        None => span,
+    }
+}
+
+/// Size the `summary_message` wrapper adds, summary text excluded.
+fn summary_envelope_size() -> PromptSize {
+    prompt_size(std::slice::from_ref(&summary_message("")))
 }
 
 /// Serialized bytes the `summary_message` wrapper adds, summary text excluded.
@@ -1077,7 +1105,7 @@ fn replaced_bytes(span: PromptSize, previous_summary: Option<PromptSize>) -> u64
 /// wrapper text: the guard that uses it decides whether compaction is worth
 /// running at all, and a stale constant would quietly bias that decision.
 fn summary_envelope_bytes() -> u64 {
-    prompt_size(std::slice::from_ref(&summary_message(""))).bytes()
+    summary_envelope_size().bytes()
 }
 
 fn summary_artifact_path(conversation: &dyn ConversationHandle) -> String {

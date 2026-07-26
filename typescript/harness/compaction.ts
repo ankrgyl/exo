@@ -1220,14 +1220,26 @@ export function compactionWouldNotShrink(
  * The cap is a character count and the prompt is charged in bytes, so the
  * estimate has to assume a bytes-per-character rate for text that has not been
  * written yet. This does not: the summary is right here.
+ *
+ * Measured in bytes **and** in estimated tokens, because shrinking one does not
+ * imply shrinking the other and the context window is denominated in tokens. A
+ * 24KB ASCII span estimates at ~8k tokens; a 5000-emoji summary is only 20KB — a
+ * win on bytes — but ~10k tokens, so it takes *more* of the window than the
+ * history it replaced. Bytes still matter for what is stored and transferred, so
+ * the replacement has to win on both rather than trade one for the other.
  */
 export function summaryWouldNotShrink(
   span: PromptSize,
   previousSummary: PromptSize | null,
   summary: string,
 ): boolean {
-  const replacement = summaryEnvelopeBytes() + PromptSize.ofText(summary).bytes;
-  return replacedBytes(span, previousSummary) <= replacement;
+  // The replacement is the summary *and* the wrapper it is delivered in.
+  const replacement = summaryEnvelopeSize().plus(PromptSize.ofText(summary));
+  const current = replacedSize(span, previousSummary);
+  return (
+    current.bytes <= replacement.bytes ||
+    current.estimatedTokens() <= replacement.estimatedTokens()
+  );
 }
 
 /**
@@ -1240,12 +1252,24 @@ function replacedBytes(
   span: PromptSize,
   previousSummary: PromptSize | null,
 ): number {
-  return (
-    span.bytes +
-    (previousSummary === null
-      ? 0
-      : summaryEnvelopeBytes() + previousSummary.bytes)
-  );
+  return replacedSize(span, previousSummary).bytes;
+}
+
+/**
+ * `span` plus the enveloped previous summary, as a measurable size rather than a
+ * single number — so callers can ask about bytes or tokens without the envelope
+ * arithmetic drifting between them.
+ *
+ * The span carries no envelope of its own: it sits in the prompt as ordinary
+ * messages. Only a summary is wrapped.
+ */
+function replacedSize(
+  span: PromptSize,
+  previousSummary: PromptSize | null,
+): PromptSize {
+  return previousSummary === null
+    ? span
+    : span.plus(summaryEnvelopeSize()).plus(previousSummary);
 }
 
 /**
@@ -1256,7 +1280,12 @@ function replacedBytes(
  * running at all, and a stale constant would quietly bias that decision.
  */
 function summaryEnvelopeBytes(): number {
-  return promptSize([summaryMessage("")]).bytes;
+  return summaryEnvelopeSize().bytes;
+}
+
+/** Size the `summaryMessage` wrapper adds, summary text excluded. */
+function summaryEnvelopeSize(): PromptSize {
+  return promptSize([summaryMessage("")]);
 }
 
 /**
