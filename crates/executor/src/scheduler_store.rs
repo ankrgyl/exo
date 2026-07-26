@@ -223,6 +223,7 @@ mod tests {
                 command: vec!["true".to_string()],
                 report_prompt: "Report.".to_string(),
                 max_output_bytes: None,
+                missed: None,
             })
             .await
             .unwrap();
@@ -245,6 +246,7 @@ mod tests {
                 command: vec!["true".to_string()],
                 report_prompt: "Report.".to_string(),
                 max_output_bytes: None,
+                missed: None,
             })
             .await
             .unwrap();
@@ -286,6 +288,7 @@ mod tests {
                 command: vec!["true".to_string()],
                 report_prompt: "Report.".to_string(),
                 max_output_bytes: None,
+                missed: None,
             })
             .await
             .unwrap();
@@ -323,6 +326,7 @@ mod tests {
                 command: vec!["true".to_string()],
                 report_prompt: "Report.".to_string(),
                 max_output_bytes: None,
+                missed: None,
             })
             .await
             .unwrap();
@@ -351,6 +355,7 @@ mod tests {
                 command: vec!["true".to_string()],
                 report_prompt: "Report.".to_string(),
                 max_output_bytes: None,
+                missed: None,
             })
             .await
             .unwrap();
@@ -381,6 +386,7 @@ mod tests {
                 command: vec!["true".to_string()],
                 report_prompt: "Report.".to_string(),
                 max_output_bytes: None,
+                missed: None,
             })
             .await
             .unwrap();

@@ -51,21 +51,46 @@ pub async fn run_due_tasks(
     let due = store
         .claim_due_tasks(now_ms(), options.limit, DEFAULT_TASK_LEASE_MS)
         .await?;
-    futures::future::try_join_all(
+    let runs = futures::future::try_join_all(
         due.into_iter()
             .map(|task| run_task(Arc::clone(&harness), store, task)),
     )
-    .await
+    .await?;
+    Ok(runs.into_iter().flatten().collect())
 }
 
+/// Runs whatever the task's missed-fire policy says it owes at this moment,
+/// then puts it back on the grid. Usually that is a single run; it is more
+/// under [`MissedPolicy::All`](crate::MissedPolicy::All) after downtime, and
+/// none under [`MissedPolicy::Skip`](crate::MissedPolicy::Skip).
 pub async fn run_task(
     harness: Arc<dyn Harness>,
     store: &SchedulerStore,
     mut task: ScheduledTaskRecord,
+) -> Result<Vec<ScheduledTaskRunRecord>> {
+    let plan = task.plan_missed_fires(now_ms())?;
+    let mut runs = Vec::with_capacity(plan.fire_slots.len());
+    for _slot_ms in &plan.fire_slots {
+        runs.push(fire_once(Arc::clone(&harness), store, &mut task).await?);
+        if !task.enabled {
+            // The agent or conversation is gone; the rest of the backlog would
+            // fail identically.
+            break;
+        }
+    }
+    task.resume_after_fires(&plan, now_ms());
+    store.put_task(&task).await?;
+    Ok(runs)
+}
+
+async fn fire_once(
+    harness: Arc<dyn Harness>,
+    store: &SchedulerStore,
+    task: &mut ScheduledTaskRecord,
 ) -> Result<ScheduledTaskRunRecord> {
     let started_at_ms = now_ms();
     let run_id = Uuid7::now().to_string();
-    let run_result = run_task_inner(Arc::clone(&harness), &mut task, &run_id).await;
+    let run_result = run_task_inner(Arc::clone(&harness), task, &run_id).await;
     let finished_at_ms = now_ms();
 
     let (mut run, result_artifact_id) = match run_result {
@@ -105,7 +130,7 @@ pub async fn run_task(
         ),
     };
 
-    task.mark_completed(&run, result_artifact_id, finished_at_ms)?;
+    task.mark_completed(&run, result_artifact_id, finished_at_ms);
     if run
         .error
         .as_deref()
@@ -116,7 +141,7 @@ pub async fn run_task(
     }
     run.task_id = task.id.clone();
     store.put_run(&run).await?;
-    store.put_task(&task).await?;
+    store.put_task(task).await?;
     Ok(run)
 }
 

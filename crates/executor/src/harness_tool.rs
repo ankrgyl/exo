@@ -14,7 +14,7 @@ use crate::conversation_sandbox::{
 };
 use crate::scheduler_store::SchedulerStore;
 use crate::scheduler_types::{
-    DEFAULT_MAX_OUTPUT_BYTES, NewScheduledTask, ScheduledTaskSandboxMode,
+    DEFAULT_MAX_OUTPUT_BYTES, MissedPolicy, NewScheduledTask, ScheduledTaskSandboxMode,
 };
 use crate::{AgentConfig, ConversationConfig, ToolRuntime};
 use crate::{SandboxScope, effective_sandbox_scope};
@@ -258,6 +258,7 @@ struct ScheduleTaskArguments {
     command: Vec<String>,
     report_prompt: String,
     max_output_bytes: Option<u64>,
+    missed: Option<MissedPolicy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -371,6 +372,7 @@ async fn execute_schedule_task_tool(
             command: args.command,
             report_prompt: args.report_prompt,
             max_output_bytes: Some(args.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)),
+            missed: args.missed,
         })
         .await?;
     Ok(serde_json::json!({
