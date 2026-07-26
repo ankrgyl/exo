@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -16,14 +16,15 @@ use lingua::{Message, UniversalStreamChunk};
 use rustyline::error::ReadlineError;
 use rustyline::history::{History, MemHistory, SearchDirection, SearchResult};
 use rustyline::{Cmd, Config, Editor, ExternalPrinter, KeyCode, KeyEvent, Modifiers};
-use serde_json::{Map, Value};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
-use crate::{
-    compact_timestamp, print_message, render_assistant_content, run_sandbox_shell_command,
+use crate::render::{
+    Verbosity, compact_result_status, compact_timestamp, print_transcript,
+    render_assistant_content, render_tool_call, render_tool_result,
 };
+use crate::run_sandbox_shell_command;
 
 const DEFAULT_SHELL_PROGRAM: &str = "/bin/bash";
 const REMOTE_HISTORY_BASE: usize = 1_000_000;
@@ -32,8 +33,9 @@ const REMOTE_HISTORY_PAGE_SIZE: u32 = 32;
 pub async fn run_chat_repl(
     agent: Arc<dyn HarnessAgent>,
     conversation: Arc<dyn HarnessConversation>,
+    verbosity: Verbosity,
 ) -> Result<()> {
-    let mut repl = ChatRepl::new(agent, conversation)?;
+    let mut repl = ChatRepl::new(agent, conversation, verbosity)?;
     repl.print_transcript().await?;
     repl.run().await
 }
@@ -351,12 +353,14 @@ struct ChatRepl {
     editor: Editor<(), ChatHistory>,
     session_id: Option<SessionId>,
     watch_after: Arc<Mutex<Option<EventId>>>,
+    verbosity: Verbosity,
 }
 
 impl ChatRepl {
     fn new(
         agent: Arc<dyn HarnessAgent>,
         conversation: Arc<dyn HarnessConversation>,
+        verbosity: Verbosity,
     ) -> Result<Self> {
         let latest_event_id = conversation.record().latest_event_id;
         let history = ChatHistory::new(conversation.exoharness_handle(), latest_event_id);
@@ -368,13 +372,13 @@ impl ChatRepl {
             editor,
             session_id: None,
             watch_after: Arc::new(Mutex::new(latest_event_id)),
+            verbosity,
         })
     }
 
     async fn print_transcript(&self) -> Result<()> {
-        for message in self.conversation.messages().await? {
-            print_message(&message);
-        }
+        let messages = self.conversation.messages().await?;
+        print_transcript(&messages, self.verbosity);
         Ok(())
     }
 
@@ -485,6 +489,23 @@ impl ChatRepl {
                             }
                         }
                         "/help" => print_help(),
+                        "/verbosity" => {
+                            println!("verbosity: {}", self.verbosity);
+                            println!("usage: /verbosity <minimal|compact|full>");
+                        }
+                        other if other.starts_with("/verbosity ") => {
+                            let arg = other
+                                .strip_prefix("/verbosity ")
+                                .expect("prefix checked")
+                                .trim();
+                            match arg.parse::<Verbosity>() {
+                                Ok(verbosity) => {
+                                    self.verbosity = verbosity;
+                                    println!("verbosity set to {verbosity}");
+                                }
+                                Err(error) => println!("{error}"),
+                            }
+                        }
                         "/shell" | "/sandbox" => {
                             println!("usage: /shell <command>");
                             println!("alias: /sandbox <command>");
@@ -696,16 +717,27 @@ impl ChatRepl {
         let mut stdout = io::stdout();
         let mut printed_assistant = false;
         let mut streamed_text = String::new();
+        // Tool names by call id, so results (which only carry the id) can be
+        // labeled in compact mode.
+        let mut pending_tool_calls: HashMap<String, String> = HashMap::new();
+        // Compact call line left open (no newline) so the matching result can
+        // acknowledge receipt on the same line.
+        let mut open_call: Option<String> = None;
 
         while let Some(event) = stream.next().await {
             match event? {
                 ExecutionStreamEvent::FirstChunk { ttft } => {
-                    print_ttft(ttft);
+                    if self.verbosity == Verbosity::Full {
+                        print_ttft(ttft);
+                    }
                 }
                 ExecutionStreamEvent::Chunk(chunk) => {
                     let text = chunk_text(&chunk);
                     if text.is_empty() {
                         continue;
+                    }
+                    if open_call.take().is_some() {
+                        println!();
                     }
                     if !printed_assistant {
                         print!("{} assistant: ", compact_timestamp());
@@ -717,19 +749,50 @@ impl ChatRepl {
                     streamed_text.push_str(&text);
                 }
                 ExecutionStreamEvent::ToolCall {
+                    tool_call_id,
                     tool_name,
                     arguments,
-                    ..
                 } => {
-                    if printed_assistant && !streamed_text.ends_with('\n') {
+                    if open_call.take().is_some() {
                         println!();
                     }
-                    println!("{}", render_tool_call(&tool_name, &arguments));
-                    printed_assistant = false;
-                    streamed_text.clear();
+                    if printed_assistant && !streamed_text.ends_with('\n') {
+                        println!();
+                        printed_assistant = false;
+                        streamed_text.clear();
+                    }
+                    if let Some(rendered) = render_tool_call(&tool_name, &arguments, self.verbosity)
+                    {
+                        if self.verbosity == Verbosity::Compact {
+                            print!("{rendered}");
+                            stdout.flush()?;
+                            open_call = Some(tool_call_id.clone());
+                        } else {
+                            println!("{rendered}");
+                        }
+                        printed_assistant = false;
+                        streamed_text.clear();
+                    }
+                    pending_tool_calls.insert(tool_call_id, tool_name);
                 }
-                ExecutionStreamEvent::ToolResult { result, .. } => {
-                    println!("{}", render_tool_result(&result));
+                ExecutionStreamEvent::ToolResult {
+                    tool_call_id,
+                    result,
+                } => {
+                    let tool_name = pending_tool_calls
+                        .remove(&tool_call_id)
+                        .unwrap_or_else(|| "tool".to_string());
+                    if open_call.as_deref() == Some(tool_call_id.as_str()) {
+                        open_call = None;
+                        println!(" {}", compact_result_status(&result));
+                    } else if let Some(rendered) =
+                        render_tool_result(&tool_name, &result, self.verbosity)
+                    {
+                        if open_call.take().is_some() {
+                            println!();
+                        }
+                        println!("{rendered}");
+                    }
                 }
                 ExecutionStreamEvent::Completed(result) => {
                     self.session_id = Some(result.session_id);
@@ -738,13 +801,16 @@ impl ChatRepl {
                 }
             }
         }
+        if open_call.is_some() {
+            println!();
+        }
 
         if printed_assistant {
             println!();
         } else if let Some(last_message) = self.conversation.messages().await?.last().cloned()
             && let Message::Assistant { content, .. } = last_message
         {
-            let rendered = render_assistant_content(&content);
+            let rendered = render_assistant_content(&content, self.verbosity);
             if !rendered.is_empty() {
                 println!("{} assistant: {}", compact_timestamp(), rendered);
             }
@@ -756,6 +822,7 @@ impl ChatRepl {
     fn spawn_event_printer(&mut self) -> Result<JoinHandle<()>> {
         let conversation = self.conversation.exoharness_handle();
         let watch_after = Arc::clone(&self.watch_after);
+        let verbosity = self.verbosity;
         let mut printer = self.editor.create_external_printer()?;
         Ok(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -777,7 +844,7 @@ impl ChatRepl {
                         for event in result.events {
                             *watch_after.lock().expect("chat event watch poisoned") =
                                 Some(event.id);
-                            for rendered in render_external_event(&event.data) {
+                            for rendered in render_external_event(&event.data, verbosity) {
                                 let _ = printer.print(format!("{rendered}\n"));
                             }
                         }
@@ -833,59 +900,7 @@ fn print_ttft(ttft: Duration) {
     }
 }
 
-fn render_tool_call(tool_name: &str, arguments: &Map<String, Value>) -> String {
-    let mut lines = vec![format!("tool call {tool_name}")];
-    append_object_fields(&mut lines, arguments, "  ");
-    lines.join("\n")
-}
-
-fn render_tool_result(result: &Value) -> String {
-    let mut lines = vec!["tool result".to_string()];
-    match result {
-        Value::Object(object) => append_object_fields(&mut lines, object, "  "),
-        other => lines.push(format!("  {}", render_value_inline(other))),
-    }
-    lines.join("\n")
-}
-
-fn append_object_fields(lines: &mut Vec<String>, object: &Map<String, Value>, indent: &str) {
-    if object.is_empty() {
-        lines.push(format!("{indent}{{}}"));
-        return;
-    }
-
-    for (key, value) in object {
-        append_field(lines, key, value, indent);
-    }
-}
-
-fn append_field(lines: &mut Vec<String>, key: &str, value: &Value, indent: &str) {
-    match value {
-        Value::String(text) if text.contains('\n') => {
-            lines.push(format!("{indent}{key}:"));
-            for line in text.lines() {
-                lines.push(format!("{indent}  {line}"));
-            }
-            if text.ends_with('\n') {
-                lines.push(format!("{indent}  "));
-            }
-        }
-        Value::Object(object) => {
-            lines.push(format!("{indent}{key}:"));
-            append_object_fields(lines, object, &format!("{indent}  "));
-        }
-        other => lines.push(format!("{indent}{key}: {}", render_value_inline(other))),
-    }
-}
-
-fn render_value_inline(value: &Value) -> String {
-    match value {
-        Value::String(text) => format!("{text:?}"),
-        other => serde_json::to_string(other).unwrap_or_else(|_| "<unrenderable>".to_string()),
-    }
-}
-
-fn render_external_event(data: &EventData) -> Vec<String> {
+fn render_external_event(data: &EventData, verbosity: Verbosity) -> Vec<String> {
     let EventData::Messages { messages, .. } = data else {
         return Vec::new();
     };
@@ -895,7 +910,7 @@ fn render_external_event(data: &EventData) -> Vec<String> {
             Message::User { content } => render_external_user_content(content)
                 .map(|rendered| format!("{} user: {rendered}", compact_timestamp())),
             Message::Assistant { content, .. } => {
-                let rendered = render_assistant_content(content);
+                let rendered = render_assistant_content(content, verbosity);
                 (!rendered.is_empty())
                     .then(|| format!("{} assistant: {rendered}", compact_timestamp()))
             }
@@ -961,6 +976,7 @@ fn print_help() {
     println!("repl commands:");
     println!("  /quit | /exit        exit the repl");
     println!("  /history             reprint the conversation transcript");
+    println!("  /verbosity <level>   set tool output detail: minimal, compact, or full");
     println!("  /cost | /usage       summarize token usage and dollar cost");
     println!("  /snapshot [<id>]     snapshot a sandbox in this conversation");
     println!("                       (defaults to the latest one if no id is given)");
@@ -1057,59 +1073,25 @@ async fn sandbox_id_for_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        render_external_event, render_tool_call, render_tool_result,
-        render_user_content_for_history,
-    };
+    use super::{Verbosity, render_external_event, render_user_content_for_history};
     use executor::EventData;
     use lingua::Message;
     use lingua::universal::UserContent;
-    use serde_json::{Map, Value};
-
-    #[test]
-    fn renders_multiline_tool_call_arguments_as_indented_block() {
-        let arguments = Map::from_iter([(
-            "code".to_string(),
-            Value::String("const x = 1;\nconst y = 2;".to_string()),
-        )]);
-
-        let rendered = render_tool_call("repl_execute", &arguments);
-
-        assert_eq!(
-            rendered,
-            "tool call repl_execute\n  code:\n    const x = 1;\n    const y = 2;"
-        );
-    }
-
-    #[test]
-    fn renders_multiline_tool_result_fields_as_indented_block() {
-        let result = Value::Object(Map::from_iter([
-            ("error".to_string(), Value::Null),
-            (
-                "stdout".to_string(),
-                Value::String("line 1\nline 2".to_string()),
-            ),
-        ]));
-
-        let rendered = render_tool_result(&result);
-
-        assert_eq!(
-            rendered,
-            "tool result\n  error: null\n  stdout:\n    line 1\n    line 2"
-        );
-    }
 
     #[test]
     fn renders_scheduled_task_wakeup_user_messages() {
-        let rendered = render_external_event(&EventData::Messages {
-            messages: vec![Message::User {
-                content: UserContent::String(
-                    "Scheduled task `joke` completed.\n\nstdout preview:\nhello".to_string(),
-                ),
-            }],
-            response_id: None,
-            usage: None,
-        });
+        let rendered = render_external_event(
+            &EventData::Messages {
+                messages: vec![Message::User {
+                    content: UserContent::String(
+                        "Scheduled task `joke` completed.\n\nstdout preview:\nhello".to_string(),
+                    ),
+                }],
+                response_id: None,
+                usage: None,
+            },
+            Verbosity::Compact,
+        );
 
         assert_eq!(rendered.len(), 1);
         assert!(rendered[0].contains("user: Scheduled task `joke` completed."));
