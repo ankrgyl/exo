@@ -638,6 +638,46 @@ export async function readActiveCheckpointEvent(
 }
 
 /**
+ * The active checkpoint for a caller that is building a prompt, with a failed
+ * query reported as "no checkpoint" rather than thrown.
+ *
+ * A malformed checkpoint already decodes to null and replays the full log; a
+ * query that *fails* is the same situation for the prompt. The raw messages are
+ * readable either way, so propagating would fail the turn over optional
+ * compaction metadata — and this query runs before anyone knows whether the
+ * conversation has a checkpoint at all, so it takes down turns on conversations
+ * that never compacted and agents with compaction switched off.
+ *
+ * Deliberately not the default. `runCompaction` re-reads the head immediately
+ * before publishing, and there an unanswered query is not "no checkpoint" — it
+ * is "unknown", and publishing on that guess is how a shorter prefix silently
+ * replaces a longer one. That caller keeps the throwing version, where the
+ * error becomes a recorded compaction failure instead of a lost turn.
+ */
+export async function readActiveCheckpointEventForPrompt(
+  conversation: Conversation,
+): Promise<{ eventId: string; checkpoint: CompactionCheckpoint } | null> {
+  try {
+    return await readActiveCheckpointEvent(conversation);
+  } catch (error) {
+    console.warn(
+      "compaction: could not read the active checkpoint; using full history",
+      error,
+    );
+    return null;
+  }
+}
+
+/** `readActiveCheckpointEventForPrompt` without the carrying event's id. */
+export async function readActiveCheckpointForPrompt(
+  conversation: Conversation,
+): Promise<CompactionCheckpoint | null> {
+  return (
+    (await readActiveCheckpointEventForPrompt(conversation))?.checkpoint ?? null
+  );
+}
+
+/**
  * The **whole** conversation as messages, checkpoint or not.
  *
  * Not a prompt builder — `materializePromptHistory` is. The distinction matters
@@ -695,7 +735,7 @@ export async function materializeConversationMessages(
 export async function materializePromptHistory(
   conversation: Conversation,
 ): Promise<Message[]> {
-  const checkpoint = await readActiveCheckpoint(conversation);
+  const checkpoint = await readActiveCheckpointForPrompt(conversation);
   const summary = checkpoint
     ? summaryText(await readCheckpointSummary(conversation, checkpoint))
     : null;
@@ -838,7 +878,7 @@ export class PromptHistoryCache {
     // the checkpoint or its summary, and replaying the compacted prefix for the
     // rest of its tool rounds. This is one bounded `desc limit:1` query against
     // an incremental scan the round is doing anyway.
-    const active = await readActiveCheckpointEvent(conversation);
+    const active = await readActiveCheckpointEventForPrompt(conversation);
     const activeId = active?.eventId ?? null;
 
     if (!this.primed || activeId !== this.checkpointEventId) {

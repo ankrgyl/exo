@@ -1,6 +1,7 @@
 import {
   DEFAULT_COMPACTION_POLICY,
   readActiveCheckpoint,
+  readActiveCheckpointForPrompt,
   readActiveCheckpointSummaryText,
   resolveCompactionPolicy,
   type CompactionCheckpoint,
@@ -127,7 +128,9 @@ export async function compactionInstruction(
   context: TurnContext,
 ): Promise<Message | null> {
   const conversation = conversationOf(context);
-  const checkpoint = await readActiveCheckpoint(conversation);
+  // The non-throwing reader: this runs while instructions are assembled, so a
+  // failed lookup must leave the notice off rather than take the turn down.
+  const checkpoint = await readActiveCheckpointForPrompt(conversation);
   if (checkpoint === null) {
     return null;
   }

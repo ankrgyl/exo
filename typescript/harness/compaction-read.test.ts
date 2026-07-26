@@ -39,6 +39,14 @@ class StubConversation {
    */
   failArtifactReads = false;
 
+  /**
+   * Makes only the *checkpoint* query reject, leaving ordinary history queries
+   * working. Failing every query would prove nothing: the point is that
+   * optional compaction metadata must not take down a materialization whose raw
+   * messages are perfectly readable.
+   */
+  failCheckpointQueries = false;
+
   constructor(options: StubOptions) {
     this.events = options.events;
     this.artifacts = options.artifacts ?? new Map();
@@ -50,6 +58,12 @@ class StubConversation {
 
   async getEvents(query?: EventQuery): Promise<GetEventsResult> {
     this.queries.push(query ?? {});
+    if (
+      this.failCheckpointQueries &&
+      query?.types?.includes(COMPACTION_CHECKPOINT_EVENT)
+    ) {
+      throw new Error("event store unavailable");
+    }
     let events = [...this.events];
     if (query?.types) {
       const types = new Set(query.types);
@@ -364,6 +378,36 @@ describe("materializePromptHistory with a checkpoint", () => {
     expect(rendered).not.toContain("SUMMARY OF EARLIER");
   });
 
+  it("falls back to full history when the checkpoint query fails", async () => {
+    // The last checkpoint read that did not follow this feature's failure
+    // policy — and the sibling of the Rust fix, left behind for a round. Every
+    // other one falls back to the full log; this one propagated, so a backend
+    // that could serve the raw messages perfectly well would still fail the
+    // turn over optional compaction metadata. The query runs before anyone
+    // knows whether the conversation even has a checkpoint, so it takes down
+    // turns on conversations that never compacted too.
+    const older = turn("ancient");
+    const summaryArtifact = unreadArtifactId();
+    const stub = new StubConversation({
+      events: [
+        ...older,
+        checkpointEvent({
+          upToEventId: older.at(-1)!.id,
+          artifactId: summaryArtifact,
+        }),
+        ...turn("recent"),
+      ],
+      artifacts: new Map([[summaryArtifact, "SUMMARY OF EARLIER"]]),
+    });
+    stub.failCheckpointQueries = true;
+
+    const rendered = texts(
+      await materializePromptHistory(asConversation(stub)),
+    );
+    expect(rendered).toContain("ancient");
+    expect(rendered).toContain("recent");
+  });
+
   it("uses the newest checkpoint when several exist", async () => {
     const first = turn("ancient");
     const firstCheckpoint = checkpointEvent({
@@ -520,6 +564,39 @@ describe("PromptHistoryCache", () => {
     expect(during.join("\n")).not.toContain("SUMMARY OF EARLIER");
 
     stub.failArtifactReads = false;
+    const after = texts(await cache.materialize(asConversation(stub)));
+    expect(after.join("\n")).toContain("SUMMARY OF EARLIER");
+    expect(after).not.toContain("ancient");
+  });
+
+  it("falls back to full history when the checkpoint query fails", async () => {
+    // The cache's own copy of the same read, and the one that runs on *every*
+    // model round of the turn — so propagating here fails turns mid-loop, after
+    // tool calls are recorded but before their tools run.
+    const older = turn("ancient");
+    const summaryArtifact = unreadArtifactId();
+    const stub = new StubConversation({
+      events: [
+        ...older,
+        checkpointEvent({
+          upToEventId: older.at(-1)!.id,
+          artifactId: summaryArtifact,
+        }),
+        ...turn("recent"),
+      ],
+      artifacts: new Map([[summaryArtifact, "SUMMARY OF EARLIER"]]),
+    });
+    const cache = new PromptHistoryCache();
+
+    stub.failCheckpointQueries = true;
+    const during = texts(await cache.materialize(asConversation(stub)));
+    expect(during).toContain("ancient");
+    expect(during.join("\n")).not.toContain("SUMMARY OF EARLIER");
+
+    // And it recovers: the entry records the checkpoint id it was built
+    // against, so the null stored during the outage stops matching once the
+    // query answers again.
+    stub.failCheckpointQueries = false;
     const after = texts(await cache.materialize(asConversation(stub)));
     expect(after.join("\n")).toContain("SUMMARY OF EARLIER");
     expect(after).not.toContain("ancient");
