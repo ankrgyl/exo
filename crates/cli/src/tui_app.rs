@@ -26,8 +26,8 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
 use crate::render::{
-    Verbosity, compact_result_status, compact_timestamp, render_tool_call, render_tool_result,
-    render_transcript_lines,
+    ASSISTANT_LABEL, Verbosity, compact_result_status, compact_timestamp, render_tool_call,
+    render_tool_result, render_transcript_lines,
 };
 use crate::tui::{
     ReplCommand, ReplInput, chunk_text, cost_lines, parse_repl_input, render_external_event,
@@ -469,7 +469,7 @@ impl TuiApp {
                         String::new()
                     } else {
                         self.assistant_prefixed = true;
-                        format!("{} assistant: ", compact_timestamp())
+                        format!("{} {ASSISTANT_LABEL}: ", compact_timestamp())
                     };
                     self.transcript.push(Line::from(vec![
                         Span::styled(prefix, Style::new().dim()),

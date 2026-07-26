@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
 use crate::render::{
-    Verbosity, compact_result_status, compact_timestamp, print_transcript,
+    ASSISTANT_LABEL, Verbosity, compact_result_status, compact_timestamp, print_transcript,
     render_assistant_content, render_tool_call, render_tool_result,
 };
 use crate::run_sandbox_shell_command;
@@ -587,7 +587,7 @@ impl ChatRepl {
                         println!();
                     }
                     if !printed_assistant {
-                        print!("{} assistant: ", compact_timestamp());
+                        print!("{} {ASSISTANT_LABEL}: ", compact_timestamp());
                         stdout.flush()?;
                         printed_assistant = true;
                     }
@@ -659,7 +659,7 @@ impl ChatRepl {
         {
             let rendered = render_assistant_content(&content, self.verbosity);
             if !rendered.is_empty() {
-                println!("{} assistant: {}", compact_timestamp(), rendered);
+                println!("{} {ASSISTANT_LABEL}: {}", compact_timestamp(), rendered);
             }
         }
         println!();
@@ -754,7 +754,7 @@ pub(crate) fn render_external_event(data: &EventData, verbosity: Verbosity) -> V
             Message::Assistant { content, .. } => {
                 let rendered = render_assistant_content(content, verbosity);
                 (!rendered.is_empty())
-                    .then(|| format!("{} assistant: {rendered}", compact_timestamp()))
+                    .then(|| format!("{} {ASSISTANT_LABEL}: {rendered}", compact_timestamp()))
             }
             _ => None,
         })

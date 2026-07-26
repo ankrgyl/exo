@@ -13,6 +13,9 @@ use lingua::universal::{
 };
 use serde_json::{Map, Value};
 
+/// Speaker label for model output in transcripts.
+pub(crate) const ASSISTANT_LABEL: &str = "agent";
+
 /// Longest compact tool-call summary before it is truncated with an ellipsis.
 const COMPACT_SUMMARY_MAX_CHARS: usize = 100;
 
@@ -195,7 +198,7 @@ fn render_assistant_message_lines(
 ) -> Vec<String> {
     if verbosity == Verbosity::Full {
         return vec![format!(
-            "{timestamp} assistant: {}",
+            "{timestamp} {ASSISTANT_LABEL}: {}",
             render_assistant_content(content, verbosity)
         )];
     }
@@ -203,7 +206,7 @@ fn render_assistant_message_lines(
     let mut lines = Vec::new();
     let text = render_assistant_content(content, verbosity);
     if !text.trim().is_empty() {
-        lines.push(format!("{timestamp} assistant: {text}"));
+        lines.push(format!("{timestamp} {ASSISTANT_LABEL}: {text}"));
     }
     if verbosity == Verbosity::Compact
         && let AssistantContent::Array(parts) = content
@@ -574,7 +577,7 @@ mod tests {
         );
 
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].ends_with("assistant: running it"));
+        assert!(lines[0].ends_with("agent: running it"));
         assert_eq!(lines[1], "→ shell: ls");
     }
 
@@ -587,7 +590,7 @@ mod tests {
         );
 
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].ends_with("assistant: running it"));
+        assert!(lines[0].ends_with("agent: running it"));
     }
 
     fn tool_result_message(exit_code: i64) -> Message {
