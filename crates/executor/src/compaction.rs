@@ -1062,18 +1062,37 @@ pub(crate) async fn read_latest_turn_ended(
 /// it cannot have.
 #[derive(Debug, Default)]
 pub(crate) struct CompactionLatch {
-    attempted_at: Option<Option<EventId>>,
+    /// The boundary at the last settled attempt, and whether that attempt
+    /// was a rescue. Both, because a skip is only deterministic given the
+    /// pressure it was asked under — see `is_settled`.
+    attempted_at: Option<(Option<EventId>, bool)>,
 }
 
 impl CompactionLatch {
-    /// True when nothing that could change the cut point has happened since the
+    /// True when nothing that could change the answer has happened since the
     /// last attempt in this turn.
-    pub(crate) fn is_settled(&self, latest_turn_ended: Option<EventId>) -> bool {
-        self.attempted_at == Some(latest_turn_ended)
+    ///
+    /// The boundary is most of that, but not all of it. A skip is deterministic
+    /// *given the pressure it was asked under*: "the span is smaller than the
+    /// summary cap" settles a housekeeping attempt, and the rescue path
+    /// deliberately ignores that same cap because a rejected request is worse
+    /// than a small win. So a turn that skipped at boundary B while under the
+    /// threshold, and then had a large tool result push it past the model's hard
+    /// limit, is asking a different question at the same boundary — and gating
+    /// on the boundary alone would suppress the rescue and send the oversized
+    /// request. Crossing into rescue reopens the latch; the reverse does not,
+    /// since a rescue answers the housekeeping question too.
+    pub(crate) fn is_settled(&self, latest_turn_ended: Option<EventId>, rescue: bool) -> bool {
+        match self.attempted_at {
+            Some((boundary, settled_under_rescue)) => {
+                boundary == latest_turn_ended && (settled_under_rescue || !rescue)
+            }
+            None => false,
+        }
     }
 
-    pub(crate) fn mark_attempted(&mut self, latest_turn_ended: Option<EventId>) {
-        self.attempted_at = Some(latest_turn_ended);
+    pub(crate) fn mark_attempted(&mut self, latest_turn_ended: Option<EventId>, rescue: bool) {
+        self.attempted_at = Some((latest_turn_ended, rescue));
     }
 }
 
@@ -2055,19 +2074,19 @@ mod tests {
         let mut latch = CompactionLatch::default();
 
         // Nothing attempted yet: never settled, whatever the log looks like.
-        assert!(!latch.is_settled(Some(boundary)));
-        assert!(!latch.is_settled(None));
+        assert!(!latch.is_settled(Some(boundary), false));
+        assert!(!latch.is_settled(None, false));
 
-        latch.mark_attempted(Some(boundary));
+        latch.mark_attempted(Some(boundary), false);
         // Same boundary: a re-scan can only reach the same answer, and
         // re-summarizing for it is real money on a long tool loop.
-        assert!(latch.is_settled(Some(boundary)));
+        assert!(latch.is_settled(Some(boundary), false));
 
         // Turns are not serialized, so other turns complete while this one
         // loops. An attempt that skipped for want of completed turns must not
         // suppress every later check — that is how a growing tool loop reaches
         // the provider limit with compaction enabled and idle.
-        assert!(!latch.is_settled(Some(Uuid7::now())));
+        assert!(!latch.is_settled(Some(Uuid7::now()), false));
     }
 
     #[test]
@@ -2075,9 +2094,39 @@ mod tests {
         // A conversation with no completed turn reports `None`; the first
         // `TurnEnded` to land is exactly what makes a cut possible at all.
         let mut latch = CompactionLatch::default();
-        latch.mark_attempted(None);
-        assert!(latch.is_settled(None));
-        assert!(!latch.is_settled(Some(Uuid7::now())));
+        latch.mark_attempted(None, false);
+        assert!(latch.is_settled(None, false));
+    }
+
+    #[test]
+    fn crossing_into_a_rescue_reopens_the_latch() {
+        // A skip is deterministic given the pressure it was asked under. "The
+        // span is smaller than the summary cap" settles a housekeeping attempt,
+        // and the rescue path deliberately ignores that cap — so a turn that
+        // skipped at a boundary under the threshold and then had a large tool
+        // result push it past the hard limit is asking a different question at
+        // the same boundary. Gating on the boundary alone sends the oversized
+        // request.
+        let boundary = Uuid7::now();
+        let mut latch = CompactionLatch::default();
+        latch.mark_attempted(Some(boundary), false);
+
+        assert!(
+            latch.is_settled(Some(boundary), false),
+            "housekeeping at the same boundary still cannot change its answer"
+        );
+        assert!(
+            !latch.is_settled(Some(boundary), true),
+            "but a rescue at that boundary can"
+        );
+
+        // And the reverse does not reopen it: a rescue already answered the
+        // housekeeping question, so there is nothing left for one to ask.
+        let mut latch = CompactionLatch::default();
+        latch.mark_attempted(Some(boundary), true);
+        assert!(latch.is_settled(Some(boundary), true));
+        assert!(latch.is_settled(Some(boundary), false));
+        assert!(!latch.is_settled(Some(Uuid7::now()), false));
     }
 
     /// `bytes` of ASCII — one byte per character, so size reads as the count.

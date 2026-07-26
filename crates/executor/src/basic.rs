@@ -313,6 +313,13 @@ where
         // Provider counts when a response has come back; the pessimistic local
         // estimate otherwise — the same input the trigger just used.
         let observed_tokens = prompt_tokens.unwrap_or_else(|| prompt_size.estimated_tokens());
+        // A rescue rather than housekeeping: the prompt is past the model's hard
+        // limit, so the cheaper cost heuristics give way and the latch has to
+        // treat this as a different question from an earlier skip at the same
+        // boundary. See `PromptPressure` and `CompactionLatch::is_settled`.
+        let over_input_limit = max_input_tokens
+            .filter(|limit| *limit > 0)
+            .is_some_and(|limit| observed_tokens >= limit as u64);
 
         // Re-attempting within a turn costs a log scan and possibly a
         // summarizer call, so it needs a reason. The reason is a turn boundary
@@ -329,7 +336,7 @@ where
                 return false;
             }
         };
-        if latch.is_settled(latest_turn_ended) {
+        if latch.is_settled(latest_turn_ended, over_input_limit) {
             return false;
         }
 
@@ -371,9 +378,7 @@ where
                 // the case where the cheaper heuristics must give way, because
                 // the alternative to compacting is a rejected request that
                 // produces no usage and so never reaches the accurate one.
-                over_input_limit: max_input_tokens
-                    .filter(|limit| *limit > 0)
-                    .is_some_and(|limit| observed_tokens >= limit as u64),
+                over_input_limit,
             },
             &|input| {
                 Box::pin(self.summarize(
@@ -411,7 +416,7 @@ where
             CompactionOutcome::Compacted { .. } => true,
         };
         if settles {
-            latch.mark_attempted(latest_turn_ended);
+            latch.mark_attempted(latest_turn_ended, over_input_limit);
         }
 
         let conversation_id = conversation.record().id;

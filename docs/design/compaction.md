@@ -224,6 +224,14 @@ suppress every later check while the prompt kept growing. So the latch stores th
 newest turn boundary at the last attempt; a new one means the answer may have
 changed, the same one means it cannot have.
 
+The boundary is most of that and not all of it. A skip is deterministic _given
+the pressure it was asked under_, and a rescue deliberately ignores the cost
+heuristic a housekeeping skip relies on — so a turn that skipped at a boundary
+under the threshold, then had a large tool result push it past the hard limit,
+is asking a different question at the same boundary. Crossing into rescue
+reopens the latch; the reverse does not, since a rescue already answers the
+housekeeping question.
+
 ### RLM does not compact, on purpose
 
 The RLM executor is the exception, and it is worth being precise about why —

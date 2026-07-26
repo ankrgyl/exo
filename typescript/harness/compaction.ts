@@ -608,24 +608,42 @@ export function resolveSummarizerModel(
  * it cannot have.
  */
 export class CompactionGate {
-  private attemptedAt: string | null | undefined = undefined;
+  /**
+   * The boundary at the last settled attempt, and whether that attempt was a
+   * rescue. Both, because a skip is only deterministic given the pressure it
+   * was asked under — see `shouldAttempt`.
+   */
+  private attemptedAt:
+    | { boundary: string | null; rescue: boolean }
+    | undefined = undefined;
 
   shouldAttempt(
     args: ShouldCompactArgs,
     /** Id of the newest `turn_ended` event, from `readLatestTurnEnded`. */
     latestTurnEnded: string | null,
   ): boolean {
+    // The boundary is most of what decides this, but not all of it. A skip is
+    // deterministic *given the pressure it was asked under*: "the span is
+    // smaller than the summary cap" settles a housekeeping attempt, and the
+    // rescue path deliberately ignores that cap because a rejected request is
+    // worse than a small win. A turn that skipped at boundary B under the
+    // threshold, then had a large tool result push it past the model's hard
+    // limit, is asking a different question at the same boundary. Crossing into
+    // rescue reopens the gate; the reverse does not, since a rescue answers the
+    // housekeeping question too.
+    const rescue = overHardInputLimit(args);
     if (
       this.attemptedAt !== undefined &&
-      this.attemptedAt === latestTurnEnded
+      this.attemptedAt.boundary === latestTurnEnded &&
+      (this.attemptedAt.rescue || !rescue)
     ) {
       return false;
     }
     return shouldCompact(args);
   }
 
-  markAttempted(latestTurnEnded: string | null): void {
-    this.attemptedAt = latestTurnEnded;
+  markAttempted(latestTurnEnded: string | null, rescue = false): void {
+    this.attemptedAt = { boundary: latestTurnEnded, rescue };
   }
 
   /**
@@ -645,14 +663,19 @@ export class CompactionGate {
    * in `turn-loop.ts` cannot be mutation-checked, because nothing tests that
    * file.
    */
-  settle(latestTurnEnded: string | null, result: CompactionResult): void {
+  settle(
+    latestTurnEnded: string | null,
+    result: CompactionResult,
+    /** Whether the attempt ran under rescue pressure. See `shouldAttempt`. */
+    rescue = false,
+  ): void {
     if (result.status === "failed") {
       return;
     }
     if (result.status === "skipped" && result.retryable) {
       return;
     }
-    this.markAttempted(latestTurnEnded);
+    this.markAttempted(latestTurnEnded, rescue);
   }
 
   /**

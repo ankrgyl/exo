@@ -216,7 +216,11 @@ async function runResponsesTurnLoop(
       });
       await recordSummarizerUsage(context, summarizerUsage.usage);
       summarizerUsage.usage = undefined;
-      compaction.settle(preflight.latestTurnEnded, result);
+      compaction.settle(
+        preflight.latestTurnEnded,
+        result,
+        preflight.overInputLimit,
+      );
       if (result.status === "compacted") {
         // The checkpoint just written replaces the prefix this prompt was built
         // from, so rebuild it before sending.
@@ -327,7 +331,11 @@ async function runResponsesTurnLoop(
       });
       await recordSummarizerUsage(context, summarizerUsage.usage);
       summarizerUsage.usage = undefined;
-      compaction.settle(roundAttempt.latestTurnEnded, result);
+      compaction.settle(
+        roundAttempt.latestTurnEnded,
+        result,
+        roundAttempt.overInputLimit,
+      );
       if (result.status === "compacted") {
         // The cache holds exactly the prefix that was just replaced.
         history.invalidate();

@@ -1118,6 +1118,32 @@ describe("CompactionGate", () => {
     expect(gate.shouldAttempt(args, boundary)).toBe(true);
   });
 
+  it("reopens when the prompt crosses the hard input limit", () => {
+    // A skip is deterministic given the pressure it was asked under. "The span
+    // is smaller than the summary cap" settles a housekeeping attempt, and the
+    // rescue path deliberately ignores that cap — so a turn that skipped at a
+    // boundary under the threshold and then had a large tool result push it
+    // past the hard limit is asking a different question at the same boundary.
+    const gate = new CompactionGate();
+    const housekeeping = {
+      ...args,
+      promptTokens: 8_000,
+      maxInputTokens: 10_000,
+    };
+    const rescue = { ...args, promptTokens: 10_000, maxInputTokens: 10_000 };
+
+    gate.markAttempted(boundary, false);
+    expect(gate.shouldAttempt(housekeeping, boundary)).toBe(false);
+    expect(gate.shouldAttempt(rescue, boundary)).toBe(true);
+
+    // The reverse does not reopen it: a rescue already answered the
+    // housekeeping question, so there is nothing left for one to ask.
+    const settled = new CompactionGate();
+    settled.markAttempted(boundary, true);
+    expect(settled.shouldAttempt(rescue, boundary)).toBe(false);
+    expect(settled.shouldAttempt(housekeeping, boundary)).toBe(false);
+  });
+
   it("does not settle on a failed attempt", async () => {
     // A summarizer outage or a rejected artifact write says nothing about the
     // next attempt. Settling on it lets one blip suppress every later check in
