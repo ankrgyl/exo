@@ -14,9 +14,10 @@ use lingua::universal::{ToolContentPart, ToolResultContentPart};
 use serde_json::json;
 
 use crate::compaction::{
-    CompactionOutcome, SummarizeInput, estimated_tokens_from_chars, prompt_chars,
-    read_active_checkpoint, read_summary, record_summarizer_usage, run_compaction, should_compact,
-    summarizer_instruction, summarizer_max_output_tokens, summary_message, tool_definition_chars,
+    CompactionOutcome, SummarizeInput, estimated_tokens_from_chars, previous_summary_message,
+    prompt_chars, read_active_checkpoint, read_summary, record_summarizer_usage,
+    resolve_summarizer_model, run_compaction, should_compact, summarizer_instruction,
+    summarizer_max_output_tokens, summary_message, tool_definition_chars,
 };
 use crate::execution_tracing::TurnExecutionTrace;
 use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor};
@@ -263,6 +264,19 @@ where
             .summary_model
             .clone()
             .unwrap_or_else(|| model.to_string());
+        // A configured summary model can have a smaller input window than the
+        // agent's; when the prompt does not fit it, summarize with the agent's
+        // model rather than losing the compaction to a rejected request.
+        let summary_model_input_limit = self.pricing.max_input_tokens(&summary_model);
+        let summary_model = resolve_summarizer_model(
+            summary_model,
+            model,
+            summary_model_input_limit,
+            max_input_tokens,
+            // Provider counts when a response has come back; the pessimistic
+            // char estimate otherwise, the same input the trigger just used.
+            prompt_tokens.unwrap_or_else(|| estimated_tokens_from_chars(prompt_chars)),
+        );
         // Collected during the summarizer call and written below. Safe to write
         // right here, mid-round: it goes on a custom event, which prompt
         // assembly ignores outright. See `COMPACTION_USAGE_EVENT`.
@@ -281,7 +295,6 @@ where
                     &summarizer_usage,
                     &agent_config.model,
                     &summary_model,
-                    config.effective_max_summary_chars(),
                 ))
             },
         )
@@ -333,11 +346,21 @@ where
         usage_sink: &std::sync::Mutex<Option<Box<UsageRecord>>>,
         binding: &str,
         model: &str,
-        max_summary_chars: u32,
     ) -> Result<String> {
         let model_binding = resolve_model_binding(conversation, binding).await?;
-        let mut messages = vec![system_message(&summarizer_instruction(&input))];
-        messages.extend(input.messages);
+        let instruction = summarizer_instruction(&input);
+        let SummarizeInput {
+            messages: span,
+            previous_summary,
+            max_chars,
+        } = input;
+        let mut messages = vec![system_message(&instruction)];
+        // Ahead of the span, delimited, at user priority — deliberately not
+        // spliced into the instruction. See `previous_summary_message`.
+        if let Some(previous) = previous_summary {
+            messages.push(previous_summary_message(&previous));
+        }
+        messages.extend(span);
 
         let response = self
             .model
@@ -351,7 +374,7 @@ where
                 // Bound the response at request time. `cap_summary` truncates
                 // only after generation, so without this a runaway summary is
                 // paid for in full before being thrown away.
-                max_output_tokens: Some(summarizer_max_output_tokens(max_summary_chars)),
+                max_output_tokens: Some(summarizer_max_output_tokens(max_chars)),
             })
             .await?;
         let text = assistant_messages_text(&response.messages);

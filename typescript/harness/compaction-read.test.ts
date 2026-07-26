@@ -103,6 +103,11 @@ function eventId(n: number): string {
   return `01920000-0000-7000-8000-${String(n).padStart(12, "0")}`;
 }
 
+/** Artifact ids are uuids too; a distinct prefix keeps them apart from events. */
+function artifactId(n: number): string {
+  return `01920000-0000-7000-9000-${String(n).padStart(12, "0")}`;
+}
+
 let nextId = 0;
 function event(type: string, extra: Record<string, unknown> = {}): Event {
   nextId += 1;
@@ -172,12 +177,12 @@ describe("materializeConversationMessages with a checkpoint", () => {
     const cut = older.at(-1)!;
     const checkpoint = checkpointEvent({
       upToEventId: cut.id,
-      artifactId: "art-1",
+      artifactId: artifactId(1),
     });
     const recent = turn("recent");
     const stub = new StubConversation({
       events: [...older, checkpoint, ...recent],
-      artifacts: new Map([["art-1", "SUMMARY: the user likes tea"]]),
+      artifacts: new Map([[artifactId(1), "SUMMARY: the user likes tea"]]),
     });
 
     const messages = await materializeConversationMessages(
@@ -197,11 +202,11 @@ describe("materializeConversationMessages with a checkpoint", () => {
     const older = turn("ancient");
     const checkpoint = checkpointEvent({
       upToEventId: older.at(-1)!.id,
-      artifactId: "art-1",
+      artifactId: artifactId(1),
     });
     const stub = new StubConversation({
       events: [...older, checkpoint, ...turn("recent")],
-      artifacts: new Map([["art-1", "SUMMARY"]]),
+      artifacts: new Map([[artifactId(1), "SUMMARY"]]),
     });
 
     const rendered = texts(
@@ -217,11 +222,11 @@ describe("materializeConversationMessages with a checkpoint", () => {
     const older = [...turn("a"), ...turn("b"), ...turn("c")];
     const checkpoint = checkpointEvent({
       upToEventId: older.at(-1)!.id,
-      artifactId: "art-1",
+      artifactId: artifactId(1),
     });
     const stub = new StubConversation({
       events: [...older, checkpoint, ...turn("recent")],
-      artifacts: new Map([["art-1", "SUMMARY"]]),
+      artifacts: new Map([[artifactId(1), "SUMMARY"]]),
     });
 
     await materializeConversationMessages(asConversation(stub));
@@ -241,16 +246,16 @@ describe("materializeConversationMessages with a checkpoint", () => {
         ...older,
         checkpointEvent({
           upToEventId: older.at(-1)!.id,
-          artifactId: "art-7",
+          artifactId: artifactId(7),
         }),
         ...turn("recent"),
       ],
-      artifacts: new Map([["art-7", "SUMMARY"]]),
+      artifacts: new Map([[artifactId(7), "SUMMARY"]]),
     });
 
     // listArtifacts() throws in the stub; reaching it is the failure.
     await materializeConversationMessages(asConversation(stub));
-    expect(stub.artifactReads).toEqual(["art-7"]);
+    expect(stub.artifactReads).toEqual([artifactId(7)]);
   });
 
   it("falls back to full history when the summary artifact is missing", async () => {
@@ -262,7 +267,7 @@ describe("materializeConversationMessages with a checkpoint", () => {
         ...older,
         checkpointEvent({
           upToEventId: older.at(-1)!.id,
-          artifactId: "gone",
+          artifactId: artifactId(999),
         }),
         ...turn("recent"),
       ],
@@ -280,12 +285,12 @@ describe("materializeConversationMessages with a checkpoint", () => {
     const first = turn("ancient");
     const firstCheckpoint = checkpointEvent({
       upToEventId: first.at(-1)!.id,
-      artifactId: "art-1",
+      artifactId: artifactId(1),
     });
     const middle = turn("middle");
     const secondCheckpoint = checkpointEvent({
       upToEventId: middle.at(-1)!.id,
-      artifactId: "art-2",
+      artifactId: artifactId(2),
     });
     const stub = new StubConversation({
       events: [
@@ -296,8 +301,8 @@ describe("materializeConversationMessages with a checkpoint", () => {
         ...turn("recent"),
       ],
       artifacts: new Map([
-        ["art-1", "OLD SUMMARY"],
-        ["art-2", "NEW SUMMARY"],
+        [artifactId(1), "OLD SUMMARY"],
+        [artifactId(2), "NEW SUMMARY"],
       ]),
     });
 
@@ -321,13 +326,13 @@ describe("readActiveCheckpoint", () => {
     const older = turn("ancient");
     const checkpoint = checkpointEvent({
       upToEventId: older.at(-1)!.id,
-      artifactId: "art-1",
+      artifactId: artifactId(1),
     });
     const stub = new StubConversation({
       events: [...older, checkpoint, ...turn("recent")],
     });
     const active = await readActiveCheckpoint(asConversation(stub));
-    expect(active?.artifactId).toBe("art-1");
+    expect(active?.artifactId).toBe(artifactId(1));
   });
 });
 
@@ -385,7 +390,7 @@ describe("PromptHistoryCache", () => {
     const older = turn("ancient");
     const stub = new StubConversation({
       events: [...older],
-      artifacts: new Map([["art-1", "SUMMARY"]]),
+      artifacts: new Map([[artifactId(1), "SUMMARY"]]),
     });
     const cache = new PromptHistoryCache();
     expect(texts(await cache.materialize(asConversation(stub)))).toEqual([
@@ -393,7 +398,10 @@ describe("PromptHistoryCache", () => {
     ]);
 
     stub.append(
-      checkpointEvent({ upToEventId: older.at(-1)!.id, artifactId: "art-1" }),
+      checkpointEvent({
+        upToEventId: older.at(-1)!.id,
+        artifactId: artifactId(1),
+      }),
     );
     stub.append(...turn("recent"));
 
@@ -413,7 +421,7 @@ describe("PromptHistoryCache", () => {
     const older = turn("ancient");
     const stub = new StubConversation({
       events: [...older],
-      artifacts: new Map([["art-1", "SUMMARY"]]),
+      artifacts: new Map([[artifactId(1), "SUMMARY"]]),
     });
     const cache = new PromptHistoryCache();
     expect(texts(await cache.materialize(asConversation(stub)))).toEqual([
@@ -422,7 +430,10 @@ describe("PromptHistoryCache", () => {
 
     // Another turn compacts. This cache is never told.
     stub.append(
-      checkpointEvent({ upToEventId: older.at(-1)!.id, artifactId: "art-1" }),
+      checkpointEvent({
+        upToEventId: older.at(-1)!.id,
+        artifactId: artifactId(1),
+      }),
     );
     stub.append(...turn("recent"));
 
@@ -480,11 +491,11 @@ describe("materializePromptMessages", () => {
         ...older,
         checkpointEvent({
           upToEventId: older.at(-1)!.id,
-          artifactId: "art-1",
+          artifactId: artifactId(1),
         }),
         ...turn("recent"),
       ],
-      artifacts: new Map([["art-1", "SUMMARY"]]),
+      artifacts: new Map([[artifactId(1), "SUMMARY"]]),
     });
 
     const rendered = texts(

@@ -10,11 +10,12 @@ import {
   CompactionGate,
   estimatedTokensFromChars,
   resolveCompactionPolicy,
+  resolveSummarizerModel,
   runCompaction,
   summarizerMaxOutputTokens,
+  summarizerMessages,
   turnMetadata,
   type BuiltInToolName,
-  type CompactionPolicy,
   type EventData,
   type HarnessToolRegistry,
   type JsonObject,
@@ -163,26 +164,39 @@ async function runResponsesTurnLoop(
     const toolDefinitions = tools.definitions();
     const preflightChars =
       promptChars(messages) + toolDefinitionChars(toolDefinitions);
+    const preflightTable = getTable() ?? new Map();
     if (
       compaction.shouldAttempt({
         policy,
         promptTokens: estimatedTokensFromChars(preflightChars),
-        maxInputTokens: maxInputTokens(getTable() ?? new Map(), model),
+        maxInputTokens: maxInputTokens(preflightTable, model),
         materializedChars: preflightChars,
       })
     ) {
       compaction.markAttempted();
+      // A configured summary model can have a smaller input window than the
+      // agent's; when the prompt does not fit it, summarize with the agent's
+      // model rather than losing the compaction to a rejected request.
+      const summaryModel = resolveSummarizerModel({
+        summaryModel: policy.summaryModel ?? model,
+        agentModel: model,
+        summaryModelInputLimit: maxInputTokens(
+          preflightTable,
+          policy.summaryModel ?? model,
+        ),
+        agentModelInputLimit: maxInputTokens(preflightTable, model),
+        promptTokens: estimatedTokensFromChars(preflightChars),
+      });
       const result = await runCompaction({
         conversation,
         turn: context.exoharness.current.turn,
         policy,
-        model: policy.summaryModel ?? model,
+        model: summaryModel,
         promptTokensBefore: null,
         summarize: (input) =>
           summarizeWithModel(
             runtime,
-            policy,
-            model,
+            summaryModel,
             turnParent,
             round,
             input,
@@ -248,28 +262,46 @@ async function runResponsesTurnLoop(
           cacheCreation: responseCacheCreationTokens(response),
         })
       : null;
+    // Walking the whole prompt is only needed when there is no provider count
+    // to work from — either the price table does not know the model's limit
+    // (the trigger's fallback path) or the response carried no usage (the
+    // summary-model fit check below).
+    const materializedChars =
+      modelInputLimit === null || occupancy === null
+        ? promptChars(messages)
+        : 0;
     if (
       compaction.shouldAttempt({
         policy,
         promptTokens: occupancy,
         maxInputTokens: modelInputLimit,
-        // Only the fallback trigger reads this, so skip walking the whole
-        // prompt when the price table knows the model's limit.
-        materializedChars: modelInputLimit === null ? promptChars(messages) : 0,
+        materializedChars,
       })
     ) {
       compaction.markAttempted();
+      // A configured summary model can have a smaller input window than the
+      // agent's; when the prompt does not fit it, summarize with the agent's
+      // model rather than losing the compaction to a rejected request.
+      const summaryModel = resolveSummarizerModel({
+        summaryModel: policy.summaryModel ?? model,
+        agentModel: model,
+        summaryModelInputLimit: maxInputTokens(
+          table,
+          policy.summaryModel ?? model,
+        ),
+        agentModelInputLimit: modelInputLimit,
+        promptTokens: occupancy ?? estimatedTokensFromChars(materializedChars),
+      });
       const result = await runCompaction({
         conversation,
         turn: context.exoharness.current.turn,
         policy,
-        model: policy.summaryModel ?? model,
+        model: summaryModel,
         promptTokensBefore: occupancy,
         summarize: (input) =>
           summarizeWithModel(
             runtime,
-            policy,
-            model,
+            summaryModel,
             turnParent,
             round,
             input,
@@ -370,53 +402,26 @@ function toolDefinitionChars(tools: unknown[]): number {
   return total;
 }
 
-const SUMMARIZER_INSTRUCTION = `You are compacting the earlier portion of an agent conversation so it can be dropped from the prompt while remaining usable.
-
-Write a dense factual summary of what happened. Prioritise, in order:
-1. Decisions made and conclusions reached, with the reasoning that led to them.
-2. Durable facts about the user, the task, and the environment.
-3. Work completed, files or resources changed, and commands that mattered.
-4. Open threads: what was in progress, what failed, what was agreed for later.
-
-Rules:
-- Write in the third person about what "the user" and "the agent" did.
-- Preserve specifics: names, paths, ids, numbers, error messages. Those are what a summary usually loses and what is most expensive to lose.
-- Do not speculate or add anything not present in the material.
-- Do not address the reader or describe the summary itself. Output only the summary.`;
-
 /**
  * Summarize a compacted span with a model call carrying no tools.
  *
- * When a previous summary exists it is merged rather than appended, so a long
- * conversation converges on a fixed-size summary instead of accumulating one
- * paragraph per compaction.
+ * The prompt itself comes from `summarizerMessages`, which is where the rule
+ * that summarized content never rides at developer priority is enforced.
  */
 async function summarizeWithModel(
   runtime: ResponsesRuntimeLike,
-  policy: CompactionPolicy,
   model: string,
   turnParent: TraceParent,
   round: number,
   input: SummarizeInput,
-  // Filled with what this call cost. The caller writes it at a point where no
-  // tool call is outstanding — see `flushSummarizerUsage`.
+  // Filled with what this call cost. Written on a custom event, which prompt
+  // assembly ignores outright — see `COMPACTION_USAGE_EVENT`.
   usageSink: { usage: JsonObject | undefined },
 ): Promise<string> {
-  const merge =
-    input.previousSummary === null
-      ? ""
-      : `\n\nA summary of even earlier history is provided first. Merge it with the new material into a single summary that covers both — do not simply append, and do not drop facts from the earlier summary.\n\n<earlier_summary>\n${input.previousSummary}\n</earlier_summary>`;
-
   const response = await runtime.complete(
     {
-      model: policy.summaryModel ?? model,
-      messages: [
-        {
-          role: "developer",
-          content: `${SUMMARIZER_INSTRUCTION}${merge}\n\nKeep the summary under ${input.maxChars} characters.`,
-        },
-        ...input.messages,
-      ],
+      model,
+      messages: summarizerMessages(input),
       // No tools: the summarizer reads, it does not act.
       tools: [],
       // Bound the response at request time. `capSummary` truncates only after

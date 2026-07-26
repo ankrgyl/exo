@@ -1457,9 +1457,12 @@ fn prompt_text(messages: &[Message]) -> String {
 }
 
 /// Turns carry realistic bulk: compaction deliberately does nothing when the
-/// compactable span is already smaller than the summary cap, so a fixture of
-/// single-word turns would exercise only that skip path.
-const TURN_PADDING_CHARS: usize = 4_000;
+/// compactable span is already smaller than the summary cap *plus* the envelope
+/// that wraps it into a prompt, so a fixture of single-word turns would exercise
+/// only that skip path. Sized well clear of the 8k default cap rather than a
+/// hair over it, so the guard's exact threshold is not load-bearing here — the
+/// test that pins that threshold sets its own cap.
+const TURN_PADDING_CHARS: usize = 8_000;
 
 async fn seed_completed_turns(conversation: &dyn ConversationHandle, labels: &[&str]) {
     for label in labels {
@@ -1736,6 +1739,98 @@ async fn compacted_history_is_not_re_summarized() {
     assert!(summarized.contains("two"), "{summarized}");
     // `three` is the kept turn; folding it in would duplicate it in the prompt.
     assert!(!summarized.contains("three"), "{summarized}");
+}
+
+#[tokio::test]
+async fn a_slow_compaction_does_not_replace_a_newer_checkpoint() {
+    // Turns on one conversation are not serialized, and the summarizer call is
+    // the slowest step in a compaction. Everything in the checkpoint payload —
+    // the chain link, the cumulative count, the cut boundary — is computed
+    // against the head as it stood when the pass started. Readers take the
+    // newest checkpoint, so publishing a stale one makes a shorter prefix
+    // silently replace a longer one and leaves the chain pointing past a
+    // checkpoint no longer reachable from the head.
+    let (_harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["one", "two", "three"]).await;
+    let config = CompactionConfig {
+        keep_recent_turns: 1,
+        ..CompactionConfig::default()
+    };
+
+    let turn = open_turn(conversation.as_ref()).await;
+    // The summarizer stands in for a slow model call: while it runs, another
+    // turn completes a compaction of its own and publishes a checkpoint.
+    let racing = conversation.clone();
+    let racing_config = config.clone();
+    let outcome = run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &config,
+        "summary-model",
+        None,
+        &move |_input| {
+            let racing = racing.clone();
+            let racing_config = racing_config.clone();
+            Box::pin(async move {
+                let other = open_turn(racing.as_ref()).await;
+                let other_outcome = run_compaction(
+                    racing.as_ref(),
+                    other.as_ref(),
+                    &racing_config,
+                    "summary-model",
+                    None,
+                    &|_input| Box::pin(async { Ok("WINNER".to_string()) }),
+                )
+                .await;
+                assert!(
+                    matches!(other_outcome, CompactionOutcome::Compacted { .. }),
+                    "the racing compaction should have landed: {other_outcome:?}"
+                );
+                other.finish().await.expect("finish racing turn");
+                Ok("LOSER".to_string())
+            })
+        },
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, CompactionOutcome::Skipped { .. }),
+        "the stale pass must stand down, got {outcome:?}"
+    );
+    let checkpoints = checkpoint_events(conversation.as_ref()).await;
+    assert_eq!(checkpoints.len(), 1, "only the winner should be published");
+
+    // And the surviving checkpoint's summary is the winner's, not the loser's.
+    let executor = test_executor();
+    turn.finish().await.expect("finish turn");
+    let prompt = executor
+        .materialize_prompt_history(conversation.as_ref(), &[])
+        .await
+        .expect("materialize");
+    let text = prompt_text(&prompt);
+    assert!(text.contains("WINNER"), "{text}");
+    assert!(!text.contains("LOSER"), "{text}");
+}
+
+/// Checkpoint events on a conversation, newest last.
+async fn checkpoint_events(conversation: &dyn ConversationHandle) -> Vec<EventData> {
+    conversation
+        .get_events(Some(EventQuery {
+            cursor: None,
+            direction: Some(EventQueryDirection::Asc),
+            limit: None,
+            session_id: None,
+            turn_id: None,
+            types: Some(vec![EventKind::custom(
+                crate::compaction::COMPACTION_CHECKPOINT_EVENT,
+            )]),
+        }))
+        .await
+        .expect("get events")
+        .events
+        .into_iter()
+        .map(|event| event.data)
+        .collect()
 }
 
 /// The shared materialize helper returns the **whole** log, checkpoint or not.

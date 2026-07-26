@@ -24,6 +24,11 @@ function eventId(n: number): string {
   return `01920000-0000-7000-8000-${String(n).padStart(12, "0")}`;
 }
 
+/** Artifact ids are uuids too; a distinct prefix keeps them apart from events. */
+function artifactId(n: number): string {
+  return `01920000-0000-7000-9000-${String(n).padStart(12, "0")}`;
+}
+
 let nextId = 0;
 function event(type: string, extra: Record<string, unknown> = {}): Event {
   nextId += 1;
@@ -41,7 +46,7 @@ function checkpointEvent(): Event {
     event_type: COMPACTION_CHECKPOINT_EVENT,
     payload: checkpointToPayload({
       upToEventId: eventId(1),
-      artifactId: "art-1",
+      artifactId: artifactId(1),
       artifactPath: "compaction/conv-1/summary.md",
       artifactVersion: 2,
       previousCheckpointId: null,
@@ -88,7 +93,7 @@ function makeContext(options: {
     // are small, but the registry still needs the method to exist.
     async writeArtifactText(args: { path: string }) {
       return {
-        artifactId: "art-tool",
+        artifactId: artifactId(11),
         path: args.path,
         version: 1,
         createdAt: new Date(0).toISOString(),

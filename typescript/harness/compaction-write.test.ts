@@ -21,6 +21,11 @@ function eventId(n: number): string {
   return `01920000-0000-7000-8000-${String(n).padStart(12, "0")}`;
 }
 
+/** Artifact ids are uuids too; a distinct prefix keeps them apart from events. */
+function artifactId(n: number): string {
+  return `01920000-0000-7000-9000-${String(n).padStart(12, "0")}`;
+}
+
 let nextId = 0;
 function event(type: string, extra: Record<string, unknown> = {}): Event {
   nextId += 1;
@@ -33,9 +38,12 @@ function event(type: string, extra: Record<string, unknown> = {}): Event {
 }
 
 // Turns carry realistic bulk: compaction deliberately does nothing when the
-// compactable span is already smaller than the summary cap, so a fixture of
-// single-character turns would exercise only that skip path.
-const TURN_PADDING = "x".repeat(4_000);
+// compactable span is already smaller than the summary cap *plus* the envelope
+// that wraps it into a prompt, so a fixture of single-character turns would
+// exercise only that skip path. Sized well clear of the 8k default cap rather
+// than a hair over it, so the guard's exact threshold is not load-bearing here
+// — the test that pins that threshold sets its own cap.
+const TURN_PADDING = "x".repeat(8_000);
 
 function turn(text: string): Event[] {
   return [
@@ -92,11 +100,11 @@ class StubTarget {
       throw new Error("artifact store unavailable");
     }
     this.artifactSeq += 1;
-    const artifactId = `art-${this.artifactSeq}`;
-    this.artifacts.set(artifactId, args.text);
+    const id = artifactId(this.artifactSeq);
+    this.artifacts.set(id, args.text);
     this.written.push(args);
     return {
-      artifactId,
+      artifactId: id,
       path: args.path,
       version: 1,
       createdAt: new Date(0).toISOString(),
@@ -174,7 +182,7 @@ describe("runCompaction", () => {
     const checkpoints = checkpointEvents(stub);
     expect(checkpoints).toHaveLength(1);
     const payload = checkpointPayload(checkpoints[0]);
-    expect(payload.artifact_id).toBe("art-1");
+    expect(payload.artifact_id).toBe(artifactId(1));
     expect(payload.artifact_path).toBe(stub.written[0].path);
     expect(payload.model).toBe("test-model");
     expect(payload.prompt_tokens_before).toBe(123);
@@ -214,6 +222,37 @@ describe("runCompaction", () => {
     // The count is what the agent is shown to judge how much history it is
     // missing, so it has to cover the whole chain, not just this pass.
     expect(Number(payload.compacted_event_count)).toBeGreaterThan(4);
+  });
+
+  it("stands down when a newer checkpoint lands mid-summary", async () => {
+    // Turns on one conversation are not serialized, and the summarizer call is
+    // the slowest step in a compaction. Everything in the checkpoint payload —
+    // the chain link, the cumulative count, the cut boundary — is computed
+    // against the head as it stood when the pass started. Readers take the
+    // newest checkpoint, so publishing a stale one makes a shorter prefix
+    // silently replace a longer one.
+    const stub = target([...turn("a"), ...turn("b"), ...turn("c")]);
+    const result = await runCompaction(
+      args(stub, {
+        summarize: (async () => {
+          const other = await runCompaction(
+            args(stub, {
+              summarize: (async () => "WINNER") satisfies SummarizeFn,
+            }),
+          );
+          expect(other.status).toBe("compacted");
+          return "LOSER";
+        }) satisfies SummarizeFn,
+      }),
+    );
+
+    expect(result.status).toBe("skipped");
+    const checkpoints = checkpointEvents(stub);
+    expect(checkpoints).toHaveLength(1);
+    const payload = checkpointPayload(checkpoints[0]);
+    // The surviving checkpoint points at the winner's artifact, not the
+    // loser's — which was written before the race was noticed.
+    expect(payload.artifact_id).toBe(artifactId(1));
   });
 
   it("caps an oversized summary rather than trusting the model", async () => {
@@ -311,7 +350,7 @@ describe("checkpoint payload shape", () => {
   it("matches what the read path decodes", () => {
     const payload = checkpointToPayload({
       upToEventId: eventId(1),
-      artifactId: "art-1",
+      artifactId: artifactId(1),
       artifactPath: "compaction/conv-1/1.md",
       artifactVersion: 1,
       previousCheckpointId: null,

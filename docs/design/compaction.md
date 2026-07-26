@@ -83,8 +83,21 @@ so neither can occur. `selectCutPoint` additionally verifies no call is pending
 and walks back to an earlier boundary if one is — a log truncated by a crash can
 violate the invariant that `turn_ended` otherwise guarantees.
 
-A property test over randomised event streams covers this in both languages.
-Mutating the cut point to land mid-round makes it fail.
+**A `turn_ended` marker proves only that its own turn ended.** Turns on one
+conversation are not serialized, so another turn can have appended its user
+message and be waiting on a model response when that marker lands. Cutting there
+would fold the other turn's own request into the summary, and its next round
+would materialize a prompt where its verbatim input has been replaced by a
+paraphrase — while its later events keep arriving after the cut. So a boundary is
+usable only when every turn open before it has also closed, which the selector
+checks by balancing `turn_started` against `turn_ended`. The pending-tool-call
+check cannot see this case: the other turn has not requested a tool yet, and may
+never. Both markers therefore have to be in the scan query — dropping
+`turn_started` does not fail loudly, it just makes the check blind.
+
+A property test over randomised event streams covers the tool-round invariant in
+both languages. Mutating the cut point to land mid-round makes it fail; so does
+dropping the open-turn check from an overlapping-turn fixture.
 
 ## When compaction triggers
 
@@ -174,7 +187,31 @@ than append, so a long conversation converges on a fixed-size summary instead of
 accumulating one paragraph per compaction.
 
 `maxSummaryChars` is enforced in code, not by asking the model nicely.
-Unbounded recursive summarization is the standard way this design rots.
+Unbounded recursive summarization is the standard way this design rots. It also
+bounds the request itself, via `summarizerMaxOutputTokens` — `capSummary` alone
+truncates only after a response has been generated, transferred and billed.
+
+### The summarizer's own context window
+
+`summaryModel` exists to run summaries on something cheaper than the agent's
+model, and cheaper models routinely have smaller input windows. Compaction fires
+at a share of the **agent** model's limit, so the span it hands the summarizer
+can be well inside budget for the agent and well over the summary model's — and
+the request is rejected. Because compaction failures are non-fatal by design,
+the only symptom would be a conversation that stops compacting exactly when it
+has grown large enough to need it.
+
+`resolveSummarizerModel` therefore falls back to the agent's own model when the
+prompt does not fit the configured one. The agent's model fits by construction:
+it was carrying that prompt a moment ago. The yardstick is the whole prompt
+rather than the span that will actually be summarized — an over-estimate, since
+the span excludes the kept turns and the tool schemas, but the span is not known
+until a cut point has been chosen, which happens after the model id is fixed and
+recorded on the checkpoint. Erring towards the agent's model costs money on one
+summary; erring the other way costs the compaction.
+
+This does not address a span too large for **any** available model — see
+_Known limits_.
 
 ### The summary is not an instruction
 
@@ -189,6 +226,20 @@ escalation — and one that only manifests on long conversations, where it is
 hardest to notice. `user` is the ceiling of what went into the summary, since
 instructions are rebuilt every round and never sourced from events. The envelope
 tells the model it is reading a record rather than a request.
+
+The same rule applies one step earlier, to the **summarizer's own** prompt. When
+a previous summary is merged in, it arrives as a delimited user message ahead of
+the material — never spliced into the summarizer's system instruction. That call
+is the one that decides what survives into every later prompt, and whatever it
+produces gets re-merged into every subsequent summary, so it is the worst
+possible place to hand conversation-derived text the harness's authority.
+
+Because the wrapper is part of what lands in the prompt, it is also part of the
+"is this worth doing" arithmetic: the no-growth guard compares the span against
+`maxSummaryChars` **plus** the envelope, not against the cap alone. Comparing
+bare summary text to enveloped span text makes the guard too permissive by
+exactly the wrapper's size — precisely the band where compaction is least likely
+to pay for itself.
 
 ## What survives compaction
 
@@ -215,6 +266,16 @@ from a broken checkpoint's boundary would summarize only the tail and then write
 a perfectly readable checkpoint over it — disarming the fallback and dropping
 everything before the break from the prompt for good. Instead, compaction
 rebuilds from the start of the log: one larger summarizer call, nothing lost.
+
+A compaction that finishes summarizing only to find a **newer checkpoint** at
+the head stands down without publishing. Everything in its payload — the chain
+link, the cumulative `compactedEventCount`, the cut boundary — was computed
+against the head as it stood when the pass began, and readers always take the
+newest checkpoint. Publishing anyway would let a shorter prefix silently replace
+a longer one and leave the chain pointing past a checkpoint no longer reachable
+from the head. The handle API has no compare-and-append, so the re-read
+immediately before the write narrows the window rather than closing it;
+discarding a summary already paid for is the cheap side of that trade.
 
 The summarizer is a real, billable call, so its usage is recorded — on its own
 custom event, `exo.compaction.usage.v1`.
@@ -335,6 +396,13 @@ summarizer for the same result.
 - A conversation whose _retained_ turns alone exceed the input limit cannot be
   rescued by compaction: there is nothing safe left to cut. Lowering
   `keepRecentTurns` helps; cutting mid-turn would corrupt tool rounds.
+- A span too large for the summarizer's own context window is not handled.
+  Falling back from `summaryModel` to the agent's model covers the
+  configuration case; a span that fits no available window would need the
+  summarizer to work in chunks.
+- Two compactions racing on one conversation resolve by the later one standing
+  down, but only because it re-reads the head just before writing. Without a
+  compare-and-append primitive there is still a window where both publish.
 - Summaries are flat, not hierarchical. If a flat summary proves lossy in
   practice, tiered summaries are the next step.
 - Summary _quality_ is not covered by the test suite — the deterministic tests
