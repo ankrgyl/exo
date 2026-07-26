@@ -545,6 +545,43 @@ export class CompactionGate {
   markAttempted(latestTurnEnded: string | null): void {
     this.attemptedAt = latestTurnEnded;
   }
+
+  /**
+   * The whole decision, including the boundary read, with the two rules the
+   * turn loop must not get wrong.
+   *
+   * The threshold check comes **first** because it is free — policy and a
+   * number already in hand — while the boundary read is a query. Reading
+   * unconditionally taxes every round of every turn, including turns on
+   * conversations with compaction switched off.
+   *
+   * A failed read means **skip**, not throw. Compaction is housekeeping, and
+   * the entire failure policy of this feature is that an oversized prompt beats
+   * a dead conversation. Letting the query reject out of the caller would be
+   * the one place housekeeping kills a turn — and at the post-response call
+   * site it would do so after tool calls were recorded but before their tools
+   * ran.
+   *
+   * The read is injected rather than performed here so this module stays
+   * I/O-free and the rules above stay unit-testable; the turn loop passes
+   * `() => readLatestTurnEnded(conversation)`.
+   */
+  async consider(
+    args: ShouldCompactArgs,
+    readLatestTurnEnded: () => Promise<string | null>,
+  ): Promise<{ latestTurnEnded: string | null } | null> {
+    if (!shouldCompact(args)) {
+      return null;
+    }
+    try {
+      const latestTurnEnded = await readLatestTurnEnded();
+      return this.shouldAttempt(args, latestTurnEnded)
+        ? { latestTurnEnded }
+        : null;
+    } catch {
+      return null;
+    }
+  }
 }
 
 /**

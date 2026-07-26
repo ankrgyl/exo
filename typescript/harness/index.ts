@@ -697,7 +697,7 @@ export async function materializePromptHistory(
 ): Promise<Message[]> {
   const checkpoint = await readActiveCheckpoint(conversation);
   const summary = checkpoint
-    ? await readCheckpointSummary(conversation, checkpoint)
+    ? summaryText(await readCheckpointSummary(conversation, checkpoint))
     : null;
 
   // A checkpoint whose artifact has vanished is worse than no checkpoint: it
@@ -714,19 +714,45 @@ export async function materializePromptHistory(
   return summary === null ? history : [summaryMessage(summary), ...history];
 }
 
+/**
+ * Outcome of trying to read a checkpoint's summary.
+ *
+ * Three states, not two, because a caller that caches has to tell "there is no
+ * summary" from "I could not find out". Both produce the same prompt — the
+ * full-log replay — but only the first is a fact about the conversation. The
+ * second is a fact about right now, and remembering it as though it were
+ * permanent means never retrying after the store recovers. Mirrors `SummaryRead`
+ * in the Rust executor.
+ */
+type SummaryRead =
+  | { text: string }
+  /** The artifact is gone. Nothing will bring it back, so this answer keeps. */
+  | { text: null; conclusive: true }
+  /** The store would not answer. It may next time. */
+  | { text: null; conclusive: false };
+
+function summaryText(read: SummaryRead): string | null {
+  return read.text;
+}
+
+function summaryIsConclusive(read: SummaryRead): boolean {
+  return read.text !== null || read.conclusive;
+}
+
 async function readCheckpointSummary(
   conversation: Conversation,
   checkpoint: CompactionCheckpoint,
-): Promise<string | null> {
+): Promise<SummaryRead> {
   try {
-    return await conversation.readArtifactText({
+    const text = await conversation.readArtifactText({
       artifactId: checkpoint.artifactId,
       version: checkpoint.artifactVersion,
     });
+    return text === null ? { text: null, conclusive: true } : { text };
   } catch {
-    // Treated the same as a missing artifact: fall back to full history rather
-    // than fail the turn over a summary we can reconstruct next time.
-    return null;
+    // Not a failure of the turn: fall back to full history rather than die over
+    // a summary that is reconstructible. But not a fact worth caching either.
+    return { text: null, conclusive: false };
   }
 }
 
@@ -800,9 +826,10 @@ export class PromptHistoryCache {
     conversation: Conversation,
     active: { eventId: string; checkpoint: CompactionCheckpoint } | null,
   ): Promise<void> {
-    this.summary = active
+    const read: SummaryRead = active
       ? await readCheckpointSummary(conversation, active.checkpoint)
-      : null;
+      : { text: null, conclusive: true };
+    this.summary = summaryText(read);
     const start = this.summary === null ? null : active?.checkpoint.upToEventId;
     const result = await conversation.getEvents({
       direction: "asc",
@@ -813,11 +840,18 @@ export class PromptHistoryCache {
     // Fall back to the checkpoint id on an empty page so the next round still
     // reads incrementally instead of re-scanning from the top.
     this.cursor = result.events.at(-1)?.id ?? start ?? null;
-    // Track the checkpoint we primed against, even when its summary was
-    // unreadable and we fell back to the full log: re-priming on every round
-    // would defeat the cache entirely.
-    this.checkpointEventId = active?.eventId ?? null;
-    this.primed = true;
+    // Track the checkpoint we primed against, even when its summary artifact was
+    // *missing* and we fell back to the full log: that answer will not change,
+    // and re-priming on every round would defeat the cache entirely.
+    //
+    // An errored read is different. Remembering it would mean never retrying the
+    // artifact for the life of this cache, so a blip in the store becomes a
+    // full-history replay that outlasts it. Leave the entry unprimed and pay for
+    // a rebuild next round instead — that is how it finds out the store is back.
+    if (summaryIsConclusive(read)) {
+      this.checkpointEventId = active?.eventId ?? null;
+      this.primed = true;
+    }
   }
 }
 

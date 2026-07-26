@@ -646,6 +646,14 @@ impl FakeExoHarness {
             .fail_artifact_reads = true;
     }
 
+    /// Let artifact reads succeed again, standing in for a recovered store.
+    fn allow_artifact_reads(&self) {
+        self.state
+            .lock()
+            .expect("state poisoned")
+            .fail_artifact_reads = false;
+    }
+
     /// Arrange for `hook` to run once inside the next `get_events`, standing in
     /// for another turn acting while a read is in flight.
     fn on_next_get_events(&self, hook: GetEventsHook) {
@@ -1869,6 +1877,59 @@ async fn an_unreadable_summary_artifact_replays_history_instead_of_failing_the_t
     assert!(text.contains("old"), "{text}");
     assert!(text.contains("recent"), "{text}");
     assert!(!text.contains("SUMMARY OF EARLIER"), "{text}");
+}
+
+#[tokio::test]
+async fn a_failed_summary_read_is_retried_rather_than_cached() {
+    // The history cache outlives the turn. Priming it against a checkpoint
+    // whose artifact merely *failed to read* would make one transient storage
+    // error permanent for this executor: every later materialization matches
+    // the cached checkpoint id, never retries the artifact, and replays full
+    // history long after the store recovered. A missing artifact is different —
+    // that answer will not change, so it is worth remembering.
+    let (harness, conversation) = compaction_fixture().await;
+    seed_completed_turns(conversation.as_ref(), &["ancient", "old", "recent"]).await;
+
+    let turn = open_turn(conversation.as_ref()).await;
+    let outcome = run_compaction(
+        conversation.as_ref(),
+        turn.as_ref(),
+        &CompactionConfig {
+            keep_recent_turns: 1,
+            ..CompactionConfig::default()
+        },
+        "summary-model",
+        None,
+        &|_input| Box::pin(async { Ok("SUMMARY OF EARLIER".to_string()) }),
+    )
+    .await;
+    let CompactionOutcome::Compacted { .. } = outcome else {
+        panic!("expected compaction, got {outcome:?}");
+    };
+    turn.finish().await.expect("finish turn");
+
+    // The store is down: full history, and nothing worth remembering.
+    let executor = test_executor();
+    harness.fail_artifact_reads();
+    let during = executor
+        .materialize_prompt_history(conversation.as_ref(), &[])
+        .await
+        .expect("materialize");
+    assert!(prompt_text(&during).contains("ancient"));
+    assert!(!prompt_text(&during).contains("SUMMARY OF EARLIER"));
+
+    // The store recovers. The same executor must pick the summary back up.
+    harness.allow_artifact_reads();
+    let after = executor
+        .materialize_prompt_history(conversation.as_ref(), &[])
+        .await
+        .expect("materialize");
+    let text = prompt_text(&after);
+    assert!(
+        text.contains("SUMMARY OF EARLIER"),
+        "a recovered artifact store must be noticed: {text}"
+    );
+    assert!(!text.contains("ancient"), "{text}");
 }
 
 /// Checkpoint events on a conversation, newest last.

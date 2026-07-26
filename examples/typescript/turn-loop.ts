@@ -169,21 +169,17 @@ async function runResponsesTurnLoop(
       toolDefinitionSize(toolDefinitions),
     );
     const preflightTable = getTable() ?? new Map();
-    // The newest turn boundary is what a cut point depends on, so it is what
-    // decides whether re-attempting within this turn could reach a new answer.
-    const preflightTurnEnded = await readLatestTurnEnded(conversation);
-    if (
-      compaction.shouldAttempt(
-        {
-          policy,
-          promptTokens: preflightSize.estimatedTokens(),
-          maxInputTokens: maxInputTokens(preflightTable, model),
-          materializedChars: preflightSize.bytes,
-        },
-        preflightTurnEnded,
-      )
-    ) {
-      compaction.markAttempted(preflightTurnEnded);
+    const preflightArgs = {
+      policy,
+      promptTokens: preflightSize.estimatedTokens(),
+      maxInputTokens: maxInputTokens(preflightTable, model),
+      materializedChars: preflightSize.bytes,
+    };
+    const preflight = await compaction.consider(preflightArgs, () =>
+      readLatestTurnEnded(conversation),
+    );
+    if (preflight !== null) {
+      compaction.markAttempted(preflight.latestTurnEnded);
       // A configured summary model can have a smaller input window than the
       // agent's; when the prompt does not fit it, summarize with the agent's
       // model rather than losing the compaction to a rejected request.
@@ -280,19 +276,17 @@ async function runResponsesTurnLoop(
       modelInputLimit === null || occupancy === null
         ? promptSize(messages)
         : new PromptSize();
-    const roundTurnEnded = await readLatestTurnEnded(conversation);
-    if (
-      compaction.shouldAttempt(
-        {
-          policy,
-          promptTokens: occupancy,
-          maxInputTokens: modelInputLimit,
-          materializedChars: materialized.bytes,
-        },
-        roundTurnEnded,
-      )
-    ) {
-      compaction.markAttempted(roundTurnEnded);
+    const roundAttempt = await compaction.consider(
+      {
+        policy,
+        promptTokens: occupancy,
+        maxInputTokens: modelInputLimit,
+        materializedChars: materialized.bytes,
+      },
+      () => readLatestTurnEnded(conversation),
+    );
+    if (roundAttempt !== null) {
+      compaction.markAttempted(roundAttempt.latestTurnEnded);
       // A configured summary model can have a smaller input window than the
       // agent's; when the prompt does not fit it, summarize with the agent's
       // model rather than losing the compaction to a rejected request.

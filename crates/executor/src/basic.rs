@@ -163,6 +163,9 @@ where
             _ => None,
         };
 
+        // Whether the summary answer is worth remembering. An errored read is
+        // not: see `SummaryRead`.
+        let mut summary_is_conclusive = true;
         let summary = match &cached_entry {
             Some(entry) => entry.summary.clone(),
             // A checkpoint whose artifact has vanished is worse than none: it
@@ -177,12 +180,14 @@ where
             // same way. This is what `readCheckpointSummary` already does in the
             // TypeScript harness.
             None => match active {
-                Some((_, checkpoint)) => read_summary_or_fall_back(conversation, &checkpoint)
-                    .await
-                    .map(|summary| CachedSummary {
-                        text: summary,
+                Some((_, checkpoint)) => {
+                    let read = read_summary_or_fall_back(conversation, &checkpoint).await;
+                    summary_is_conclusive = read.is_conclusive();
+                    read.text().map(|text| CachedSummary {
+                        text: text.to_string(),
                         up_to_event_id: checkpoint.up_to_event_id,
-                    }),
+                    })
+                }
                 None => None,
             },
         };
@@ -221,7 +226,17 @@ where
             // Only publish if nothing invalidated the cache while this read was
             // in flight. Dropping the entry costs one rebuild; keeping a stale
             // one costs correctness.
-            if self.cache_generation.load(Ordering::Acquire) == generation {
+            //
+            // And only when the summary answer was conclusive. This cache
+            // outlives the turn, so priming it against a checkpoint whose
+            // artifact merely *failed to read* would make one transient storage
+            // error permanent for this executor: every later materialization
+            // matches the cached checkpoint id, never retries the artifact, and
+            // replays full history long after the store recovered. Rebuilding
+            // each round while the store is down is the cost of finding out
+            // when it comes back.
+            if self.cache_generation.load(Ordering::Acquire) == generation && summary_is_conclusive
+            {
                 cache.insert(
                     conversation_id,
                     HistoryCacheEntry {

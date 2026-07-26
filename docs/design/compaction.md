@@ -328,10 +328,17 @@ which runs while instructions are assembled and so gets no later chance to fall
 back.
 
 A missing artifact and an erroring read are different failures but the same
-situation: the raw log is intact either way, so propagating the error would take
-a working conversation down over something recoverable, and take it down
-repeatedly, since every later turn consults the same checkpoint. Losing the
-summary costs prompt space; losing the turn costs the agent.
+situation _for the prompt_: the raw log is intact either way, so propagating the
+error would take a working conversation down over something recoverable, and take
+it down repeatedly, since every later turn consults the same checkpoint. Losing
+the summary costs prompt space; losing the turn costs the agent.
+
+They are **not** the same situation for a cache. A missing artifact is a fact
+about the conversation and will not change; an errored read is a fact about right
+now. Remembering the second as though it were the first means never retrying, so
+one blip turns into a full-history replay that outlives it — and the Rust history
+cache outlives the turn. Hence `SummaryRead` has three states, and a cache primes
+only on a conclusive one.
 
 That fallback is also why an unreadable summary **stops the chain**. Compacting
 from a broken checkpoint's boundary would summarize only the tail and then write
@@ -413,14 +420,14 @@ including tool rounds that span a batch boundary.
 
 ## Configuration
 
-| Field                | Default       | Meaning                                                   |
-| -------------------- | ------------- | --------------------------------------------------------- |
-| `enabled`            | `true`        | Off means unbounded prompts.                              |
-| `thresholdRatio`     | `0.7`         | Fraction of the input limit that triggers compaction.     |
-| `keepRecentTurns`    | `3`           | Turns kept verbatim after the cut.                        |
-| `maxSummaryChars`    | `8000`        | Hard ceiling on summary size.                             |
-| `summaryModel`       | agent's model | Model id (within the agent's binding) used for summaries. |
-| `fallbackCharBudget` | `400000`      | Used when the model's input limit is unknown.             |
+| Field                | Default       | Meaning                                                    |
+| -------------------- | ------------- | ---------------------------------------------------------- |
+| `enabled`            | `true`        | Off means unbounded prompts.                               |
+| `thresholdRatio`     | `0.7`         | Fraction of the input limit that triggers compaction.      |
+| `keepRecentTurns`    | `3`           | Turns kept verbatim after the cut.                         |
+| `maxSummaryChars`    | `8000`        | Hard ceiling on summary size.                              |
+| `summaryModel`       | agent's model | Model id (within the agent's binding) used for summaries.  |
+| `fallbackCharBudget` | `64000`       | UTF-8 bytes. Used when the model's input limit is unknown. |
 
 From the CLI:
 

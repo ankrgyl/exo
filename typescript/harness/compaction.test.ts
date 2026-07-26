@@ -895,6 +895,41 @@ describe("CompactionGate", () => {
     expect(gate.shouldAttempt(args, boundary)).toBe(true);
   });
 
+  it("does not read the boundary when the threshold is not crossed", async () => {
+    // The threshold check is free; the boundary read is a query. Doing it
+    // unconditionally taxes every round of every turn, including turns on
+    // conversations with compaction switched off entirely.
+    const gate = new CompactionGate();
+    let reads = 0;
+    const read = async () => {
+      reads += 1;
+      return boundary;
+    };
+
+    expect(await gate.consider({ ...args, promptTokens: 10_000 }, read)).toBe(
+      null,
+    );
+    expect(reads).toBe(0);
+
+    expect(await gate.consider(args, read)).toEqual({
+      latestTurnEnded: boundary,
+    });
+    expect(reads).toBe(1);
+  });
+
+  it("skips rather than throws when the boundary read fails", async () => {
+    // Compaction is housekeeping: an oversized prompt beats a dead
+    // conversation. This is the one place where letting the query reject would
+    // kill an otherwise valid turn — and at the post-response call site it
+    // would do so after tool calls were recorded but before their tools ran.
+    const gate = new CompactionGate();
+    const failing = async (): Promise<string | null> => {
+      throw new Error("event store unavailable");
+    };
+
+    await expect(gate.consider(args, failing)).resolves.toBe(null);
+  });
+
   it("still respects the threshold before the first attempt", () => {
     const gate = new CompactionGate();
     expect(

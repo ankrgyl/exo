@@ -533,7 +533,10 @@ async fn compact(
         // "rebuild from the start of the log" — the same handling a missing
         // artifact gets, and strictly better than failing the compaction over a
         // read the next pass may well succeed at.
-        Some((_, checkpoint)) => read_summary_or_fall_back(conversation, checkpoint).await,
+        Some((_, checkpoint)) => read_summary_or_fall_back(conversation, checkpoint)
+            .await
+            .text()
+            .map(str::to_string),
         None => None,
     };
 
@@ -781,21 +784,52 @@ impl CompactionLatch {
     }
 }
 
-/// Summary text for a checkpoint, or `None` if it cannot be had — whether the
-/// artifact is missing or the store refused to hand it over.
+/// Outcome of trying to read a checkpoint's summary.
 ///
-/// Callers on the read path must not distinguish the two. A missing artifact
-/// already means "replay the full log", and the raw log is equally intact when
-/// the store returns a permission or transport error, so propagating that error
-/// would take a working conversation down over something recoverable — and take
-/// it down repeatedly, since every later turn consults the same checkpoint.
-/// Losing the summary costs prompt space; losing the turn costs the agent.
+/// Three states, not two, because a caller that caches has to tell "there is no
+/// summary" from "I could not find out". Both produce the same prompt — the
+/// full-log replay — but only the first is a fact about the conversation. The
+/// second is a fact about right now, and caching it as though it were permanent
+/// turns one transient storage error into a conversation that replays full
+/// history forever, long after the store recovered.
+#[derive(Debug)]
+pub(crate) enum SummaryRead {
+    Loaded(String),
+    /// The artifact is gone. Nothing will bring it back, so this answer keeps.
+    Missing,
+    /// The store would not answer. It may next time.
+    Unavailable,
+}
+
+impl SummaryRead {
+    pub(crate) fn text(&self) -> Option<&str> {
+        match self {
+            Self::Loaded(summary) => Some(summary),
+            _ => None,
+        }
+    }
+
+    /// Whether this answer is safe to remember. `Unavailable` is not.
+    pub(crate) fn is_conclusive(&self) -> bool {
+        !matches!(self, Self::Unavailable)
+    }
+}
+
+/// A checkpoint's summary, with an errored read reported rather than raised.
+///
+/// Callers on the read path must not fail over this. A missing artifact already
+/// means "replay the full log", and the raw log is equally intact when the store
+/// returns a permission or transport error, so propagating would take a working
+/// conversation down over something recoverable — repeatedly, since every later
+/// turn consults the same checkpoint. Losing the summary costs prompt space;
+/// losing the turn costs the agent.
 pub(crate) async fn read_summary_or_fall_back(
     conversation: &dyn ConversationHandle,
     checkpoint: &CompactionCheckpoint,
-) -> Option<String> {
+) -> SummaryRead {
     match read_summary(conversation, checkpoint).await {
-        Ok(summary) => summary,
+        Ok(Some(summary)) => SummaryRead::Loaded(summary),
+        Ok(None) => SummaryRead::Missing,
         Err(error) => {
             tracing::warn!(
                 %error,
@@ -803,7 +837,7 @@ pub(crate) async fn read_summary_or_fall_back(
                 artifact_id = %checkpoint.artifact_id,
                 "compaction: summary artifact could not be read; replaying full history"
             );
-            None
+            SummaryRead::Unavailable
         }
     }
 }

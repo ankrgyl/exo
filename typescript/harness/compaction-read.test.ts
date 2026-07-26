@@ -478,6 +478,35 @@ describe("PromptHistoryCache", () => {
     expect(rendered).toContain("recent");
   });
 
+  it("retries the summary after a failed read rather than caching the fallback", async () => {
+    // A missing artifact is a fact that keeps; an errored read is not. Priming
+    // the cache against the latter means never retrying it for the life of the
+    // cache, so a blip in the store outlasts the blip.
+    const older = turn("ancient");
+    const stub = new StubConversation({
+      events: [
+        ...older,
+        checkpointEvent({
+          upToEventId: older.at(-1)!.id,
+          artifactId: artifactId(1),
+        }),
+        ...turn("recent"),
+      ],
+      artifacts: new Map([[artifactId(1), "SUMMARY OF EARLIER"]]),
+    });
+    const cache = new PromptHistoryCache();
+
+    stub.failArtifactReads = true;
+    const during = texts(await cache.materialize(asConversation(stub)));
+    expect(during).toContain("ancient");
+    expect(during.join("\n")).not.toContain("SUMMARY OF EARLIER");
+
+    stub.failArtifactReads = false;
+    const after = texts(await cache.materialize(asConversation(stub)));
+    expect(after.join("\n")).toContain("SUMMARY OF EARLIER");
+    expect(after).not.toContain("ancient");
+  });
+
   it("notices a checkpoint written by another turn, without invalidation", async () => {
     // `invalidate()` only reaches the cache belonging to the turn that
     // compacted. Turns on one conversation are not serialized, so a cache primed
