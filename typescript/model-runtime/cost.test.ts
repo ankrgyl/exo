@@ -59,6 +59,21 @@ describe("cost", () => {
     );
   });
 
+  it("counts cache-creation tokens toward occupancy", () => {
+    // A cache-write-heavy turn: Anthropic reports the written tokens separately
+    // from input_tokens, so ignoring them makes a prompt that nearly fills the
+    // window look small and the threshold is missed on exactly the turn that
+    // filled the cache.
+    expect(
+      inputOccupancy(table, "claude-sonnet-4-6", {
+        prompt: 5_000,
+        completion: 100,
+        cached: 10_000,
+        cacheCreation: 150_000,
+      }),
+    ).toBe(165_000);
+  });
+
   it("trusts prompt tokens for inclusive providers", () => {
     // OpenAI's prompt count already includes cache reads; adding them again
     // would double-count the cached prefix and compact too eagerly.

@@ -246,6 +246,27 @@ describe("capSummary", () => {
     expect(capSummary("short", 100)).toBe("short");
   });
 
+  it("measures by code point, matching Rust's chars().count()", () => {
+    // "\u{1F600}" is one code point but two UTF-16 units. Measuring with
+    // `.length` would truncate an emoji-heavy summary twice as early as Rust,
+    // and slicing by unit can cut a surrogate pair in half.
+    // 30 code points, 60 UTF-16 units. Under a 40 cap it fits by code point
+    // and does not by `.length`, so a UTF-16 measurement truncates a summary
+    // that should have been left whole.
+    const emoji = "\u{1F600}".repeat(30);
+    expect(capSummary(emoji, 40)).toBe(emoji);
+    expect(capSummary(emoji, 40)).not.toContain("summary truncated");
+
+    const capped = capSummary("\u{1F600}".repeat(100), 50);
+    expect(Array.from(capped).length).toBeLessThanOrEqual(50);
+    // A split surrogate pair leaves a lone half — a code point in the
+    // surrogate range, which no well-formed string contains.
+    for (const ch of capped) {
+      const cp = ch.codePointAt(0)!;
+      expect(cp >= 0xd800 && cp <= 0xdfff).toBe(false);
+    }
+  });
+
   it("keeps summary text rather than spending a tiny cap on the marker", () => {
     // The marker is ~22 chars. Below that, spending the budget on it leaves a
     // "summary" with no facts — non-empty, so the empty-summary guard lets it
@@ -293,6 +314,38 @@ describe("checkpoint events", () => {
     };
     const parsed = checkpointFromEvent(checkpointEvent(toPayload(checkpoint)));
     expect(parsed).toEqual(checkpoint);
+  });
+
+  it("rejects an optional field present with the wrong type", () => {
+    // Rust models these as Option<T> and serde rejects a present-but-wrong-type
+    // value, falling back to the full log. Coercing to null here would make the
+    // two runtimes select different histories for the same event.
+    const complete = {
+      up_to_event_id: "evt-1",
+      artifact_id: "art-1",
+      artifact_path: "compaction/1.md",
+      artifact_version: 1,
+      compacted_event_count: 4,
+      summary_chars: 20,
+      model: "m",
+    };
+    expect(
+      checkpointFromEvent(
+        checkpointEvent({ ...complete, previous_checkpoint_id: 42 }),
+      ),
+    ).toBeNull();
+    expect(
+      checkpointFromEvent(
+        checkpointEvent({ ...complete, prompt_tokens_before: "lots" }),
+      ),
+    ).toBeNull();
+    // Absent and explicit null both remain valid.
+    expect(
+      checkpointFromEvent(
+        checkpointEvent({ ...complete, previous_checkpoint_id: null }),
+      ),
+    ).not.toBeNull();
+    expect(checkpointFromEvent(checkpointEvent(complete))).not.toBeNull();
   });
 
   it("rejects a payload missing any required field", () => {

@@ -61,7 +61,18 @@ export interface CompactionPolicy {
    * same provider without extra configuration.
    */
   summaryModel: string | null;
-  /** Used when the price table has no input limit for the model. */
+  /**
+   * Used when the price table has no input limit for the model.
+   *
+   * Deliberately sized for a *small* context window rather than a typical one.
+   * This value is only reached when the model's real limit is unknown — an
+   * unlisted model, or a price table that failed to download — so it has to be
+   * safe for the smallest window it might stand in for. Guessing high on a 32k
+   * model means the request is rejected, and because no response comes back the
+   * accurate post-response trigger never runs: every later turn replays the same
+   * oversized history and fails the same way. Guessing low just compacts earlier
+   * than strictly necessary.
+   */
   fallbackCharBudget: number;
 }
 
@@ -71,7 +82,7 @@ export const DEFAULT_COMPACTION_POLICY: CompactionPolicy = {
   keepRecentTurns: 3,
   maxSummaryChars: 8_000,
   summaryModel: null,
-  fallbackCharBudget: 400_000,
+  fallbackCharBudget: 64_000,
 };
 
 export interface CutPoint {
@@ -217,14 +228,40 @@ export class CompactionGate {
 }
 
 /**
+ * Number of Unicode code points in a string.
+ *
+ * Not `.length`, which counts UTF-16 code units. Rust's `chars().count()` counts
+ * code points, so measuring summaries with `.length` would make the two runtimes
+ * disagree about the same text: an emoji-heavy summary truncates up to twice as
+ * early in TypeScript, and `summary_chars` on the checkpoint would differ for a
+ * byte-identical artifact.
+ */
+export function codePointCount(text: string): number {
+  return Array.from(text).length;
+}
+
+/**
+ * First `count` Unicode code points of a string.
+ *
+ * Not `.slice()`, which cuts by UTF-16 code unit and can land between the halves
+ * of a surrogate pair — leaving a lone surrogate that renders as a replacement
+ * character in the stored artifact.
+ */
+function sliceCodePoints(text: string, count: number): string {
+  return Array.from(text).slice(0, count).join("");
+}
+
+/**
  * Enforce the summary ceiling. Chained compaction feeds each summary back into
  * the next one, so without a hard cap the summary itself grows without bound —
  * the classic way this design rots. Truncation is deliberately blunt: the model
  * gets one chance to respect the cap, and this is the backstop.
+ *
+ * Measured in code points, matching Rust's `cap_summary`.
  */
 export function capSummary(summary: string, maxChars: number): string {
   const trimmed = summary.trim();
-  if (trimmed.length <= maxChars) {
+  if (codePointCount(trimmed) <= maxChars) {
     return trimmed;
   }
   const marker = "\n...[summary truncated]";
@@ -233,11 +270,15 @@ export function capSummary(summary: string, maxChars: number): string {
   // with no facts in it, and because that is non-empty the empty-summary guard
   // waves it through and checkpoints a cut whose summary says nothing. Keep the
   // summary instead; a short true summary beats a longer empty one.
-  if (maxChars <= marker.length) {
-    return trimmed.slice(0, maxChars);
+  const markerChars = codePointCount(marker);
+  if (maxChars <= markerChars) {
+    return sliceCodePoints(trimmed, maxChars);
   }
-  const head = maxChars - marker.length;
-  return `${trimmed.slice(0, head)}${marker}`.slice(0, maxChars);
+  const head = maxChars - markerChars;
+  return sliceCodePoints(
+    `${sliceCodePoints(trimmed, head)}${marker}`,
+    maxChars,
+  );
 }
 
 export function checkpointToPayload(
@@ -279,9 +320,18 @@ function customEventPayload(
     : null;
 }
 
+/** True when a field is absent/null, or present with the expected type. */
+function isAbsentOrType(
+  value: unknown,
+  expected: "string" | "number",
+): boolean {
+  return value === undefined || value === null || typeof value === expected;
+}
+
 /**
  * Decode a checkpoint event, or null if it is not one / is malformed. A partial
- * read would silently drop history, so every required field is validated.
+ * read would silently drop history, so every field is validated — required ones
+ * for presence and type, optional ones for type when present.
  */
 export function checkpointFromEvent(
   data: EventData,
@@ -313,6 +363,17 @@ export function checkpointFromEvent(
     typeof summaryChars !== "number" ||
     typeof model !== "string"
   ) {
+    return null;
+  }
+  // The optional fields are optional in *type*, not in validity. Rust models
+  // them as `Option<T>`, and serde rejects the whole payload when a present
+  // value has the wrong type — so coercing a bad value to null here would let
+  // the two runtimes pick different histories for the same event: Rust falls
+  // back to the full log, TypeScript honours a checkpoint it half-understood.
+  if (!isAbsentOrType(payload.previous_checkpoint_id, "string")) {
+    return null;
+  }
+  if (!isAbsentOrType(payload.prompt_tokens_before, "number")) {
     return null;
   }
   return {
@@ -485,7 +546,8 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
   // be larger grows the prompt instead of shrinking it, and spends a model call
   // to do so. Nothing to reclaim means nothing to do.
   const spanChars = messagesChars(compactedMessages);
-  const previousChars = previousSummary?.length ?? 0;
+  const previousChars =
+    previousSummary === null ? 0 : codePointCount(previousSummary);
   if (spanChars + previousChars <= policy.maxSummaryChars) {
     return {
       status: "skipped",
@@ -527,7 +589,7 @@ async function compact(args: RunCompactionArgs): Promise<CompactionResult> {
     // understate it on every compaction after the first.
     compactedEventCount:
       (previous?.checkpoint.compactedEventCount ?? 0) + cut.compactedEventCount,
-    summaryChars: summary.length,
+    summaryChars: codePointCount(summary),
     promptTokensBefore,
     model,
   };

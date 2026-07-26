@@ -696,11 +696,19 @@ function anthropicUsageToResponseUsage(
   const input = usage.input_tokens ?? 0;
   const output = usage.output_tokens ?? 0;
   const cached = usage.cache_read_input_tokens ?? 0;
+  // Cache *writes* are reported separately from `input_tokens` and are just as
+  // real an occupant of the context window. Dropping them here made a
+  // cache-write-heavy prompt look far smaller than it was, so the compaction
+  // threshold could be missed on exactly the turn that filled the cache.
+  const cacheCreation = usage.cache_creation_input_tokens ?? 0;
   return {
     input_tokens: input,
     output_tokens: output,
     total_tokens: input + output,
-    input_tokens_details: { cached_tokens: cached },
+    input_tokens_details: {
+      cached_tokens: cached,
+      cache_creation_tokens: cacheCreation,
+    },
     output_tokens_details: { reasoning_tokens: 0 },
   };
 }
@@ -1170,6 +1178,24 @@ export function responseToLinguaEvents(response: Response): EventData[] {
 }
 
 /**
+ * Cache-*creation* tokens for a response, or undefined when the provider did not
+ * report any.
+ *
+ * The OpenAI SDK's `InputTokensDetails` has no field for this, but the Anthropic
+ * adapter carries it through on the same object, and it occupies the context
+ * window just like cache reads do. Read behind a narrow cast rather than
+ * widening the SDK type.
+ */
+export function responseCacheCreationTokens(
+  response: Response,
+): number | undefined {
+  const details = response.usage?.input_tokens_details as
+    | { cache_creation_tokens?: number }
+    | undefined;
+  return details?.cache_creation_tokens;
+}
+
+/**
  * Usage + cost for a response, in the shape the `messages` event carries.
  *
  * Exported so a caller can record what an out-of-band model call cost — the
@@ -1190,16 +1216,25 @@ function usageRecord(response: Response): JsonObject | undefined {
   const prompt = usage.input_tokens;
   const completion = usage.output_tokens;
   const cached = usage.input_tokens_details?.cached_tokens;
+  const cacheCreation = responseCacheCreationTokens(response);
   const reasoning = usage.output_tokens_details?.reasoning_tokens;
   const table = getTable();
   const cost = table
-    ? computeCostUsd(table, response.model, { prompt, completion, cached })
+    ? computeCostUsd(table, response.model, {
+        prompt,
+        completion,
+        cached,
+        cacheCreation,
+      })
     : null;
 
   const record: JsonObject = { model: response.model };
   if (prompt != null) record.prompt_tokens = prompt;
   if (completion != null) record.completion_tokens = completion;
   if (cached != null) record.prompt_cached_tokens = cached;
+  if (cacheCreation != null) {
+    record.prompt_cache_creation_tokens = cacheCreation;
+  }
   if (reasoning != null) record.completion_reasoning_tokens = reasoning;
   if (cost != null) record.cost_usd = cost;
   return record;

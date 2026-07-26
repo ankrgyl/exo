@@ -45,6 +45,15 @@ happily agree with whatever shape that runtime writes. So the format is pinned
 by a golden fixture that _both_ test suites parse:
 [`tests/fixtures/compaction-checkpoint.json`](../../tests/fixtures/compaction-checkpoint.json).
 
+Agreeing on the bytes is not sufficient; the two decoders must also agree on what
+is _valid_. Rust's serde rejects a payload whose field has the wrong type,
+including an optional one, and a rejected checkpoint falls back to the full log.
+TypeScript therefore validates every field rather than coercing — otherwise the
+same event yields a checkpoint on one runtime and a full replay on the other.
+Sizes are counted in **code points** on both sides (`chars().count()`,
+`Array.from(...).length`), not UTF-16 units, or an emoji-heavy summary truncates
+twice as early in TypeScript and `summary_chars` disagrees for identical text.
+
 Two payload fields store event ids, and both are cursors rather than data:
 `up_to_event_id` (the cut boundary) and `previous_checkpoint_id` (the previous
 checkpoint _event's_ id, which makes the chain traversable — storing the previous
@@ -97,8 +106,18 @@ compaction exists for. `inputOccupancy` reuses `isAdditive()` to add the cache
 fields back for those providers, and trusts `prompt_tokens` for the inclusive
 ones (where adding them would double-count).
 
+Occupancy counts cache **writes** as well as cache reads. Anthropic reports
+`cache_creation_input_tokens` separately from `input_tokens`, and those tokens
+occupy the window like any other — ignoring them makes the turn that fills the
+cache look small at exactly the moment it is largest.
+
 When either value is unavailable — the price table is fetched over the network
-and is explicitly best-effort — a character budget stands in.
+and is explicitly best-effort — a character budget stands in. That budget is
+deliberately sized for a _small_ window (~32k tokens), not a typical one: it is
+only reached when the real limit is unknown, so it has to be safe for the
+smallest model it might be standing in for. Guessing high gets the request
+rejected, and with no response the accurate trigger never runs; guessing low just
+compacts earlier than necessary.
 
 ### Two triggers, and why both are needed
 

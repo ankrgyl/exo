@@ -22,6 +22,7 @@ import {
 import {
   responseMessages,
   responseToLinguaEvents,
+  responseCacheCreationTokens,
   responseToolCalls,
   responseUsageRecord,
   runtimeFromModelBinding,
@@ -244,6 +245,7 @@ async function runResponsesTurnLoop(
           prompt: response.usage.input_tokens,
           completion: response.usage.output_tokens,
           cached: response.usage.input_tokens_details?.cached_tokens,
+          cacheCreation: responseCacheCreationTokens(response),
         })
       : null;
     if (

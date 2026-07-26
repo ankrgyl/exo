@@ -67,6 +67,19 @@ pub struct CompactionConfig {
     /// the same provider without extra configuration.
     pub summary_model: Option<String>,
     /// Used when the price table has no input limit for the model.
+    ///
+    /// Deliberately sized for a *small* context window rather than a typical
+    /// one. This value is only reached when the model's real limit is unknown —
+    /// an unlisted model, or a price table that failed to download — so it has
+    /// to be safe for the smallest window it might be standing in for. Guessing
+    /// high on a 32k model means the request is rejected, and because no
+    /// response comes back the accurate post-response trigger never runs: every
+    /// later turn replays the same oversized history and fails the same way.
+    /// Guessing low just compacts earlier than strictly necessary.
+    ///
+    /// The default assumes roughly a 32k-token window at the estimator's
+    /// 3 chars/token, at about two thirds full. Raise it if every model you run
+    /// has a large window.
     pub fallback_char_budget: u64,
 }
 
@@ -78,7 +91,7 @@ impl Default for CompactionConfig {
             keep_recent_turns: 3,
             max_summary_chars: 8_000,
             summary_model: None,
-            fallback_char_budget: 400_000,
+            fallback_char_budget: 64_000,
         }
     }
 }
@@ -876,6 +889,22 @@ mod tests {
     #[test]
     fn cap_summary_leaves_short_input_alone() {
         assert_eq!(cap_summary("short", 100), "short");
+    }
+
+    #[test]
+    fn the_unknown_limit_fallback_is_safe_for_a_small_window() {
+        // This budget only applies when the model's real limit is unknown, so
+        // it has to be safe for the smallest window it might stand in for.
+        // Guessing high means the request is rejected, and with no response the
+        // accurate post-response trigger never runs — the conversation is stuck.
+        let config = CompactionConfig::default();
+        let smallest_supported_window_tokens = 32_000u64;
+        let budget_in_tokens = estimated_tokens_from_chars(config.fallback_char_budget);
+        assert!(
+            budget_in_tokens < smallest_supported_window_tokens,
+            "fallback budget estimates {budget_in_tokens} tokens, which a \
+             {smallest_supported_window_tokens}-token model would reject"
+        );
     }
 
     #[test]
