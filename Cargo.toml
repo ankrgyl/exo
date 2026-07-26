@@ -16,6 +16,7 @@ rust-version = "1.95"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+agent-client-protocol = "=2.0.0"
 async-trait = "0.1.89"
 actix-web = "4.9.0"
 aws-config = "1.8.17"

@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use crate::{AgentConfig, ConversationConfig, ExecutionStreamHandle, SendRequest, SendResult};
+use crate::{
+    AgentConfig, ConversationConfig, ExecutionCancellation, ExecutionStreamHandle, SendRequest,
+    SendResult,
+};
 use async_trait::async_trait;
 use exoharness::{
     AgentHandle, AgentRecord, ConversationHandle, ConversationRecord, ExoHarness, NewAgentRequest,
@@ -36,11 +39,12 @@ pub(crate) trait HarnessRuntime: Send + Sync + Clone + 'static {
         conversation: Arc<dyn ConversationHandle>,
         request: SendRequest,
     ) -> Result<SendResult>;
-    async fn send_stream(
+    async fn send_stream_with_cancellation(
         &self,
         agent: Arc<dyn AgentHandle>,
         conversation: Arc<dyn ConversationHandle>,
         request: SendRequest,
+        cancellation: ExecutionCancellation,
     ) -> Result<ExecutionStreamHandle>;
     async fn flush_tracing(&self) -> Result<()>;
 }
@@ -341,14 +345,24 @@ where
     }
 
     async fn send_stream(&self, request: SendRequest) -> Result<ExecutionStreamHandle> {
+        self.send_stream_with_cancellation(request, ExecutionCancellation::new())
+            .await
+    }
+
+    async fn send_stream_with_cancellation(
+        &self,
+        request: SendRequest,
+        cancellation: ExecutionCancellation,
+    ) -> Result<ExecutionStreamHandle> {
         let send_lock = conversation_send_lock(&self.conversation.record().id.to_string());
         let send_guard = send_lock.lock_owned().await;
         let stream = self
             .runtime
-            .send_stream(
+            .send_stream_with_cancellation(
                 Arc::clone(&self.agent),
                 Arc::clone(&self.conversation),
                 request,
+                cancellation,
             )
             .await?;
         Ok(stream.with_send_guard(send_guard))

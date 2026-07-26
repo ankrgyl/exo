@@ -104,12 +104,11 @@ impl AppleKeychainSecretKeyProvider {
 #[cfg(feature = "apple-keychain")]
 impl SecretKeyProvider for AppleKeychainSecretKeyProvider {
     fn get_or_create_key(&self) -> Result<[u8; MASTER_KEY_LEN]> {
-        use keyring_core::{Entry, Error as KeyringError};
+        use keyring::{Entry, Error as KeyringError};
 
         if let Some(key) = self.key.get() {
             return Ok(*key);
         }
-        ensure_apple_keychain_store()?;
         let entry = Entry::new(KEYCHAIN_SERVICE, &self.account)?;
         let key = match entry.get_password() {
             Ok(serialized) => deserialize_key(&serialized)?,
@@ -201,21 +200,6 @@ fn random_nonce() -> [u8; NONCE_LEN] {
     let mut nonce = [0u8; NONCE_LEN];
     nonce.copy_from_slice(&Uuid::new_v4().as_bytes()[..NONCE_LEN]);
     nonce
-}
-
-#[cfg(feature = "apple-keychain")]
-fn ensure_apple_keychain_store() -> Result<()> {
-    use std::collections::HashMap;
-
-    static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-    let result = INIT.get_or_init(|| {
-        keyring::use_apple_keychain_store(&HashMap::new())
-            .map_err(|error| format!("failed to initialize macOS keychain store: {error}"))
-    });
-    match result {
-        Ok(()) => Ok(()),
-        Err(message) => Err(anyhow!(message.clone())),
-    }
 }
 
 fn parse_master_key_bytes(bytes: &[u8]) -> Result<[u8; MASTER_KEY_LEN]> {

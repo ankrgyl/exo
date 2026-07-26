@@ -320,6 +320,7 @@ async fn rlm_send_stream_suppresses_internal_control_text() {
             ExecutionStreamEvent::ToolCall { .. } => {}
             ExecutionStreamEvent::ToolResult { .. } => {}
             ExecutionStreamEvent::Completed(_) => {}
+            ExecutionStreamEvent::Cancelled(_) => {}
         }
     }
 
