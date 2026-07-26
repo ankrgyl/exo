@@ -375,8 +375,7 @@ impl TuiApp {
         let messages = self.conversation.messages().await?;
         self.transcript = render_transcript_lines(&messages, self.verbosity)
             .iter()
-            .flat_map(|rendered| rendered.split('\n'))
-            .map(|line| style_transcript_line(line.to_string()))
+            .flat_map(|rendered| styled_message_lines(rendered))
             .collect();
         Ok(())
     }
@@ -598,10 +597,7 @@ impl TuiApp {
             }
             AppEvent::External(lines) => {
                 for rendered in lines {
-                    for line in rendered.split('\n') {
-                        self.transcript
-                            .push(style_transcript_line(line.to_string()));
-                    }
+                    self.transcript.extend(styled_message_lines(&rendered));
                 }
             }
         }
@@ -871,14 +867,30 @@ impl TuiApp {
 /// Basic styling for pre-rendered transcript strings, keyed off the line
 /// shape the render module produces.
 fn style_transcript_line(line: String) -> Line<'static> {
-    let style = if line.starts_with('→') || line.starts_with('←') {
+    let style = transcript_line_style(&line);
+    Line::styled(line, style)
+}
+
+fn transcript_line_style(line: &str) -> Style {
+    if line.starts_with('→') || line.starts_with('←') {
         Style::new().cyan()
     } else if line.contains("] user: ") {
         Style::new().bold()
     } else {
         Style::new()
-    };
-    Line::styled(line, style)
+    }
+}
+
+/// One logical message line as visual lines: the style is decided once from
+/// the whole message (whose first line carries the speaker prefix), then
+/// applied to every line after splitting on embedded newlines — so
+/// continuation lines keep the message's look.
+fn styled_message_lines(rendered: &str) -> Vec<Line<'static>> {
+    let style = transcript_line_style(rendered);
+    rendered
+        .split('\n')
+        .map(|line| Line::styled(line.to_string(), style))
+        .collect()
 }
 
 fn status_style(status: &str) -> Style {
