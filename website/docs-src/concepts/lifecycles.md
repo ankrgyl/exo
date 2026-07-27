@@ -245,7 +245,7 @@ attach/detach).
 or conversation config (image, mounts, networking, provider).
 
 **Attach** is for bring-your-own environments — e.g. a container started
-by an external harness (Harbor and similar flows). Exo does not build that
+by any external process (Harbor and similar flows). Exo does not build that
 container; it binds an existing one into the conversation and routes
 execution there.
 
@@ -276,6 +276,17 @@ Executor selection (simplified):
 
 An attached sandbox wins over a normal created one so external workflows
 can temporarily own execution without fighting auto-provisioning.
+
+**Config changes do not migrate an existing conversation sandbox.** If you
+change the sandbox spec mid-flight (image, mounts, networking, provider,
+etc.), the next turn that needs a sandbox looks for a candidate matching
+the *new* spec. The old sandbox is left as-is (still in history; no longer
+the preferred match) and Exo **spins up a fresh sandbox** for the new
+spec. Filesystem state is not copied over — install tools again, or
+snapshot/restore / attach if you need continuity. (Agent-scoped sandboxes
+are different: once created they keep a fixed identity and ignore later
+config drift until you explicitly recreate them; see [Agent
+lifecycle](#agent-lifecycle).)
 
 ### Snapshot and rewind
 
