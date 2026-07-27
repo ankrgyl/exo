@@ -1,0 +1,166 @@
+{
+  "codex": [
+    {
+      "task": "build-pov-ray",
+      "native": 1.0,
+      "over_exo": 0.0
+    },
+    {
+      "task": "cancel-async-tasks",
+      "native": 1.0,
+      "over_exo": 0.0
+    },
+    {
+      "task": "cobol-modernization",
+      "native": 0.0,
+      "over_exo": 1.0
+    },
+    {
+      "task": "configure-git-webserver",
+      "native": 0.0,
+      "over_exo": 1.0
+    },
+    {
+      "task": "dna-assembly",
+      "native": 0.0,
+      "over_exo": 1.0
+    },
+    {
+      "task": "extract-moves-from-video",
+      "native": 1.0,
+      "over_exo": 0.0
+    },
+    {
+      "task": "fix-git",
+      "native": 0.0,
+      "over_exo": 1.0
+    },
+    {
+      "task": "kv-store-grpc",
+      "native": 1.0,
+      "over_exo": 0.0
+    },
+    {
+      "task": "make-mips-interpreter",
+      "native": 1.0,
+      "over_exo": 0.0
+    },
+    {
+      "task": "mcmc-sampling-stan",
+      "native": null,
+      "over_exo": 1.0
+    },
+    {
+      "task": "mteb-leaderboard",
+      "native": 1.0,
+      "over_exo": 0.0
+    },
+    {
+      "task": "mteb-retrieve",
+      "native": 0.0,
+      "over_exo": 1.0
+    },
+    {
+      "task": "polyglot-c-py",
+      "native": 1.0,
+      "over_exo": 0.0
+    },
+    {
+      "task": "qemu-alpine-ssh",
+      "native": 1.0,
+      "over_exo": null
+    },
+    {
+      "task": "qemu-startup",
+      "native": 1.0,
+      "over_exo": null
+    },
+    {
+      "task": "query-optimize",
+      "native": 1.0,
+      "over_exo": 0.0
+    },
+    {
+      "task": "sanitize-git-repo",
+      "native": 0.0,
+      "over_exo": 1.0
+    },
+    {
+      "task": "tune-mjcf",
+      "native": 1.0,
+      "over_exo": 0.0
+    }
+  ],
+  "claude": [
+    {
+      "task": "break-filter-js-from-html",
+      "native": 1.0,
+      "over_exo": 0.0
+    },
+    {
+      "task": "configure-git-webserver",
+      "native": 1.0,
+      "over_exo": 0.0
+    },
+    {
+      "task": "count-dataset-tokens",
+      "native": 0.0,
+      "over_exo": 1.0
+    },
+    {
+      "task": "filter-js-from-html",
+      "native": 0.0,
+      "over_exo": null
+    },
+    {
+      "task": "largest-eigenval",
+      "native": 1.0,
+      "over_exo": 0.0
+    },
+    {
+      "task": "llm-inference-batching-scheduler",
+      "native": 0.0,
+      "over_exo": 1.0
+    },
+    {
+      "task": "log-summary-date-ranges",
+      "native": 1.0,
+      "over_exo": 0.0
+    },
+    {
+      "task": "mailman",
+      "native": 1.0,
+      "over_exo": 0.0
+    },
+    {
+      "task": "modernize-scientific-stack",
+      "native": 1.0,
+      "over_exo": 0.0
+    },
+    {
+      "task": "path-tracing-reverse",
+      "native": 1.0,
+      "over_exo": 0.0
+    },
+    {
+      "task": "pytorch-model-cli",
+      "native": 1.0,
+      "over_exo": 0.0
+    },
+    {
+      "task": "pytorch-model-recovery",
+      "native": 1.0,
+      "over_exo": 0.0
+    },
+    {
+      "task": "qemu-alpine-ssh",
+      "native": 1.0,
+      "over_exo": null
+    },
+    {
+      "task": "qemu-startup",
+      "native": 1.0,
+      "over_exo": null
+    }
+  ]
+}

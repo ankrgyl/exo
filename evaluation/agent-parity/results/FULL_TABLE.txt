@@ -1,0 +1,20 @@
+
+# Agent-integration parity — Terminal-Bench 2.0
+
+Mean reward (1.0 = solved). Same tasks, same model per agent.
+
+| | Native | Over Exo |
+|---|---|---|
+| **Codex** | 0.74 (66/89) | 0.71 (63/89) |
+| **Claude Code** | 0.55 (40/89, err27) | 0.45 (40/89, err27) |
+
+## Detail
+
+- Codex / Native: 66/89 = 0.742  errors=2  cost=$84.71  [codex__gpt-5.5__terminal-bench · 2026-06-27__04-07-57]
+- Codex / Over Exo: 63/89 = 0.708  errors=4  cost=n/a  [exo-codex__gpt-5.5__terminal-bench · 2026-06-27__06-09-13 + install-fix re-measure]
+  - The original run lost qemu-startup/qemu-alpine-ssh at the codex *install* step
+    (npm absent on the qemu image). After the node+npm install fix both run;
+    qemu-startup passes (so 62→63), qemu-alpine-ssh runs but is unsolved.
+- Claude Code / Native: mean=0.550561797752809  trials=89 errors=27  cost=$35.96  [claude-code__claude-sonnet-4-6__terminal-bench · 2026-06-27__07-29-10]
+- Claude Code / Over Exo: mean=0.449438202247191  trials=86 errors=27  cost=n/a  [exo-claude-code__claude-sonnet-4-6__terminal-bench · 2026-06-27__11-39-12]
+

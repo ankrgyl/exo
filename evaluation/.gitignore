@@ -1,0 +1,22 @@
+# Downloads / build outputs (recreated by setup.sh + build-bundle.sh)
+exo-bundle.tar.gz
+.cache/
+.venv/
+# upstream harbor reference clone — not needed at runtime (CLI pulls dataset from registry)
+/harbor/
+
+# Run artifacts / generated outputs (regenerated per run)
+jobs/
+reports/
+
+# Python cruft
+__pycache__/
+*.pyc
+
+# Local working notes (scratchpad — the committed story is the README)
+WORKING_NOTES.md
+
+# Run logs / scratch task lists (regenerated per run)
+*.log
+compare/
+hard_tasks.txt

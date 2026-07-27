@@ -1,0 +1,190 @@
+# Per-task parity comparison
+
+jobs: {('claude', 'over_exo'): '2026-06-27__11-39-12', ('codex', 'over_exo'): '2026-06-27__06-09-13', ('codex', 'native'): '2026-06-27__04-07-57', ('claude', 'native'): '2026-06-27__07-29-10'} 
+
+
+## codex: native vs over_exo
+  adaptive-rejection-sampler                         native=1.0   over_exo=1.0  
+  bn-fit-modify                                      native=1.0   over_exo=1.0  
+  break-filter-js-from-html                          native=1.0   over_exo=1.0  
+  build-cython-ext                                   native=1.0   over_exo=1.0  
+  build-pmars                                        native=1.0   over_exo=1.0  
+  build-pov-ray                                      native=1.0   over_exo=0.0    <-- DIFF
+  caffe-cifar-10                                     native=1.0   over_exo=1.0  
+  cancel-async-tasks                                 native=1.0   over_exo=0.0    <-- DIFF
+  chess-best-move                                    native=1.0   over_exo=1.0  
+  circuit-fibsqrt                                    native=1.0   over_exo=1.0  
+  cobol-modernization                                native=0.0   over_exo=1.0    <-- DIFF
+  code-from-image                                    native=1.0   over_exo=1.0  
+  compile-compcert                                   native=1.0   over_exo=1.0  
+  configure-git-webserver                            native=0.0   over_exo=1.0    <-- DIFF
+  constraints-scheduling                             native=1.0   over_exo=1.0  
+  count-dataset-tokens                               native=1.0   over_exo=1.0  
+  crack-7z-hash                                      native=1.0   over_exo=1.0  
+  custom-memory-heap-crash                           native=1.0   over_exo=1.0  
+  db-wal-recovery                                    native=0.0   over_exo=0.0  
+  distribution-search                                native=1.0   over_exo=1.0  
+  dna-assembly                                       native=0.0   over_exo=1.0    <-- DIFF
+  dna-insert                                         native=0.0   over_exo=0.0  
+  extract-elf                                        native=0.0   over_exo=0.0  
+  extract-moves-from-video                           native=1.0   over_exo=0.0    <-- DIFF
+  feal-differential-cryptanalysis                    native=1.0   over_exo=1.0  
+  feal-linear-cryptanalysis                          native=1.0   over_exo=1.0  
+  filter-js-from-html                                native=0.0   over_exo=0.0  
+  financial-document-processor                       native=1.0   over_exo=1.0  
+  fix-code-vulnerability                             native=1.0   over_exo=1.0  
+  fix-git                                            native=0.0   over_exo=1.0    <-- DIFF
+  fix-ocaml-gc                                       native=1.0   over_exo=1.0  
+  gcode-to-text                                      native=0.0   over_exo=0.0  
+  git-leak-recovery                                  native=1.0   over_exo=1.0  
+  git-multibranch                                    native=1.0   over_exo=1.0  
+  gpt2-codegolf                                      native=1.0   over_exo=1.0  
+  headless-terminal                                  native=1.0   over_exo=1.0  
+  hf-model-inference                                 native=1.0   over_exo=1.0  
+  install-windows-3.11                               native=0.0   over_exo=0.0  
+  kv-store-grpc                                      native=1.0   over_exo=0.0    <-- DIFF
+  large-scale-text-editing                           native=1.0   over_exo=1.0  
+  largest-eigenval                                   native=1.0   over_exo=1.0  
+  llm-inference-batching-scheduler                   native=1.0   over_exo=1.0  
+  log-summary-date-ranges                            native=1.0   over_exo=1.0  
+  mailman                                            native=1.0   over_exo=1.0  
+  make-doom-for-mips                                 native=0.0   over_exo=0.0  
+  make-mips-interpreter                              native=1.0   over_exo=0.0    <-- DIFF
+  mcmc-sampling-stan                                 native=None  over_exo=1.0    <-- DIFF
+  merge-diff-arc-agi-task                            native=1.0   over_exo=1.0  
+  model-extraction-relu-logits                       native=1.0   over_exo=1.0  
+  modernize-scientific-stack                         native=1.0   over_exo=1.0  
+  mteb-leaderboard                                   native=1.0   over_exo=0.0    <-- DIFF
+  mteb-retrieve                                      native=0.0   over_exo=1.0    <-- DIFF
+  multi-source-data-merger                           native=1.0   over_exo=1.0  
+  nginx-request-logging                              native=1.0   over_exo=1.0  
+  openssl-selfsigned-cert                            native=1.0   over_exo=1.0  
+  overfull-hbox                                      native=1.0   over_exo=1.0  
+  password-recovery                                  native=1.0   over_exo=1.0  
+  path-tracing                                       native=1.0   over_exo=1.0  
+  path-tracing-reverse                               native=1.0   over_exo=1.0  
+  polyglot-c-py                                      native=1.0   over_exo=0.0    <-- DIFF
+  polyglot-rust-c                                    native=0.0   over_exo=0.0  
+  portfolio-optimization                             native=1.0   over_exo=1.0  
+  protein-assembly                                   native=1.0   over_exo=1.0  
+  prove-plus-comm                                    native=1.0   over_exo=1.0  
+  pypi-server                                        native=0.0   over_exo=0.0  
+  pytorch-model-cli                                  native=1.0   over_exo=1.0  
+  pytorch-model-recovery                             native=0.0   over_exo=0.0  
+  qemu-alpine-ssh                                    native=1.0   over_exo=None   <-- DIFF
+  qemu-startup                                       native=1.0   over_exo=None   <-- DIFF
+  query-optimize                                     native=1.0   over_exo=0.0    <-- DIFF
+  raman-fitting                                      native=0.0   over_exo=0.0  
+  regex-chess                                        native=1.0   over_exo=1.0  
+  regex-log                                          native=1.0   over_exo=1.0  
+  reshard-c4-data                                    native=1.0   over_exo=1.0  
+  rstan-to-pystan                                    native=1.0   over_exo=1.0  
+  sam-cell-seg                                       native=0.0   over_exo=0.0  
+  sanitize-git-repo                                  native=0.0   over_exo=1.0    <-- DIFF
+  schemelike-metacircular-eval                       native=1.0   over_exo=1.0  
+  sparql-university                                  native=1.0   over_exo=1.0  
+  sqlite-db-truncate                                 native=1.0   over_exo=1.0  
+  sqlite-with-gcov                                   native=1.0   over_exo=1.0  
+  torch-pipeline-parallelism                         native=0.0   over_exo=0.0  
+  torch-tensor-parallelism                           native=0.0   over_exo=0.0  
+  train-fasttext                                     native=0.0   over_exo=0.0  
+  tune-mjcf                                          native=1.0   over_exo=0.0    <-- DIFF
+  video-processing                                   native=0.0   over_exo=0.0  
+  vulnerable-secret                                  native=1.0   over_exo=1.0  
+  winning-avg-corewars                               native=1.0   over_exo=1.0  
+  write-compressor                                   native=1.0   over_exo=1.0  
+  --- codex: 71 agree, 18 differ | mean native=0.742 over_exo=0.697 (n=89, None=0) ---
+
+## claude: native vs over_exo
+  adaptive-rejection-sampler                         native=0.0   over_exo=0.0  
+  bn-fit-modify                                      native=1.0   over_exo=1.0  
+  break-filter-js-from-html                          native=1.0   over_exo=0.0    <-- DIFF
+  build-cython-ext                                   native=1.0   over_exo=1.0  
+  build-pmars                                        native=1.0   over_exo=1.0  
+  build-pov-ray                                      native=1.0   over_exo=1.0  
+  caffe-cifar-10                                     native=0.0   over_exo=0.0  
+  cancel-async-tasks                                 native=0.0   over_exo=0.0  
+  chess-best-move                                    native=0.0   over_exo=0.0  
+  circuit-fibsqrt                                    native=0.0   over_exo=0.0  
+  cobol-modernization                                native=1.0   over_exo=1.0  
+  code-from-image                                    native=1.0   over_exo=1.0  
+  compile-compcert                                   native=1.0   over_exo=1.0  
+  configure-git-webserver                            native=1.0   over_exo=0.0    <-- DIFF
+  constraints-scheduling                             native=1.0   over_exo=1.0  
+  count-dataset-tokens                               native=0.0   over_exo=1.0    <-- DIFF
+  crack-7z-hash                                      native=1.0   over_exo=1.0  
+  custom-memory-heap-crash                           native=1.0   over_exo=1.0  
+  db-wal-recovery                                    native=0.0   over_exo=0.0  
+  distribution-search                                native=0.0   over_exo=0.0  
+  dna-assembly                                       native=0.0   over_exo=0.0  
+  dna-insert                                         native=0.0   over_exo=0.0  
+  extract-elf                                        native=0.0   over_exo=0.0  
+  extract-moves-from-video                           native=0.0   over_exo=0.0  
+  feal-differential-cryptanalysis                    native=0.0   over_exo=0.0  
+  feal-linear-cryptanalysis                          native=0.0   over_exo=0.0  
+  filter-js-from-html                                native=0.0   over_exo=None   <-- DIFF
+  financial-document-processor                       native=1.0   over_exo=1.0  
+  fix-code-vulnerability                             native=1.0   over_exo=1.0  
+  fix-git                                            native=1.0   over_exo=1.0  
+  fix-ocaml-gc                                       native=1.0   over_exo=1.0  
+  gcode-to-text                                      native=0.0   over_exo=0.0  
+  git-leak-recovery                                  native=1.0   over_exo=1.0  
+  git-multibranch                                    native=1.0   over_exo=1.0  
+  gpt2-codegolf                                      native=0.0   over_exo=0.0  
+  headless-terminal                                  native=1.0   over_exo=1.0  
+  hf-model-inference                                 native=1.0   over_exo=1.0  
+  install-windows-3.11                               native=0.0   over_exo=0.0  
+  kv-store-grpc                                      native=1.0   over_exo=1.0  
+  large-scale-text-editing                           native=1.0   over_exo=1.0  
+  largest-eigenval                                   native=1.0   over_exo=0.0    <-- DIFF
+  llm-inference-batching-scheduler                   native=0.0   over_exo=1.0    <-- DIFF
+  log-summary-date-ranges                            native=1.0   over_exo=0.0    <-- DIFF
+  mailman                                            native=1.0   over_exo=0.0    <-- DIFF
+  make-doom-for-mips                                 native=0.0   over_exo=0.0  
+  make-mips-interpreter                              native=0.0   over_exo=0.0  
+  mcmc-sampling-stan                                 native=1.0   over_exo=1.0  
+  merge-diff-arc-agi-task                            native=1.0   over_exo=1.0  
+  model-extraction-relu-logits                       native=0.0   over_exo=0.0  
+  modernize-scientific-stack                         native=1.0   over_exo=0.0    <-- DIFF
+  mteb-leaderboard                                   native=0.0   over_exo=0.0  
+  mteb-retrieve                                      native=0.0   over_exo=0.0  
+  multi-source-data-merger                           native=1.0   over_exo=1.0  
+  nginx-request-logging                              native=1.0   over_exo=1.0  
+  openssl-selfsigned-cert                            native=1.0   over_exo=1.0  
+  overfull-hbox                                      native=0.0   over_exo=0.0  
+  password-recovery                                  native=1.0   over_exo=1.0  
+  path-tracing                                       native=0.0   over_exo=0.0  
+  path-tracing-reverse                               native=1.0   over_exo=0.0    <-- DIFF
+  polyglot-c-py                                      native=0.0   over_exo=0.0  
+  polyglot-rust-c                                    native=0.0   over_exo=0.0  
+  portfolio-optimization                             native=1.0   over_exo=1.0  
+  protein-assembly                                   native=0.0   over_exo=0.0  
+  prove-plus-comm                                    native=1.0   over_exo=1.0  
+  pypi-server                                        native=1.0   over_exo=1.0  
+  pytorch-model-cli                                  native=1.0   over_exo=0.0    <-- DIFF
+  pytorch-model-recovery                             native=1.0   over_exo=0.0    <-- DIFF
+  qemu-alpine-ssh                                    native=1.0   over_exo=None   <-- DIFF
+  qemu-startup                                       native=1.0   over_exo=None   <-- DIFF
+  query-optimize                                     native=1.0   over_exo=1.0  
+  raman-fitting                                      native=0.0   over_exo=0.0  
+  regex-chess                                        native=0.0   over_exo=0.0  
+  regex-log                                          native=1.0   over_exo=1.0  
+  reshard-c4-data                                    native=1.0   over_exo=1.0  
+  rstan-to-pystan                                    native=1.0   over_exo=1.0  
+  sam-cell-seg                                       native=0.0   over_exo=0.0  
+  sanitize-git-repo                                  native=0.0   over_exo=0.0  
+  schemelike-metacircular-eval                       native=1.0   over_exo=1.0  
+  sparql-university                                  native=1.0   over_exo=1.0  
+  sqlite-db-truncate                                 native=1.0   over_exo=1.0  
+  sqlite-with-gcov                                   native=0.0   over_exo=0.0  
+  torch-pipeline-parallelism                         native=0.0   over_exo=0.0  
+  torch-tensor-parallelism                           native=1.0   over_exo=1.0  
+  train-fasttext                                     native=0.0   over_exo=0.0  
+  tune-mjcf                                          native=0.0   over_exo=0.0  
+  video-processing                                   native=0.0   over_exo=0.0  
+  vulnerable-secret                                  native=1.0   over_exo=1.0  
+  winning-avg-corewars                               native=0.0   over_exo=0.0  
+  write-compressor                                   native=0.0   over_exo=0.0  
+  --- claude: 75 agree, 14 differ | mean native=0.551 over_exo=0.449 (n=89, None=0) ---
+
+wrote results/discrepancies.json

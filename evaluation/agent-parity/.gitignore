@@ -1,0 +1,15 @@
+# Full Harbor run artifacts (per-task transcripts, images, etc.) — too large to track.
+jobs/
+jobs_archive_smoke/
+results/lowconc_rerun/jobs/
+
+# Verbose run/driver/watchdog logs (keep the summary .txt/.json/.md below).
+results/*.log
+results/lowconc_rerun/*.log
+
+# Keep (NOT ignored): the distilled, useful stats —
+#   results/FULL_TABLE.txt, results/COMPARISON.txt, results/discrepancies.json,
+#   results/FULL_TABLE*.txt, REPORT.md, and all scripts + README.
+!results/FULL_TABLE.txt
+!results/COMPARISON.txt
+!results/discrepancies.json

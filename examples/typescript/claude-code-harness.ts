@@ -48,8 +48,8 @@ import {
 } from "./shared";
 
 const DEFAULT_CLAUDE_CODE_SANDBOX_EXECUTABLE = "/usr/local/bin/claude-code";
-const CLAUDE_RESULT_GRACE_MS = 5_000;
-const CLAUDE_MAX_API_RETRIES = 2;
+// Tolerate SDK api_retry attempts before aborting, so Claude rides out 529 overloads like the native CLI.
+const CLAUDE_MAX_API_RETRIES = 8;
 const CLAUDE_STDERR_PREVIEW_CHARS = 4_000;
 const CLAUDE_STARTUP_TIMEOUT_MS = 20_000;
 
@@ -160,7 +160,6 @@ async function consumeClaudeQuery(
   turnParent: TraceParent,
   state: ClaudeTraceState,
 ): Promise<void> {
-  let graceTimer: ReturnType<typeof setTimeout> | null = null;
   let startupTimedOut = false;
   let sawSdkMessage = false;
   const startupTimer = setTimeout(() => {
@@ -170,23 +169,6 @@ async function consumeClaudeQuery(
     }
   }, CLAUDE_STARTUP_TIMEOUT_MS);
   startupTimer.unref?.();
-
-  const clearGraceTimer = () => {
-    if (graceTimer) {
-      clearTimeout(graceTimer);
-      graceTimer = null;
-    }
-  };
-
-  const scheduleGraceClose = () => {
-    if (state.result || graceTimer) {
-      return;
-    }
-    graceTimer = setTimeout(() => {
-      claudeQuery.close();
-    }, CLAUDE_RESULT_GRACE_MS);
-    graceTimer.unref?.();
-  };
 
   try {
     for await (const message of claudeQuery) {
@@ -198,17 +180,11 @@ async function consumeClaudeQuery(
         throw new Error(apiRetryError);
       }
       if (message.type === "result") {
-        clearGraceTimer();
         claudeQuery.close();
         break;
       }
-      if (
-        message.type === "assistant" &&
-        state.finalText &&
-        !claudeAssistantHasToolUse(message.message.content)
-      ) {
-        scheduleGraceClose();
-      }
+      // End only on the SDK `result` message (above) so Claude runs its full loop.
+      // Don't close on text-only narration between tool calls — that killed tasks mid-loop.
     }
     if (startupTimedOut && !state.result && !state.finalText) {
       throw new Error(
@@ -225,12 +201,10 @@ async function consumeClaudeQuery(
       {
         metadata: turnMetadata(context),
         error: errorMessage(error),
-        grace_ms: CLAUDE_RESULT_GRACE_MS,
       },
     );
   } finally {
     clearTimeout(startupTimer);
-    clearGraceTimer();
     claudeQuery.close();
   }
 }
@@ -289,6 +263,7 @@ function claudeOptions(
     cwd: sandboxCwd(context),
     persistSession: false,
     includePartialMessages: true,
+    permissionMode: "bypassPermissions",
     env: claudeSandboxBaseEnv(modelBinding),
     pathToClaudeCodeExecutable: claudeSandboxExecutable(),
     spawnClaudeCodeProcess: (options) =>
@@ -458,13 +433,6 @@ function claudeAssistantText(content: unknown): string {
       return "";
     })
     .join("");
-}
-
-function claudeAssistantHasToolUse(content: unknown): boolean {
-  return (
-    Array.isArray(content) &&
-    content.some((part) => asRecord(part).type === "tool_use")
-  );
 }
 
 function claudeTraceOutput(state: ClaudeTraceState): Record<string, unknown> {
