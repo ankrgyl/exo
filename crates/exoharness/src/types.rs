@@ -17,6 +17,43 @@ use serde_json::{Map, Value};
 
 use crate::{Result, Uuid7};
 
+/// Serde bridge for lingua types embedded in exoharness types.
+///
+/// lingua vendors a serde_json fork with `arbitrary_precision` enabled; its
+/// `Number` serializes through a private struct token that only lingua's own
+/// serializer understands. Serializing a lingua value with std `serde_json`
+/// (event storage, the JSONL/HTTP protocol) therefore leaks
+/// `{"$serde_json::private::Number":"3000"}` maps into the JSON, which
+/// downstream consumers forward to models and tools verbatim. Cross the
+/// boundary via lingua's own JSON text instead: lingua serializes to text and
+/// std serde_json re-parses it. The reverse direction also re-parses through
+/// lingua's deserializer, which heals token maps leaked by older builds.
+mod lingua_json_bridge {
+    use serde::de::Error as _;
+    use serde::ser::Error as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<T, S>(value: &T, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        T: Serialize,
+        S: Serializer,
+    {
+        let text = lingua::serde_json::to_string(value).map_err(S::Error::custom)?;
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(S::Error::custom)?;
+        value.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, T, D>(deserializer: D) -> std::result::Result<T, D::Error>
+    where
+        T: serde::de::DeserializeOwned,
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let text = serde_json::to_string(&value).map_err(D::Error::custom)?;
+        lingua::serde_json::from_str(&text).map_err(D::Error::custom)
+    }
+}
+
 #[async_trait]
 pub trait ExoHarness: Send + Sync {
     async fn list_agents(&self) -> Result<Vec<Arc<dyn AgentHandle>>>;
@@ -192,6 +229,7 @@ pub struct TurnRecord {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BeginTurnRequest {
     pub session_id: Option<SessionId>,
+    #[serde(with = "lingua_json_bridge")]
     pub input: Vec<Message>,
 }
 
@@ -343,6 +381,7 @@ pub enum EventData {
     TurnStarted,
     TurnEnded,
     Messages {
+        #[serde(with = "lingua_json_bridge")]
         messages: Vec<Message>,
         response_id: Option<ResponseId>,
         // Boxed to keep `EventData` small: `UsageRecord` is ~170 bytes and
@@ -362,6 +401,7 @@ pub enum EventData {
         result: ToolResult,
     },
     LinguaStreamChunk {
+        #[serde(with = "lingua_json_bridge")]
         chunk: UniversalStreamChunk,
     },
     Error {
@@ -1028,6 +1068,94 @@ mod tests {
             EventData::Messages { usage, .. } => assert!(usage.is_none()),
             _ => panic!("expected Messages variant"),
         }
+    }
+
+    fn tool_call_message(arguments_json: &str) -> Message {
+        use lingua::universal::{AssistantContent, AssistantContentPart, ToolCallArguments};
+        Message::Assistant {
+            content: AssistantContent::Array(vec![AssistantContentPart::ToolCall {
+                tool_call_id: "call_1".to_string(),
+                tool_name: "web_fetch".to_string(),
+                arguments: ToolCallArguments::from(arguments_json.to_string()),
+                encrypted_content: None,
+                provider_options: None,
+                provider_executed: None,
+            }]),
+            id: None,
+        }
+    }
+
+    #[test]
+    fn messages_event_does_not_leak_lingua_number_internals() {
+        // lingua's arbitrary-precision Number serializes through a private
+        // token that std serde_json renders as a literal
+        // {"$serde_json::private::Number": "..."} map. The bridge must keep
+        // numbers plain when events cross the std-serde_json boundary
+        // (storage, JSONL/HTTP protocol).
+        let event = EventData::Messages {
+            messages: vec![tool_call_message(
+                r#"{"url":"https://x.test/","maxChars":3000}"#,
+            )],
+            response_id: None,
+            usage: None,
+        };
+        let json = serde_json::to_string(&event).expect("event should serialize");
+        assert!(
+            !json.contains("$serde_json::private::Number"),
+            "lingua number internals leaked into event JSON: {json}"
+        );
+        assert!(
+            json.contains(r#""maxChars":3000"#),
+            "unexpected JSON: {json}"
+        );
+
+        let round_tripped: EventData = serde_json::from_str(&json).expect("event should parse");
+        let EventData::Messages { messages, .. } = round_tripped else {
+            panic!("expected Messages variant");
+        };
+        assert_eq!(
+            lingua::serde_json::to_string(&messages).unwrap(),
+            lingua::serde_json::to_string(&[tool_call_message(
+                r#"{"url":"https://x.test/","maxChars":3000}"#
+            )])
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn messages_event_heals_legacy_leaked_number_maps() {
+        // Events written by builds that predate the bridge contain the leaked
+        // token maps; lingua's own deserializer recognizes the token, so
+        // reading them back must recover plain numbers.
+        let json = serde_json::json!({
+            "type": "messages",
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_call",
+                    "tool_call_id": "call_1",
+                    "tool_name": "web_fetch",
+                    "arguments": {
+                        "type": "valid",
+                        "value": {
+                            "url": "https://x.test/",
+                            "maxChars": {"$serde_json::private::Number": "3000"}
+                        }
+                    }
+                }],
+                "id": null
+            }],
+            "response_id": null,
+        });
+        let event: EventData = serde_json::from_value(json).expect("legacy event should parse");
+        let EventData::Messages { messages, .. } = event else {
+            panic!("expected Messages variant");
+        };
+        let healed = lingua::serde_json::to_string(&messages).unwrap();
+        assert!(
+            healed.contains(r#""maxChars":3000"#),
+            "unexpected: {healed}"
+        );
     }
 
     #[test]
