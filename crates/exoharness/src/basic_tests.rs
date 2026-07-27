@@ -47,6 +47,17 @@ async fn basic_backend_supports_agent_and_conversation_crud() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn basic_backend_supports_thread_and_conversation_apis() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let harness: std::sync::Arc<dyn ExoHarness> = std::sync::Arc::new(
+        BasicExoHarness::new(local_test_config(tempdir.path()))
+            .await
+            .expect("harness should initialize"),
+    );
+    crate::contract_tests::supports_thread_api_and_conversation_compatibility(harness).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn basic_backend_lists_conversations_recent_first_and_paginates() {
     let tempdir = TempDir::new().expect("tempdir");
     let harness: std::sync::Arc<dyn ExoHarness> = std::sync::Arc::new(
@@ -824,7 +835,7 @@ async fn conversation_scope_overrides_agent_scope_and_fork_copies_local_state() 
     assert!(
         events
             .iter()
-            .any(|event| matches!(event.data, EventData::ConversationForked { .. }))
+            .any(|event| matches!(event.data, EventData::ThreadForked { .. }))
     );
 }
 

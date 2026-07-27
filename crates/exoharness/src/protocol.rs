@@ -4,20 +4,23 @@ use crate::{
     AddEventsRequest, AddEventsResult, AgentId, AgentRecord, Artifact, ArtifactVersion,
     AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
     CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, ConversationId,
-    ConversationRecord, CreateSandboxRequest, Event, EventData, EventId, EventQuery,
-    ForkConversationRequest, GetEventsResult, GetSandboxProcessEventsResult,
-    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
-    PutSecretRequest, ReadArtifactRequest, SandboxAttachment, SandboxId, SandboxProcessEventQuery,
+    CreateSandboxRequest, Event, EventData, EventId, EventQuery, ForkConversationRequest,
+    GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
+    ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
+    ReadArtifactRequest, SandboxAttachment, SandboxId, SandboxProcessEventQuery,
     SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId, SecretMetadata, SessionId,
-    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnId, TurnRecord,
+    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, ThreadRecord, TurnId, TurnRecord,
     WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ConversationHandleInfo {
+pub struct ThreadHandleInfo {
     pub agent_id: AgentId,
-    pub record: ConversationRecord,
+    pub record: ThreadRecord,
 }
+
+/// Compatibility name for [`ThreadHandleInfo`].
+pub type ConversationHandleInfo = ThreadHandleInfo;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TurnHandleInfo {

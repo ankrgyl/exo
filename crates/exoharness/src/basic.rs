@@ -1226,7 +1226,7 @@ impl AgentHandle for BasicAgentHandle {
             None,
             None,
             None,
-            vec![EventData::ConversationCreated {
+            vec![EventData::ThreadCreated {
                 slug: record.slug.clone(),
                 name: record.name.clone(),
             }],
@@ -1272,7 +1272,7 @@ impl AgentHandle for BasicAgentHandle {
                 None,
                 None,
                 record.latest_event_id,
-                vec![EventData::ConversationDeleted],
+                vec![EventData::ThreadDeleted],
                 &mut record,
             )
             .await?;
@@ -2292,7 +2292,10 @@ impl ConversationHandle for BasicConversationHandle {
                 events.retain(|event| event.turn_id == Some(turn_id));
             }
             if let Some(types) = query.types {
-                events.retain(|event| types.contains(&event.data.kind()));
+                events.retain(|event| {
+                    let event_kind = event.data.kind();
+                    types.iter().any(|kind| kind.matches(&event_kind))
+                });
             }
             match query.direction.unwrap_or(EventQueryDirection::Asc) {
                 EventQueryDirection::Asc => {
@@ -2415,7 +2418,7 @@ impl ConversationHandle for BasicConversationHandle {
         for mut event in events {
             let new_event_id = Uuid7::now();
             event.id = new_event_id;
-            event.conversation_id = record.id;
+            event.thread_id = record.id;
             event.created_at = new_event_id.timestamp().expect("uuid7 timestamp");
             latest_event_id = Some(new_event_id);
             self.harness
@@ -2439,8 +2442,8 @@ impl ConversationHandle for BasicConversationHandle {
             None,
             None,
             fork_record.latest_event_id,
-            vec![EventData::ConversationForked {
-                source_conversation_id: self.record.id,
+            vec![EventData::ThreadForked {
+                source_thread_id: self.record.id,
                 up_to_inclusive: request.up_to_inclusive,
             }],
             &mut fork_record,
@@ -3887,7 +3890,7 @@ async fn append_events_to_conversation(
         let id = Uuid7::now();
         let event = Event {
             id,
-            conversation_id,
+            thread_id: conversation_id,
             session_id,
             turn_id,
             created_at: id.timestamp().expect("uuid7 timestamp"),
