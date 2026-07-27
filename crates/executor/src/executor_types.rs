@@ -30,6 +30,11 @@ pub struct AgentConfig {
     pub model: String,
     pub max_output_tokens: Option<i64>,
     pub max_tool_round_trips: Option<u32>,
+    /// Ask the model provider for reasoning summaries and store them in the
+    /// conversation trace. Off by default: reasoning is never requested or
+    /// stored unless explicitly enabled.
+    #[serde(default)]
+    pub capture_reasoning: bool,
     pub braintrust: Option<BraintrustTracingConfig>,
 }
 

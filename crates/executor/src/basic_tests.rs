@@ -1316,6 +1316,7 @@ fn default_agent_config() -> AgentConfig {
         model: "test-model".to_string(),
         max_output_tokens: None,
         max_tool_round_trips: Some(4),
+        capture_reasoning: false,
         braintrust: None,
     }
 }

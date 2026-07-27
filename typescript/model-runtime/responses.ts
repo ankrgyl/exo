@@ -77,6 +77,10 @@ export interface NativeResponsesRequest {
   responseTools?: Tool[];
   maxOutputTokens?: number | null;
   metadata?: Record<string, string>;
+  // Request reasoning summaries from providers that support them so the
+  // model's thinking is captured in the trace. Default false: omitted from
+  // the request body entirely.
+  captureReasoning?: boolean;
 }
 
 export interface NativeStreamHandlers {
@@ -792,7 +796,7 @@ async function traceRootExecutorTurn(
   );
 }
 
-function buildNonStreamingBody(
+export function buildNonStreamingBody(
   request: NativeResponsesRequest,
 ): ResponseCreateParamsNonStreaming {
   return {
@@ -803,12 +807,13 @@ function buildNonStreamingBody(
       toolDefinitionsToResponsesTools(request.tools ?? []),
     max_output_tokens: request.maxOutputTokens ?? null,
     metadata: request.metadata ?? null,
+    reasoning: reasoningParam(request),
     stream: false,
     store: false,
   };
 }
 
-function buildStreamingBody(
+export function buildStreamingBody(
   request: NativeResponsesRequest,
 ): ResponseCreateParamsStreaming {
   return {
@@ -819,9 +824,25 @@ function buildStreamingBody(
       toolDefinitionsToResponsesTools(request.tools ?? []),
     max_output_tokens: request.maxOutputTokens ?? null,
     metadata: request.metadata ?? null,
+    reasoning: reasoningParam(request),
     stream: true,
     store: false,
   };
+}
+
+// Reasoning summaries are opt-in (agent config captureReasoning): the model's
+// thinking is only requested — and therefore only stored in the conversation
+// trace — when the agent explicitly asked for it. `auto` lets the provider
+// pick summary verbosity; effort stays at the model default either way.
+// Caveat: capture only stores reasoning that actually happens. Models whose
+// default effort is none (observed live on gpt-5.4) produce zero reasoning
+// tokens and therefore no summaries; models that reason by default (e.g.
+// gpt-5-codex, o3-pro) return summaries with summary-only requests. The
+// provider also skips the summary entirely for very short reasoning bursts.
+function reasoningParam(
+  request: NativeResponsesRequest,
+): { summary: "auto" } | undefined {
+  return request.captureReasoning ? { summary: "auto" } : undefined;
 }
 
 function buildChatNonStreamingBody(

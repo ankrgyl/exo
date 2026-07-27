@@ -127,6 +127,7 @@ async function runResponsesTurnLoop(
       tools: tools.definitions(),
       maxOutputTokens: context.agentConfig.maxOutputTokens,
       metadata: turnMetadata(context),
+      captureReasoning: context.agentConfig.captureReasoning,
     };
 
     const response = context.streaming

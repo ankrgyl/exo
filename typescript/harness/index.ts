@@ -37,6 +37,9 @@ export interface AgentConfig {
   model: string;
   maxOutputTokens?: number | null;
   maxToolRoundTrips?: number | null;
+  // Request and store model reasoning summaries in the conversation trace.
+  // Off by default: reasoning is never requested unless explicitly enabled.
+  captureReasoning: boolean;
   braintrust?: unknown;
 }
 

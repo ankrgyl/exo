@@ -80,6 +80,7 @@ async fn rlm_send_executes_repl_steps_and_persists_final_answer() {
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
             max_tool_round_trips: Some(4),
+            capture_reasoning: false,
             braintrust: None,
         })
         .await
@@ -227,6 +228,7 @@ async fn rlm_subquery_variable_can_store_final_answer() {
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
             max_tool_round_trips: Some(6),
+            capture_reasoning: false,
             braintrust: None,
         })
         .await
@@ -298,6 +300,7 @@ async fn rlm_send_stream_suppresses_internal_control_text() {
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
             max_tool_round_trips: None,
+            capture_reasoning: false,
             braintrust: None,
         })
         .await
@@ -415,6 +418,7 @@ globalThis.answer = String(\n\
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
             max_tool_round_trips: None,
+            capture_reasoning: false,
             braintrust: None,
         })
         .await
@@ -492,6 +496,7 @@ async fn rlm_can_finish_by_setting_final_in_repl() {
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
             max_tool_round_trips: None,
+            capture_reasoning: false,
             braintrust: None,
         })
         .await
