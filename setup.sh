@@ -404,7 +404,8 @@ missing_has() {
 
 is_exo_checkout() {
   local dir="$1"
-  [[ -d "$dir/.git" && -f "$dir/exo.sh" ]]
+  # In linked Git worktrees, .git is a file rather than a directory.
+  [[ -e "$dir/.git" && -f "$dir/exo.sh" ]]
 }
 
 prompt_yes_no() {

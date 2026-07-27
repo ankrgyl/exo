@@ -648,6 +648,8 @@ enum ConversationSandboxCommands {
 #[derive(Debug, Subcommand)]
 enum SecretCommands {
     List,
+    #[command(hide = true)]
+    Check,
     Set {
         name: String,
         #[arg(long, value_parser = parse_env_var_name)]
@@ -1938,6 +1940,11 @@ async fn main() -> Result<()> {
                         })
                         .collect(),
                 )?;
+            }
+            SecretCommands::Check => {
+                BasicExoHarness::new(exo_config.clone())
+                    .await?
+                    .verify_secret_key_access()?;
             }
             SecretCommands::Set { name, env, value } => {
                 let value = match (env, value) {

@@ -25,7 +25,7 @@ use crate::sandbox::{
     SandboxSpec, SnapshotKind, SnapshotPayload, sandbox_spec_hash,
 };
 #[cfg(feature = "apple-keychain")]
-use crate::secrets::AppleKeychainSecretKeyProvider;
+use crate::secrets::{AppleKeychainSecretKeyProvider, migrate_apple_keychain_master_key};
 use crate::secrets::{
     EncryptedSecret, FileBackedSecretKeyProvider, SecretCipher, SecretKeyProvider,
     StaticSecretKeyProvider, default_master_key_path,
@@ -773,6 +773,11 @@ impl BasicExoHarness {
         Self::new_with_backend(config, None).await
     }
 
+    /// Verify that the configured secret-key provider can open the master key.
+    pub fn verify_secret_key_access(&self) -> Result<()> {
+        self.inner.secret_cipher.verify_key_access()
+    }
+
     #[cfg(test)]
     pub(crate) async fn new_with_sandbox_backend(
         config: BasicExoHarnessConfig,
@@ -817,9 +822,15 @@ impl BasicExoHarness {
             cache.insert(sandbox_default, backend);
         }
 
+        let keychain_account = root.to_string_lossy().to_string();
         let storage = BasicObjectStore::local_filesystem(&root).await?;
-        let secret_cipher =
-            build_secret_cipher(secret_backend, root.to_string_lossy().to_string())?;
+        #[cfg(feature = "apple-keychain")]
+        let keychain_account = if matches!(&secret_backend, SecretBackendChoice::AppleKeychain) {
+            keychain_migration::prepare_keychain_account(&storage, &keychain_account).await?
+        } else {
+            keychain_account
+        };
+        let secret_cipher = build_secret_cipher(secret_backend, keychain_account)?;
         Ok(Self {
             inner: Arc::new(BasicExoHarnessInner {
                 storage,
@@ -4220,4 +4231,203 @@ fn build_secret_cipher(
         SecretBackendChoice::Static(key) => Arc::new(StaticSecretKeyProvider::new(key)),
     };
     Ok(SecretCipher::new(provider))
+}
+
+#[cfg(feature = "apple-keychain")]
+mod keychain_migration {
+    use super::*;
+
+    const SECRET_STORE_ID_PATH: &str = "metadata/secret-store.json";
+    const KEYCHAIN_MIGRATION_PATH: &str = "metadata/keychain-migration-v1.json";
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    struct SecretStoreIdentity {
+        id: uuid::Uuid,
+    }
+
+    pub(super) async fn prepare_keychain_account(
+        storage: &BasicObjectStore,
+        legacy_account: &str,
+    ) -> Result<String> {
+        let account = keychain_account_for_store(storage).await?;
+        migrate_keychain_account_if_needed(storage, &account, legacy_account).await?;
+        Ok(account)
+    }
+
+    async fn keychain_account_for_store(storage: &BasicObjectStore) -> Result<String> {
+        let identity = secret_store_identity(storage).await?;
+        Ok(format!("exo-secret-store:{}", identity.id))
+    }
+
+    async fn migrate_keychain_account_if_needed(
+        storage: &BasicObjectStore,
+        account: &str,
+        legacy_account: &str,
+    ) -> Result<()> {
+        let marker = Path::new(KEYCHAIN_MIGRATION_PATH);
+        if storage
+            .get_json_if_exists::<bool>(marker)
+            .await?
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        if has_stored_secret_records(storage).await? {
+            migrate_apple_keychain_master_key(account, legacy_account)?;
+        }
+        storage.put_json(marker, &true).await
+    }
+
+    async fn has_stored_secret_records(storage: &BasicObjectStore) -> Result<bool> {
+        Ok(storage.list_keys("").await?.iter().any(|key| {
+            let components = key.split('/').collect::<Vec<_>>();
+            matches!(
+                components.as_slice(),
+                ["secrets", file]
+                    | ["agents", _, "secrets", file]
+                    | ["agents", _, "conversations", _, "secrets", file]
+                    if file.ends_with(".json")
+            )
+        }))
+    }
+
+    async fn secret_store_identity(storage: &BasicObjectStore) -> Result<SecretStoreIdentity> {
+        let path = Path::new(SECRET_STORE_ID_PATH);
+        if let Some(identity) = storage
+            .get_json_if_exists::<SecretStoreIdentity>(path)
+            .await?
+        {
+            return Ok(identity);
+        }
+        let candidate = SecretStoreIdentity {
+            id: uuid::Uuid::new_v4(),
+        };
+        storage.put_json(path, &candidate).await?;
+        Ok(candidate)
+    }
+
+    #[cfg(test)]
+    mod keychain_account_tests {
+        use tempfile::TempDir;
+
+        use super::{
+            BasicObjectStore, KEYCHAIN_MIGRATION_PATH, has_stored_secret_records,
+            keychain_account_for_store, migrate_keychain_account_if_needed,
+        };
+
+        #[tokio::test]
+        async fn fresh_store_identity_is_stable_across_paths() {
+            let parent = TempDir::new().expect("parent tempdir");
+            let original_path = parent.path().join("original");
+            let moved_path = parent.path().join("moved");
+            tokio::fs::create_dir(&original_path)
+                .await
+                .expect("create original store");
+            let storage = BasicObjectStore::local_filesystem(&original_path)
+                .await
+                .expect("object store");
+            let first = keychain_account_for_store(&storage)
+                .await
+                .expect("first account");
+            drop(storage);
+            tokio::fs::rename(&original_path, &moved_path)
+                .await
+                .expect("move store");
+            let moved_storage = BasicObjectStore::local_filesystem(&moved_path)
+                .await
+                .expect("moved object store");
+            let moved = keychain_account_for_store(&moved_storage)
+                .await
+                .expect("moved account");
+
+            assert_eq!(first, moved);
+            assert!(first.starts_with("exo-secret-store:"));
+        }
+
+        #[tokio::test]
+        async fn distinct_stores_have_distinct_identities() {
+            let first_dir = TempDir::new().expect("first tempdir");
+            let second_dir = TempDir::new().expect("second tempdir");
+            let first_storage = BasicObjectStore::local_filesystem(first_dir.path())
+                .await
+                .expect("first object store");
+            let second_storage = BasicObjectStore::local_filesystem(second_dir.path())
+                .await
+                .expect("second object store");
+
+            let first = keychain_account_for_store(&first_storage)
+                .await
+                .expect("first account");
+            let second = keychain_account_for_store(&second_storage)
+                .await
+                .expect("second account");
+
+            assert_ne!(first, second);
+        }
+
+        #[tokio::test]
+        async fn fresh_stores_complete_migration_without_keychain_access() {
+            let tempdir = TempDir::new().expect("tempdir");
+            let storage = BasicObjectStore::local_filesystem(tempdir.path())
+                .await
+                .expect("object store");
+
+            migrate_keychain_account_if_needed(
+                &storage,
+                "unused-current-account",
+                "unused-legacy-account",
+            )
+            .await
+            .expect("complete migration");
+
+            assert!(
+                storage
+                    .get_json::<bool>(KEYCHAIN_MIGRATION_PATH)
+                    .await
+                    .expect("migration marker")
+            );
+        }
+
+        #[tokio::test]
+        async fn stored_secret_detection_checks_each_supported_scope() {
+            for secret_path in [
+                "secrets/root.json",
+                "agents/agent-id/secrets/agent.json",
+                "agents/agent-id/conversations/conversation-id/secrets/conversation.json",
+            ] {
+                let tempdir = TempDir::new().expect("tempdir");
+                let storage = BasicObjectStore::local_filesystem(tempdir.path())
+                    .await
+                    .expect("object store");
+                storage
+                    .put_json(secret_path, &"encrypted fixture")
+                    .await
+                    .expect("encrypted secret marker");
+
+                assert!(
+                    has_stored_secret_records(&storage)
+                        .await
+                        .expect("detect stored secret"),
+                    "failed to detect {secret_path}"
+                );
+            }
+
+            let tempdir = TempDir::new().expect("tempdir");
+            let storage = BasicObjectStore::local_filesystem(tempdir.path())
+                .await
+                .expect("object store");
+            storage
+                .put_json(
+                    "agents/agent-id/artifacts/secrets/not-a-secret.json",
+                    &"fixture",
+                )
+                .await
+                .expect("unrelated fixture");
+            assert!(
+                !has_stored_secret_records(&storage)
+                    .await
+                    .expect("check unrelated json")
+            );
+        }
+    }
 }

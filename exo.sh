@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/macos-keychain.sh
+. "$ROOT_DIR/scripts/macos-keychain.sh"
 
 # setup.sh installs node/pnpm/rust through mise; make its shims available even
 # in shells where mise was never activated (the harness runner spawns node).
@@ -306,6 +308,7 @@ configure_guardian_for_current_launch() {
 build_exo() {
   echo "Building exo binary..."
   (cd "$ROOT_DIR" && CARGO_TARGET_DIR=target cargo build -p exo --ignore-rust-version)
+  codesign_binary "$EXO_BIN"
 }
 
 build_exo_scheduler() {
@@ -313,6 +316,26 @@ build_exo_scheduler() {
   (cd "$ROOT_DIR" && CARGO_TARGET_DIR=target cargo build \
     --manifest-path examples/exo/scheduler-runner/Cargo.toml \
     --ignore-rust-version)
+  codesign_binary "$SCHEDULER_BIN"
+}
+
+# Give all macOS development binaries one stable, worktree-specific designated
+# requirement. Keychain records this identity when a binary creates an item, so
+# sharing it lets the CLI and scheduler retain access across rebuilds.
+codesign_binary() {
+  local binary="$1"
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    return
+  fi
+
+  local root_digest identifier requirement
+  root_digest="$(printf '%s' "$ROOT_DIR" | shasum -a 256)"
+  root_digest="${root_digest%% *}"
+  identifier="ai.exoharness.exo.dev.${root_digest:0:16}"
+  requirement="=designated => identifier \"$identifier\""
+  echo "Applying local development signature to $(basename "$binary")..."
+  codesign --force --sign - --identifier "$identifier" \
+    --requirements "$requirement" "$binary"
 }
 
 build_all() {
@@ -326,9 +349,13 @@ register_model() {
   [[ -n "$SECRET_NAME" ]] || die "register-model requires --secret-name"
   [[ -n "$SECRET_ENV" ]] || die "register-model requires --secret-env"
   ensure_exo_bin
+  # Repair access to an existing master key before the CLI opens the secret store.
+  exo_macos_prepare_keychain_for_ssh "$ROOT_DIR" "$EXO_BIN" "$SCHEDULER_BIN"
   local upstream="${UPSTREAM_MODEL:-$MODEL}"
   echo "Storing secret $SECRET_NAME from \$$SECRET_ENV..."
   exo secret set "$SECRET_NAME" --env "$SECRET_ENV"
+  # A fresh secret store creates its master key above; authorize the scheduler now.
+  exo_macos_prepare_keychain_for_ssh "$ROOT_DIR" "$EXO_BIN" "$SCHEDULER_BIN"
   echo "Registering model $MODEL -> $upstream..."
   local args=(model register "$MODEL" --model "$upstream" --secret "$SECRET_NAME")
   if [[ -n "$MODEL_BASE_URL" ]]; then
@@ -890,6 +917,10 @@ fresh_start() {
 
 run_repl() {
   ensure_exo_bin
+  if [[ "$START_SCHEDULER" == true ]]; then
+    ensure_scheduler_bin
+  fi
+  exo_macos_prepare_keychain_for_ssh "$ROOT_DIR" "$EXO_BIN" "$SCHEDULER_BIN"
   if [[ "$SETUP_PROFILE" == true ]]; then
     setup_local_profile
   fi
