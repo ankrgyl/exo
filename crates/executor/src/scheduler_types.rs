@@ -278,6 +278,11 @@ impl ScheduledTaskRecord {
     /// policy only decides what happens to the rest. Called on demand for a
     /// task that is not yet due, it plans exactly one fire.
     ///
+    /// A task whose command runs longer than its own interval therefore
+    /// executes back to back rather than losing slots: each run finishes one
+    /// slot late, which is still a backlog of one, so no policy suppresses it
+    /// and every slot fires in turn.
+    ///
     /// Slots are counted from `next_run_at_ms` rather than from the anchor, so
     /// a record left off-grid by an older build still gets a sane backlog and
     /// is pulled back onto the grid by the resume.
@@ -886,5 +891,91 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    const HOUR_MS: u64 = 3_600_000;
+
+    /// `@every 1h` with a command that takes 70 minutes. Every run finishes
+    /// past the slot it was supposed to hand off to, so the task is
+    /// permanently late — but never by more than one slot at a time, which is
+    /// precisely the case the missed-fire policy must keep its hands off.
+    /// Slots are handed out serially instead of being dropped.
+    ///
+    /// Four cycles deliberately: the lag grows by ten minutes each time, so at
+    /// the seventh the task really is two slots behind and the policy *should*
+    /// engage. That case is
+    /// `task_overshooting_several_intervals_engages_the_missed_policy`.
+    #[test]
+    fn task_longer_than_interval_runs_back_to_back_without_skipping() {
+        const RUN_MS: u64 = 70 * 60 * 1_000;
+
+        for policy in [MissedPolicy::Skip, MissedPolicy::Once, MissedPolicy::All] {
+            let mut task = task_at(0, "1h", policy);
+            let mut fired = Vec::new();
+            let mut clock = HOUR_MS;
+
+            for cycle in 1..=4u64 {
+                let plan = task.plan_missed_fires(clock).unwrap();
+                assert_eq!(
+                    plan.fire_slots.len(),
+                    1,
+                    "policy {policy:?} cycle {cycle}: an over-long run is one slot behind, \
+                     never two, so no policy may suppress it"
+                );
+                assert_eq!(
+                    plan.outcome.skipped_slots, 0,
+                    "policy {policy:?} cycle {cycle}"
+                );
+                fired.extend(plan.fire_slots.iter().copied());
+
+                // The command overruns its own slot.
+                clock += RUN_MS;
+                task.resume_after_fires(&plan, clock);
+                assert!(
+                    task.is_due(clock),
+                    "policy {policy:?} cycle {cycle}: the next slot is already in the past, \
+                     so the task is due the moment it finishes"
+                );
+            }
+
+            assert_eq!(
+                fired,
+                vec![HOUR_MS, 2 * HOUR_MS, 3 * HOUR_MS, 4 * HOUR_MS],
+                "policy {policy:?}: every grid slot fires exactly once, in order — \
+                 none skipped, none repeated"
+            );
+        }
+    }
+
+    /// The same over-long task, except one run overshoots by two and a half
+    /// intervals. Now there genuinely is a backlog, and the policy decides.
+    #[test]
+    fn task_overshooting_several_intervals_engages_the_missed_policy() {
+        // Due at 1h, still running at 3.5h: slots 2h and 3h came and went too.
+        let evaluated_at_ms = HOUR_MS + 9_000_000;
+
+        for (policy, expected_fires, expected_skips) in [
+            (MissedPolicy::Skip, Vec::new(), 3),
+            (MissedPolicy::Once, vec![HOUR_MS], 2),
+            (
+                MissedPolicy::All,
+                vec![HOUR_MS, 2 * HOUR_MS, 3 * HOUR_MS],
+                0,
+            ),
+        ] {
+            let task = task_at(0, "1h", policy);
+            let plan = task.plan_missed_fires(evaluated_at_ms).unwrap();
+
+            assert_eq!(plan.fire_slots, expected_fires, "policy {policy:?}");
+            assert_eq!(
+                plan.outcome.skipped_slots, expected_skips,
+                "policy {policy:?}"
+            );
+            assert_eq!(
+                plan.next_run_at_ms,
+                4 * HOUR_MS,
+                "policy {policy:?}: whatever it fires, it resumes on the grid"
+            );
+        }
     }
 }
