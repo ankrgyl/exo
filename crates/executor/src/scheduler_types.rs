@@ -1,6 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
+use chrono::DateTime;
 use exoharness::Uuid7;
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,10 @@ pub struct ScheduledTaskRecord {
     /// record can see that runs were skipped rather than infer it from gaps.
     #[serde(default)]
     pub last_missed_fire: Option<MissedFireOutcome>,
+    /// Set once a one-shot (`@at`) task has fired. A completed task stays
+    /// visible in listings but is never due again.
+    #[serde(default)]
+    pub completed_at_ms: Option<u64>,
     pub latest_run_id: Option<String>,
     pub latest_result_artifact_id: Option<String>,
     pub lease: Option<ScheduledTaskLease>,
@@ -103,6 +108,9 @@ pub struct MissedFirePlan {
     /// Slots to fire, oldest first. Empty means "fire nothing, just resume".
     pub fire_slots: Vec<u64>,
     pub next_run_at_ms: u64,
+    /// Set for a one-shot: the task is finished once these fires are done and
+    /// must never be fired again.
+    pub completes: bool,
     pub outcome: MissedFireOutcome,
 }
 
@@ -151,8 +159,11 @@ pub struct ScheduledTaskLease {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ParsedSchedule {
-    interval_ms: u64,
+pub enum ParsedSchedule {
+    /// Recurring: fires land on `anchor + n * interval_ms`.
+    Every { interval_ms: u64 },
+    /// One-shot: fires once at `at_ms`, then the task is done.
+    At { at_ms: u64 },
 }
 
 impl ScheduledTaskRecord {
@@ -195,6 +206,7 @@ impl ScheduledTaskRecord {
             last_run_at_ms: None,
             last_fired_slot_ms: None,
             last_missed_fire: None,
+            completed_at_ms: None,
             latest_run_id: None,
             latest_result_artifact_id: None,
             lease: None,
@@ -203,6 +215,7 @@ impl ScheduledTaskRecord {
 
     pub fn is_due(&self, now_ms: u64) -> bool {
         self.enabled
+            && self.completed_at_ms.is_none()
             && self.next_run_at_ms <= now_ms
             && self
                 .lease
@@ -250,7 +263,32 @@ impl ScheduledTaskRecord {
     pub fn plan_missed_fires(&self, now_ms: u64) -> Result<MissedFirePlan> {
         let schedule = parse_schedule(&self.schedule)?;
         let due_slot_ms = self.next_run_at_ms;
-        let interval_ms = schedule.interval_ms();
+        let interval_ms = match schedule {
+            ParsedSchedule::Every { interval_ms } => interval_ms,
+            // A one-shot has no grid and so no backlog: it fires once whenever
+            // the runner reaches it, late or not, and is then terminal.
+            ParsedSchedule::At { at_ms } => {
+                let fire_slots = if self.completed_at_ms.is_some() {
+                    Vec::new()
+                } else {
+                    vec![at_ms]
+                };
+                let fired_slots = u32::try_from(fire_slots.len()).unwrap_or(u32::MAX);
+                return Ok(MissedFirePlan {
+                    fire_slots,
+                    next_run_at_ms: at_ms,
+                    completes: true,
+                    outcome: MissedFireOutcome {
+                        policy: self.missed,
+                        evaluated_at_ms: now_ms,
+                        due_slot_ms,
+                        fired_slots,
+                        skipped_slots: 0,
+                        truncated: false,
+                    },
+                });
+            }
+        };
         let elapsed_ms = now_ms.saturating_sub(due_slot_ms);
         // Slots that came and went behind the due one.
         let overdue = elapsed_ms / interval_ms;
@@ -278,6 +316,7 @@ impl ScheduledTaskRecord {
         Ok(MissedFirePlan {
             fire_slots,
             next_run_at_ms: schedule.next_slot_after_ms(self.anchor_ms, now_ms),
+            completes: false,
             outcome: MissedFireOutcome {
                 policy: self.missed,
                 evaluated_at_ms: now_ms,
@@ -298,22 +337,27 @@ impl ScheduledTaskRecord {
             self.last_fired_slot_ms = Some(*slot);
         }
         self.last_missed_fire = Some(plan.outcome);
+        if plan.completes {
+            self.completed_at_ms = Some(now_ms);
+        }
         self.lease = None;
     }
 }
 
 impl ParsedSchedule {
-    pub fn interval_ms(&self) -> u64 {
-        self.interval_ms
-    }
-
     /// First slot strictly after `after_ms` on the grid anchored at
     /// `anchor_ms`. The anchor itself is not a slot: the first fire of a new
-    /// task is one interval after it was created.
+    /// task is one interval after it was created. A one-shot has no grid, so
+    /// its only slot is its timestamp.
     pub fn next_slot_after_ms(&self, anchor_ms: u64, after_ms: u64) -> u64 {
-        let elapsed_ms = after_ms.saturating_sub(anchor_ms);
-        let slots = (elapsed_ms / self.interval_ms).saturating_add(1);
-        anchor_ms.saturating_add(slots.saturating_mul(self.interval_ms))
+        match self {
+            Self::Every { interval_ms } => {
+                let elapsed_ms = after_ms.saturating_sub(anchor_ms);
+                let slots = (elapsed_ms / interval_ms).saturating_add(1);
+                anchor_ms.saturating_add(slots.saturating_mul(*interval_ms))
+            }
+            Self::At { at_ms } => *at_ms,
+        }
     }
 }
 
@@ -359,6 +403,9 @@ pub fn parse_schedule(raw: &str) -> Result<ParsedSchedule> {
     if let Some(interval) = schedule.strip_prefix("@every ") {
         return parse_interval(interval.trim());
     }
+    if let Some(timestamp) = schedule.strip_prefix("@at ") {
+        return parse_at(timestamp.trim());
+    }
 
     let parts = schedule.split_whitespace().collect::<Vec<_>>();
     if parts.len() == 5
@@ -375,12 +422,12 @@ pub fn parse_schedule(raw: &str) -> Result<ParsedSchedule> {
         if minutes == 0 {
             bail!("cron minute interval must be greater than zero");
         }
-        return Ok(ParsedSchedule {
+        return Ok(ParsedSchedule::Every {
             interval_ms: minutes.saturating_mul(60_000),
         });
     }
 
-    bail!("schedule must be '@every <duration>' or '*/N * * * *'");
+    bail!("schedule must be '@every <duration>', '@at <rfc3339>', or '*/N * * * *'");
 }
 
 fn parse_interval(raw: &str) -> Result<ParsedSchedule> {
@@ -401,9 +448,21 @@ fn parse_interval(raw: &str) -> Result<ParsedSchedule> {
         "d" => 86_400_000,
         _ => bail!("interval unit must be one of s, m, h, or d"),
     };
-    Ok(ParsedSchedule {
+    Ok(ParsedSchedule::Every {
         interval_ms: value.saturating_mul(multiplier),
     })
+}
+
+/// `@at <rfc3339>` — a single fire at an absolute time, e.g.
+/// `@at 2026-07-26T17:00:00Z`. A timestamp already in the past is accepted and
+/// fires as soon as the runner sees it: the task was still owed, just late.
+fn parse_at(raw: &str) -> Result<ParsedSchedule> {
+    let at = DateTime::parse_from_rfc3339(raw).map_err(|error| {
+        anyhow!("@at timestamp must be RFC 3339, for example '@at 2026-07-26T17:00:00Z': {error}")
+    })?;
+    let at_ms = u64::try_from(at.timestamp_millis())
+        .map_err(|_| anyhow!("@at timestamp must be at or after the unix epoch"))?;
+    Ok(ParsedSchedule::At { at_ms })
 }
 
 fn validate_task_name(name: &str) -> Result<()> {
@@ -632,6 +691,100 @@ mod tests {
 
         let decoded = serde_json::from_value::<ScheduledTaskRecord>(stored).unwrap();
         assert_eq!(decoded.missed, MissedPolicy::Once);
+    }
+
+    fn one_shot_at(raw: &str, now_ms: u64) -> ScheduledTaskRecord {
+        ScheduledTaskRecord::new(
+            NewScheduledTask {
+                agent_id: "agent".to_string(),
+                conversation_id: "conversation".to_string(),
+                name: "remind".to_string(),
+                schedule: raw.to_string(),
+                sandbox_mode: None,
+                setup_command: None,
+                command: vec!["true".to_string()],
+                report_prompt: "Report.".to_string(),
+                max_output_bytes: None,
+                missed: None,
+            },
+            now_ms,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn parses_one_shot_at_schedule() {
+        assert_eq!(
+            parse_schedule("@at 1970-01-01T00:00:10Z").unwrap(),
+            ParsedSchedule::At { at_ms: 10_000 }
+        );
+        // Offsets are normalized to UTC.
+        assert_eq!(
+            parse_schedule("@at 1970-01-01T01:00:10+01:00").unwrap(),
+            ParsedSchedule::At { at_ms: 10_000 }
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_one_shot_schedules() {
+        assert!(parse_schedule("@at tomorrow").is_err());
+        assert!(parse_schedule("@at 1969-12-31T23:59:59Z").is_err());
+        assert!(parse_schedule("@at").is_err());
+    }
+
+    #[test]
+    fn one_shot_is_due_at_its_timestamp_not_an_interval_later() {
+        let task = one_shot_at("@at 1970-01-01T00:00:10Z", 1_000);
+
+        assert_eq!(task.next_run_at_ms, 10_000);
+        assert!(!task.is_due(9_999));
+        assert!(task.is_due(10_000));
+    }
+
+    #[test]
+    fn one_shot_fires_once_and_becomes_terminal() {
+        let mut task = one_shot_at("@at 1970-01-01T00:00:10Z", 1_000);
+
+        let plan = task.plan_missed_fires(10_500).unwrap();
+        assert_eq!(plan.fire_slots, vec![10_000]);
+        assert!(plan.completes);
+
+        task.resume_after_fires(&plan, 10_500);
+        assert_eq!(task.completed_at_ms, Some(10_500));
+        assert!(
+            task.enabled,
+            "a completed one-shot stays enabled so it stays visible in listings"
+        );
+        assert!(!task.is_due(u64::MAX), "and is never due again");
+
+        // Even asked directly, a completed one-shot plans no further fires.
+        let replan = task.plan_missed_fires(20_000).unwrap();
+        assert!(replan.fire_slots.is_empty());
+    }
+
+    #[test]
+    fn late_one_shot_still_fires_under_every_missed_policy() {
+        for policy in [MissedPolicy::Skip, MissedPolicy::Once, MissedPolicy::All] {
+            let mut task = one_shot_at("@at 1970-01-01T00:00:10Z", 1_000);
+            task.missed = policy;
+            // A week late: a one-shot has no grid, so there is no backlog to
+            // have a policy about.
+            let plan = task.plan_missed_fires(10_000 + 7 * 86_400_000).unwrap();
+
+            assert_eq!(plan.fire_slots, vec![10_000], "policy {policy:?}");
+            assert_eq!(plan.outcome.skipped_slots, 0, "policy {policy:?}");
+        }
+    }
+
+    #[test]
+    fn recurring_tasks_never_complete() {
+        let mut task = task_at(0, "1s", MissedPolicy::Once);
+        let plan = task.plan_missed_fires(1_000).unwrap();
+
+        assert!(!plan.completes);
+        task.resume_after_fires(&plan, 1_000);
+        assert_eq!(task.completed_at_ms, None);
+        assert!(task.is_due(2_000));
     }
 
     #[test]

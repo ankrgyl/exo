@@ -372,6 +372,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_one_shot_stays_listed_but_is_never_due() {
+        let tempdir = TempDir::new().unwrap();
+        let store = SchedulerStore::new(tempdir.path());
+        let mut task = store
+            .create_task(NewScheduledTask {
+                agent_id: "agent".to_string(),
+                conversation_id: "conversation".to_string(),
+                name: "remind".to_string(),
+                schedule: "@at 1970-01-01T00:00:10Z".to_string(),
+                sandbox_mode: None,
+                setup_command: None,
+                command: vec!["true".to_string()],
+                report_prompt: "Report.".to_string(),
+                max_output_bytes: None,
+                missed: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.due_tasks(10_000).await.unwrap().len(), 1);
+
+        let plan = task.plan_missed_fires(10_000).unwrap();
+        task.resume_after_fires(&plan, 10_000);
+        store.put_task(&task).await.unwrap();
+
+        assert!(store.due_tasks(u64::MAX).await.unwrap().is_empty());
+        assert_eq!(
+            store
+                .list_tasks_for_conversation("agent", "conversation", false)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a fired one-shot is history, not a hidden task"
+        );
+    }
+
+    #[tokio::test]
     async fn claim_due_tasks_leases_until_expiry() {
         let tempdir = TempDir::new().unwrap();
         let store = SchedulerStore::new(tempdir.path());
