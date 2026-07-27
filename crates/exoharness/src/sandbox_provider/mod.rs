@@ -33,6 +33,14 @@ pub mod process_bridge;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 mod sprites;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+mod tensorlake;
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "basic-backend")))]
+mod tensorlake {
+    pub fn default_tensorlake_image() -> String {
+        "tensorlake/ubuntu-minimal".to_string()
+    }
+}
+#[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 mod vercel;
 #[cfg(not(all(not(target_arch = "wasm32"), feature = "basic-backend")))]
 mod vercel {
@@ -60,6 +68,12 @@ pub use docker::default_docker_image;
 pub use e2b::{DEFAULT_E2B_API_URL, DEFAULT_E2B_ENVD_PORT, E2bConfig, E2bSandboxBackend};
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use sprites::{DEFAULT_SPRITES_API_URL, SpritesConfig, SpritesSandboxBackend};
+pub use tensorlake::default_tensorlake_image;
+#[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+pub use tensorlake::{
+    DEFAULT_TENSORLAKE_API_URL, DEFAULT_TENSORLAKE_IMAGE, TensorlakeConfig,
+    TensorlakeSandboxBackend,
+};
 pub use vercel::default_vercel_image;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use vercel::{DEFAULT_VERCEL_API_URL, VercelConfig, VercelSandboxBackend};

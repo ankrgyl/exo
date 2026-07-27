@@ -61,10 +61,10 @@ pub use exoharness::{
     HTTP_EXOHARNESS_TRACING_TARGET, HttpExoHarness, PutSecretRequest, SANDBOX_MAIN_MOUNT_DIR,
     SandboxAttachment, SandboxBackendRegistration, SandboxId, SandboxProvider,
     SandboxProviderConfig, Secret, SecretBackendChoice, SecretMetadata, SessionId, SnapshotId,
-    SpritesBackendSpec, StartSandboxRequest, ToolRequest, Uuid7, VercelBackendSpec,
-    default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
-    default_vercel_image, serve_exoharness_http_listener,
-    serve_exoharness_http_listener_with_options,
+    SpritesBackendSpec, StartSandboxRequest, TensorlakeBackendSpec, ToolRequest, Uuid7,
+    VercelBackendSpec, default_aws_agentcore_image, default_daytona_image, default_docker_image,
+    default_e2b_template, default_tensorlake_image, default_vercel_image,
+    serve_exoharness_http_listener, serve_exoharness_http_listener_with_options,
 };
 pub use harness_basic::BasicHarness;
 pub use harness_config::load_agent_config;

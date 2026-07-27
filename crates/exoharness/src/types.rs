@@ -654,6 +654,7 @@ pub enum SandboxProvider {
     Daytona,
     E2b,
     Sprites,
+    Tensorlake,
     Vercel,
     #[serde(rename = "aws_agentcore", alias = "aws-agentcore")]
     AwsAgentCore,
@@ -677,6 +678,7 @@ impl SandboxProvider {
             Self::Daytona => "daytona",
             Self::E2b => "e2b",
             Self::Sprites => "sprites",
+            Self::Tensorlake => "tensorlake",
             Self::Vercel => "vercel",
             Self::AwsAgentCore => "aws-agentcore",
             Self::AppleContainer => "apple-container",
@@ -701,6 +703,7 @@ impl FromStr for SandboxProvider {
             "daytona" => Ok(Self::Daytona),
             "e2b" => Ok(Self::E2b),
             "sprites" => Ok(Self::Sprites),
+            "tensorlake" => Ok(Self::Tensorlake),
             "vercel" => Ok(Self::Vercel),
             "aws-agentcore" | "aws_agentcore" => Ok(Self::AwsAgentCore),
             "apple-container" | "apple_container" => Ok(Self::AppleContainer),
@@ -1000,6 +1003,19 @@ pub enum SandboxProviderConfig {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         labels: Vec<String>,
     },
+    Tensorlake {
+        api_key_secret_id: SecretId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_url: Option<String>,
+        #[serde(default = "crate::sandbox_provider::default_tensorlake_image")]
+        default_image: String,
+        /// Whole CPU cores per sandbox. Unset uses the Tensorlake default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cpus: Option<u32>,
+        /// Memory per sandbox in MiB. Unset uses the Tensorlake default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory_mb: Option<u64>,
+    },
     #[serde(rename = "aws_agentcore", alias = "aws-agentcore")]
     AwsAgentCore {
         runtime_arn: String,
@@ -1025,6 +1041,7 @@ impl SandboxProviderConfig {
             Self::Daytona { .. } => SandboxProvider::Daytona,
             Self::E2b { .. } => SandboxProvider::E2b,
             Self::Sprites { .. } => SandboxProvider::Sprites,
+            Self::Tensorlake { .. } => SandboxProvider::Tensorlake,
             Self::Vercel { .. } => SandboxProvider::Vercel,
             Self::Docker { .. } => SandboxProvider::Docker,
             Self::AwsAgentCore { .. } => SandboxProvider::AwsAgentCore,
@@ -1038,6 +1055,7 @@ impl SandboxProviderConfig {
             | Self::Vercel { default_image, .. }
             | Self::Docker { default_image, .. }
             | Self::E2b { default_image, .. }
+            | Self::Tensorlake { default_image, .. }
             | Self::AwsAgentCore { default_image, .. } => Some(default_image),
             Self::Sprites { .. } => None,
         }

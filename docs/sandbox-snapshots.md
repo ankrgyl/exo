@@ -1,8 +1,8 @@
 # Sandbox Snapshots
 
-Status: implemented for the Docker, E2B, Sprites, and Daytona sandbox
-backends; stubs in place for the others. Daytona can additionally restore a
-Docker snapshot (the cross-provider "teleport" bridge).
+Status: implemented for the Docker, E2B, Sprites, Tensorlake, and Daytona
+sandbox backends; stubs in place for the others. Daytona can additionally
+restore a Docker snapshot (the cross-provider "teleport" bridge).
 
 ## Summary
 

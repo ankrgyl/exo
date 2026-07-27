@@ -167,6 +167,20 @@ impl SandboxBackendRegistration {
         })
     }
 
+    pub fn tensorlake(spec: TensorlakeBackendSpec) -> Self {
+        Self::from_factory(SandboxProvider::Tensorlake, move |inner| {
+            let spec = spec.clone();
+            Box::pin(async move {
+                let config = match inner.tensorlake_config_from_binding().await? {
+                    Some(config) => config,
+                    None => inner.tensorlake_config_from_spec(&spec).await?,
+                };
+                Ok(Arc::new(crate::TensorlakeSandboxBackend::new(config)?)
+                    as Arc<dyn ManagedSandboxBackend>)
+            })
+        })
+    }
+
     pub fn vercel(spec: VercelBackendSpec) -> Self {
         Self::from_factory(SandboxProvider::Vercel, move |inner| {
             let spec = spec.clone();
@@ -298,6 +312,29 @@ impl Default for SpritesBackendSpec {
             url_auth: None,
             organization: None,
             labels: Vec::new(),
+        }
+    }
+}
+
+/// Tensorlake connection config plus the secret-store name for the API key,
+/// resolved lazily on first use.
+#[derive(Debug, Clone)]
+pub struct TensorlakeBackendSpec {
+    pub api_url: String,
+    pub api_key_secret: String,
+    pub default_image: String,
+    pub cpus: Option<u32>,
+    pub memory_mb: Option<u64>,
+}
+
+impl Default for TensorlakeBackendSpec {
+    fn default() -> Self {
+        Self {
+            api_url: crate::DEFAULT_TENSORLAKE_API_URL.to_string(),
+            api_key_secret: "TENSORLAKE_API_KEY".to_string(),
+            default_image: crate::default_tensorlake_image(),
+            cpus: None,
+            memory_mb: None,
         }
     }
 }
@@ -520,6 +557,69 @@ impl BasicExoHarnessInner {
             url_auth,
             organization,
             extra_labels: labels,
+        }))
+    }
+
+    async fn tensorlake_config_from_spec(
+        &self,
+        spec: &TensorlakeBackendSpec,
+    ) -> Result<crate::TensorlakeConfig> {
+        let api_key = self
+            .secret_key(&spec.api_key_secret)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "tensorlake sandbox requested but secret {:?} is not set",
+                    spec.api_key_secret
+                )
+            })?;
+        Ok(crate::TensorlakeConfig {
+            api_key,
+            api_url: spec.api_url.clone(),
+            default_image: spec.default_image.clone(),
+            cpus: spec.cpus.map(f64::from),
+            memory_mb: spec.memory_mb,
+            sandbox_base_url: None,
+        })
+    }
+
+    async fn tensorlake_config_from_binding(&self) -> Result<Option<crate::TensorlakeConfig>> {
+        let bindings = list_binding_records(&self.storage, Path::new("bindings")).await?;
+        let Some((api_key_secret_id, api_url, default_image, cpus, memory_mb)) = bindings
+            .into_iter()
+            .rev()
+            .find_map(|record| match record.binding {
+                Binding::Sandbox {
+                    config:
+                        SandboxProviderConfig::Tensorlake {
+                            api_key_secret_id,
+                            api_url,
+                            default_image,
+                            cpus,
+                            memory_mb,
+                        },
+                    ..
+                } => Some((api_key_secret_id, api_url, default_image, cpus, memory_mb)),
+                _ => None,
+            })
+        else {
+            return Ok(None);
+        };
+        let api_key = self
+            .secret_key_by_id(api_key_secret_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "tensorlake sandbox binding references secret id {api_key_secret_id}, which is not set"
+                )
+            })?;
+        Ok(Some(crate::TensorlakeConfig {
+            api_key,
+            api_url: api_url.unwrap_or_else(|| crate::DEFAULT_TENSORLAKE_API_URL.to_string()),
+            default_image,
+            cpus: cpus.map(f64::from),
+            memory_mb,
+            sandbox_base_url: None,
         }))
     }
 

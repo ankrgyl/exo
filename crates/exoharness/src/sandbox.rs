@@ -138,6 +138,9 @@ pub enum SnapshotKind {
     /// Reference to a Sprites checkpoint id on a named sprite. Payload bytes are
     /// a small JSON manifest; restoring is `POST .../checkpoints/{id}/restore`.
     SpritesSnapshot,
+    /// Reference to a Tensorlake platform snapshot id. Payload bytes are a small
+    /// JSON manifest; restoring is `POST /sandboxes { snapshot_id: <id> }`.
+    TensorlakeSnapshot,
 }
 
 #[async_trait]
@@ -601,6 +604,10 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
             (_, SnapshotKind::SpritesSnapshot) => bail!(
                 "SpritesSnapshot payloads can only be restored by the Sprites sandbox provider; \
                  select provider sprites to rewind this snapshot"
+            ),
+            (_, SnapshotKind::TensorlakeSnapshot) => bail!(
+                "TensorlakeSnapshot payloads can only be restored by the Tensorlake sandbox \
+                 provider; select provider tensorlake to rewind this snapshot"
             ),
         }
 

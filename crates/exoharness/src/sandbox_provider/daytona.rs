@@ -298,7 +298,9 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
             SnapshotKind::DockerImageTar => {
                 import_docker_image_tar(&self.handle_backend(), &payload.bytes).await?
             }
-            SnapshotKind::E2bSnapshot | SnapshotKind::SpritesSnapshot => bail!(
+            SnapshotKind::E2bSnapshot
+            | SnapshotKind::SpritesSnapshot
+            | SnapshotKind::TensorlakeSnapshot => bail!(
                 "the Daytona backend cannot restore a {:?} payload; \
                  select the provider that produced the snapshot",
                 payload.kind

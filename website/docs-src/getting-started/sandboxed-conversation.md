@@ -36,7 +36,8 @@ Local backends are selected with `--sandbox-backend` (or
   Use it only when you trust the agent and the task.
 :::
 
-Remote sandbox providers (Daytona, E2B, Vercel, Sprites, AWS AgentCore) are
+Remote sandbox providers (Daytona, E2B, Vercel, Sprites, Tensorlake, AWS
+AgentCore) are
 configured as *provider bindings*:
 
 ```bash
