@@ -34,12 +34,12 @@ use executor::{
     Harness, HarnessAgent, HarnessConversation, HttpExoHarness, LocalSandboxExoHarness,
     PutSecretRequest, RlmHarness, SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment,
     SandboxBackendRegistration, SandboxProvider, SandboxProviderConfig, SandboxScope, Secret,
-    SecretBackendChoice, SpritesBackendSpec, TensorlakeBackendSpec,
-    ToolRequest, ToolRuntime, TypeScriptHarness, TypeScriptHarnessConfig, Uuid7, VercelBackendSpec,
+    SecretBackendChoice, SpritesBackendSpec, TensorlakeBackendSpec, ToolRequest, ToolRuntime,
+    TypeScriptHarness, TypeScriptHarnessConfig, Uuid7, VercelBackendSpec,
     default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
     default_tensorlake_image, default_vercel_image, effective_sandbox_scope,
-    finalize_rebuild_update_file, load_agent_config, record_host_event,
-    send_conversation_wakeup, serve_exoharness_http_listener_with_options,
+    finalize_rebuild_update_file, load_agent_config, record_host_event, send_conversation_wakeup,
+    serve_exoharness_http_listener_with_options,
 };
 use serde::Deserialize;
 use tabwriter::TabWriter;
@@ -2111,6 +2111,11 @@ async fn main() -> Result<()> {
                     && session_storage_mount_path.is_some()
                 {
                     bail!("--session-storage-mount-path is only valid for aws-agentcore");
+                }
+                if !matches!(provider, SandboxProviderArg::Tensorlake)
+                    && (cpus.is_some() || memory_mb.is_some())
+                {
+                    bail!("--cpus and --memory-mb are only valid for tensorlake");
                 }
                 let config = match provider {
                     SandboxProviderArg::Daytona => {

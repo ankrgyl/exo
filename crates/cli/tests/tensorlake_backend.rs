@@ -562,6 +562,11 @@ async fn snapshot_returns_a_tensorlake_manifest() {
         .expect(1)
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/snapshots/snap-123"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "status": "completed" })))
+        .mount(&server)
+        .await;
 
     let handle = backend.acquire(request).await.expect("acquire");
     let payload = handle.snapshot().await.expect("snapshot");
@@ -785,4 +790,106 @@ fn touch_command() -> exoharness::SandboxCommand {
         cwd: None,
         timeout: None,
     }
+}
+
+/// The snapshot id is only worth persisting once the platform can restore from
+/// it; `POST /snapshot` returns before that is true.
+#[tokio::test]
+async fn snapshot_waits_for_the_platform_to_finish_writing_it() {
+    let server = MockServer::start().await;
+    let backend = backend_for_mock(&server);
+    let request = make_request("conv-snap-wait", "sandbox-snap-wait");
+    let name = expected_sandbox_name(&request);
+    mount_running_sandbox(&server, &name, "sbx-snap-wait").await;
+
+    Mock::given(method("POST"))
+        .and(path("/sandboxes/sbx-snap-wait/snapshot"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+            "snapshot_id": "snap-slow",
+            "status": "in_progress",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/snapshots/snap-slow"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "status": "in_progress" })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/snapshots/snap-slow"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "status": "completed" })))
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let handle = backend.acquire(request).await.expect("acquire");
+    let payload = handle.snapshot().await.expect("snapshot");
+    let manifest: Value = serde_json::from_slice(&payload.bytes).expect("manifest json");
+    assert_eq!(manifest["snapshot_id"], json!("snap-slow"));
+}
+
+#[tokio::test]
+async fn snapshot_surfaces_a_failed_snapshot_instead_of_persisting_its_id() {
+    let server = MockServer::start().await;
+    let backend = backend_for_mock(&server);
+    let request = make_request("conv-snap-fail", "sandbox-snap-fail");
+    let name = expected_sandbox_name(&request);
+    mount_running_sandbox(&server, &name, "sbx-snap-fail").await;
+
+    Mock::given(method("POST"))
+        .and(path("/sandboxes/sbx-snap-fail/snapshot"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+            "snapshot_id": "snap-bad",
+            "status": "in_progress",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/snapshots/snap-bad"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "failed",
+            "error": "export exceeded disk budget",
+        })))
+        .mount(&server)
+        .await;
+
+    let handle = backend.acquire(request).await.expect("acquire");
+    let error = match handle.snapshot().await {
+        Ok(_) => panic!("a failed snapshot must not yield a usable manifest"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("export exceeded disk budget"),
+        "unexpected error: {error}"
+    );
+}
+
+/// Restoring one sandbox's filesystem under another's identity would hand the
+/// caller someone else's state.
+#[tokio::test]
+async fn acquire_from_snapshot_rejects_a_manifest_from_another_sandbox() {
+    let server = MockServer::start().await;
+    let backend = backend_for_mock(&server);
+    let request = make_request("conv-restore", "sandbox-restore");
+
+    let payload = SnapshotPayload {
+        kind: SnapshotKind::TensorlakeSnapshot,
+        bytes: Bytes::from(
+            serde_json::to_vec(&json!({
+                "snapshot_id": "snap-elsewhere",
+                "sandbox_name": "exo-0000000000000000",
+            }))
+            .unwrap(),
+        ),
+    };
+
+    let error = match backend.acquire_from_snapshot(request, payload).await {
+        Ok(_) => panic!("expected a sandbox-identity mismatch"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("exo-0000000000000000"),
+        "unexpected error: {error}"
+    );
 }

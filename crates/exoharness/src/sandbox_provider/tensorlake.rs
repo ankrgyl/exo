@@ -19,7 +19,6 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -35,6 +34,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+use crate::SandboxAttachment;
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput,
     SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotKind, SnapshotPayload,
@@ -57,6 +57,9 @@ const PROCESS_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const PROCESS_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Client-side backstop on top of the server-side `timeout` for one-shot exec.
 const EXEC_TIMEOUT_GRACE: Duration = Duration::from_secs(10);
+/// A snapshot is accepted before it is restorable; how long to wait for it.
+const SNAPSHOT_READY_TIMEOUT: Duration = Duration::from_secs(300);
+const SNAPSHOT_READY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// A just-terminated name can linger briefly before it is free to reuse.
 const NAME_CONFLICT_RETRIES: usize = 5;
 const NAME_CONFLICT_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -203,6 +206,18 @@ impl ManagedSandboxBackend for TensorlakeSandboxBackend {
         let backend = self.handle_backend();
         let name = sandbox_name_for_request(&request);
 
+        // Restoring one sandbox's filesystem under another's identity would
+        // silently hand the caller someone else's state, so refuse when the
+        // manifest was captured from a different sandbox.
+        if let (Some(captured_from), Some(name)) = (&manifest.sandbox_name, &name)
+            && captured_from != name
+        {
+            bail!(
+                "Tensorlake snapshot was taken from sandbox {captured_from}, \
+                 but this sandbox key maps to {name}"
+            );
+        }
+
         // A restored sandbox must boot from the snapshot, so any sandbox already
         // holding this name is terminated first — mirrors the Docker backend
         // evicting its warm container before restoring an image.
@@ -224,6 +239,16 @@ impl ManagedSandboxBackend for TensorlakeSandboxBackend {
             request,
             backend,
         )))
+    }
+
+    async fn attach(
+        &self,
+        _request: SandboxRequest,
+        _attachment: SandboxAttachment,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        // An attachment carries a provider-native handle to an already-running
+        // sandbox; there is no Tensorlake variant to accept yet.
+        bail!("Tensorlake sandbox backend does not support external attachments")
     }
 }
 
@@ -454,17 +479,66 @@ impl TensorlakeBackendHandle {
             .with_context(|| format!("snapshotting Tensorlake sandbox {sandbox_id}"))?;
         let snapshot: SnapshotSandboxResponse =
             decode_json_response(response, "Tensorlake snapshot-sandbox").await?;
+        self.wait_until_snapshot_restorable(&snapshot.snapshot_id)
+            .await?;
         Ok(snapshot.snapshot_id)
     }
+
+    /// `POST /sandboxes/{id}/snapshot` returns `202` with the snapshot still
+    /// being written, so the id alone does not mean it can be restored. Persist
+    /// it only once the platform says otherwise: a caller who snapshots and
+    /// immediately rewinds would otherwise hand back an id that create rejects.
+    async fn wait_until_snapshot_restorable(&self, snapshot_id: &str) -> Result<()> {
+        let deadline = time::Instant::now() + SNAPSHOT_READY_TIMEOUT;
+        loop {
+            let response = self
+                .client
+                .get(self.api_endpoint(&format!("/snapshots/{snapshot_id}")))
+                .send()
+                .await
+                .with_context(|| format!("polling Tensorlake snapshot {snapshot_id}"))?;
+            let info: SnapshotInfo =
+                decode_json_response(response, "Tensorlake get-snapshot").await?;
+            match info.status.as_str() {
+                // Local and replicating are both restorable; waiting for full
+                // durability would stall a rewind for no benefit.
+                "completed" | "local_ready" | "replicating" => return Ok(()),
+                "failed" => bail!(
+                    "Tensorlake snapshot {snapshot_id} failed{}",
+                    info.error
+                        .as_deref()
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default()
+                ),
+                "deleting" => bail!("Tensorlake snapshot {snapshot_id} is being deleted"),
+                _ => {}
+            }
+            if time::Instant::now() >= deadline {
+                bail!(
+                    "Tensorlake snapshot {snapshot_id} was still {} after {}s",
+                    info.status,
+                    SNAPSHOT_READY_TIMEOUT.as_secs()
+                );
+            }
+            time::sleep(SNAPSHOT_READY_POLL_INTERVAL).await;
+        }
+    }
+}
+
+/// A resolved proxy target and whether the last call to it succeeded.
+struct ProxyTarget {
+    target: TensorlakeSandboxTarget,
+    live: bool,
 }
 
 struct TensorlakeSandboxHandle {
     id: String,
     /// `Some` for named (resumable) sandboxes, `None` for ephemeral ones.
     name: Option<String>,
-    target: Mutex<TensorlakeSandboxTarget>,
-    /// Cleared when a proxy call fails so the next call re-checks placement.
-    target_is_live: AtomicBool,
+    /// The proxy target plus whether it is still believed reachable. One
+    /// mutex rather than a separate flag: the two are only ever read and
+    /// written together.
+    target: Mutex<ProxyTarget>,
     request: SandboxRequest,
     backend: TensorlakeBackendHandle,
 }
@@ -480,8 +554,7 @@ impl TensorlakeSandboxHandle {
         Self {
             id,
             name,
-            target: Mutex::new(target),
-            target_is_live: AtomicBool::new(true),
+            target: Mutex::new(ProxyTarget { target, live: true }),
             request,
             backend,
         }
@@ -490,26 +563,26 @@ impl TensorlakeSandboxHandle {
     /// The proxy target for the next command, re-resolving (and resuming) when a
     /// previous call found the sandbox gone — named sandboxes suspend on idle.
     async fn running_target(&self) -> Result<TensorlakeSandboxTarget> {
-        let mut target = self.target.lock().await;
-        if self.target_is_live.load(Ordering::Acquire) {
-            return Ok(target.clone());
+        let mut state = self.target.lock().await;
+        if state.live {
+            return Ok(state.target.clone());
         }
         let identifier = self
             .name
             .clone()
-            .unwrap_or_else(|| target.sandbox_id.clone());
+            .unwrap_or_else(|| state.target.sandbox_id.clone());
         let info = self
             .backend
             .get_sandbox(&identifier)
             .await?
             .ok_or_else(|| anyhow!("Tensorlake sandbox {identifier} no longer exists"))?;
-        *target = self.backend.drive_to_running(info).await?;
-        self.target_is_live.store(true, Ordering::Release);
-        Ok(target.clone())
+        state.target = self.backend.drive_to_running(info).await?;
+        state.live = true;
+        Ok(state.target.clone())
     }
 
-    fn mark_unreachable(&self) {
-        self.target_is_live.store(false, Ordering::Release);
+    async fn mark_unreachable(&self) {
+        self.target.lock().await.live = false;
     }
 
     /// Runs a proxy call, retrying once against a freshly resolved target when
@@ -525,7 +598,7 @@ impl TensorlakeSandboxHandle {
             match call(target.base_url).await {
                 Ok(value) => return Ok(value),
                 Err(ProxyCallError::Unavailable(error)) => {
-                    self.mark_unreachable();
+                    self.mark_unreachable().await;
                     last_unavailable = Some(error);
                 }
                 Err(ProxyCallError::Failed(error)) => return Err(error),
@@ -572,13 +645,22 @@ impl ManagedSandboxHandle for TensorlakeSandboxHandle {
     }
 
     async fn stop(&self) -> Result<()> {
-        let target = self.target.lock().await.clone();
         match &self.name {
             // Named sandboxes keep their filesystem across sessions; the next
             // `acquire` resumes this same sandbox by name.
             Some(name) => self.backend.suspend_sandbox(name).await,
-            None => self.backend.delete_sandbox(&target.sandbox_id).await,
+            None => {
+                let sandbox_id = self.target.lock().await.target.sandbox_id.clone();
+                self.backend.delete_sandbox(&sandbox_id).await
+            }
         }
+    }
+
+    async fn detach(&self) -> Result<SandboxAttachment> {
+        // Detach hands lifecycle ownership to someone else without stopping the
+        // sandbox. Exo owns a Tensorlake sandbox through its derived name, and
+        // there is no descriptor to hand over.
+        bail!("Tensorlake sandboxes cannot be detached")
     }
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {
@@ -1154,6 +1236,13 @@ struct SnapshotSandboxBody {
 #[derive(Debug, Deserialize)]
 struct SnapshotSandboxResponse {
     snapshot_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotInfo {
+    status: String,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
