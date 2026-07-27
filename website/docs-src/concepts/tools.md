@@ -22,7 +22,10 @@ sandbox still use that sandbox's policy, but there is not yet a capability
 sandbox around the tool module itself.
 
 Credentials belong in Exoharness secrets. Tool configuration refers to a
-secret; definitions, prompts, and results must not contain the raw value.
+secret; definitions, prompts, and results must not contain the raw value. For
+installed tools, an initialization value of exactly `${ENV_VAR}` is resolved
+from the host environment each time the tool loads, so the raw value never
+enters the lockfile.
 
 ## Local tool sources
 
@@ -34,6 +37,13 @@ in a small lockfile.
 Each source contains an `exo-tool.json` with exactly `schemaVersion`, `id`, and
 `module`. The TypeScript module owns its model-facing name, description, input
 and output schemas, handler, and initialization contract.
+
+Argument schemas must satisfy the model API's strict mode: every key in
+`properties` also listed in `required`, optional parameters typed as nullable
+(for example `{"type": ["string", "null"]}`), and `additionalProperties: false`
+at every object level. Non-conforming installs are rejected, and a
+non-conforming installed tool is skipped at registration instead of breaking
+the model call for every turn.
 
 There is one workspace-local registry and no agent or conversation tool scope.
 Each `tools.lock.json` tool entry contains only `id`, `source`,

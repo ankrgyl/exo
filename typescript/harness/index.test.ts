@@ -955,6 +955,119 @@ describe("agent tool loading", () => {
     ).rejects.toThrow("tool initialization.prefix is required");
   });
 
+  it("rejects agent tool schemas that violate strict mode", async () => {
+    const nonStrictTool = {
+      definition: {
+        name: "non_strict",
+        description: "Tool with an optional property missing from required.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            prompt: { type: "string" },
+            style: { type: ["string", "null"] },
+          },
+          required: ["prompt"],
+        },
+      },
+      initializationParameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {},
+      },
+      initialize() {
+        return {
+          async execute(): Promise<ToolResult> {
+            return { ok: true };
+          },
+        };
+      },
+    } satisfies Tool;
+
+    await expect(
+      initializeTool(nonStrictTool, "agent", {}, fakeTurnContext()),
+    ).rejects.toThrow(
+      "tool definition.parameters.required must list every key in properties for strict mode, missing: style",
+    );
+    await expect(
+      initializeTool(nonStrictTool, "library", {}, fakeTurnContext()),
+    ).resolves.toMatchObject({ source: "library" });
+  });
+
+  it("rejects agent tool schemas with non-strict nested objects", async () => {
+    const nestedTool = {
+      definition: {
+        name: "nested_non_strict",
+        description: "Tool with a nested object missing additionalProperties.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            options: {
+              type: "object",
+              properties: {
+                verbose: { type: "boolean" },
+              },
+              required: ["verbose"],
+            },
+          },
+          required: ["options"],
+        },
+      },
+      initializationParameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {},
+      },
+      initialize() {
+        return {
+          async execute(): Promise<ToolResult> {
+            return { ok: true };
+          },
+        };
+      },
+    } satisfies Tool;
+
+    await expect(
+      initializeTool(nestedTool, "agent", {}, fakeTurnContext()),
+    ).rejects.toThrow(
+      "tool definition.parameters.properties.options.additionalProperties must be false for strict mode",
+    );
+  });
+
+  it("expands ${VAR} environment references in agent tool initialization", async () => {
+    const registry = createToolRegistry(fakeTurnContext());
+    process.env.EXO_TEST_PREFIX = "from-env: ";
+    try {
+      await registerAgentTools(registry, fakeTurnContext(), {
+        tool: uppercaseTool,
+        initialization: { prefix: "${EXO_TEST_PREFIX}" },
+      });
+    } finally {
+      delete process.env.EXO_TEST_PREFIX;
+    }
+
+    await expect(
+      registry
+        .get("uppercase")
+        ?.handler.execute({ text: "hello" }, { context: fakeTurnContext() }),
+    ).resolves.toEqual({ text: "from-env: HELLO" });
+  });
+
+  it("rejects agent tool initialization referencing unset environment variables", async () => {
+    const registry = createToolRegistry(fakeTurnContext());
+    delete process.env.EXO_TEST_MISSING_VAR;
+
+    await expect(
+      registerAgentTools(registry, fakeTurnContext(), {
+        tool: uppercaseTool,
+        initialization: { prefix: "${EXO_TEST_MISSING_VAR}" },
+      }),
+    ).rejects.toThrow(
+      "tool initialization references environment variable EXO_TEST_MISSING_VAR, which is not set",
+    );
+  });
+
   it("rejects generated tools using legacy inputSchema and invoke shapes", async () => {
     const generatedTool = {
       definition: {

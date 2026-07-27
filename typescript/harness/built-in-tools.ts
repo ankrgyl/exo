@@ -145,7 +145,7 @@ export function createManageToolInstance(): ToolInstance {
     definition: {
       name: "manage_tool",
       description:
-        "Install or remove a manifest-based TypeScript tool from a workspace-relative directory or pinned Git commit. For agent-authored tools, write under /workspace/exo/.exo/tool-sources/<name> with shell and pass .exo/tool-sources/<name> as the local path. Installing the same stable manifest id replaces the existing installation.",
+        "Install or remove a manifest-based TypeScript tool from a workspace-relative directory or pinned Git commit. For agent-authored tools, write under /workspace/exo/.exo/tool-sources/<name> with shell and pass .exo/tool-sources/<name> as the local path. The tool's parameters schema must satisfy strict mode: every key in properties also listed in required, with optional parameters typed as nullable. Installing the same stable manifest id replaces the existing installation.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -190,7 +190,7 @@ export function createManageToolInstance(): ToolInstance {
           initialization: {
             type: ["string", "null"],
             description:
-              "Optional JSON-encoded initialization object. Use null for defaults.",
+              'Optional JSON-encoded initialization object. Use null for defaults. For secrets, pass a "${ENV_VAR}" reference (resolved from the host environment when the tool loads) instead of a literal value.',
           },
         },
         required: ["action", "toolId", "source", "initialization"],

@@ -283,6 +283,12 @@ export async function initializeTool(
   context: TurnContext,
 ): Promise<ToolInstance> {
   validateToolDefinition(tool.definition);
+  if (source === "agent") {
+    validateStrictToolParameters(
+      tool.definition.parameters as JsonValue,
+      "tool definition.parameters",
+    );
+  }
   validateJsonSchema(
     tool.initializationParameters,
     initializationArgs,
@@ -332,6 +338,63 @@ function validateToolDefinition(definition: ToolDefinition): void {
     throw new Error(
       "tool definition.parameters.additionalProperties must be false",
     );
+  }
+}
+
+// The model runtime sends every tool with strict mode enabled, so a schema
+// that violates the strict rules is rejected by the model API on every turn
+// and would otherwise leave the agent unable to respond at all. Reject such
+// schemas here instead: this runs both when manage_tool validates an install
+// and when installed tools are registered at the start of a turn (where a
+// failure skips the one broken tool rather than the whole turn).
+export function validateStrictToolParameters(
+  schema: JsonValue,
+  path: string,
+): void {
+  if (!isRecord(schema)) {
+    return;
+  }
+  const type = schema.type;
+  const isObjectType =
+    type === "object" || (Array.isArray(type) && type.includes("object"));
+  if (isObjectType) {
+    const properties = isRecord(schema.properties) ? schema.properties : {};
+    const propertyNames = Object.keys(properties);
+    const required = Array.isArray(schema.required)
+      ? schema.required.filter((key): key is string => typeof key === "string")
+      : [];
+    const missing = propertyNames.filter((name) => !required.includes(name));
+    if (missing.length > 0) {
+      throw new Error(
+        `${path}.required must list every key in properties for strict mode, missing: ${missing.join(", ")}. ` +
+          `Keep optional parameters in required and mark them nullable, for example { "type": ["string", "null"] }.`,
+      );
+    }
+    const unknown = required.filter((name) => !(name in properties));
+    if (unknown.length > 0) {
+      throw new Error(
+        `${path}.required lists keys that are not in properties: ${unknown.join(", ")}`,
+      );
+    }
+    if (schema.additionalProperties !== false) {
+      throw new Error(
+        `${path}.additionalProperties must be false for strict mode`,
+      );
+    }
+    for (const [key, propertySchema] of Object.entries(properties)) {
+      validateStrictToolParameters(propertySchema, `${path}.properties.${key}`);
+    }
+  }
+  if (schema.items !== undefined) {
+    validateStrictToolParameters(schema.items, `${path}.items`);
+  }
+  for (const combiner of ["anyOf", "oneOf", "allOf"] as const) {
+    const branches = schema[combiner];
+    if (Array.isArray(branches)) {
+      branches.forEach((branch, index) => {
+        validateStrictToolParameters(branch, `${path}.${combiner}[${index}]`);
+      });
+    }
   }
 }
 

@@ -129,6 +129,38 @@ mounted at `/workspace/exo`, and ExoChat for remote access. Pass
 of ExoChat, or `--template minimal` for a bare REPL with no Docker defaults or
 adapter setup.
 
+## Basic Debugging and Visibility
+
+To see what the agent is doing, follow its durable event stream from another
+terminal:
+
+```bash
+pnpm events:tail
+```
+
+This shows recent messages, tool calls and results, and turn boundaries, then
+continues following new events. It defaults to the `exo-agent` agent and `dev`
+conversation. Pass different slugs when needed, or change how much history is
+shown:
+
+```bash
+pnpm events:tail exo-agent dev --history 50
+pnpm events:tail exo-agent dev --history 0  # new events only
+```
+
+Press `Ctrl-C` to stop following events.
+
+The scheduler and adapter services have separate host-side logs:
+
+```bash
+tail -F .exo/exo-scheduler.log  # scheduled task execution
+tail -F .exo/exo-adapters.log   # adapter startup, delivery, and failures
+```
+
+These logs and the canonical event history remain available across ordinary
+restarts. `./exo.sh fresh` deletes agent and conversation state, so preserve
+anything needed for debugging before using it.
+
 ## Understanding Exo
 
 There are only a few key components you need to know about to understand how

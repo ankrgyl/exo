@@ -3,7 +3,7 @@ import type { Dirent } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import type { JsonObject, TurnContext } from "./index";
+import type { JsonObject, JsonValue, TurnContext } from "./index";
 import {
   initializeTool,
   type HarnessToolRegistry,
@@ -246,12 +246,54 @@ function initializeToolModuleEntry(
   entry: ToolModuleEntry,
   source: Extract<HarnessToolSource, "library" | "agent">,
 ): Promise<ToolInstance> {
+  const initialization =
+    entry.initialization ?? entry.tool.initialization ?? {};
   return initializeTool(
     entry.tool,
     source,
-    entry.initialization ?? entry.tool.initialization ?? {},
+    source === "agent"
+      ? expandInitializationEnvironmentReferences(initialization)
+      : initialization,
     context,
   );
+}
+
+// Agent tool initialization is persisted in the tool lockfile, so secrets must
+// stay out of it. A string value of exactly "${NAME}" is resolved from the
+// host environment when the tool loads; any other string passes through
+// unchanged.
+function expandInitializationEnvironmentReferences(
+  initialization: JsonObject,
+): JsonObject {
+  return expandEnvironmentValue(initialization) as JsonObject;
+}
+
+function expandEnvironmentValue(value: JsonValue): JsonValue {
+  if (typeof value === "string") {
+    const match = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(value);
+    if (!match) {
+      return value;
+    }
+    const resolved = process.env[match[1]];
+    if (resolved === undefined) {
+      throw new Error(
+        `tool initialization references environment variable ${match[1]}, which is not set`,
+      );
+    }
+    return resolved;
+  }
+  if (Array.isArray(value)) {
+    return value.map(expandEnvironmentValue);
+  }
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        expandEnvironmentValue(item),
+      ]),
+    );
+  }
+  return value;
 }
 
 function normalizeToolModuleExport(

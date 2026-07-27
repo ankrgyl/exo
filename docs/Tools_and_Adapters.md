@@ -38,10 +38,15 @@ module itself. Installing a source whose stable id is already installed
 replaces the existing installation; there is no separate upgrade action.
 
 Installation validates before it commits: the source is staged, the manifest is
-parsed, the module is loaded and initialized, and the tool name is checked for
-collisions. Only then does the registry record change. Failed installs leave no
-partial state. A successfully installed tool becomes callable on the next model
-round.
+parsed, the module is loaded and initialized, the argument schema is checked
+against the model API's strict-mode rules (every property listed in `required`,
+optional parameters expressed as nullable types, `additionalProperties: false`
+at every object level), and the tool name is checked for collisions. Only then
+does the registry record change. Failed installs leave no partial state. The
+same strict-schema check runs again when installed tools are registered at the
+start of each round, so a bad tool is skipped with a logged error instead of
+poisoning the model call for every turn. A successfully installed tool becomes
+callable on the next model round.
 
 ### Management and inspection
 
@@ -67,7 +72,9 @@ tool is a trust decision, not a security boundary. Tools may use harness APIs
 for sandbox processes, artifacts, and secrets; secret values must never appear
 in model-visible definitions, prompts, or results. Credentials reach tools
 through environment variables or secret references, not raw values in
-configuration.
+configuration: an initialization value of exactly `${ENV_VAR}` is resolved from
+the host environment each time the tool loads, so the raw value never enters
+the tool lockfile.
 
 Deferred, deliberately: capability sandboxes, remote registries, signatures,
 publisher trust, and generated command tools.

@@ -40,9 +40,17 @@ The manifest owns only stable identity and the module entrypoint. The
 TypeScript module owns its model-facing name, description, input and output
 schemas, execution handler, and initialization contract.
 
+Argument schemas must satisfy the model API's strict mode: every key in
+`properties` also appears in `required`, optional parameters use nullable types
+(for example `{"type": ["string", "null"]}`), and `additionalProperties` is
+`false` at every object level. Installs that violate these rules are rejected,
+and a previously installed tool that violates them is skipped at registration
+with a logged error rather than failing the whole turn.
+
 Initialization values are harness configuration, not model arguments. Keep
-credentials in Exoharness secrets and pass references to them; never put raw
-secret values in definitions, prompts, or results.
+credentials out of the lockfile by passing an initialization value of exactly
+`${ENV_VAR}`; the harness resolves it from the host environment each time the
+tool loads. Never put raw secret values in definitions, prompts, or results.
 
 ## Workspace registry
 
