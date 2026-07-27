@@ -404,7 +404,17 @@ missing_has() {
 
 is_exo_checkout() {
   local dir="$1"
-  [[ -d "$dir/.git" && -f "$dir/exo.sh" ]]
+  # .git is a file (not a directory) in worktrees and submodules.
+  [[ -e "$dir/.git" && -f "$dir/exo.sh" ]]
+}
+
+exo_checkout_root() {
+  # Print the root of the Exo checkout containing $PWD, if any.
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
+  [[ -n "$toplevel" ]] || return 1
+  is_exo_checkout "$toplevel" || return 1
+  printf '%s' "$toplevel"
 }
 
 prompt_yes_no() {
@@ -628,9 +638,10 @@ trust_mise_config() {
 }
 
 choose_install_dir() {
-  if is_exo_checkout "$PWD"; then
-    echo "Using current Exo checkout: $PWD" >&2
-    printf '%s' "$PWD"
+  local checkout_root
+  if checkout_root="$(exo_checkout_root)"; then
+    echo "Using current Exo checkout: $checkout_root" >&2
+    printf '%s' "$checkout_root"
     return
   fi
   if [[ -n "${EXO_INSTALL_DIR:-}" ]]; then
