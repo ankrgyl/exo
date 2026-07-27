@@ -10,8 +10,8 @@ use crate::conversation_sandbox::{create_conversation_sandbox, ensure_conversati
 use crate::conversation_wakeup::send_conversation_wakeup;
 use crate::scheduler_store::SchedulerStore;
 use crate::scheduler_types::{
-    DEFAULT_COMMAND_TIMEOUT_MS, DEFAULT_TASK_LEASE_MS, ScheduledTaskRecord, ScheduledTaskRunRecord,
-    ScheduledTaskSandboxMode, now_ms,
+    DEFAULT_COMMAND_TIMEOUT_MS, DEFAULT_TASK_LEASE_MS, ScheduledFireRecord, ScheduledTaskRecord,
+    ScheduledTaskRunRecord, ScheduledTaskSandboxMode, now_ms,
 };
 use crate::{Harness, Uuid7};
 
@@ -59,6 +59,44 @@ pub async fn run_due_tasks(
     Ok(runs.into_iter().flatten().collect())
 }
 
+/// Delivers wakeups for fires that were recorded but never confirmed, and
+/// returns how many landed.
+///
+/// Call this on scheduler startup, before the first pass: a run whose process
+/// died between finishing the command and waking the conversation is otherwise
+/// invisible — the work happened, the artifact exists, and the conversation
+/// never hears about it. Delivery is at-least-once, so a crash after the
+/// wakeup lands but before it is marked will repeat it; the `(task, slot)` key
+/// keeps that bounded to one repeat rather than a loop.
+pub async fn redeliver_pending_wakes(
+    harness: Arc<dyn Harness>,
+    store: &SchedulerStore,
+) -> Result<usize> {
+    let mut delivered = 0;
+    for fire in store.pending_fires().await? {
+        let Some(agent) = harness.get_agent(&fire.agent_id).await? else {
+            // The owner is gone, so the wakeup has nowhere to land. Retiring it
+            // keeps a deleted agent from pinning the queue forever.
+            store
+                .mark_fire_delivered(&fire.task_id, fire.slot_ms)
+                .await?;
+            continue;
+        };
+        let Some(conversation) = agent.get_conversation(&fire.conversation_id).await? else {
+            store
+                .mark_fire_delivered(&fire.task_id, fire.slot_ms)
+                .await?;
+            continue;
+        };
+        send_conversation_wakeup(conversation.as_ref(), fire.prompt.clone()).await?;
+        store
+            .mark_fire_delivered(&fire.task_id, fire.slot_ms)
+            .await?;
+        delivered += 1;
+    }
+    Ok(delivered)
+}
+
 /// Runs whatever the task's missed-fire policy says it owes at this moment,
 /// then puts it back on the grid. Usually that is a single run; it is more
 /// under [`MissedPolicy::All`](crate::MissedPolicy::All) after downtime, and
@@ -70,8 +108,8 @@ pub async fn run_task(
 ) -> Result<Vec<ScheduledTaskRunRecord>> {
     let plan = task.plan_missed_fires(now_ms())?;
     let mut runs = Vec::with_capacity(plan.fire_slots.len());
-    for _slot_ms in &plan.fire_slots {
-        runs.push(fire_once(Arc::clone(&harness), store, &mut task).await?);
+    for slot_ms in &plan.fire_slots {
+        runs.push(fire_once(Arc::clone(&harness), store, &mut task, *slot_ms).await?);
         if !task.enabled {
             // The agent or conversation is gone; the rest of the backlog would
             // fail identically.
@@ -87,10 +125,11 @@ async fn fire_once(
     harness: Arc<dyn Harness>,
     store: &SchedulerStore,
     task: &mut ScheduledTaskRecord,
+    slot_ms: u64,
 ) -> Result<ScheduledTaskRunRecord> {
     let started_at_ms = now_ms();
     let run_id = Uuid7::now().to_string();
-    let run_result = run_task_inner(Arc::clone(&harness), task, &run_id).await;
+    let run_result = run_task_inner(Arc::clone(&harness), store, task, &run_id, slot_ms).await;
     let finished_at_ms = now_ms();
 
     let (mut run, result_artifact_id) = match run_result {
@@ -161,8 +200,10 @@ struct TaskOutput {
 
 async fn run_task_inner(
     harness: Arc<dyn Harness>,
+    store: &SchedulerStore,
     task: &mut ScheduledTaskRecord,
     run_id: &str,
+    slot_ms: u64,
 ) -> Result<TaskOutput> {
     let agent = harness
         .get_agent(&task.agent_id)
@@ -294,7 +335,25 @@ async fn run_task_inner(
             &stderr,
         )
     };
-    send_conversation_wakeup(conversation.as_ref(), prompt).await?;
+    // The wakeup is the only thing that tells the conversation this run
+    // happened, and nothing retries a machine-sent event. Record it before
+    // attempting delivery so a crash in between leaves a redeliverable trace
+    // rather than silence.
+    let fire = ScheduledFireRecord {
+        task_id: task.id.clone(),
+        task_name: task.name.clone(),
+        slot_ms,
+        run_id: run_id.to_string(),
+        agent_id: task.agent_id.clone(),
+        conversation_id: task.conversation_id.clone(),
+        prompt,
+        fired_at_ms: now_ms(),
+    };
+    store.put_pending_fire(&fire).await?;
+    send_conversation_wakeup(conversation.as_ref(), fire.prompt.clone()).await?;
+    store
+        .mark_fire_delivered(&fire.task_id, fire.slot_ms)
+        .await?;
 
     Ok(TaskOutput {
         exit_code,

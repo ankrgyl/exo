@@ -158,6 +158,27 @@ pub struct ScheduledTaskLease {
     pub expires_at_ms: u64,
 }
 
+/// A fire whose conversation wakeup has not been confirmed delivered yet.
+///
+/// Written before the wakeup is attempted and cleared once it lands, so a
+/// process that dies in between leaves something the next startup can
+/// redeliver. It carries the whole prompt rather than a pointer to the run:
+/// redelivery has to send the wakeup without re-running the command, and a
+/// prompt that has to be recomputed is one that can be recomputed differently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduledFireRecord {
+    pub task_id: String,
+    pub task_name: String,
+    /// Grid slot this fire belongs to. With `task_id` it is the dedupe key, so
+    /// redelivery cannot wake a conversation twice for the same slot.
+    pub slot_ms: u64,
+    pub run_id: String,
+    pub agent_id: String,
+    pub conversation_id: String,
+    pub prompt: String,
+    pub fired_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParsedSchedule {
     /// Recurring: fires land on `anchor + n * interval_ms`.

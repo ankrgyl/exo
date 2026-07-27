@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use executor::{
     BasicExoHarnessConfig, BraintrustRuntimeConfig, ExoToolRuntime, Harness,
     SandboxBackendRegistration, SchedulerRunOptions, SchedulerStore, SecretBackendChoice,
-    TypeScriptHarness, run_due_tasks,
+    TypeScriptHarness, redeliver_pending_wakes, run_due_tasks,
 };
 
 #[derive(Debug, Parser)]
@@ -67,6 +67,12 @@ async fn main() -> Result<()> {
         } => {
             let _lock = SchedulerRunnerLock::acquire(&cli.root)?;
             let store = SchedulerStore::new(cli.root.join("scheduled-tasks"));
+            // A previous runner may have died between finishing a task and
+            // waking its conversation. Settle that before taking new work.
+            let redelivered = redeliver_pending_wakes(Arc::clone(&harness), &store).await?;
+            if redelivered > 0 {
+                println!("redelivered {redelivered} pending conversation wakeup(s)");
+            }
             loop {
                 let runs =
                     run_due_tasks(Arc::clone(&harness), &store, SchedulerRunOptions { limit })

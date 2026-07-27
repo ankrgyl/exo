@@ -6,7 +6,8 @@ use serde::Serialize;
 use tokio::fs;
 
 use crate::scheduler_types::{
-    NewScheduledTask, ScheduledTaskRecord, ScheduledTaskRunRecord, migrate_scheduled_task, now_ms,
+    NewScheduledTask, ScheduledFireRecord, ScheduledTaskRecord, ScheduledTaskRunRecord,
+    migrate_scheduled_task, now_ms,
 };
 
 #[derive(Debug, Clone)]
@@ -80,6 +81,11 @@ impl SchedulerStore {
             .collect())
     }
 
+    /// Reads, leases, and writes back without a conditional put, so two
+    /// runners racing the same due task can both win. The PID lockfile in the
+    /// runner is the real guard today. The fix is a claim keyed by
+    /// `(task, slot)` written conditionally, which is deferred pending the
+    /// conditional puts in upstream PR #113 rather than raced against it.
     pub async fn claim_due_tasks(
         &self,
         now_ms: u64,
@@ -135,6 +141,78 @@ impl SchedulerStore {
         Ok(Some(task))
     }
 
+    /// Records a fire whose wakeup has not been delivered yet. A no-op if this
+    /// `(task, slot)` was already delivered, so a retry cannot resurrect a
+    /// wakeup the conversation has already had.
+    pub async fn put_pending_fire(&self, fire: &ScheduledFireRecord) -> Result<()> {
+        if self.fire_was_delivered(&fire.task_id, fire.slot_ms).await? {
+            return Ok(());
+        }
+        fs::create_dir_all(self.pending_fires_dir()).await?;
+        let path = self.pending_fire_path(&fire.task_id, fire.slot_ms);
+        write_json_file(&path, fire)
+            .await
+            .with_context(|| format!("failed to write scheduled task fire {}", path.display()))
+    }
+
+    /// Fires written but never confirmed delivered, oldest first.
+    pub async fn pending_fires(&self) -> Result<Vec<ScheduledFireRecord>> {
+        let dir = self.pending_fires_dir();
+        match fs::metadata(&dir).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let mut entries = fs::read_dir(&dir)
+            .await
+            .with_context(|| format!("failed to read scheduled fire directory {dir:?}"))?;
+        let mut fires = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = fs::read(&path).await.with_context(|| {
+                format!("failed to read scheduled task fire {}", path.display())
+            })?;
+            fires.push(serde_json::from_slice::<ScheduledFireRecord>(&bytes)?);
+        }
+        fires.sort_by_key(|fire| (fire.fired_at_ms, fire.slot_ms));
+        Ok(fires)
+    }
+
+    /// Moves a fire from pending to delivered. The rename is the commit point,
+    /// mirroring how the adapter outbox claims a message.
+    pub async fn mark_fire_delivered(&self, task_id: &str, slot_ms: u64) -> Result<()> {
+        let pending_path = self.pending_fire_path(task_id, slot_ms);
+        match fs::metadata(&pending_path).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        fs::create_dir_all(self.delivered_fires_dir()).await?;
+        let delivered_path = self.delivered_fire_path(task_id, slot_ms);
+        fs::rename(&pending_path, &delivered_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to mark scheduled task fire {} delivered as {}",
+                    pending_path.display(),
+                    delivered_path.display()
+                )
+            })
+    }
+
+    pub async fn fire_was_delivered(&self, task_id: &str, slot_ms: u64) -> Result<bool> {
+        match fs::metadata(self.delivered_fire_path(task_id, slot_ms)).await {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub async fn put_run(&self, run: &ScheduledTaskRunRecord) -> Result<()> {
         fs::create_dir_all(self.runs_dir(&run.task_id)).await?;
         let path = self.run_path(&run.task_id, &run.id);
@@ -157,6 +235,24 @@ impl SchedulerStore {
 
     fn run_path(&self, task_id: &str, run_id: &str) -> PathBuf {
         self.runs_dir(task_id).join(format!("{run_id}.json"))
+    }
+
+    fn pending_fires_dir(&self) -> PathBuf {
+        self.root.join("fires").join("pending")
+    }
+
+    fn delivered_fires_dir(&self) -> PathBuf {
+        self.root.join("fires").join("delivered")
+    }
+
+    fn pending_fire_path(&self, task_id: &str, slot_ms: u64) -> PathBuf {
+        self.pending_fires_dir()
+            .join(format!("{task_id}-{slot_ms}.json"))
+    }
+
+    fn delivered_fire_path(&self, task_id: &str, slot_ms: u64) -> PathBuf {
+        self.delivered_fires_dir()
+            .join(format!("{task_id}-{slot_ms}.json"))
     }
 }
 
@@ -434,5 +530,94 @@ mod tests {
         assert_eq!(claimed.len(), 1);
         assert!(store.claim_due_tasks(3, 10, 100).await.unwrap().is_empty());
         assert_eq!(store.claim_due_tasks(103, 10, 100).await.unwrap().len(), 1);
+    }
+
+    fn fire(task_id: &str, slot_ms: u64) -> ScheduledFireRecord {
+        ScheduledFireRecord {
+            task_id: task_id.to_string(),
+            task_name: "check".to_string(),
+            slot_ms,
+            run_id: "run".to_string(),
+            agent_id: "agent".to_string(),
+            conversation_id: "conversation".to_string(),
+            prompt: "Scheduled task `check` completed.".to_string(),
+            fired_at_ms: slot_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_fires_survive_until_delivery_is_marked() {
+        let tempdir = TempDir::new().unwrap();
+        let store = SchedulerStore::new(tempdir.path());
+
+        store.put_pending_fire(&fire("task", 1_000)).await.unwrap();
+        store.put_pending_fire(&fire("task", 2_000)).await.unwrap();
+        assert_eq!(
+            store
+                .pending_fires()
+                .await
+                .unwrap()
+                .iter()
+                .map(|fire| fire.slot_ms)
+                .collect::<Vec<_>>(),
+            vec![1_000, 2_000],
+            "a restart should see both undelivered wakeups, oldest first"
+        );
+
+        store.mark_fire_delivered("task", 1_000).await.unwrap();
+        assert_eq!(
+            store
+                .pending_fires()
+                .await
+                .unwrap()
+                .iter()
+                .map(|fire| fire.slot_ms)
+                .collect::<Vec<_>>(),
+            vec![2_000]
+        );
+        assert!(store.fire_was_delivered("task", 1_000).await.unwrap());
+        assert!(!store.fire_was_delivered("task", 2_000).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_delivered_slot_cannot_be_woken_again() {
+        let tempdir = TempDir::new().unwrap();
+        let store = SchedulerStore::new(tempdir.path());
+        store.put_pending_fire(&fire("task", 1_000)).await.unwrap();
+        store.mark_fire_delivered("task", 1_000).await.unwrap();
+
+        // A retry of the same (task, slot) must not re-queue the wakeup.
+        store.put_pending_fire(&fire("task", 1_000)).await.unwrap();
+        assert!(store.pending_fires().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn marking_an_unknown_fire_delivered_is_a_no_op() {
+        let tempdir = TempDir::new().unwrap();
+        let store = SchedulerStore::new(tempdir.path());
+
+        store.mark_fire_delivered("task", 1_000).await.unwrap();
+        assert!(store.pending_fires().await.unwrap().is_empty());
+        assert!(!store.fire_was_delivered("task", 1_000).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn fires_for_different_slots_are_independent() {
+        let tempdir = TempDir::new().unwrap();
+        let store = SchedulerStore::new(tempdir.path());
+        store
+            .put_pending_fire(&fire("task-a", 1_000))
+            .await
+            .unwrap();
+        store
+            .put_pending_fire(&fire("task-b", 1_000))
+            .await
+            .unwrap();
+
+        store.mark_fire_delivered("task-a", 1_000).await.unwrap();
+
+        let pending = store.pending_fires().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].task_id, "task-b");
     }
 }
