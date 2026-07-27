@@ -28,6 +28,9 @@ handle** the executor uses to append events and finish the turn. Head
 tracking and write ordering stay inside the exoharness, so the executor can
 start the model call as quickly as possible after input arrives.
 
+For create/resume/fork/delete and how sessions and turns relate to
+adapter wakeups, see [Lifecycles → Conversations](./lifecycles#conversation-lifecycle).
+
 ## Event
 
 An event is an append-only record of a change to conversation state:
