@@ -86,8 +86,8 @@ JSON.stringify({{
   variable_names: Object.keys(__rlm_globals).sort().slice(0, {max_variable_names}),
 }});
 "#,
-            context_json = &self.context_json,
-            history_messages_json = &self.history_messages_json,
+            context_json = self.context_json,
+            history_messages_json = self.history_messages_json,
             state_json = serde_json::to_string(&self.globals)?,
             code_json = serde_json::to_string(code)?,
             final_preview_chars = FINAL_PREVIEW_CHARS,

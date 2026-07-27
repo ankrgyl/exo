@@ -6,13 +6,28 @@ export default defineConfig({
   resolve: {
     alias: {
       "@exo/harness/tool": fileURLToPath(
-        new URL("./typescript/harness/tool.ts", import.meta.url),
+        new URL("./exoharness/typescript/harness/tool.ts", import.meta.url),
       ),
       "@exo/harness": fileURLToPath(
-        new URL("./typescript/harness/index.ts", import.meta.url),
+        new URL("./exoharness/typescript/harness/index.ts", import.meta.url),
       ),
       "@exo/model-runtime/responses": fileURLToPath(
-        new URL("./typescript/model-runtime/responses.ts", import.meta.url),
+        new URL(
+          "./exoharness/typescript/model-runtime/responses.ts",
+          import.meta.url,
+        ),
+      ),
+      "@exo/model-runtime/shared": fileURLToPath(
+        new URL(
+          "./exoharness/typescript/model-runtime/shared.ts",
+          import.meta.url,
+        ),
+      ),
+      "@exo/model-runtime/turn-loop": fileURLToPath(
+        new URL(
+          "./exoharness/typescript/model-runtime/turn-loop.ts",
+          import.meta.url,
+        ),
       ),
     },
   },

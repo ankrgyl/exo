@@ -56,7 +56,7 @@ starting an authorized worker; raw credentials do not belong in prompts or
 durable configuration.
 
 Protocol-specific code lives with each adapter under
-[`examples/exo/adapters/`](https://github.com/exoharness/exo/tree/main/examples/exo/adapters).
+[`exo/adapters/`](https://github.com/exoharness/exo/tree/main/exo/adapters).
 Adapter records, event history, and the outbound queue are stored under
 `.exo/adapters/`.
 
@@ -87,7 +87,7 @@ itself.
 
 `create_adapter` currently accepts only `source: "library"`. There are no
 built-in adapter implementations in the host; every shipped type is a library
-worker module under `examples/exo/adapters/<type>/worker.ts`.
+worker module under `exo/adapters/<type>/worker.ts`.
 
 A universal adapter command envelope and manifest-generated model tools are
 deferred. Protocol-specific commands may remain explicit tools until there is
@@ -175,7 +175,7 @@ Events API port/path for Slack, and the mount root for agent-cli.
 ::: info
   Each adapter has a full setup walkthrough (bot creation, permissions,
   linking, troubleshooting) in its README under
-  [`examples/exo/adapters/`](https://github.com/exoharness/exo/tree/main/examples/exo/adapters)
+  [`exo/adapters/`](https://github.com/exoharness/exo/tree/main/exo/adapters)
   — start there when setting one up for real.
 :::
 

@@ -191,9 +191,9 @@ impl TypeScriptHarnessPreset {
 
     fn module_path(self) -> &'static Path {
         match self {
-            Self::Codex => Path::new("examples/typescript/codex-harness.ts"),
-            Self::ClaudeCode => Path::new("examples/typescript/claude-code-harness.ts"),
-            Self::Cursor => Path::new("examples/typescript/cursor-sdk-harness.ts"),
+            Self::Codex => Path::new("exoharness/examples/typescript/codex-harness.ts"),
+            Self::ClaudeCode => Path::new("exoharness/examples/typescript/claude-code-harness.ts"),
+            Self::Cursor => Path::new("exoharness/examples/typescript/cursor-sdk-harness.ts"),
         }
     }
 

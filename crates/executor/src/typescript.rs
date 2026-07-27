@@ -251,6 +251,7 @@ impl TypeScriptRunnerProcess {
         module_path: &str,
     ) -> Result<Self> {
         let runner_path = workspace_root
+            .join("exoharness")
             .join("typescript")
             .join("harness")
             .join("runner.ts");
@@ -882,7 +883,7 @@ impl TypeScriptHarness<ExoToolRuntime> {
             .context("failed to resolve current directory for Exo harness")?;
         let root = root.as_ref();
         let exoharness: Arc<dyn ExoHarness> = Arc::new(BasicExoHarness::new(exo_config).await?);
-        let adapter_worker_root = workspace_root.join("examples/exo/adapters");
+        let adapter_worker_root = workspace_root.join("exo/adapters");
         let tools = Arc::new(ExoToolRuntime::with_roots(
             root.join("scheduled-tasks"),
             root.join("adapters"),

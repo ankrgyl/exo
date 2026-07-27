@@ -11,15 +11,23 @@
     "moduleResolution": "Bundler",
     "paths": {
       "*": ["./*"],
-      "@exo/harness": ["./typescript/harness/index.ts"],
-      "@exo/harness/tool": ["./typescript/harness/tool.ts"],
+      "@exo/harness": ["./exoharness/typescript/harness/index.ts"],
+      "@exo/harness/tool": ["./exoharness/typescript/harness/tool.ts"],
       "@exo/model-runtime/responses": [
-        "./typescript/model-runtime/responses.ts"
+        "./exoharness/typescript/model-runtime/responses.ts"
       ],
-      "@exo/model-runtime/cost": ["./typescript/model-runtime/cost.ts"],
-      "@exo/codex/app-server": ["./typescript/codex/app-server.ts"],
-      "@exo/cursor/sdk": ["./typescript/cursor/sdk.ts"],
-      "@exo/cursor/protocol": ["./typescript/cursor/protocol.ts"]
+      "@exo/model-runtime/cost": [
+        "./exoharness/typescript/model-runtime/cost.ts"
+      ],
+      "@exo/model-runtime/shared": [
+        "./exoharness/typescript/model-runtime/shared.ts"
+      ],
+      "@exo/model-runtime/turn-loop": [
+        "./exoharness/typescript/model-runtime/turn-loop.ts"
+      ],
+      "@exo/codex/app-server": ["./exoharness/typescript/codex/app-server.ts"],
+      "@exo/cursor/sdk": ["./exoharness/typescript/cursor/sdk.ts"],
+      "@exo/cursor/protocol": ["./exoharness/typescript/cursor/protocol.ts"]
     },
     "resolveJsonModule": true,
     "isolatedModules": true,

@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Shell entry point for the agent-cli adapter. Symlink this onto your PATH
+# (e.g. ln -s "$PWD/exo/scripts/exo-cli" ~/bin/exo-cli).
+#
+# Fast path: the agent-cli adapter is already listening, so the prompt goes
+# straight to the agent. First run: this script bootstraps the adapter by
+# adding the workspace mount and asking the running agent to create it. The
+# only prerequisite is that the Exo stack (./exo.sh) is running.
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+CLIENT="$SCRIPT_DIR/../adapters/agent-cli/client.mjs"
+
+AGENT="${EXO_AGENT:-exo-agent}"
+CONVERSATION="${EXO_CONVERSATION:-dev}"
+MOUNT_ROOT="${EXO_AGENT_CLI_ROOT:-$HOME/projects}"
+MOUNT_PATH="${EXO_AGENT_CLI_MOUNT:-/agent-cli}"
+SOCKET_PATH="${EXO_AGENT_CLI_SOCKET:-$HOME/.exo/agent-cli.sock}"
+EXO_BIN="${EXO_BIN:-$ROOT_DIR/target/debug/exo}"
+ENV_FILE="${EXO_ENV_FILE:-$ROOT_DIR/.env}"
+BOOTSTRAP_WAIT_SECONDS="${EXO_AGENT_CLI_BOOTSTRAP_WAIT:-180}"
+
+die() {
+  echo "exo-cli: $*" >&2
+  exit 1
+}
+
+exo() {
+  "$EXO_BIN" --env-file-if-exists "$ENV_FILE" "$@"
+}
+
+adapter_runner_running() {
+  local pid_file="$ROOT_DIR/.exo/exo-adapters.pid"
+  [[ -f "$pid_file" ]] || return 1
+  local pid
+  pid="$(<"$pid_file")"
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" >/dev/null 2>&1
+}
+
+bootstrap() {
+  echo "exo-cli: agent-cli adapter not running; bootstrapping it now..." >&2
+
+  [[ -x "$EXO_BIN" ]] || die "exo binary not found at $EXO_BIN. Build it or start the stack: ./exo.sh"
+  adapter_runner_running || die "the Exo adapter runner is not running. Start the stack first: ./exo.sh"
+  [[ -d "$MOUNT_ROOT" ]] || die "workspace root does not exist: $MOUNT_ROOT (override with EXO_AGENT_CLI_ROOT)"
+
+  echo "exo-cli: mounting $MOUNT_ROOT at $MOUNT_PATH in the agent sandbox..." >&2
+  exo conversation mount add "$AGENT" "$CONVERSATION" "$MOUNT_ROOT" "$MOUNT_PATH" --rw >/dev/null
+
+  echo "exo-cli: asking the agent to create the agent-cli adapter..." >&2
+  exo conversation send "$AGENT" "$CONVERSATION" "$(bootstrap_prompt)" >/dev/null
+
+  echo "exo-cli: waiting for the adapter socket at $SOCKET_PATH (up to ${BOOTSTRAP_WAIT_SECONDS}s)..." >&2
+  local waited=0
+  while [[ ! -S "$SOCKET_PATH" ]]; do
+    if (( waited >= BOOTSTRAP_WAIT_SECONDS )); then
+      die "adapter socket never appeared. Check the adapter runner log: $ROOT_DIR/.exo/exo-adapters.log"
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  echo "exo-cli: adapter is up." >&2
+}
+
+bootstrap_prompt() {
+  cat <<EOF
+Set up the agent-cli adapter so I can talk to you from my shell with exo-cli.
+
+If an enabled agent-cli adapter already exists for this conversation, do nothing else. Otherwise create a built-in adapter with:
+- name: agent-cli
+- source: built_in
+- config: type agent-cli, socketPath null, mountRoot $MOUNT_ROOT, mountPath $MOUNT_PATH
+
+Do not reply over the adapter for this setup message; the client is not connected yet.
+EOF
+}
+
+run_client() {
+  EXO_AGENT_CLI_SOCKET="$SOCKET_PATH" node "$CLIENT" "$@"
+}
+
+rc=0
+run_client "$@" || rc=$?
+if [[ "$rc" -ne 3 ]]; then
+  exit "$rc"
+fi
+
+bootstrap
+run_client "$@"

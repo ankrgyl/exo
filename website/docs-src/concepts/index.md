@@ -72,5 +72,5 @@ agent was never at risk.
   guardian, scheduler, memory, and the self-improvement loop.
 
 The canonical reference is
-[`docs/spec.md`](https://github.com/exoharness/exo/blob/main/docs/spec.md);
+[`exoharness/docs/spec.md`](https://github.com/exoharness/exo/blob/main/exoharness/docs/spec.md);
 these pages are a guided tour of the same material.
