@@ -30,8 +30,8 @@ const MAX_EVENT_LIMIT: u32 = 200;
 /// (messages, tool calls, stream chunks), which would drown the signal.
 fn default_event_kinds() -> Vec<EventKind> {
     vec![
-        EventKind::CONVERSATION_CREATED,
-        EventKind::CONVERSATION_FORKED,
+        EventKind::THREAD_CREATED,
+        EventKind::THREAD_FORKED,
         EventKind::SESSION_STARTED,
         EventKind::SESSION_ENDED,
         EventKind::ERROR,
@@ -183,7 +183,7 @@ mod tests {
             .iter()
             .map(|event| event["data"]["event_type"].as_str().unwrap_or_default())
             .collect::<Vec<_>>();
-        // Default kinds include conversation_created; custom host events come
+        // Default kinds include thread_created; custom host events come
         // first because the listing is newest first.
         assert_eq!(kinds[0], HOST_EVENT_ADAPTER_RUNNER_STARTED);
         assert_eq!(kinds[1], HOST_EVENT_REBOOT);
@@ -191,7 +191,7 @@ mod tests {
             events.last().unwrap()["data"]["type"]
                 .as_str()
                 .unwrap_or_default(),
-            "conversation_created"
+            "thread_created"
         );
     }
 
