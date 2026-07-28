@@ -187,7 +187,8 @@ Add a new adapter type called `webhook` to your own source tree and use it.
    that wakes this conversation. Wire up its creation config alongside the
    existing adapter types.
 
-3. Run rebuild_and_restart_exo to validate, build, and activate the change.
+3. Run rebuild_and_restart_exo with a short reason (for example
+   "Add webhook adapter") to validate, build, and activate the change.
 
 4. After the restart, create a webhook adapter for this conversation on
    port 8787 and tell me the adapter id.

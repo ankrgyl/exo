@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Deferred rebuild_and_restart_exo runner.
+#
+# Sleeps briefly so the requesting turn can finish, runs the guardian
+# build-and-restart pipeline, then finalizes the durable outcome file and
+# appends a rebuild_and_restart_exo host event to the requesting conversation.
+#
+# Args:
+#   $1 delay_seconds
+#   $2 outcome_path
+#   $3 update_id
+#   $4 reason_json          JSON-encoded string|null
+#   $5 exo_bin
+#   $6 env_file
+#   $@ guardian command...
+set -u
+
+delay="$1"
+record="$2"
+update_id="$3"
+reason_json="$4"
+exo_bin="$5"
+env_file="$6"
+shift 6
+
+printf '\n[%s] queued rebuild update %s reason=%s:' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  "$update_id" \
+  "$reason_json"
+for arg in "$@"; do
+  printf ' %q' "$arg"
+done
+printf '\n'
+
+sleep "$delay"
+set +e
+"$@"
+code=$?
+completed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if [ "$code" -eq 0 ]; then
+  status=succeeded
+else
+  status=failed
+fi
+
+if [ ! -x "$exo_bin" ]; then
+  printf '[%s] rebuild update %s: exo binary missing at %s; writing outcome without event log\n' \
+    "$completed_at" "$update_id" "$exo_bin"
+  node -e '
+const fs = require("node:fs");
+const [path, status, exitCode, completedAt] = process.argv.slice(1);
+const record = JSON.parse(fs.readFileSync(path, "utf8"));
+record.status = status;
+record.exitCode = Number(exitCode);
+record.completedAt = completedAt;
+fs.writeFileSync(path, `${JSON.stringify(record)}\n`);
+' "$record" "$status" "$code" "$completed_at"
+  exit "$code"
+fi
+
+set +e
+"$exo_bin" --env-file-if-exists "$env_file" conversation complete-rebuild-update \
+  --outcome "$record" \
+  --status "$status" \
+  --exit-code "$code" \
+  --completed-at "$completed_at"
+record_code=$?
+if [ "$record_code" -ne 0 ]; then
+  printf '[%s] rebuild update %s: failed to record conversation event (exit %s); outcome file may be incomplete\n' \
+    "$completed_at" "$update_id" "$record_code"
+fi
+exit "$code"

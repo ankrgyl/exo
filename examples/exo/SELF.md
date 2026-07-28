@@ -92,8 +92,9 @@ definition that delegates to it:
    `registerHostTool` from `examples/exo/host-tools.ts`, wired into the
    registry in `examples/exo/harness.ts` (see `sandbox-tools.ts` for the
    pattern).
-3. Call `rebuild_and_restart_exo` so both the Rust binary and the harness pick
-   up the change.
+3. Call `rebuild_and_restart_exo` with a short `reason` naming the change so
+   both the Rust binary and the harness pick up the update and the durable
+   update record stays self-describing.
 4. Never create an agent-installed tool with the same name as a Rust-backed
    tool; the registry conflict makes calls ambiguous.
 
@@ -111,7 +112,9 @@ inside the conversation before touching host services:
    restart time).
 3. `list_conversation_events` reads the canonical conversation event log,
    which host components also write to. `host_reboot` records a planned host
-   restart with its reason; `adapter_runner_started` records every adapter
+   restart with its reason; `rebuild_and_restart_exo` records whether a deferred
+   self-update finished (succeeded or failed) with its `updateId` and tool
+   reason; `adapter_runner_started` records every adapter
    runner start (without a preceding `host_reboot` it implies a crash or
    manual restart); `adapter_runner_draining` records a graceful shutdown
    beginning. This is the immutable history of what happened to you — use it
@@ -128,8 +131,9 @@ inside the conversation before touching host services:
 - Use the `shell` tool for sandbox-local inspection and experiments.
 - Use `snapshot_sandbox` before risky filesystem changes.
 - Use `rebuild_and_restart_exo` after code changes that require host services
-  to pick up a new build. The restart is deferred briefly so the current turn
-  can finish before services stop.
+  to pick up a new build. Always pass a short `reason` describing the change
+  being activated. The restart is deferred briefly so the current turn can
+  finish before services stop.
 - In control mode, service guardian builds write `.exo/exo-control.restart`;
   the `./exo.sh --control` wrapper restarts only the child `exo repl` and
   keeps the user's terminal open.

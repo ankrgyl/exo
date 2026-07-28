@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import type {
   HarnessToolRegistry,
   JsonObject,
+  ToolExecutionContext,
   ToolInstance,
   ToolResult,
 } from "@exo/harness";
@@ -20,10 +21,16 @@ const GUARDIAN_SCRIPT = new URL(
   "./scripts/exo-service-guardian",
   import.meta.url,
 ).pathname;
+const DEFERRED_SCRIPT = new URL(
+  "./scripts/deferred-rebuild-and-restart",
+  import.meta.url,
+).pathname;
 const ROOT_DIR = new URL("../..", import.meta.url).pathname;
 const STATE_DIR = join(ROOT_DIR, ".exo");
 const DEFERRED_LOG_PATH = join(STATE_DIR, "exo-service-guardian-actions.log");
 const UPDATE_DIR = join(STATE_DIR, "guardian-updates");
+const EXO_BIN = join(ROOT_DIR, "target/debug/exo");
+const ENV_FILE = join(ROOT_DIR, ".env");
 const DEFERRED_RESTART_DELAY_SECONDS = 2;
 
 export function registerGuardianTools(registry: HarnessToolRegistry): void {
@@ -36,23 +43,46 @@ export function rebuildAndRestartExoTool(): ToolInstance {
     definition: {
       name: "rebuild_and_restart_exo",
       description:
-        "Validate and rebuild Exo, then restart its guardian-managed scheduler and adapter services. This narrow operation is asynchronous: it durably records an update, lets the current turn finish, and returns an update id. The existing guardian reboot notice wakes active adapter conversations after a successful restart.",
+        "Validate and rebuild Exo, then restart its guardian-managed scheduler and adapter services. This narrow operation is asynchronous: it durably records an update, lets the current turn finish, and returns an update id. Pass reason as a short free-text note describing the change being activated so the update record is self-describing. On completion, the outcome is written to .exo/guardian-updates/<id>.json and recorded in this conversation's event log as rebuild_and_restart_exo (visible via list_conversation_events). The existing guardian reboot notice wakes active adapter conversations after a successful restart.",
       parameters: {
         type: "object",
         additionalProperties: false,
-        properties: {},
-        required: [],
+        properties: {
+          reason: {
+            type: ["string", "null"],
+            description:
+              "Short free-text note describing why this rebuild was requested, for example the change being activated. Prefer a concrete description over null.",
+          },
+        },
+        required: ["reason"],
       },
     },
     handler: {
-      execute() {
-        return Promise.resolve(queueRebuildAndRestart());
+      execute(args, execution) {
+        return Promise.resolve(
+          queueRebuildAndRestart(parseRebuildReason(args), execution),
+        );
       },
     },
   };
 }
 
-function queueRebuildAndRestart(): ToolResult {
+export function parseRebuildReason(args: JsonObject): string | null {
+  if (!("reason" in args) || args.reason === null) {
+    return null;
+  }
+  if (typeof args.reason !== "string") {
+    throw new Error("rebuild_and_restart_exo reason must be a string or null");
+  }
+  const reason = args.reason.trim();
+  return reason.length > 0 ? reason : null;
+}
+
+function queueRebuildAndRestart(
+  reason: string | null,
+  execution: ToolExecutionContext,
+): ToolResult {
+  const { agent, conversation } = execution.context.exoharness.current;
   const updateId = randomUUID();
   const outcomePath = join(UPDATE_DIR, `${updateId}.json`);
   mkdirSync(UPDATE_DIR, { recursive: true });
@@ -61,17 +91,26 @@ function queueRebuildAndRestart(): ToolResult {
     operation: "rebuild_and_restart_exo",
     status: "queued",
     requestedAt: new Date().toISOString(),
+    reason,
+    agentId: agent.record.id,
+    agentSlug: agent.record.slug,
+    conversationId: conversation.record.id,
+    conversationSlug: conversation.record.slug,
   });
   const result = runGuardianDeferredWithOutcome(
     ["restart-all", "--build"],
     updateId,
     outcomePath,
+    reason,
   );
   return {
     ok: true,
     updateId,
     status: "queued",
     deferred: true,
+    reason,
+    agentId: agent.record.id,
+    conversationId: conversation.record.id,
     pid: result.pid,
     delaySeconds: DEFERRED_RESTART_DELAY_SECONDS,
     outcomePath,
@@ -84,6 +123,7 @@ function runGuardianDeferredWithOutcome(
   args: string[],
   updateId: string,
   outcomePath: string,
+  reason: string | null,
 ): {
   command: string[];
   logPath: string;
@@ -93,14 +133,14 @@ function runGuardianDeferredWithOutcome(
   const logFd = openSync(DEFERRED_LOG_PATH, "a");
   const command = [GUARDIAN_SCRIPT, ...args];
   const child = spawn(
-    "bash",
+    DEFERRED_SCRIPT,
     [
-      "-lc",
-      'delay="$1"; record="$2"; update_id="$3"; shift 3; printf "\\n[%s] queued rebuild update %s:" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$update_id"; for arg in "$@"; do printf " %q" "$arg"; done; printf "\\n"; sleep "$delay"; set +e; "$@"; code=$?; completed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; if [ "$code" -eq 0 ]; then status=succeeded; else status=failed; fi; tmp="${record}.tmp.$$"; printf \'{"updateId":"%s","operation":"rebuild_and_restart_exo","status":"%s","exitCode":%s,"completedAt":"%s"}\\n\' "$update_id" "$status" "$code" "$completed_at" >"$tmp"; mv "$tmp" "$record"; exit "$code"',
-      "exo-rebuild-and-restart-deferred",
       String(DEFERRED_RESTART_DELAY_SECONDS),
       outcomePath,
       updateId,
+      JSON.stringify(reason),
+      EXO_BIN,
+      ENV_FILE,
       ...command,
     ],
     {

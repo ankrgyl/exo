@@ -116,7 +116,10 @@ rebuild_and_restart_exo
 ```
 
 `rebuild_and_restart_exo` uses the guarded host service rather than accepting
-arbitrary deployment commands.
+arbitrary deployment commands. Pass a short `reason` so the durable update
+record under `.exo/guardian-updates/` is self-describing. When the deferred
+job finishes, the same outcome is appended to the requesting conversation's
+event log as a `rebuild_and_restart_exo` host event (including failures).
 
 The practical profile adds the current scheduler and adapter tools plus the
 shipped sandbox recovery, introspection, memory, todo, skill, and web tools.

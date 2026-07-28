@@ -2,6 +2,7 @@ import { HarnessToolRegistry, type TurnContext } from "@exo/harness";
 import { describe, expect, it } from "vitest";
 
 import {
+  parseRebuildReason,
   rebuildAndRestartExoTool,
   registerGuardianTools,
 } from "./guardian-tools";
@@ -17,7 +18,7 @@ describe("guardian tools", () => {
     ]);
   });
 
-  it("defines the narrow asynchronous rebuild facade", () => {
+  it("defines the narrow asynchronous rebuild facade with a reason", () => {
     const tool = rebuildAndRestartExoTool();
 
     expect(tool.source).toBe("built_in");
@@ -25,8 +26,25 @@ describe("guardian tools", () => {
     expect(tool.definition.parameters).toEqual({
       type: "object",
       additionalProperties: false,
-      properties: {},
-      required: [],
+      properties: {
+        reason: {
+          type: ["string", "null"],
+          description:
+            "Short free-text note describing why this rebuild was requested, for example the change being activated. Prefer a concrete description over null.",
+        },
+      },
+      required: ["reason"],
     });
+  });
+
+  it("parses rebuild reasons for the durable update record", () => {
+    expect(parseRebuildReason({ reason: "Add webhook adapter" })).toBe(
+      "Add webhook adapter",
+    );
+    expect(parseRebuildReason({ reason: "  " })).toBeNull();
+    expect(parseRebuildReason({ reason: null })).toBeNull();
+    expect(() => parseRebuildReason({ reason: 12 })).toThrow(
+      "rebuild_and_restart_exo reason must be a string or null",
+    );
   });
 });
