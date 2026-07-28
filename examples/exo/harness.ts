@@ -14,6 +14,7 @@ import {
   type TurnContext,
 } from "@exo/harness";
 
+import { registerEditTools } from "./edit-tools";
 import { registerSchedulerTools } from "./scheduler-tools";
 import { registerSandboxTools } from "./sandbox-tools";
 import { registerGuardianTools } from "./guardian-tools";
@@ -54,8 +55,10 @@ export default defineHarness({
 export async function registerExoTools(
   tools: HarnessToolRegistry,
   context: TurnContext,
+  model: string,
 ): Promise<void> {
   registerBuiltInTools(tools, context, builtInToolNames(context));
+  registerEditTools(tools, model);
   registerSchedulerTools(tools);
   registerAdapterTools(tools);
   registerIntrospectionTools(tools);

@@ -25,9 +25,12 @@ import { resolveLlmBinding } from "./shared";
 
 export interface ResponsesTurnLoopOptions {
   instructions?: (context: TurnContext) => Message[] | Promise<Message[]>;
+  // registerTools receives the upstream model id from the resolved llm
+  // binding, not the local binding name.
   registerTools?: (
     tools: HarnessToolRegistry,
     context: TurnContext,
+    model: string,
   ) => Promise<void> | void;
 }
 
@@ -113,7 +116,7 @@ async function runResponsesTurnLoop(
       ? createToolRegistry(context)
       : await createDefaultToolRegistry(context);
     if (options.registerTools) {
-      await options.registerTools(tools, context);
+      await options.registerTools(tools, context, model);
     }
     const messages = await materializePromptMessages(
       conversation,
