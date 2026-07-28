@@ -2463,6 +2463,7 @@ dependencies = [
  "futures",
  "lingua",
  "ratatui",
+ "reqwest",
  "rustyline",
  "serde",
  "serde_json",
