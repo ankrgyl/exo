@@ -651,6 +651,7 @@ async fn register_test_model(exoharness: &dyn ExoHarness) {
             model: "gpt-5.4".to_string(),
             base_url: None,
             secret_id: Some(secret_id),
+            provider: None,
         })
         .await
         .expect("test model should register");

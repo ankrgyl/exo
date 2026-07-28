@@ -980,6 +980,7 @@ impl ExoHarness for BasicExoHarness {
     }
 
     async fn put_binding(&self, binding: Binding) -> Result<BindingId> {
+        binding.validate()?;
         let _guard = self.inner.write_lock.lock().await;
         let id = Uuid7::now();
         let record = stored_binding(id, binding);
@@ -1293,6 +1294,7 @@ impl AgentHandle for BasicAgentHandle {
     }
 
     async fn put_binding(&self, binding: Binding) -> Result<BindingId> {
+        binding.validate()?;
         let _guard = self.harness.inner.write_lock.lock().await;
         let id = Uuid7::now();
         let record = stored_binding(id, binding);
@@ -2532,6 +2534,7 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn put_binding(&self, binding: Binding) -> Result<BindingId> {
+        binding.validate()?;
         let _guard = self.harness.inner.write_lock.lock().await;
         let id = Uuid7::now();
         let record = stored_binding(id, binding);
@@ -4146,6 +4149,7 @@ fn binding_type(binding: &Binding) -> BindingType {
         Binding::Env { .. } => BindingType::Env,
         Binding::Mcp { .. } => BindingType::Mcp,
         Binding::Llm { .. } => BindingType::Llm,
+        Binding::Provider { .. } => BindingType::Provider,
         Binding::Sandbox { .. } => BindingType::Sandbox,
     }
 }
@@ -4155,6 +4159,7 @@ fn binding_name(binding: &Binding) -> &str {
         Binding::Env { name, .. }
         | Binding::Mcp { name, .. }
         | Binding::Llm { name, .. }
+        | Binding::Provider { name, .. }
         | Binding::Sandbox { name, .. } => name,
     }
 }

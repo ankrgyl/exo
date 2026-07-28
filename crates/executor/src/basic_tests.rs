@@ -1287,6 +1287,7 @@ fn test_model_binding() -> Binding {
         model: "test-model".to_string(),
         base_url: None,
         secret_id: Some(Uuid7::now()),
+        provider: None,
     }
 }
 

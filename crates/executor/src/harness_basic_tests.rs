@@ -240,6 +240,7 @@ async fn usage_record_is_persisted_with_computed_cost() {
             model: "claude-sonnet-4-6".to_string(),
             base_url: None,
             secret_id: Some(secret_id),
+            provider: None,
         })
         .await
         .expect("binding should register");
@@ -387,6 +388,7 @@ async fn usage_record_with_anthropic_cache_hits() {
             model: "claude-sonnet-4-6".to_string(),
             base_url: None,
             secret_id: Some(secret_id),
+            provider: None,
         })
         .await
         .expect("binding should register");
@@ -509,6 +511,7 @@ async fn usage_record_with_openai_inclusive_accounting() {
             model: "gpt-4o-mini".to_string(),
             base_url: None,
             secret_id: Some(secret_id),
+            provider: None,
         })
         .await
         .expect("binding should register");
@@ -1495,6 +1498,7 @@ async fn register_test_models(exoharness: &dyn ExoHarness) {
                 model: model.to_string(),
                 base_url: None,
                 secret_id: Some(secret_id),
+                provider: None,
             })
             .await
             .expect("test model should register");

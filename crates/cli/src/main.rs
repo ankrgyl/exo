@@ -2033,7 +2033,7 @@ async fn main() -> Result<()> {
             ModelCommands::List => {
                 let models = list_model_bindings(harness.exoharness_handle().as_ref()).await?;
                 print_table(
-                    &["MODEL", "UPSTREAM_MODEL", "SECRET", "BASE_URL"],
+                    &["MODEL", "UPSTREAM_MODEL", "SECRET", "BASE_URL", "PROVIDER"],
                     models
                         .into_iter()
                         .map(|model| {
@@ -2042,6 +2042,7 @@ async fn main() -> Result<()> {
                                 model.model,
                                 model.secret_name.unwrap_or_else(|| "none".to_string()),
                                 model.base_url.unwrap_or_else(|| "default".to_string()),
+                                model.provider.unwrap_or_else(|| "none".to_string()),
                             ]
                         })
                         .collect(),
@@ -2064,6 +2065,7 @@ async fn main() -> Result<()> {
                         model: upstream_model,
                         base_url,
                         secret_id: Some(secret_id),
+                        provider: None,
                     })
                     .await?;
                 println!("registered model {} ({})", name, id);
@@ -2629,6 +2631,7 @@ struct RegisteredModel {
     model: String,
     secret_name: Option<String>,
     base_url: Option<String>,
+    provider: Option<String>,
 }
 
 async fn list_model_bindings(exoharness: &dyn ExoHarness) -> Result<Vec<RegisteredModel>> {
@@ -2640,6 +2643,7 @@ async fn list_model_bindings(exoharness: &dyn ExoHarness) -> Result<Vec<Register
             model,
             base_url,
             secret_id,
+            provider,
         } = metadata.binding
         else {
             continue;
@@ -2655,6 +2659,7 @@ async fn list_model_bindings(exoharness: &dyn ExoHarness) -> Result<Vec<Register
             model,
             secret_name,
             base_url,
+            provider,
         });
     }
     let mut deduped = Vec::<RegisteredModel>::new();
