@@ -11,9 +11,107 @@ use tracing::info;
 use crate::{
     AddEventsRequest, BeginTurnRequest, Binding, EventData, EventKind, EventQuery,
     EventQueryDirection, ExoHarness, ForkConversationRequest, ListConversationsRequest,
-    ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest, NewConversationRequest,
-    SandboxCommand, SandboxRequest, Uuid7, WriteArtifactRequest,
+    ListThreadsRequest, ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest,
+    NewConversationRequest, NewThreadRequest, SandboxCommand, SandboxRequest, ThreadHandle, Uuid7,
+    WriteArtifactRequest,
 };
+
+pub async fn supports_thread_api_and_conversation_compatibility(harness: Arc<dyn ExoHarness>) {
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: unique_slug("agent"),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent should be created");
+    let thread: Arc<dyn ThreadHandle> = agent
+        .new_thread(NewThreadRequest {
+            slug: Some(unique_slug("thread")),
+            name: Some("Thread".to_string()),
+        })
+        .await
+        .expect("thread should be created");
+    let thread_id = thread.record().id;
+    let created = thread
+        .get_events(None)
+        .await
+        .expect("thread events should load")
+        .events
+        .into_iter()
+        .find(|event| matches!(event.data, EventData::ThreadCreated { .. }))
+        .expect("thread creation event should use the compatible event schema");
+    assert_eq!(created.thread_id, thread_id);
+    assert_eq!(created.data.kind(), EventKind::THREAD_CREATED);
+    for kind in [EventKind::THREAD_CREATED, EventKind::CONVERSATION_CREATED] {
+        let events = thread
+            .get_events(Some(EventQuery {
+                types: Some(vec![kind]),
+                ..Default::default()
+            }))
+            .await
+            .expect("thread event filter should succeed")
+            .events;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.data, EventData::ThreadCreated { .. }))
+        );
+    }
+
+    assert!(
+        agent
+            .get_conversation(&thread_id)
+            .await
+            .expect("legacy get conversation should succeed")
+            .is_some()
+    );
+    assert!(
+        agent
+            .list_conversations(ListConversationsRequest::default())
+            .await
+            .expect("legacy list conversations should succeed")
+            .conversations
+            .iter()
+            .any(|candidate| candidate.record().id == thread_id)
+    );
+
+    let conversation = agent
+        .new_conversation(NewConversationRequest {
+            slug: Some(unique_slug("conversation")),
+            name: Some("Conversation".to_string()),
+        })
+        .await
+        .expect("legacy conversation should be created");
+    assert!(
+        agent
+            .get_thread(&conversation.record().id)
+            .await
+            .expect("get thread should read a legacy conversation")
+            .is_some()
+    );
+    assert!(
+        agent
+            .list_threads(ListThreadsRequest::default())
+            .await
+            .expect("list threads should read legacy conversations")
+            .threads
+            .iter()
+            .any(|candidate| candidate.record().id == conversation.record().id)
+    );
+
+    assert!(
+        agent
+            .delete_thread(&thread_id)
+            .await
+            .expect("delete thread should succeed")
+    );
+    assert!(
+        agent
+            .delete_conversation(&conversation.record().id)
+            .await
+            .expect("legacy delete conversation should succeed")
+    );
+}
 
 pub async fn supports_agent_and_conversation_crud(harness: Arc<dyn ExoHarness>) {
     let agent_slug = unique_slug("agent");
@@ -40,7 +138,7 @@ pub async fn supports_agent_and_conversation_crud(harness: Arc<dyn ExoHarness>) 
     assert!(
         events
             .iter()
-            .any(|event| matches!(event.data, EventData::ConversationCreated { .. }))
+            .any(|event| matches!(event.data, EventData::ThreadCreated { .. }))
     );
 
     assert!(
@@ -363,7 +461,7 @@ pub async fn conversation_scope_overrides_agent_scope_and_fork_copies_bindings(
     assert!(
         events
             .iter()
-            .any(|event| matches!(event.data, EventData::ConversationForked { .. }))
+            .any(|event| matches!(event.data, EventData::ThreadForked { .. }))
     );
 }
 

@@ -1011,7 +1011,7 @@ impl ConversationHandle for FakeConversationHandle {
             let created_at = event_id.timestamp().expect("uuid7 timestamp");
             let event = Event {
                 id: event_id,
-                conversation_id: state.conversation.record.id,
+                thread_id: state.conversation.record.id,
                 session_id: request.session_id,
                 turn_id: request.turn_id,
                 created_at,
@@ -1244,7 +1244,7 @@ fn append_event(
     state.conversation.record.latest_event_id = Some(event_id);
     state.conversation.events.push(Event {
         id: event_id,
-        conversation_id,
+        thread_id: conversation_id,
         session_id: Some(session_id),
         turn_id,
         created_at,
