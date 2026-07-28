@@ -24,6 +24,10 @@ They are deliberately separate from tools:
 - Inbound adapter events wake a conversation by creating a normal turn.
 - Outbound sends are **explicit tool calls**, never implicit model output.
 
+For how the adapter runner supervises workers, drains/restarts, and how
+create → enable → disable → delete interacts with conversations, see
+[Lifecycles → Adapters](./lifecycles#adapter-lifecycle).
+
 ## Workers
 
 Adapters run as supervised worker processes speaking JSONL over
