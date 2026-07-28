@@ -67,11 +67,22 @@ export type Binding =
       model: string;
       baseUrl?: string | null;
       secretId?: string | null;
+      provider?: string | null;
+    }
+  | {
+      type: "provider";
+      name: string;
+      baseUrl: string;
+      secretId?: string | null;
+      format: "chat-completions" | "responses" | "anthropic";
+      auth?: "bearer" | "x-api-key" | "none" | null;
+      models: string[];
+      costUsagePath?: string[] | null;
     };
 
 export interface BindingRecord {
   id: string;
-  type: "env" | "mcp" | "llm";
+  type: "env" | "mcp" | "llm" | "provider";
   name: string;
   createdAt: string;
   binding: Binding;

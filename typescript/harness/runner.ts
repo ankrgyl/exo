@@ -139,11 +139,22 @@ type RawBinding =
       model: string;
       base_url?: string | null;
       secret_id?: string | null;
+      provider?: string | null;
+    }
+  | {
+      type: "provider";
+      name: string;
+      base_url: string;
+      secret_id?: string | null;
+      format: "chat-completions" | "responses" | "anthropic";
+      auth?: "bearer" | "x-api-key" | "none" | null;
+      models?: string[] | null;
+      cost_usage_path?: string[] | null;
     };
 
 interface RawBindingRecord {
   id: string;
-  type: "env" | "mcp" | "llm";
+  type: "env" | "mcp" | "llm" | "provider";
   name: string;
   created_at: string;
   binding: RawBinding;
@@ -954,12 +965,25 @@ function toBinding(raw: RawBinding): Binding {
       secretId: raw.secret_id ?? null,
     };
   }
+  if (raw.type === "provider") {
+    return {
+      type: "provider",
+      name: raw.name,
+      baseUrl: raw.base_url,
+      secretId: raw.secret_id ?? null,
+      format: raw.format,
+      auth: raw.auth ?? null,
+      models: raw.models ?? [],
+      costUsagePath: raw.cost_usage_path ?? null,
+    };
+  }
   return {
     type: "llm",
     name: raw.name,
     model: raw.model,
     baseUrl: raw.base_url ?? null,
     secretId: raw.secret_id ?? null,
+    provider: raw.provider ?? null,
   };
 }
 

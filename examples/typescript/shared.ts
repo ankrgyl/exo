@@ -15,6 +15,8 @@ import {
 import {
   errorMessage,
   tracedUnderParent,
+  type ProviderAuthScheme,
+  type ProviderWireFormat,
   type TraceParent,
 } from "@exo/model-runtime/responses";
 
@@ -31,6 +33,9 @@ export interface ResolvedLlmBinding {
   model: string;
   apiKey?: string;
   baseUrl?: string | null;
+  format?: ProviderWireFormat | null;
+  auth?: ProviderAuthScheme | null;
+  costUsagePath?: string[] | null;
 }
 
 export class AsyncQueue<T> {
@@ -230,9 +235,8 @@ export async function resolveLlmBinding(
   context: TurnContext,
 ): Promise<ResolvedLlmBinding> {
   const name = context.agentConfig.model;
-  const metadata = (
-    await context.exoharness.current.conversation.listBindings()
-  )
+  const records = await context.exoharness.current.conversation.listBindings();
+  const metadata = records
     .filter((binding) => binding.type === "llm")
     .filter((binding) => binding.name === name)
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
@@ -247,11 +251,42 @@ export async function resolveLlmBinding(
   if (!binding || binding.type !== "llm") {
     throw new Error(`registered model binding disappeared: ${name}`);
   }
-  let apiKey: string | undefined;
-  if (binding.secretId) {
-    const secret = await context.exoharness.current.conversation.getSecret(
-      binding.secretId,
+  // A referenced provider record supplies base URL, credential, and wire
+  // format; explicit values on the model binding win, mirroring the Rust
+  // executor's resolution.
+  let baseUrl = binding.baseUrl ?? null;
+  let secretId = binding.secretId ?? null;
+  let format: ProviderWireFormat | null = null;
+  let auth: ProviderAuthScheme | null = null;
+  let costUsagePath: string[] | null = null;
+  if (binding.provider) {
+    const providerMetadata = records
+      .filter((record) => record.type === "provider")
+      .filter((record) => record.name === binding.provider)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+    if (!providerMetadata) {
+      throw new Error(
+        `model ${name} references provider ${binding.provider}, which is not registered`,
+      );
+    }
+    const provider = await context.exoharness.current.conversation.getBinding(
+      providerMetadata.id,
     );
+    if (!provider || provider.type !== "provider") {
+      throw new Error(
+        `registered provider binding disappeared: ${binding.provider}`,
+      );
+    }
+    baseUrl = baseUrl ?? provider.baseUrl;
+    secretId = secretId ?? provider.secretId ?? null;
+    format = provider.format;
+    auth = provider.auth ?? null;
+    costUsagePath = provider.costUsagePath ?? null;
+  }
+  let apiKey: string | undefined;
+  if (secretId) {
+    const secret =
+      await context.exoharness.current.conversation.getSecret(secretId);
     if (!secret) {
       throw new Error(`model secret does not exist for ${name}`);
     }
@@ -264,7 +299,10 @@ export async function resolveLlmBinding(
     name,
     model: binding.model,
     apiKey,
-    baseUrl: binding.baseUrl ?? null,
+    baseUrl,
+    format,
+    auth,
+    costUsagePath,
   };
 }
 
