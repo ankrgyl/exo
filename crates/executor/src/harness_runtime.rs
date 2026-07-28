@@ -11,7 +11,7 @@ use braintrust_llm_router::{
     AuthConfig, ClientHeaders, ModelCatalog, ModelFlavor, ModelSpec, Router, create_provider,
 };
 use bytes::Bytes;
-use exoharness::{Result, Uuid7};
+use exoharness::{AuthScheme, Result, Uuid7, WireFormat};
 use futures::{Stream, StreamExt};
 use lingua::processing::adapter_for_format;
 use lingua::serde_json as lingua_json;
@@ -56,7 +56,11 @@ impl ModelClient for RouterModelClient {
         let route = resolve_provider_route(&router, &request.model, format)?;
         let (prepared, _router_metadata) = router.create_request(payload, format, &route).await?;
         let body = router.complete(prepared, &ClientHeaders::new()).await?;
-        let provider_cost_usd = extract_provider_cost(&body);
+        let cost_usage_path = request
+            .provider
+            .as_ref()
+            .and_then(|provider| provider.cost_usage_path.as_deref());
+        let provider_cost_usd = extract_provider_cost(&body, cost_usage_path);
         let response = lingua::response_to_universal(body)?;
         let mut model_response = normalize_model_response(response)?;
         model_response.provider_cost_usd = provider_cost_usd;
@@ -81,6 +85,10 @@ impl ModelClient for RouterModelClient {
             format,
             accumulator: UniversalResponseAccumulator::default(),
             provider_cost_usd: None,
+            cost_usage_path: request
+                .provider
+                .as_ref()
+                .and_then(|provider| provider.cost_usage_path.clone()),
         }))
     }
 }
@@ -90,6 +98,7 @@ struct RouterModelResponseStream {
     format: ProviderFormat,
     accumulator: UniversalResponseAccumulator,
     provider_cost_usd: Option<f64>,
+    cost_usage_path: Option<Vec<String>>,
 }
 
 #[async_trait]
@@ -103,7 +112,7 @@ impl ModelResponseStream for RouterModelResponseStream {
             let Some(raw) = self.raw.next().await.transpose()? else {
                 return Ok(None);
             };
-            if let Some(cost) = extract_provider_cost(&raw.data) {
+            if let Some(cost) = extract_provider_cost(&raw.data, self.cost_usage_path.as_deref()) {
                 self.provider_cost_usd = Some(cost);
             }
             match lingua::parse_stream_event(raw.data, self.format, self.format) {
@@ -141,13 +150,87 @@ fn resolve_runtime_config(
     request: &ModelRequest,
     env: &HashMap<String, String>,
 ) -> Result<ResolvedRuntimeConfig> {
-    if is_anthropic_model(&request.model) {
+    if let Some(provider) = &request.provider {
+        resolve_declared_config(provider, request)
+    } else if is_anthropic_model(&request.model) {
         resolve_anthropic_config(request, env)
     } else if is_openrouter_request(request) {
         resolve_openrouter_config(request, env)
     } else {
         resolve_openai_config(request, env)
     }
+}
+
+/// A registered provider record (`Binding::Provider`) declares its wire
+/// format, auth scheme, and endpoint as data, so no name/base-URL detection
+/// heuristics apply. The credential comes from the provider's secret via the
+/// binding resolution — there is no env-var fallback for registered providers.
+fn resolve_declared_config(
+    provider: &crate::ModelRequestProvider,
+    request: &ModelRequest,
+) -> Result<ResolvedRuntimeConfig> {
+    let endpoint = request
+        .base_url
+        .clone()
+        .map(|raw| {
+            // Base-URL contract: provider records store the provider root
+            // (e.g. https://api.opper.ai/v3/compat) and each client appends
+            // its own path — the Anthropic TS SDK adds `/v1/messages` itself,
+            // while the Rust provider joins `messages` onto the endpoint. So
+            // extend the root with `v1/` here (the trailing slash makes
+            // `Url::join` append rather than replace the last segment).
+            // Registration rejects `/v1`-suffixed roots for this format.
+            let raw = if matches!(provider.format, WireFormat::Anthropic) {
+                format!("{}/v1/", raw.trim_end_matches('/'))
+            } else {
+                raw
+            };
+            Url::parse(&raw)
+        })
+        .transpose()?;
+    let (provider_kind, format) = match provider.format {
+        WireFormat::ChatCompletions => ("openai", ProviderFormat::ChatCompletions),
+        WireFormat::Responses => ("openai", ProviderFormat::Responses),
+        WireFormat::Anthropic => ("anthropic", ProviderFormat::Anthropic),
+    };
+    // Auth scheme and wire format are independent properties: a gateway can
+    // speak the Anthropic format but authenticate with `Bearer`. Absent an
+    // explicit scheme, derive the format's native one.
+    let scheme = provider.auth.unwrap_or(match provider.format {
+        WireFormat::Anthropic => AuthScheme::XApiKey,
+        _ => AuthScheme::Bearer,
+    });
+    let auth = match scheme {
+        AuthScheme::None => AuthConfig::Custom {
+            headers: HashMap::new(),
+        },
+        AuthScheme::Bearer | AuthScheme::XApiKey => {
+            let key = request.api_key.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "model request is missing an API key (provider {} has no secret)",
+                    provider.name
+                )
+            })?;
+            let (header, prefix) = match scheme {
+                AuthScheme::Bearer => ("authorization", Some("Bearer".to_string())),
+                _ => ("x-api-key", None),
+            };
+            AuthConfig::ApiKey {
+                key,
+                header: Some(header.to_string()),
+                prefix,
+            }
+        }
+    };
+    Ok(ResolvedRuntimeConfig {
+        provider_alias: provider.name.clone(),
+        provider_kind: provider_kind.to_string(),
+        format,
+        endpoint,
+        endpoint_template: None,
+        metadata: HashMap::new(),
+        auth,
+    })
 }
 
 /// OpenRouter is an OpenAI-compatible aggregator selected by its base URL (it
@@ -404,6 +487,7 @@ mod tests {
             model: "gpt-5.4".to_string(),
             api_key: None,
             base_url: None,
+            provider: None,
             messages: Vec::new(),
             tools: Vec::new(),
             max_output_tokens: None,
@@ -470,13 +554,215 @@ mod tests {
     }
 
     #[test]
+    fn declared_provider_format_overrides_detection_heuristics() {
+        let mut request = model_request();
+        // A model name that would otherwise route to the native Anthropic path.
+        request.model = "claude-sonnet-4-6".to_string();
+        request.api_key = Some("op-test".to_string());
+        request.base_url = Some("https://api.opper.ai/v3/compat".to_string());
+        request.provider = Some(crate::ModelRequestProvider {
+            name: "opper".to_string(),
+            format: WireFormat::ChatCompletions,
+            auth: None,
+            cost_usage_path: None,
+        });
+
+        let config = resolve_runtime_config(&request, &HashMap::new()).unwrap();
+
+        assert_eq!(config.provider_alias, "opper");
+        assert_eq!(config.provider_kind, "openai");
+        assert_eq!(config.format, ProviderFormat::ChatCompletions);
+        assert!(matches!(
+            config.auth,
+            AuthConfig::ApiKey { ref header, ref prefix, .. }
+                if header.as_deref() == Some("authorization")
+                    && prefix.as_deref() == Some("Bearer")
+        ));
+    }
+
+    #[test]
+    fn declared_anthropic_format_uses_native_auth() {
+        let mut request = model_request();
+        request.api_key = Some("sk-ant-test".to_string());
+        request.base_url = Some("https://anthropic.example/v1".to_string());
+        request.provider = Some(crate::ModelRequestProvider {
+            name: "anthropic-proxy".to_string(),
+            format: WireFormat::Anthropic,
+            auth: None,
+            cost_usage_path: None,
+        });
+
+        let config = resolve_runtime_config(&request, &HashMap::new()).unwrap();
+
+        assert_eq!(config.provider_kind, "anthropic");
+        assert_eq!(config.format, ProviderFormat::Anthropic);
+        assert!(matches!(
+            config.auth,
+            AuthConfig::ApiKey { ref header, ref prefix, .. }
+                if header.as_deref() == Some("x-api-key") && prefix.is_none()
+        ));
+    }
+
+    #[test]
+    fn declared_auth_scheme_is_independent_of_wire_format() {
+        // Anthropic wire format with Bearer auth — e.g. Opper's
+        // Anthropic-compatible endpoint, which is Bearer-only.
+        let mut request = model_request();
+        request.api_key = Some("op-test".to_string());
+        request.base_url = Some("https://api.opper.ai/v3/compat".to_string());
+        request.provider = Some(crate::ModelRequestProvider {
+            name: "opper".to_string(),
+            format: WireFormat::Anthropic,
+            auth: Some(AuthScheme::Bearer),
+            cost_usage_path: None,
+        });
+
+        let config = resolve_runtime_config(&request, &HashMap::new()).unwrap();
+
+        assert_eq!(config.provider_kind, "anthropic");
+        assert_eq!(config.format, ProviderFormat::Anthropic);
+        assert!(matches!(
+            config.auth,
+            AuthConfig::ApiKey { ref header, ref prefix, .. }
+                if header.as_deref() == Some("authorization")
+                    && prefix.as_deref() == Some("Bearer")
+        ));
+    }
+
+    #[test]
+    fn declared_anthropic_endpoint_extends_the_provider_root_with_v1() {
+        // The record stores the provider root (registration rejects a
+        // /v1-suffixed value); trailing slash or not must not matter.
+        for base in [
+            "https://api.opper.ai/v3/compat",
+            "https://api.opper.ai/v3/compat/",
+        ] {
+            let mut request = model_request();
+            request.api_key = Some("op-test".to_string());
+            request.base_url = Some(base.to_string());
+            request.provider = Some(crate::ModelRequestProvider {
+                name: "opper".to_string(),
+                format: WireFormat::Anthropic,
+                auth: Some(AuthScheme::Bearer),
+                cost_usage_path: None,
+            });
+
+            let config = resolve_runtime_config(&request, &HashMap::new()).unwrap();
+
+            let endpoint = config.endpoint.expect("endpoint should be set");
+            assert_eq!(
+                endpoint.join("messages").unwrap().as_str(),
+                "https://api.opper.ai/v3/compat/v1/messages",
+                "base {base}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_auth_none_sends_no_credential_and_needs_no_key() {
+        let mut request = model_request();
+        request.base_url = Some("http://localhost:11434/v1".to_string());
+        request.provider = Some(crate::ModelRequestProvider {
+            name: "local".to_string(),
+            format: WireFormat::ChatCompletions,
+            auth: Some(AuthScheme::None),
+            cost_usage_path: None,
+        });
+
+        let config = resolve_runtime_config(&request, &HashMap::new()).unwrap();
+
+        assert!(matches!(
+            config.auth,
+            AuthConfig::Custom { ref headers } if headers.is_empty()
+        ));
+    }
+
+    #[test]
+    fn declared_provider_without_key_is_an_error() {
+        let mut request = model_request();
+        request.provider = Some(crate::ModelRequestProvider {
+            name: "gateway".to_string(),
+            format: WireFormat::ChatCompletions,
+            auth: None,
+            cost_usage_path: None,
+        });
+
+        assert!(resolve_runtime_config(&request, &HashMap::new()).is_err());
+    }
+
+    /// Live end-to-end check for the declared-provider path against a real
+    /// OpenAI-compatible gateway (Opper). Ignored by default; run with:
+    ///   OPPER_API_KEY=... cargo test -p executor --lib provider_live -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "live: requires OPPER_API_KEY and network access"]
+    async fn provider_live_declared_chat_completions_end_to_end() {
+        let key = std::env::var("OPPER_API_KEY")
+            .expect("set OPPER_API_KEY to run the live provider test");
+        let client = RouterModelClient::new(HashMap::new());
+        let request = ModelRequest {
+            model: "openai/gpt-4.1-mini".to_string(),
+            api_key: Some(key),
+            base_url: Some("https://api.opper.ai/v3/compat".to_string()),
+            provider: Some(crate::ModelRequestProvider {
+                name: "opper".to_string(),
+                format: WireFormat::ChatCompletions,
+                auth: None,
+                cost_usage_path: None,
+            }),
+            messages: vec![Message::User {
+                content: lingua::universal::UserContent::String(
+                    "Reply with exactly: provider-binding-ok".to_string(),
+                ),
+            }],
+            tools: Vec::new(),
+            max_output_tokens: Some(30),
+        };
+
+        let response = client
+            .complete(request)
+            .await
+            .expect("live completion through the declared provider should succeed");
+
+        let text = response
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant { content, .. } => Some(match content {
+                    AssistantContent::String(text) => text.clone(),
+                    AssistantContent::Array(parts) => parts
+                        .iter()
+                        .filter_map(|part| match part {
+                            AssistantContentPart::Text(text) => Some(text.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                }),
+                _ => None,
+            })
+            .collect::<String>();
+
+        assert!(
+            text.contains("provider-binding-ok"),
+            "unexpected assistant content: {text:?}"
+        );
+    }
+
+    #[test]
     fn extracts_provider_reported_cost_from_usage() {
         let body = br#"{"usage":{"prompt_tokens":16,"completion_tokens":6,"cost":0.000006}}"#;
-        assert_eq!(extract_provider_cost(body), Some(0.000006));
+        assert_eq!(extract_provider_cost(body, None), Some(0.000006));
+
+        // A provider-declared path reads nested vendor extensions (Opper).
+        let opper = br#"{"usage":{"prompt_tokens":14,"opper":{"cost":{"total":0.0000035}}}}"#;
+        let path = vec!["opper".to_string(), "cost".to_string(), "total".to_string()];
+        assert_eq!(extract_provider_cost(opper, Some(&path)), Some(0.0000035));
+        // The default path does not read the nested shape, and vice versa.
+        assert_eq!(extract_provider_cost(opper, None), None);
+        assert_eq!(extract_provider_cost(body, Some(&path)), None);
 
         // No cost field (OpenAI/Anthropic) -> None, and cheaply skipped.
         let no_cost = br#"{"usage":{"prompt_tokens":16,"completion_tokens":6}}"#;
-        assert_eq!(extract_provider_cost(no_cost), None);
+        assert_eq!(extract_provider_cost(no_cost, None), None);
     }
 
     #[test]
@@ -576,14 +862,35 @@ fn serialize_request(format: ProviderFormat, request: &UniversalRequest) -> Resu
 /// request in `usage.cost`. lingua's `UniversalUsage` doesn't carry that field,
 /// so we read it straight off the raw response/stream JSON. Returns `None` when
 /// absent (the common case — OpenAI and Anthropic don't send it).
-fn extract_provider_cost(data: &[u8]) -> Option<f64> {
-    // Cheap guard so we don't JSON-parse every streamed content chunk; only the
-    // final usage chunk carries a cost field.
-    if !data.windows(6).any(|window| window == b"\"cost\"") {
+/// Reads the provider-reported spend from a response body. Cost is not part
+/// of the standard chat completions `usage` schema, so providers extend it in
+/// different places; `path` (from the provider record's `cost_usage_path`)
+/// selects the location under `usage`, defaulting to OpenRouter-style
+/// top-level `usage.cost`.
+fn extract_provider_cost(data: &[u8], path: Option<&[String]>) -> Option<f64> {
+    // Cheap guard so we don't JSON-parse every streamed content chunk; only
+    // the final usage chunk carries the cost field.
+    let last = path
+        .and_then(|path| path.last().map(String::as_str))
+        .unwrap_or("cost");
+    let needle = format!("\"{last}\"");
+    if !data
+        .windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+    {
         return None;
     }
     let value: lingua_json::Value = lingua_json::from_slice(data).ok()?;
-    value.get("usage")?.get("cost")?.as_f64()
+    let mut node = value.get("usage")?;
+    match path {
+        Some(path) => {
+            for segment in path {
+                node = node.get(segment)?;
+            }
+        }
+        None => node = node.get("cost")?,
+    }
+    node.as_f64()
 }
 
 fn normalize_model_response(response: UniversalResponse) -> Result<ModelResponse> {

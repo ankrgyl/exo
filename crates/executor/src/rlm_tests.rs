@@ -656,3 +656,196 @@ async fn register_test_model(exoharness: &dyn ExoHarness) {
         .await
         .expect("test model should register");
 }
+
+/// Registers a provider record plus a model binding routing through it. The
+/// model binding carries no base_url or secret of its own, so both must come
+/// from the provider record at resolution time.
+async fn register_test_provider_model(exoharness: &dyn ExoHarness) {
+    let secret_id = exoharness
+        .put_secret(PutSecretRequest {
+            name: "gateway-key".to_string(),
+            secret: Secret::Key {
+                value: "gateway-secret".to_string(),
+            },
+        })
+        .await
+        .expect("provider secret should register");
+
+    exoharness
+        .put_binding(Binding::Provider {
+            name: "gateway".to_string(),
+            base_url: "https://gateway.example/v1".to_string(),
+            secret_id: Some(secret_id),
+            format: exoharness::WireFormat::ChatCompletions,
+            auth: None,
+            models: vec!["vendor/model-a".to_string(), "vendor/model-b".to_string()],
+            cost_usage_path: None,
+        })
+        .await
+        .expect("provider should register");
+
+    exoharness
+        .put_binding(Binding::Llm {
+            name: "gpt-5.4".to_string(),
+            model: "vendor/model-a".to_string(),
+            base_url: None,
+            secret_id: None,
+            provider: Some("gateway".to_string()),
+        })
+        .await
+        .expect("provider-backed model should register");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn model_binding_overrides_win_over_provider_record_values() {
+    let tempdir = TempDir::new().expect("tempdir should exist");
+    let exoharness = Arc::new(
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
+            .await
+            .expect("basic exoharness should initialize"),
+    ) as Arc<dyn ExoHarness>;
+    let model = Arc::new(FakeModelClient::new(vec![ModelResponse {
+        provider_cost_usd: None,
+        response_id: Some(Uuid7::now()),
+        messages: vec![assistant_message("FINAL(done)")],
+        tool_calls: Vec::new(),
+        usage: None,
+        model: None,
+        ttft: None,
+        duration: None,
+    }]));
+    let harness = RlmHarness::new(exoharness, model.clone());
+    let handle = harness.exoharness_handle();
+    register_test_provider_model(handle.as_ref()).await;
+
+    // Re-register the model binding with its own secret and base URL; both
+    // must win over the provider record's values while the provider's wire
+    // format still applies.
+    let own_secret_id = handle
+        .put_secret(PutSecretRequest {
+            name: "own-key".to_string(),
+            secret: Secret::Key {
+                value: "own-secret".to_string(),
+            },
+        })
+        .await
+        .expect("own secret should register");
+    handle
+        .put_binding(Binding::Llm {
+            name: "gpt-5.4".to_string(),
+            model: "vendor/model-b".to_string(),
+            base_url: Some("https://override.example/v1".to_string()),
+            secret_id: Some(own_secret_id),
+            provider: Some("gateway".to_string()),
+        })
+        .await
+        .expect("override binding should register");
+
+    let agent = harness
+        .create_agent(CreateAgentRequest {
+            slug: "demo".to_string(),
+            name: Some("Demo".to_string()),
+            harness: crate::AgentHarnessKind::Rlm,
+            typescript: None,
+            enable_agent_tool_creation: true,
+            sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
+            sandbox_scope: None,
+            enable_networking: false,
+            model: "gpt-5.4".to_string(),
+            max_output_tokens: Some(512),
+            max_tool_round_trips: Some(4),
+            braintrust: None,
+        })
+        .await
+        .expect("agent should be created");
+    let conversation = agent
+        .create_conversation(CreateConversationRequest::default())
+        .await
+        .expect("conversation should be created");
+
+    conversation
+        .send(SendRequest {
+            input: vec![user_message("hello")],
+            session_id: None,
+        })
+        .await
+        .expect("send should succeed");
+
+    let requests = model.observed_requests();
+    assert!(!requests.is_empty());
+    let request = &requests[0];
+    assert_eq!(request.api_key.as_deref(), Some("own-secret"));
+    assert_eq!(
+        request.base_url.as_deref(),
+        Some("https://override.example/v1")
+    );
+    let provider = request.provider.as_ref().expect("provider should be set");
+    assert_eq!(provider.format, exoharness::WireFormat::ChatCompletions);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn provider_backed_model_resolves_base_url_key_and_format_from_record() {
+    let tempdir = TempDir::new().expect("tempdir should exist");
+    let exoharness = Arc::new(
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
+            .await
+            .expect("basic exoharness should initialize"),
+    ) as Arc<dyn ExoHarness>;
+    let model = Arc::new(FakeModelClient::new(vec![ModelResponse {
+        provider_cost_usd: None,
+        response_id: Some(Uuid7::now()),
+        messages: vec![assistant_message("FINAL(done)")],
+        tool_calls: Vec::new(),
+        usage: None,
+        model: None,
+        ttft: None,
+        duration: None,
+    }]));
+    let harness = RlmHarness::new(exoharness, model.clone());
+    register_test_provider_model(harness.exoharness_handle().as_ref()).await;
+
+    let agent = harness
+        .create_agent(CreateAgentRequest {
+            slug: "demo".to_string(),
+            name: Some("Demo".to_string()),
+            harness: crate::AgentHarnessKind::Rlm,
+            typescript: None,
+            enable_agent_tool_creation: true,
+            sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
+            sandbox_scope: None,
+            enable_networking: false,
+            model: "gpt-5.4".to_string(),
+            max_output_tokens: Some(512),
+            max_tool_round_trips: Some(4),
+            braintrust: None,
+        })
+        .await
+        .expect("agent should be created");
+    let conversation = agent
+        .create_conversation(CreateConversationRequest::default())
+        .await
+        .expect("conversation should be created");
+
+    conversation
+        .send(SendRequest {
+            input: vec![user_message("hello")],
+            session_id: None,
+        })
+        .await
+        .expect("send should succeed");
+
+    let requests = model.observed_requests();
+    assert!(!requests.is_empty());
+    let request = &requests[0];
+    assert_eq!(request.model, "vendor/model-a");
+    assert_eq!(request.api_key.as_deref(), Some("gateway-secret"));
+    assert_eq!(
+        request.base_url.as_deref(),
+        Some("https://gateway.example/v1")
+    );
+    let provider = request.provider.as_ref().expect("provider should be set");
+    assert_eq!(provider.name, "gateway");
+    assert_eq!(provider.format, exoharness::WireFormat::ChatCompletions);
+}

@@ -602,6 +602,7 @@ async fn build_model_request(
         model: model_binding.model,
         api_key: model_binding.api_key,
         base_url: model_binding.base_url,
+        provider: model_binding.provider,
         messages,
         tools: build_tool_definitions(conversation_config),
         max_output_tokens: agent_config.max_output_tokens,
