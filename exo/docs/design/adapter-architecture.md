@@ -1,289 +1,377 @@
-# Adapter Architecture
+# Exo Adapter Architecture
 
-This document is a review map for the Exo adapter changes. It focuses on the minimal architecture: what owns adapter state, what starts workers, how messages move, and which files to inspect.
+Exo adapters are host-owned long-running integrations between an Exo
+conversation and an external application. The shared worker shape supports
+agent-cli, Discord, ExoChat, IRC, Signal, Slack, and WhatsApp, and can be
+extended to other networks and custom local services.
 
-## What Adapters Are
+Adapters are deliberately not scheduled sandbox tasks. A scheduled task is a
+periodic command: it starts, runs, writes output, wakes the conversation, and
+exits. An adapter owns a live external connection: it keeps sockets open,
+responds to protocol keepalives, reconnects after errors, parses inbound
+messages, records event history, and wakes a conversation when something should
+be handled by the agent.
 
-Adapters are long-running host-managed connections to external services. They let Exo receive messages from outside the REPL and send explicit replies back out.
+## Components
 
-The adapter subsystem is intentionally separate from normal tools:
+The implementation is split across a few small executor and CLI modules:
 
-- Tools run during a model turn.
-- Adapters run continuously in a background host process.
-- Adapter events wake a conversation by creating a normal Exo turn.
-- Outbound adapter sends are explicit tool calls, not implicit model output.
+- `crates/executor/src/adapter/types.rs` defines durable adapter records,
+  source enums, generic worker config, event records, and outbound message records.
+- `crates/executor/src/adapter/store.rs` is the file-backed store under
+  `.exo/adapters`. It stores adapter records, per-adapter event history, and
+  the adapter outbox.
+- `crates/executor/src/adapter/runtime.rs` supervises enabled worker adapters,
+  writes event artifacts, sends conversation wakeups, and queues outbound
+  messages.
+- `crates/executor/src/adapter/worker.rs` implements the generic JSONL worker
+  bridge used by host-supervised sidecar adapters.
+- `exo/adapters/<type>/worker.ts` contains protocol-specific behavior for
+  agent-cli, Discord, ExoChat, IRC, Signal, Slack, and WhatsApp.
+- `crates/executor/src/adapter/tools.rs` implements the host-backed tool calls
+  used by Exo.
+- `exoharness/typescript/harness/adapter-tools.ts` exposes the model-facing Exo tools.
+- `crates/cli/src/adapters.rs` provides `exo --harness exo adapters ...`.
+- `./exo.sh` starts the adapter runner next to the scheduler.
 
-## Sources
+At a high level:
 
-Adapter records have a `source` describing where the adapter comes from:
+```mermaid
+flowchart LR
+  externalApp["External Application"] <--> worker["Adapter Worker"]
+  worker <--> runtime["Adapter Runtime"]
+  runtime --> store["Adapter Store"]
+  tools["Adapter Tools"] --> store
+  runtime --> wakeup["Conversation Wakeup"]
+  wakeup --> convo["Exo Conversation"]
+  convo --> tools
+  scheduler["Task Scheduler"] --> convo
+  tools --> outbox["Adapter Outbox"]
+  outbox --> runtime
+```
 
-Current sources:
+## Durable Records
 
-- `built_in`: core Exo adapter. IRC is the only built-in adapter.
-- `library`: reusable adapter shipped with Exo. Signal and WhatsApp are library adapters backed by shipped workers.
+Adapter state lives under `.exo/adapters`:
 
-All adapters in this PR are worker adapters: supervised processes using JSONL over stdin/stdout. Protocol-specific code should live under `exo/adapters/<adapter>/`, not in the shared Rust runtime.
+- `.exo/adapters/adapters/<adapter-id>.json` contains the `AdapterRecord`.
+- `.exo/adapters/events/<adapter-id>/*.json` contains lifecycle, inbound,
+  outbound, and error event records.
+- `.exo/adapters/outbox/<adapter-id>/*.json` contains queued outbound messages
+  waiting for the long-running adapter connection to send them.
 
-## Data Model
+The key record is `AdapterRecord`:
 
-Core records live in `crates/executor/src/adapter/types.rs`.
+- `id`: stable adapter id used by tools and scheduler report prompts.
+- `agent_id` and `conversation_id`: the owning Exo agent/conversation.
+- `name`: human-friendly adapter name.
+- `source`: `built_in` or `library`.
+- `enabled`: disabled adapters preserve history but stop receiving.
+- `config`: worker config, including adapter type, command, initialization JSON,
+  optional state dir, and optional secret environment bindings.
+- `last_connected_at_ms`, `last_error`: runtime status fields.
 
-Important types:
+## Tool Surface
 
-- `AdapterRecord`: durable adapter config and status.
-- `AdapterConfig::Worker`: worker command, initialization JSON, capabilities, optional state dir, optional secret env vars.
-- `AdapterEventRecord`: lightweight event history.
-- `AdapterOutboundMessageRecord`: queued outbound messages.
+Exo exposes these adapter tools:
 
-There is no module adapter path in this PR. If agent-authored adapters are added later, they should compile or resolve to the same worker shape.
+- `create_adapter`: create and enable an adapter.
+- `list_adapters`: list adapters for the current conversation.
+- `disable_adapter`: stop receiving while preserving history.
+- `delete_adapter`: remove adapter state and event history.
+- `send_adapter_message`: request an explicit outbound send.
 
-## Storage
+All adapter tools are conversation-scoped. Rust derives the current `agentId`
+and `conversationId` from the active handles, then verifies that the requested
+adapter belongs to that conversation.
 
-The adapter store is file-backed in `crates/executor/src/adapter/store.rs`.
+## IRC Adapter Example
 
-Default root:
+An IRC adapter can be created from the REPL with arguments like:
+
+```json
+{
+  "name": "libera-test",
+  "source": "built_in",
+  "config": {
+    "type": "irc",
+    "server": "irc.libera.chat",
+    "port": 6697,
+    "tls": true,
+    "nick": "exo12345",
+    "username": "exo12345",
+    "realname": "Exo Test Bot",
+    "channel": "##exo12345",
+    "passwordSecretId": null,
+    "trigger": "mention"
+  }
+}
+```
+
+The IRC worker connects to the server, sends optional `PASS`, then `NICK` and
+`USER`, waits for IRC welcome numeric `001`, joins the configured channel, and
+keeps the socket open. It responds to `PING` with `PONG` so the server does not
+disconnect it.
+
+For each channel `PRIVMSG`, the worker applies the trigger policy:
+
+- `mention`: wake the conversation only if the message mentions the bot nick.
+- `all_messages`: wake the conversation for every channel message.
+
+The `mention` default is important. Busy channels can generate many messages,
+and waking the model for every line would be noisy and expensive.
+
+When a message matches, the worker emits a JSONL `message` event. The Rust
+runtime writes an inbound artifact containing the target, sender, text, metadata,
+adapter id, and timestamps. It also records an inbound event, then wakes the
+owning conversation with a user message that includes the adapter id:
 
 ```text
-.exo/adapters/
+irc message received at target `##exo12345` from spooky via adapter `libera-test`:
+
+hello @exo12345
+
+Use send_adapter_message with adapterId `...` if you should reply to IRC.
 ```
 
-Layout:
-
-```text
-.exo/adapters/adapters/<adapter-id>.json
-.exo/adapters/events/<adapter-id>/<event-id>.json
-.exo/adapters/outbox/<adapter-id>/<message-id>.json
-.exo/adapters/<adapter-type>/<adapter-id>/...
-```
-
-Adapter records and event records stay in the store. Larger, conversation-visible payloads are written as conversation artifacts by the runtime.
-
-## Runtime Ownership
-
-The adapter runner is a host process started by the Exo script:
-
-```text
-exo/scripts/exo-repl
-```
-
-It starts:
-
-```bash
-exo --harness exo adapters run --watch --limit <N>
-```
-
-The CLI entry point is:
-
-```text
-crates/cli/src/adapters.rs
-```
-
-Responsibilities:
-
-- Acquire a lock so only one adapter watch runner is active.
-- Dispatch `adapters list`, `adapters run`, `adapters disable`, and `adapters delete`.
-- Call the executor adapter runtime.
-
-The watch loop is in:
-
-```text
-crates/executor/src/adapter/runtime.rs
-```
-
-Responsibilities:
-
-- Poll enabled adapter records.
-- Start one supervisor task per enabled adapter.
-- Skip adapters that are disabled or not build-ready.
-- Restart workers after they exit or error.
-- Convert worker events into store records, artifacts, and conversation wakeups.
-- Drain the outbox and write outbound commands to workers.
+The agent decides whether to respond. There is no automatic model-output-to-IRC
+bridge.
 
 ## Worker Protocol
 
-The shared worker protocol is implemented in Rust and mirrored in TypeScript:
-
-```text
-crates/executor/src/adapter/worker.rs
-exo/adapters/protocol.ts
-```
-
-Host to worker:
-
-```json
-{ "type": "send_message", "target": "...", "text": "..." }
-```
-
-Worker to host:
-
-```json
-{"type":"connected","subject":"...","metadata":{}}
-{"type":"message","target":"...","sender":"...","text":"...","message_id":"...","metadata":{}}
-{"type":"lifecycle","name":"...","metadata":{}}
-{"type":"error","message":"..."}
-{"type":"disconnected","reason":"..."}
-```
-
-Workers receive configuration via environment:
+Agent-cli, Discord, ExoChat, IRC, Signal, Slack, and WhatsApp are implemented
+as Node.js workers. Rust launches each worker with:
 
 - `EXO_ADAPTER_ID`
 - `EXO_ADAPTER_TYPE`
 - `EXO_ADAPTER_STATE_DIR`
-- `EXO_ADAPTER_CONFIG`
-- protocol-specific secret env vars, such as `EXO_IRC_PASSWORD`
+- `EXO_ADAPTER_CONFIG`, a JSON object containing adapter-specific initialization
+- any secret-derived environment variables declared by the worker config
 
-## Inbound Flow
+Worker communication is newline-delimited JSON:
 
-1. A worker receives an external message.
-2. The worker writes a `message` JSONL event to stdout.
-3. `run_worker_loop` parses it.
-4. `runtime.rs` writes an inbound artifact into the owning conversation.
-5. `runtime.rs` records a store event.
-6. `runtime.rs` calls `send_conversation_wakeup`.
-7. Exo receives a normal user message containing:
-   - adapter name
-   - adapter id
-   - target
-   - sender
-   - message text
-   - instructions for replying with `send_adapter_message`
+- Worker to Rust: `connected`, `message`, `lifecycle`, `error`, and
+  `disconnected`.
+- Rust to worker: `send_message` with `target` and `text`.
 
-The wakeup path is shared with scheduler wakeups:
+This keeps protocol code in Exo while preserving one host-owned supervision,
+event, wakeup, and outbox implementation in Rust.
 
-```text
-crates/executor/src/conversation_wakeup.rs
+## Message Flow
+
+Inbound messages follow one shared path:
+
+1. The worker receives an external message and writes a `message` JSONL event.
+2. The Rust runtime records the event and writes an inbound conversation
+   artifact.
+3. The runtime wakes the owning conversation with the adapter id, target,
+   sender, and message.
+4. Exo decides whether the message needs a response.
+
+Outbound messages are always explicit:
+
+1. Exo calls `send_adapter_message`.
+2. The host records the outbound event and writes an outbox record.
+3. The adapter runner drains the outbox and sends a `send_message` command to
+   the worker.
+4. The worker sends the message through the external protocol.
+
+This boundary keeps protocol behavior in `exo/adapters`, model-facing tool
+schemas in the TypeScript harness, and durable records, process supervision,
+artifacts, wakeups, and the outbox in Rust.
+
+## WhatsApp Worker Example
+
+The WhatsApp adapter uses the same durable adapter store and runtime lifecycle as
+IRC, with protocol-specific work in a Node.js worker:
+
+```mermaid
+flowchart LR
+  runtime["Rust Adapter Runtime"] --> worker["Baileys Worker"]
+  worker <--> wa["WhatsApp Web"]
+  runtime --> store["Adapter Store"]
+  tools["send_adapter_message"] --> outbox["Adapter Outbox"]
+  outbox --> runtime
 ```
 
-## Outbound Flow
+The worker is launched with:
 
-1. The model explicitly calls `send_adapter_message`.
-2. TypeScript tool definitions pass the request to the host tool runtime.
-3. `runtime.rs` writes an outbound artifact into the conversation.
-4. `AdapterStore` writes an outbox record.
-5. The adapter runner drains the outbox once per second.
-6. The host writes a `send_message` JSONL command to the worker stdin.
-7. The worker sends through the external protocol.
-
-This avoids short-lived reconnects for every outbound message.
-
-## Tool Integration
-
-Model-facing adapter tools are defined in:
-
-```text
-exoharness/typescript/harness/adapter-tools.ts
+```bash
+pnpm tsx exo/adapters/whatsapp/worker.ts
 ```
 
-Tools:
+If `authDir` is not configured, auth state is stored under the worker state dir's
+`auth` subdirectory. On first connection the worker emits a `lifecycle` event
+named `qr`; scan that QR with WhatsApp to pair the account. After pairing, the
+worker emits `connected` and then `message` events for text messages.
 
-- `create_adapter`
-- `list_adapters`
-- `disable_adapter`
-- `delete_adapter`
-- `send_adapter_message`
+For inbound WhatsApp messages, the runtime writes an artifact with the chat id,
+sender, message id, and text, then wakes the conversation. The wakeup instructs
+the agent to call `send_adapter_message` with both the adapter id and WhatsApp
+`target` chat id when a reply is appropriate.
 
-These tools are registered by the Exo harness:
+The MVP is intentionally narrow: text messages only, one worker per WhatsApp
+account/session, QR pairing through logs/artifacts, and no media handling or
+message edits yet.
 
-```text
-exo/harness.ts
+## Signal Worker Example
+
+The Signal adapter follows the same worker bridge but delegates protocol work to
+`signal-cli`:
+
+```mermaid
+flowchart LR
+  runtime["Rust Adapter Runtime"] --> worker["Signal Worker"]
+  worker <--> signalCli["signal-cli jsonRpc"]
+  signalCli <--> signal["Signal"]
+  runtime --> store["Adapter Store"]
+  tools["send_adapter_message"] --> outbox["Adapter Outbox"]
+  outbox --> runtime
 ```
 
-Host-side execution is in:
+The worker is launched with:
 
-```text
-crates/executor/src/harness_tool.rs
-crates/executor/src/adapter/tools.rs
+```bash
+pnpm tsx exo/adapters/signal/worker.ts
 ```
 
-The TypeScript layer currently transforms typed user-facing adapter configs into generic worker configs. For example, a Signal config becomes a worker config pointing at:
+If `account` is not configured, the worker runs `signal-cli link`, prints a
+linked-device QR code to the adapter log, discovers the linked account with
+`signal-cli listAccounts`, then starts `signal-cli -a <account> jsonRpc`. Signal
+CLI state is stored under the worker state dir's `signal-cli` subdirectory unless
+`configDir` is set.
 
-```text
-exo/adapters/signal/worker.ts
+For inbound Signal messages, the runtime writes an artifact with the sender,
+target, text, message id, and metadata, then wakes the conversation. Outbound
+Signal messages require a `target`: use a Signal username with the `u:` prefix,
+a phone number, a UUID, a group id, or the target from an inbound wakeup.
+
+## Outbound Messages
+
+Adapter sends must be explicit and auditable. When the agent calls
+`send_adapter_message`, the tool does two things:
+
+1. Writes an outbound event for history.
+2. Writes an `AdapterOutboundMessageRecord` into the adapter outbox.
+
+The long-running adapter runtime drains that outbox once per second and sends
+queued messages to the worker as `send_message` commands. The IRC worker sends
+them as `PRIVMSG` over the already-connected IRC socket. The WhatsApp worker
+sends them through Baileys. The Signal worker sends them through `signal-cli`
+JSON-RPC. WhatsApp and Signal messages require an outbox `target`; IRC messages
+do not because the destination channel is fixed in adapter config.
+
+WhatsApp and Signal also support outbound rich attachments on `send_adapter_message`.
+Attachments specify exactly one HTTPS `url`, base64 `data` payload, or
+`sandboxPath` and a `kind` of `image`, `video`, `audio`, or `document`. Use
+`sandboxPath` for files created inside the agent sandbox; the host tool copies
+the file into `.exo/adapters/media` before queueing the outbound send. URL and
+inline-data attachments are also size-checked and staged by the host before
+they reach adapter workers. Image, video, and document WhatsApp attachments use
+the message text as the first caption-capable media caption. Documents also
+require `mimeType` and `fileName`.
+
+The outbox also decouples conversation turns from socket ownership. The model
+turn can finish after queueing a message; the adapter runtime owns the external
+connection and sends when it is ready.
+
+## Adapter Runner Lifecycle
+
+The adapter runner is started by:
+
+```bash
+./target/debug/exo --harness exo adapters run --limit 50
 ```
 
-## Protocol Workers
+`./exo.sh` starts this automatically unless `--no-adapters` is
+provided. It also records a pid file at `.exo/exo-adapters.pid`.
 
-Protocol-specific code lives under:
+The runtime periodically lists enabled adapters and starts one supervision task
+per adapter. Each supervision task:
+
+1. Loads the latest adapter record.
+2. Skips disabled or not-yet-built adapters.
+3. Connects and runs the adapter loop.
+4. Records connection events and errors.
+5. Reconnects after failures with a short delay.
+
+Disabling or deleting the adapter causes the loop to stop on its next store
+check or reconnect cycle.
+
+## Cooperation With The Scheduler
+
+The scheduler and adapter runtime cooperate through the conversation, not by
+calling each other directly.
+
+When a user says in IRC:
 
 ```text
-exo/adapters/
+exo12345: every minute, fetch BBC headlines and post them here
 ```
 
-Current workers:
+the flow is:
 
-- `irc/worker.ts`: IRC socket, registration, channel join, PING/PONG, PRIVMSG parsing.
-- `whatsapp/worker.ts`: Baileys linked-device client, QR pairing, WhatsApp messages.
-- `signal/worker.ts`: `signal-cli` linked-device flow, JSON-RPC receive/send.
+1. The IRC adapter receives the message and wakes the Exo conversation.
+2. The agent decides to create a scheduled task with `schedule_sandbox_task`.
+3. The task stores normal scheduler state under `.exo/scheduled-tasks`.
+4. The agent includes external routing in the task `reportPrompt`, including the
+   `adapterId` and, for WhatsApp or Signal, the `target`.
+5. The scheduler runner executes the task when it is due.
+6. The scheduler writes a task result artifact and wakes the conversation.
+7. The scheduler wakeup includes the task `reportPrompt`, stdout/stderr preview,
+   artifact id, and run metadata.
+8. The agent follows the `reportPrompt` and calls `send_adapter_message`.
+9. `send_adapter_message` queues an outbox record.
+10. The adapter loop drains the outbox and posts the result to the external app.
 
-Each adapter directory also has a local README and setup prompt:
+The important bridge is the task `reportPrompt`. Scheduled tasks are generic;
+they do not know that they were created from IRC unless the agent records that
+intent. For IRC-originated scheduled work, the report prompt should say something
+like:
 
 ```text
-exo/adapters/irc/README.md
-exo/adapters/irc/setup-prompt.md
-exo/adapters/whatsapp/README.md
-exo/adapters/whatsapp/setup-prompt.md
-exo/adapters/signal/README.md
-exo/adapters/signal/setup-prompt.md
+Summarize the headline output and send it back using send_adapter_message with
+adapterId 019e... . For WhatsApp, include target 123@s.whatsapp.net. For Signal,
+include target u:example.01 or the inbound target. Keep the message under 400
+chars.
 ```
 
-## Lifecycle
+This keeps side effects explicit. The scheduler wakes the agent with the result,
+and the agent performs the external send through the adapter tool.
 
-Adapter lifecycle is owned by the host runner, not by the REPL.
+## Background Credentials
 
-Startup:
+Scheduler wakeups are model turns, so the scheduler process needs access to the
+same model credentials as the REPL. On macOS, secrets may be encrypted with a
+master key stored in Keychain. Background processes can fail with secure storage
+errors until Keychain access is approved.
 
-- `exo/scripts/exo-repl` starts `exo adapters run --watch` unless `--no-adapters` is set.
-- The runner writes `.exo/exo-adapters.pid` and logs to `.exo/exo-adapters.log`.
-- The runner starts worker processes for enabled, ready adapters.
+For local testing, running the scheduler once in a normal terminal and choosing
+"Always Allow" in the macOS prompt lets future background runs decrypt the model
+secret and post scheduled task results back to IRC.
 
-Restart:
+## Source Model
 
-- Worker exit/error returns from `run_worker_loop`.
-- The watch task records the error and retries after a short delay.
+Adapters mirror the tool source model:
 
-Stopping:
+- `built_in`: core Exo adapters. IRC and agent-cli use this source.
+- `library`: shipped integrations. ExoChat, WhatsApp, Signal, Discord, and
+  Slack use this source.
 
-- `stop_adapters` in `exo/scripts/exo-repl` kills the runner and worker processes.
-- Disabling/deleting adapter records prevents future restarts.
+All current adapters use the same host-supervised worker lifecycle and outbox
+semantics.
 
-## Files To Inspect For PR Review
+## Operational Notes
 
-Core model and runtime:
-
-- `crates/executor/src/adapter/types.rs`
-- `crates/executor/src/adapter/store.rs`
-- `crates/executor/src/adapter/runtime.rs`
-- `crates/executor/src/adapter/worker.rs`
-- `crates/executor/src/adapter/tools.rs`
-- `crates/cli/src/adapters.rs`
-
-TypeScript tool surface:
-
-- `exoharness/typescript/harness/adapter-tools.ts`
-- `exoharness/typescript/harness/index.test.ts`
-- `exo/harness.ts`
-
-Protocol-specific workers:
-
-- `exo/adapters/protocol.ts`
-- `exo/adapters/irc/worker.ts`
-- `exo/adapters/whatsapp/worker.ts`
-- `exo/adapters/signal/worker.ts`
-
-Script and docs:
-
-- `exo/scripts/exo-repl`
-- `exo/README.md`
-- `exo/docs/adapter-architecture.md`
-- `exo/adapters/*/README.md`
-- `exo/adapters/*/setup-prompt.md`
-
-## Minimality Notes
-
-The intended split is:
-
-- Rust owns durable records, lifecycle supervision, outbox, artifacts, and conversation wakeups.
-- TypeScript harness owns model-facing tool schemas and transforms.
-- Adapter directories own protocol-specific code.
-
-For PR cleanup, the main question to ask in each file is whether it belongs to one of those boundaries. Protocol details should not leak into the Rust runtime beyond generic worker configuration.
+- Use short IRC nicks. Networks often reject long nicks during registration.
+- Prefer `trigger: "mention"` for public or busy channels.
+- `send_adapter_message` queues outbound messages; the adapter runner must be
+  active for them to reach the external app.
+- WhatsApp `send_adapter_message` calls must include the inbound chat id as
+  `target`.
+- Signal `send_adapter_message` calls must include a Signal username, phone
+  number, UUID, group id, or inbound target.
+- If scheduled results do not appear in IRC, check scheduler run records first.
+  The adapter may be healthy while the scheduler wakeup is failing.
+- `disable_adapter` is the safe stop operation because it preserves history.
+  `delete_adapter` removes the adapter and event/outbox state.
