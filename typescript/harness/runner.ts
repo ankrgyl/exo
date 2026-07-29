@@ -694,7 +694,18 @@ class ProtocolClient {
   }
 
   private async send(message: GuestToHostMessage): Promise<void> {
-    process.stdout.write(`${JSON.stringify(message)}\n`);
+    // A model can produce a value that JSON.stringify refuses to serialize —
+    // most commonly a BigInt (e.g. a 19-digit Discord channel id that arrives
+    // as a bare number). Unhandled, JSON.stringify throws before the line is
+    // ever written, taking the whole turn down with an opaque TypeError. Coerce
+    // BigInts to strings so the message is always emittable. This is the
+    // guest-side counterpart to the host-side decode guard in #138: that guards
+    // an emitted line the host cannot decode; this guards a message the guest
+    // cannot even emit.
+    const serialized = JSON.stringify(message, (_key, value) =>
+      typeof value === "bigint" ? value.toString() : value,
+    );
+    process.stdout.write(`${serialized}\n`);
   }
 
   private enqueueInit(payload: RawTypeScriptInitPayload): void {
