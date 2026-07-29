@@ -12,7 +12,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg?logo=rust)](Cargo.toml)
 [![TypeScript](https://img.shields.io/badge/typescript-5.x-3178c6.svg?logo=typescript&logoColor=white)](tsconfig.json)
 
-[Documentation](https://exoharness.ai/docs) · [Examples](exoharness/examples/) · [Discord](https://discord.gg/8x23hdBJU6)
+[Documentation](https://exoharness.ai/docs) · [Discord](https://discord.gg/8x23hdBJU6)
 
 </div>
 
