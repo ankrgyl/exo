@@ -42,7 +42,7 @@ function createAdapterTool(): ToolInstance {
     definition: {
       name: "create_adapter",
       description:
-        "Create and enable a long-running adapter for this conversation. Use source 'built_in' with config type 'irc' or 'agent-cli'. Use source 'library' with config type 'exochat', 'whatsapp', 'signal', 'discord', or 'slack' for shipped library adapters.",
+        "Create and enable a long-running adapter for this conversation. Use source 'built_in' with config type 'irc' or 'agent-cli'. Use source 'library' with config type 'exochat', 'nostr-chat', 'whatsapp', 'signal', 'discord', or 'slack' for shipped library adapters.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -519,6 +519,41 @@ function adapterConfigSchema(): ToolDefinition["parameters"] {
         type: "object",
         additionalProperties: false,
         properties: {
+          type: { type: "string", enum: ["nostr-chat"] },
+          relayUrl: {
+            type: ["string", "null"],
+            description:
+              "NIP-29 relay WebSocket URL. Use null for the documented public default.",
+          },
+          groupId: {
+            type: ["string", "null"],
+            description:
+              "NIP-29 group id. Use null for the documented public default.",
+          },
+          secretKeySecretId: {
+            type: ["string", "null"],
+            description:
+              "Optional Exo secret id containing a 32-byte hex key or nsec. Use null to generate a protected adapter key.",
+          },
+          trigger: {
+            type: "string",
+            enum: ["all_messages", "mentions_only"],
+            description:
+              "Wake on all new foreign messages or only messages that mention the adapter identity.",
+          },
+        },
+        required: [
+          "type",
+          "relayUrl",
+          "groupId",
+          "secretKeySecretId",
+          "trigger",
+        ],
+      },
+      {
+        type: "object",
+        additionalProperties: false,
+        properties: {
           type: { type: "string", enum: ["agent-cli"] },
           socketPath: {
             type: ["string", "null"],
@@ -557,6 +592,7 @@ function validateAdapterSource(source: string, type: string): void {
   }
   if (
     (type === "exochat" ||
+      type === "nostr-chat" ||
       type === "whatsapp" ||
       type === "signal" ||
       type === "discord" ||
