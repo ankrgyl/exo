@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio_util::task::AbortOnDropHandle;
 
 const PROCESS_PIPE_BUFFER_SIZE: usize = 64 * 1024;
 pub const PATH: &str = "/tmp/exo-process-bridge.py";
@@ -335,7 +336,7 @@ pub fn process_parts(client: Arc<dyn Client>) -> crate::SandboxProcessParts {
         error_tx.clone(),
     );
     let stdin_forwarder = spawn_stdin_forwarder(client, stdin_reader, error_tx);
-    let tasks = AbortOnDrop([output_poller, stdin_forwarder]);
+    let tasks = [output_poller, stdin_forwarder].map(AbortOnDropHandle::new);
 
     let wait: BoxFuture<'static, crate::Result<i32>> = Box::pin(async move {
         let _tasks = tasks;
@@ -362,16 +363,6 @@ pub fn process_parts(client: Arc<dyn Client>) -> crate::SandboxProcessParts {
         stderr: Box::pin(stderr_reader.compat()),
         stdin: Box::pin(stdin_writer.compat_write()),
         wait,
-    }
-}
-
-struct AbortOnDrop([JoinHandle<()>; 2]);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        for task in &self.0 {
-            task.abort();
-        }
     }
 }
 
