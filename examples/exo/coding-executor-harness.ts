@@ -46,6 +46,9 @@ export default defineHarness({
     const options = {
       instructions: exoInstructions,
       registerTools: registerCodingExecutorTools,
+      // The sandbox boundary is the containment; decisions land in the
+      // event log.
+      approvals: "auto" as const,
     };
     if (executor === "claude-code") {
       await runClaudeCodeHarnessTurn(context, options);

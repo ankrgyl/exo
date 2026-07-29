@@ -50,6 +50,10 @@ import {
   type ResolvedLlmBinding,
 } from "./shared";
 import { injectedToolRegistry, registryMcpServer } from "./registry-tools";
+import {
+  claudePermissionResult,
+  type CodingApprovalPolicy,
+} from "./executor-approvals";
 
 const DEFAULT_CLAUDE_CODE_SANDBOX_EXECUTABLE = "/usr/local/bin/claude-code";
 const CLAUDE_RESULT_GRACE_MS = 5_000;
@@ -143,6 +147,7 @@ async function runClaudeCodeTurn(
               state.systemPrompt,
               modelBinding,
               registry,
+              options.approvals ?? "auto",
             ),
           }),
           context,
@@ -306,6 +311,7 @@ function claudeOptions(
   systemPrompt: string | null,
   modelBinding: ResolvedLlmBinding,
   registry: HarnessToolRegistry,
+  approvals: CodingApprovalPolicy,
 ): Options {
   const options: Options = {
     model: modelBinding.model,
@@ -316,6 +322,27 @@ function claudeOptions(
     pathToClaudeCodeExecutable: claudeSandboxExecutable(),
     spawnClaudeCodeProcess: (options) =>
       new SandboxClaudeCodeProcess(context, options),
+    // Without a handler a permission prompt stalls the CLI until the startup
+    // timeout. Denies are recorded; allows are already visible as observed
+    // tool events.
+    permissionMode: "default",
+    canUseTool: async (toolName, _input, { toolUseID }) => {
+      const result = claudePermissionResult(approvals, toolName);
+      if (result.behavior === "deny") {
+        await appendCustomEvent(
+          context.exoharness.current.turn,
+          "claude_tool_permission",
+          {
+            metadata: turnMetadata(context),
+            tool: toolName,
+            tool_use_id: toolUseID,
+            policy: approvals,
+            decision: result.behavior,
+          },
+        );
+      }
+      return result;
+    },
   };
   if (registry.definitions().length > 0) {
     // The MCP server runs in this host process, so registry tools execute on

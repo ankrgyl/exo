@@ -58,6 +58,10 @@ import {
   injectedToolDefinitions,
   injectedToolRegistry,
 } from "./registry-tools";
+import {
+  codexApprovalDecision,
+  type CodingApprovalPolicy,
+} from "./executor-approvals";
 
 const CODEX_SHELL_TOOL = "codex.shell";
 const CODEX_WEB_SEARCH_TOOL = "codex.web_search";
@@ -90,6 +94,7 @@ interface CodexWarmTurnScope {
   protocolLog: CodexProtocolEventBuffer;
   turnParent: TraceParent;
   registry: HarnessToolRegistry;
+  approvals: CodingApprovalPolicy;
 }
 
 interface PriorResponseItems {
@@ -198,6 +203,7 @@ class CodexWarmSession {
       current.context,
       current.turnParent,
       current.registry,
+      current.approvals,
       request,
     );
   }
@@ -247,6 +253,7 @@ async function runCodexTurn(
     protocolLog,
     turnParent,
     registry,
+    approvals: options.approvals ?? "auto",
   };
   const sessionKey = codexWarmSessionKey(context, modelBinding);
   const sandboxRuntime = codexSandboxRuntimeKey(context);
@@ -637,13 +644,19 @@ async function handleCodexServerRequest(
   context: TurnContext,
   turnParent: TraceParent,
   registry: HarnessToolRegistry,
+  approvals: CodingApprovalPolicy,
   request: CodexServerRequest,
 ): Promise<JsonValue | undefined> {
-  if (
-    useCodexExternalSandbox() &&
-    request.method === "item/commandExecution/requestApproval"
-  ) {
-    return { decision: "accept" };
+  const decision = codexApprovalDecision(approvals, request.method);
+  if (decision !== undefined) {
+    await appendCustomEvent(context.exoharness.current.turn, "codex_approval", {
+      metadata: turnMetadata(context),
+      method: request.method,
+      params: toJsonValue(request.params ?? null),
+      policy: approvals,
+      response: decision,
+    });
+    return decision;
   }
   if (request.method !== "item/tool/call") {
     return undefined;
