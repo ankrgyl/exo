@@ -45,6 +45,7 @@ CONTROL=false
 SETUP_PROFILE=false
 SKIP_BUILD="${EXO_SKIP_BUILD:-false}"
 TEMPLATE="${EXO_TEMPLATE:-canonical}"
+PROFILE="${EXO_PROFILE:-practical}"
 SANDBOX_PROVIDER_EXPLICIT=false
 SANDBOX_BACKEND_EXPLICIT=false
 declare -a CONTROL_PIDS=()
@@ -117,6 +118,7 @@ Options:
                                             instead of ExoChat
                                  minimal    No Docker defaults, adapter setup prompts,
                                             control console, or guardian config
+  --profile <name>             Checked-in tool profile: practical (default) or bootstrap
   --sandbox-image <image>      Sandbox image (default: ubuntu:24.04)
   --sandbox-provider <provider>
                                 Sandbox provider: daytona, apple-container, docker, or local-process
@@ -162,7 +164,7 @@ Environment overrides:
   EXO_BIN, EXO_START_SCHEDULER, EXO_START_ADAPTERS, EXO_REPO,
   EXO_AGENT_CLI_ROOT, EXO_AGENT_CLI_MOUNT,
   EXO_SCHEDULER_BIN, EXO_SCHEDULER_INTERVAL_SECONDS, EXO_ADAPTER_LIMIT,
-  EXO_SETUP_ADAPTER, EXO_INITIAL_PROMPT_FILE, EXO_TEMPLATE,
+  EXO_SETUP_ADAPTER, EXO_INITIAL_PROMPT_FILE, EXO_TEMPLATE, EXO_PROFILE,
   EXO_SKIP_BUILD, EXO_UPSTREAM_MODEL, EXO_USER_NAME
 EOF
 }
@@ -1401,6 +1403,14 @@ while [[ $# -gt 0 ]]; do
       esac
       shift
       ;;
+    --profile)
+      PROFILE="${2:-}"
+      case "$PROFILE" in
+        bootstrap|practical) ;;
+        *) die "--profile must be bootstrap or practical" ;;
+      esac
+      shift 2
+      ;;
     --self-repo-mount)
       SELF_REPO_MOUNT_PATH="${2:-}"
       [[ -n "$SELF_REPO_MOUNT_PATH" ]] || die "--self-repo-mount requires a value"
@@ -1530,6 +1540,7 @@ apply_template_defaults
 export EXO_LOCAL_PROMPT_FILE="$LOCAL_PROMPT_FILE"
 export EXO_REPO="$SELF_REPO_MOUNT_PATH"
 export EXO_SELF_MAP="$SELF_MAP_PATH"
+export EXO_PROFILE="$PROFILE"
 
 case "$COMMAND" in
   repl)

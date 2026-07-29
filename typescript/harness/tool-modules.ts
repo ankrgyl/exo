@@ -3,7 +3,7 @@ import type { Dirent } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import type { JsonObject, TurnContext } from "./index";
+import type { JsonObject, JsonValue, TurnContext } from "./index";
 import {
   initializeTool,
   type HarnessToolRegistry,
@@ -11,6 +11,9 @@ import {
   type Tool,
   type ToolInstance,
 } from "./tools";
+import { installedToolModulePath, readToolRegistry } from "./tool-registry";
+
+export * from "./tool-registry";
 
 export const DEFAULT_AGENT_TOOL_DIRECTORY = ".exo/agent-tools";
 let agentToolImportVersion = 0;
@@ -100,6 +103,41 @@ export async function registerAgentToolsFromDirectoryIfExists(
   context: TurnContext,
   toolsDirectory = DEFAULT_AGENT_TOOL_DIRECTORY,
 ): Promise<void> {
+  await registerInstalledTools(registry, context);
+  await registerLegacyAgentToolsFromDirectoryIfExists(
+    registry,
+    context,
+    toolsDirectory,
+  );
+}
+
+export async function registerInstalledTools(
+  registry: HarnessToolRegistry,
+  context: TurnContext,
+): Promise<void> {
+  const snapshot = await readToolRegistry();
+  for (const installed of snapshot.installed) {
+    try {
+      const tool = await loadAgentTool(
+        context,
+        await installedToolModulePath(installed),
+        installed.initialization,
+      );
+      registry.register(tool);
+    } catch (error) {
+      const message = errorMessage(error);
+      console.error(
+        `skipping broken installed tool ${installed.id}: ${message}`,
+      );
+    }
+  }
+}
+
+export async function registerLegacyAgentToolsFromDirectoryIfExists(
+  registry: HarnessToolRegistry,
+  context: TurnContext,
+  toolsDirectory = DEFAULT_AGENT_TOOL_DIRECTORY,
+): Promise<void> {
   // A broken agent-written module (duplicate tool name, failed import, ...)
   // must not prevent the harness from starting: the agent cannot repair its
   // own tools if it can never boot. Skip the module and keep going.
@@ -183,6 +221,7 @@ export async function loadToolModule(
 export async function loadAgentTool(
   context: TurnContext,
   modulePath: string,
+  initialization?: JsonObject,
 ): Promise<ToolInstance> {
   const entries = normalizeToolModuleExport(
     await loadToolModule(modulePath, "agent"),
@@ -193,7 +232,13 @@ export async function loadAgentTool(
       `agent tool module must export exactly one tool: ${modulePath}`,
     );
   }
-  return initializeToolModuleEntry(context, entries[0], "agent");
+  return initializeToolModuleEntry(
+    context,
+    initialization === undefined
+      ? entries[0]
+      : { ...entries[0], initialization },
+    "agent",
+  );
 }
 
 function initializeToolModuleEntry(
@@ -201,12 +246,54 @@ function initializeToolModuleEntry(
   entry: ToolModuleEntry,
   source: Extract<HarnessToolSource, "library" | "agent">,
 ): Promise<ToolInstance> {
+  const initialization =
+    entry.initialization ?? entry.tool.initialization ?? {};
   return initializeTool(
     entry.tool,
     source,
-    entry.initialization ?? entry.tool.initialization ?? {},
+    source === "agent"
+      ? expandInitializationEnvironmentReferences(initialization)
+      : initialization,
     context,
   );
+}
+
+// Agent tool initialization is persisted in the tool lockfile, so secrets must
+// stay out of it. A string value of exactly "${NAME}" is resolved from the
+// host environment when the tool loads; any other string passes through
+// unchanged.
+function expandInitializationEnvironmentReferences(
+  initialization: JsonObject,
+): JsonObject {
+  return expandEnvironmentValue(initialization) as JsonObject;
+}
+
+function expandEnvironmentValue(value: JsonValue): JsonValue {
+  if (typeof value === "string") {
+    const match = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(value);
+    if (!match) {
+      return value;
+    }
+    const resolved = process.env[match[1]];
+    if (resolved === undefined) {
+      throw new Error(
+        `tool initialization references environment variable ${match[1]}, which is not set`,
+      );
+    }
+    return resolved;
+  }
+  if (Array.isArray(value)) {
+    return value.map(expandEnvironmentValue);
+  }
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        expandEnvironmentValue(item),
+      ]),
+    );
+  }
+  return value;
 }
 
 function normalizeToolModuleExport(

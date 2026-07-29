@@ -1,8 +1,9 @@
 import {
   createToolRegistry,
   materializePromptMessages,
-  registerAgentToolsFromDirectoryIfExists,
   registerBuiltInTools,
+  registerInstalledTools,
+  registerLegacyAgentToolsFromDirectoryIfExists,
   registerLibraryToolModulePath,
   turnMetadata,
   type BuiltInToolName,
@@ -59,10 +60,18 @@ export async function createDefaultToolRegistry(
     []) {
     await registerLibraryToolModulePath(tools, context, modulePath);
   }
-  if (context.agentConfig.enableAgentToolCreation) {
-    await registerAgentToolsFromDirectoryIfExists(tools, context);
-  }
+  await registerConfiguredAgentTools(tools, context);
   return tools;
+}
+
+export async function registerConfiguredAgentTools(
+  tools: HarnessToolRegistry,
+  context: TurnContext,
+): Promise<void> {
+  await registerInstalledTools(tools, context);
+  if (context.agentConfig.enableAgentToolCreation) {
+    await registerLegacyAgentToolsFromDirectoryIfExists(tools, context);
+  }
 }
 
 export function defaultBuiltInToolNames(

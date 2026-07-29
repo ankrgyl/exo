@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import net from "node:net";
 import readline from "node:readline";
 import tls from "node:tls";
@@ -123,11 +124,21 @@ lines.on("line", (raw) => {
       target: channel,
       sender: line.message.nick,
       text: line.message.text,
-      message_id: null,
+      message_id: ircMessageId(server, channel, line.message.raw),
       metadata: { raw: line.message.raw, server, channel },
     });
   }
 });
+
+function ircMessageId(server: string, channel: string, raw: string): string {
+  return createHash("sha256")
+    .update(server)
+    .update("\0")
+    .update(channel)
+    .update("\0")
+    .update(raw)
+    .digest("hex");
+}
 
 const input = inputReadline.createInterface({
   input: process.stdin,

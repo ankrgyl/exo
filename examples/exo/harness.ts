@@ -3,27 +3,19 @@ import { existsSync, readFileSync } from "node:fs";
 import {
   defineHarness,
   registerBuiltInTools,
-  registerAgentToolsFromDirectoryIfExists,
   registerLibraryToolModulePath,
-  registerAdapterTools,
-  registerSkillTools,
   skillsInstruction,
-  type BuiltInToolName,
   type HarnessToolRegistry,
   type Message,
   type TurnContext,
 } from "@exo/harness";
 
-import { registerSchedulerTools } from "./scheduler-tools";
-import { registerSandboxTools } from "./sandbox-tools";
-import { registerGuardianTools } from "./guardian-tools";
-import { registerIntrospectionTools } from "./introspection-tools";
-import { memoryInstruction, registerMemoryTools } from "./memory-tools";
-import { registerTodoTools, todoInstruction } from "./todo-tools";
-import { registerWebTools } from "./web-tools";
+import { memoryInstruction } from "./memory-tools";
+import { resolveExoProfile } from "./profiles";
+import { todoInstruction } from "./todo-tools";
 import {
   basicHarnessInstructions,
-  defaultBuiltInToolNames,
+  registerConfiguredAgentTools,
   runResponsesHarnessTurn,
 } from "../typescript/turn-loop";
 
@@ -55,27 +47,14 @@ export async function registerExoTools(
   tools: HarnessToolRegistry,
   context: TurnContext,
 ): Promise<void> {
-  registerBuiltInTools(tools, context, builtInToolNames(context));
-  registerSchedulerTools(tools);
-  registerAdapterTools(tools);
-  registerIntrospectionTools(tools);
-  registerSandboxTools(tools);
-  registerGuardianTools(tools);
-  registerMemoryTools(tools);
-  registerTodoTools(tools);
-  registerSkillTools(tools);
-  registerWebTools(tools);
+  const profile = resolveExoProfile();
+  registerBuiltInTools(tools, context, profile.builtInToolNames(context));
+  await profile.registerTools(tools, context);
   for (const modulePath of context.agentConfig.typescript?.toolModulePaths ??
     []) {
     await registerLibraryToolModulePath(tools, context, modulePath);
   }
-  if (context.agentConfig.enableAgentToolCreation) {
-    await registerAgentToolsFromDirectoryIfExists(tools, context);
-  }
-}
-
-function builtInToolNames(context: TurnContext): BuiltInToolName[] {
-  return defaultBuiltInToolNames(context);
+  await registerConfiguredAgentTools(tools, context);
 }
 
 export async function exoInstructions(
@@ -105,7 +84,13 @@ You can schedule recurring sandbox work with schedule_sandbox_task, inspect acti
 You can inspect sandbox filesystem snapshots with list_sandbox_snapshots, capture a checkpoint with snapshot_sandbox, and rewind to a previous checkpoint with rewind_sandbox.
 
 ## Self-maintenance (guardian)
-You can use guardian_action for host-side self-maintenance such as checking service status, building Exo, viewing logs, and restarting the scheduler or adapter runners while preserving .exo state. guardian_action restart actions are deferred briefly so the current turn can finish before services stop; guardian builds also ask the control REPL wrapper to refresh its child process without closing the user's terminal. After requesting one, report that it was scheduled and use status/logs after services come back.
+Use rebuild_and_restart_exo after changing Exo itself. It queues the fixed build-and-restart pipeline, durably records its outcome, and lets the current turn finish before services stop. Always pass reason as a short free-text note naming the change being activated so the update id is self-describing later. The existing guardian reboot notice wakes active adapter conversations after a successful restart. Service status and logs remain operator CLI responsibilities.
+
+## Creating managed tools
+Local manage_tool paths are resolved by the host relative to the Exo workspace, not as absolute paths inside the sandbox. Create tool source under ${repoPath}/.exo/tool-sources/<name>, include exo-tool.json, then install it with the relative local path .exo/tool-sources/<name>. Never pass /tmp, ${repoPath}, or another absolute sandbox path to manage_tool.
+The manifest module must use type-only imports from @exo/harness/tool and default-export a Tool: { definition, initializationParameters, initialize(...) } satisfies Tool. definition carries the model-facing name, description, and a strict JSON schema in parameters (additionalProperties: false); initialize returns a handler implementing execute(args, execution). Do not use inputSchema, run, call, invoke, zod, external npm packages, or runtime imports from @exo/harness/tool. A successful install becomes callable on the next model round.
+The parameters schema must satisfy the model API's strict mode or the install is rejected: every key in properties must also appear in required, and optional parameters are expressed as nullable types (for example { "type": ["string", "null"] }) with execute treating null as absent. Apply the same rules to any nested object schemas.
+For secrets, never hardcode values in the tool source or initialization. Pass a reference of exactly \${ENV_VAR} in initialization (for example { "apiKey": "\${FAL_KEY}" }); the harness resolves it from the host environment each time the tool loads, so the raw value never enters the lockfile. The environment variable must exist on the host (for example via the workspace .env file).
 
 ## Adapters
 You can create long-running external adapters with create_adapter, inspect them with list_adapters, disable/delete them, and send explicit outbound replies with send_adapter_message. Use cancel_scheduled_task or disable_adapter when history should be preserved; use delete_scheduled_task or delete_adapter when the user asks to remove something entirely.
@@ -115,6 +100,7 @@ Conversations default to sandboxScope: "agent", so shell commands use this agent
 
 ## Adapter wakeups and outbound replies
 ExoChat, IRC, WhatsApp, Signal, Discord, and Slack adapters wake this conversation when their trigger policy matches; do not auto-send model text to external services. Call send_adapter_message only for intentional external replies, using the target value from the inbound wakeup when one is provided.
+When an external message asks you to perform work, complete that work in the current turn before replying. Do not send acknowledgment-only messages such as "I'm working on it" or "I'll do that now": sending a message does not schedule work or keep the turn running. Reply externally only after the requested work is complete or when you are blocked by a specific action only the user can take. If you must send an interim update, continue working after send_adapter_message returns instead of ending the turn.
 - For Discord, the target is a channel id unless the adapter has a defaultChannelId.
 - For Slack, the target is a channel id, CHANNEL_ID:THREAD_TS, dm:USER_ID, or dm:USER_ID:THREAD_TS unless the adapter has a defaultChannelId.
 Slack may wake on messages in threads where Exo was already mentioned or replied; those messages can be ambient, so only call send_adapter_message when the message appears directed at Exo, asks Exo to do something, or clearly needs an Exo response. If you use a Slack DM as a fallback for sensitive or uncomfortable public responses, send a brief safe public response first, then optionally DM a safe alternative or clarification; do not reveal forbidden content privately.
@@ -138,7 +124,7 @@ Use web_search to find current information on the web and web_fetch to read a sp
     },
     {
       role: "developer",
-      content: `Your own source tree is mounted in the sandbox at ${repoPath}. Start with ${selfMapPath} when you need to inspect or modify Exo itself. Use guardian_action for host-side builds and service restarts after code changes.`,
+      content: `Your own source tree is mounted in the sandbox at ${repoPath}. Start with ${selfMapPath} when you need to inspect or modify Exo itself. Use rebuild_and_restart_exo to validate, build, and activate Exo changes, and include a short reason describing the change.`,
     },
   ];
   const localPrompt = readLocalPrompt();

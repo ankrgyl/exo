@@ -11,6 +11,7 @@ mod render;
 mod repl_tests;
 #[cfg(test)]
 mod secret_tests;
+mod tools;
 mod tui;
 mod tui_app;
 
@@ -29,14 +30,15 @@ use executor::{
     ConversationModelConfig, CreateAgentRequest, CreateConversationRequest, DaytonaBackendSpec,
     E2bBackendSpec, EventKind, EventQuery, EventQueryDirection, ExoHarness,
     ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount, FileSystemMountMode,
-    ForkConversationRequest, HTTP_EXOHARNESS_TRACING_TARGET, Harness, HarnessAgent,
-    HarnessConversation, HttpExoHarness, LocalSandboxExoHarness, PutSecretRequest, RlmHarness,
-    SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment, SandboxBackendRegistration, SandboxProvider,
-    SandboxProviderConfig, SandboxScope, Secret, SecretBackendChoice, SpritesBackendSpec,
-    ToolRequest, ToolRuntime, TypeScriptHarness, TypeScriptHarnessConfig, Uuid7, VercelBackendSpec,
-    default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
-    default_vercel_image, effective_sandbox_scope, load_agent_config, send_conversation_wakeup,
-    serve_exoharness_http_listener_with_options,
+    ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART, HTTP_EXOHARNESS_TRACING_TARGET,
+    Harness, HarnessAgent, HarnessConversation, HttpExoHarness, LocalSandboxExoHarness,
+    PutSecretRequest, RlmHarness, SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment,
+    SandboxBackendRegistration, SandboxProvider, SandboxProviderConfig, SandboxScope, Secret,
+    SecretBackendChoice, SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness,
+    TypeScriptHarnessConfig, Uuid7, VercelBackendSpec, default_aws_agentcore_image,
+    default_daytona_image, default_docker_image, default_e2b_template, default_vercel_image,
+    effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config, record_host_event,
+    send_conversation_wakeup, serve_exoharness_http_listener_with_options,
 };
 use serde::Deserialize;
 use tabwriter::TabWriter;
@@ -421,6 +423,11 @@ enum Commands {
         #[command(subcommand)]
         command: adapters::AdapterCommands,
     },
+    /// Inspect locally installed tool modules.
+    Tools {
+        #[command(subcommand)]
+        command: tools::ToolCommands,
+    },
     Serve {
         #[arg(long, default_value = "127.0.0.1:4766")]
         bind: SocketAddr,
@@ -609,6 +616,22 @@ enum ConversationCommands {
         session_id: Option<String>,
         #[arg(long)]
         turn_id: Option<String>,
+    },
+    /// Finalize a deferred rebuild_and_restart_exo outcome and record it in the
+    /// conversation event log.
+    CompleteRebuildUpdate {
+        /// Path to the queued `.exo/guardian-updates/<id>.json` record.
+        #[arg(long)]
+        outcome: PathBuf,
+        /// Final status: `succeeded` or `failed`.
+        #[arg(long)]
+        status: String,
+        /// Guardian process exit code.
+        #[arg(long)]
+        exit_code: i32,
+        /// Completion timestamp (UTC RFC3339).
+        #[arg(long)]
+        completed_at: String,
     },
     Send {
         agent: String,
@@ -836,6 +859,10 @@ async fn main() -> Result<()> {
     );
     let env_vars = env.into_vars();
     let harness_selection = cli.harness.clone();
+    if let Commands::Tools { command } = &cli.command {
+        tools::handle_tool_command(&cli.root, command)?;
+        return Ok(());
+    }
     if let Some(config) = serve_config(&cli.command) {
         serve_exoharness_http(&exo_config, config).await?;
         return Ok(());
@@ -868,6 +895,7 @@ async fn main() -> Result<()> {
     .await?;
 
     match cli.command {
+        Commands::Tools { .. } => unreachable!("tools commands return before harness startup"),
         Commands::Adapters { command } => {
             adapters::handle_adapter_command(&cli.root, Arc::clone(&harness), command).await?;
         }
@@ -918,7 +946,7 @@ async fn main() -> Result<()> {
                             name: Some(agent_slug),
                             harness: to_agent_harness_kind(harness_kind),
                             typescript,
-                            enable_agent_tool_creation: true,
+                            enable_agent_tool_creation: false,
                             sandbox_image: harness_selection
                                 .as_ref()
                                 .and_then(HarnessSelection::default_sandbox_image)
@@ -1023,7 +1051,7 @@ async fn main() -> Result<()> {
                         typescript,
                         enable_agent_tool_creation: tool_creation
                             .map(EnabledDisabled::enabled)
-                            .unwrap_or(true),
+                            .unwrap_or(false),
                         sandbox_image,
                         sandbox_provider: sandbox_provider
                             .map(SandboxProvider::from)
@@ -1896,6 +1924,49 @@ async fn main() -> Result<()> {
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&result)?);
             }
+            ConversationCommands::CompleteRebuildUpdate {
+                outcome,
+                status,
+                exit_code,
+                completed_at,
+            } => {
+                // Always finalize the side-channel outcome file first so a
+                // conversation lookup or event-append failure cannot leave the
+                // rebuild result only in process memory / logs.
+                let completed =
+                    finalize_rebuild_update_file(&outcome, &status, exit_code, &completed_at)?;
+                let conversation = match must_get_conversation(
+                    harness.as_ref(),
+                    &completed.agent_id,
+                    &completed.conversation_id,
+                )
+                .await
+                {
+                    Ok(conversation) => conversation,
+                    Err(error) => match (
+                        completed.agent_slug.as_deref(),
+                        completed.conversation_slug.as_deref(),
+                    ) {
+                        (Some(agent), Some(conversation)) => {
+                            must_get_conversation(harness.as_ref(), agent, conversation)
+                                .await
+                                .map_err(|slug_error| {
+                                    error.context(format!(
+                                        "also failed via slug {agent}/{conversation}: {slug_error}"
+                                    ))
+                                })?
+                        }
+                        _ => return Err(error),
+                    },
+                };
+                record_host_event(
+                    conversation.exoharness_handle().as_ref(),
+                    HOST_EVENT_REBUILD_AND_RESTART,
+                    serde_json::to_value(&completed)?,
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&completed)?);
+            }
             ConversationCommands::Send {
                 agent,
                 conversation,
@@ -2187,12 +2258,14 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
                 | ConversationSandboxCommands::Detach { agent, .. }
                 | ConversationSandboxCommands::Run { agent, .. } => Some(agent.as_str()),
             },
+            ConversationCommands::CompleteRebuildUpdate { .. } => None,
         },
         Commands::Repl { agent, .. } => Some(agent.as_deref().unwrap_or(DEFAULT_REPL_SLUG)),
         Commands::Secret { .. }
         | Commands::Model { .. }
         | Commands::Provider { .. }
         | Commands::Adapters { .. }
+        | Commands::Tools { .. }
         | Commands::Serve { .. } => None,
     }
 }

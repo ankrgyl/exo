@@ -4,12 +4,15 @@
 //! immutable history of what happened to the agent, and
 //! `list_conversation_events` lets the agent read that history back.
 
-use anyhow::Result;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Result, anyhow, bail};
 use exoharness::{
     AddEventsRequest, ConversationHandle, EventData, EventId, EventKind, EventQuery,
     EventQueryDirection, ToolRequest, ToolResult,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Custom event written when the adapter runner claims a reboot notice:
@@ -21,6 +24,11 @@ pub const HOST_EVENT_ADAPTER_RUNNER_STARTED: &str = "adapter_runner_started";
 /// Custom event written when the adapter runner claims a drain marker and
 /// begins a graceful shutdown.
 pub const HOST_EVENT_ADAPTER_RUNNER_DRAINING: &str = "adapter_runner_draining";
+/// Custom event written when a deferred `rebuild_and_restart_exo` finishes
+/// (succeeded or failed). The side-channel outcome file under
+/// `.exo/guardian-updates/` is updated first; this event is the durable
+/// conversation-log record of the same result.
+pub const HOST_EVENT_REBUILD_AND_RESTART: &str = "rebuild_and_restart_exo";
 
 const DEFAULT_EVENT_LIMIT: u32 = 50;
 const MAX_EVENT_LIMIT: u32 = 200;
@@ -42,7 +50,116 @@ fn default_event_kinds() -> Vec<EventKind> {
         EventKind::custom(HOST_EVENT_REBOOT),
         EventKind::custom(HOST_EVENT_ADAPTER_RUNNER_STARTED),
         EventKind::custom(HOST_EVENT_ADAPTER_RUNNER_DRAINING),
+        EventKind::custom(HOST_EVENT_REBUILD_AND_RESTART),
     ]
+}
+
+/// Queued/completed durable record for `rebuild_and_restart_exo`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RebuildUpdateRecord {
+    pub update_id: String,
+    pub operation: String,
+    pub status: String,
+    pub requested_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub agent_id: String,
+    pub conversation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+/// Reads a queued rebuild outcome and writes the completed status to the same
+/// file. Does not touch the conversation event log.
+pub fn finalize_rebuild_update_file(
+    outcome_path: &Path,
+    status: &str,
+    exit_code: i32,
+    completed_at: &str,
+) -> Result<RebuildUpdateRecord> {
+    if status != "succeeded" && status != "failed" {
+        bail!("rebuild update status must be succeeded or failed, got {status}");
+    }
+    let contents = fs::read_to_string(outcome_path).map_err(|error| {
+        anyhow!(
+            "failed to read rebuild outcome {}: {error}",
+            outcome_path.display()
+        )
+    })?;
+    let mut record: RebuildUpdateRecord = serde_json::from_str(&contents).map_err(|error| {
+        anyhow!(
+            "failed to parse rebuild outcome {}: {error}",
+            outcome_path.display()
+        )
+    })?;
+    if record.operation != "rebuild_and_restart_exo" {
+        bail!(
+            "rebuild outcome {} has unexpected operation {}",
+            outcome_path.display(),
+            record.operation
+        );
+    }
+    record.status = status.to_string();
+    record.exit_code = Some(exit_code);
+    record.completed_at = Some(completed_at.to_string());
+    write_json_atomically(outcome_path, &record)?;
+    Ok(record)
+}
+
+/// Finalizes the outcome file and appends `rebuild_and_restart_exo` to the
+/// conversation event log.
+pub async fn complete_rebuild_and_restart_update(
+    conversation: &dyn ConversationHandle,
+    outcome_path: &Path,
+    status: &str,
+    exit_code: i32,
+    completed_at: &str,
+) -> Result<RebuildUpdateRecord> {
+    let record = finalize_rebuild_update_file(outcome_path, status, exit_code, completed_at)?;
+    record_host_event(
+        conversation,
+        HOST_EVENT_REBUILD_AND_RESTART,
+        serde_json::to_value(&record)?,
+    )
+    .await?;
+    Ok(record)
+}
+
+fn write_json_atomically(path: &Path, value: &RebuildUpdateRecord) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("rebuild-update");
+    let temporary_path = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            parent.join(format!("{file_name}.tmp.{}", std::process::id()))
+        }
+        _ => PathBuf::from(format!("{file_name}.tmp.{}", std::process::id())),
+    };
+    fs::write(
+        &temporary_path,
+        format!("{}\n", serde_json::to_string(value)?),
+    )
+    .map_err(|error| {
+        anyhow!(
+            "failed to write temporary rebuild outcome {}: {error}",
+            temporary_path.display()
+        )
+    })?;
+    fs::rename(&temporary_path, path).map_err(|error| {
+        anyhow!(
+            "failed to finalize rebuild outcome {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 /// Appends a host-originated custom event to the conversation's canonical
@@ -144,6 +261,74 @@ mod tests {
             function_name: "list_conversation_events".to_string(),
             arguments: arguments.as_object().unwrap().clone(),
         }
+    }
+
+    #[tokio::test]
+    async fn completes_rebuild_update_file_and_records_host_event() {
+        let tempdir = TempDir::new().unwrap();
+        let conversation = test_conversation(&tempdir).await;
+        let outcome_path = tempdir.path().join("update.json");
+        let queued = RebuildUpdateRecord {
+            update_id: "update-1".to_string(),
+            operation: "rebuild_and_restart_exo".to_string(),
+            status: "queued".to_string(),
+            requested_at: "2026-07-28T17:00:00Z".to_string(),
+            reason: Some("Add webhook adapter".to_string()),
+            agent_id: "agent-id".to_string(),
+            conversation_id: conversation.record().id.to_string(),
+            agent_slug: Some("agent".to_string()),
+            conversation_slug: Some("conversation".to_string()),
+            exit_code: None,
+            completed_at: None,
+        };
+        fs::write(
+            &outcome_path,
+            format!("{}\n", serde_json::to_string(&queued).unwrap()),
+        )
+        .unwrap();
+
+        let completed = complete_rebuild_and_restart_update(
+            conversation.as_ref(),
+            &outcome_path,
+            "succeeded",
+            0,
+            "2026-07-28T17:01:00Z",
+        )
+        .await
+        .unwrap();
+        assert_eq!(completed.status, "succeeded");
+        assert_eq!(completed.exit_code, Some(0));
+        assert_eq!(
+            completed.completed_at.as_deref(),
+            Some("2026-07-28T17:01:00Z")
+        );
+
+        let on_disk: RebuildUpdateRecord =
+            serde_json::from_str(&fs::read_to_string(&outcome_path).unwrap()).unwrap();
+        assert_eq!(on_disk.status, "succeeded");
+
+        let result = execute_list_conversation_events_tool(
+            conversation.as_ref(),
+            &tool_request(serde_json::json!({
+                "kinds": null,
+                "limit": null,
+                "cursor": null,
+                "direction": null
+            })),
+        )
+        .await
+        .unwrap();
+        let events = result["events"].as_array().unwrap();
+        assert_eq!(
+            events[0]["data"]["event_type"].as_str().unwrap_or_default(),
+            HOST_EVENT_REBUILD_AND_RESTART
+        );
+        assert_eq!(events[0]["data"]["payload"]["updateId"], "update-1");
+        assert_eq!(events[0]["data"]["payload"]["status"], "succeeded");
+        assert_eq!(
+            events[0]["data"]["payload"]["reason"],
+            "Add webhook adapter"
+        );
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@ import {
   registerBuiltInTools,
   registerAgentTools,
   registerAgentToolsFromDirectoryIfExists,
+  registerAdapterTools,
   registerLibraryTools,
   registerLibraryToolModulePath,
   registerTools,
@@ -28,6 +29,7 @@ import {
 } from "./index";
 import { ircTool } from "../../examples/typescript/tools/irc";
 import { uppercaseTool } from "../../examples/typescript/tools/uppercase";
+import { installToolSource, readToolRegistry } from "./tool-registry";
 
 describe("HarnessToolRegistry", () => {
   it("returns registered tool definitions", () => {
@@ -391,6 +393,31 @@ describe("shell built-in tool", () => {
       buildShellToolDefinitions(context.conversationConfig),
     );
   });
+
+  it("registers and dispatches enable_adapter", async () => {
+    const requests: Array<{ functionName: string; arguments: JsonObject }> = [];
+    const context = fakeTurnContext({
+      executeTool: async (request) => {
+        requests.push(request);
+        return { ok: true };
+      },
+    });
+    const registry = createToolRegistry(context);
+    registerAdapterTools(registry, ["enable_adapter"]);
+
+    expect(registry.definitions().map((definition) => definition.name)).toEqual(
+      ["enable_adapter"],
+    );
+    await registry
+      .get("enable_adapter")
+      ?.handler.execute({ adapterId: "adapter-1" }, { context });
+    expect(requests).toEqual([
+      {
+        functionName: "enable_adapter",
+        arguments: { adapterId: "adapter-1" },
+      },
+    ]);
+  });
 });
 
 describe("library tool modules", () => {
@@ -624,6 +651,248 @@ describe("agent tool loading", () => {
     }
   });
 
+  it("installs and inspects a manifest tool from a local subdirectory", async () => {
+    const previousCwd = process.cwd();
+    const tempdir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "exo-tool-registry-"),
+    );
+    process.chdir(tempdir);
+    try {
+      const sourceRoot = "source";
+      const toolDirectory = path.join(tempdir, sourceRoot, "reverse");
+      await fs.mkdir(toolDirectory, { recursive: true });
+      await fs.writeFile(
+        path.join(toolDirectory, "exo-tool.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          id: "tool:test/reverse",
+          module: "tool.ts",
+        }),
+      );
+      await fs.writeFile(
+        path.join(toolDirectory, "tool.ts"),
+        reverseTextToolSource(),
+      );
+
+      const context = fakeTurnContext();
+      const bootstrap = createToolRegistry(context);
+      registerBuiltInTools(bootstrap, context, [
+        "inspect_tools",
+        "manage_tool",
+      ]);
+      const installed = await bootstrap.get("manage_tool")?.handler.execute(
+        {
+          action: "install",
+          toolId: null,
+          source: {
+            type: "local",
+            path: sourceRoot,
+            subdirectory: "reverse",
+          },
+          initialization: "{}",
+        },
+        { context },
+      );
+      expect(installed).toMatchObject({
+        ok: true,
+        action: "install",
+        availableNextRound: true,
+      });
+      await bootstrap.get("manage_tool")?.handler.execute(
+        {
+          action: "install",
+          toolId: null,
+          source: {
+            type: "local",
+            path: sourceRoot,
+            subdirectory: "reverse",
+          },
+          initialization: "{}",
+        },
+        { context },
+      );
+      const snapshot = await readToolRegistry();
+      expect(snapshot.installed).toHaveLength(1);
+      expect(snapshot.installed[0].source).toEqual({
+        type: "local",
+        path: "source",
+        subdirectory: "reverse",
+      });
+      expect(Object.keys(snapshot.installed[0]).sort()).toEqual([
+        "id",
+        "initialization",
+        "installPath",
+        "source",
+      ]);
+
+      const nextContext = fakeTurnContext();
+      const nextRound = createToolRegistry(nextContext);
+      registerBuiltInTools(nextRound, nextContext, [
+        "inspect_tools",
+        "manage_tool",
+      ]);
+      await registerAgentToolsFromDirectoryIfExists(nextRound, nextContext);
+      expect(nextRound.get("reverse_text")?.source).toBe("agent");
+
+      const listed = await nextRound.get("inspect_tools")?.handler.execute(
+        {
+          source: "installed",
+          operation: "list",
+          toolId: null,
+        },
+        { context: nextContext },
+      );
+      expect(listed).toMatchObject({
+        ok: true,
+        source: "installed",
+        tools: [{ toolId: "tool:test/reverse", name: "reverse_text" }],
+      });
+      const inspected = await nextRound.get("inspect_tools")?.handler.execute(
+        {
+          source: "installed",
+          operation: "get",
+          toolId: "tool:test/reverse",
+        },
+        { context: nextContext },
+      );
+      expect(inspected).toMatchObject({
+        ok: true,
+        source: "installed",
+        tool: {
+          toolId: "tool:test/reverse",
+          name: "reverse_text",
+        },
+      });
+    } finally {
+      process.chdir(previousCwd);
+      await fs.rm(tempdir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects local tool sources outside the workspace", async () => {
+    const previousCwd = process.cwd();
+    const workspace = await fs.mkdtemp(
+      path.join(os.tmpdir(), "exo-tool-workspace-"),
+    );
+    const outside = await fs.mkdtemp(
+      path.join(os.tmpdir(), "exo-tool-outside-"),
+    );
+    process.chdir(workspace);
+    try {
+      await fs.symlink(outside, path.join(workspace, "outside-link"));
+      const context = fakeTurnContext();
+      const registry = createToolRegistry(context);
+      registerBuiltInTools(registry, context, ["manage_tool"]);
+      const manage = registry.get("manage_tool");
+      if (!manage) {
+        throw new Error("manage_tool was not registered");
+      }
+      const install = (sourcePath: string) =>
+        manage.handler.execute(
+          {
+            action: "install",
+            toolId: null,
+            source: {
+              type: "local",
+              path: sourcePath,
+              subdirectory: null,
+            },
+            initialization: null,
+          },
+          { context },
+        );
+
+      await expect(install("/tmp/example-tool")).rejects.toThrow(
+        "local source path must be workspace-relative",
+      );
+      await expect(install("../example-tool")).rejects.toThrow(
+        "contained workspace-relative path",
+      );
+      await expect(install("missing-tool")).rejects.toThrow(
+        "Write it under the mounted Exo workspace",
+      );
+      await expect(install("outside-link")).rejects.toThrow(
+        "must resolve inside the workspace",
+      );
+    } finally {
+      process.chdir(previousCwd);
+      await fs.rm(workspace, { recursive: true, force: true });
+      await fs.rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("fails clearly without mutating a malformed tool lockfile", async () => {
+    const tempdir = await fs.mkdtemp(path.join(os.tmpdir(), "exo-tool-lock-"));
+    try {
+      const lockfile = JSON.stringify({
+        schemaVersion: 1,
+        tools: [{ id: "broken" }],
+      });
+      await fs.writeFile(path.join(tempdir, "tools.lock.json"), lockfile);
+      expect(readToolRegistry(tempdir)).rejects.toThrow(
+        "invalid tool lockfile",
+      );
+      expect(
+        await fs.readFile(path.join(tempdir, "tools.lock.json"), "utf8"),
+      ).toBe(lockfile);
+      expect((await fs.readdir(tempdir)).sort()).toEqual(["tools.lock.json"]);
+    } finally {
+      await fs.rm(tempdir, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes concurrent installs so neither lockfile update is lost", async () => {
+    const previousCwd = process.cwd();
+    const tempdir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "exo-tool-registry-race-"),
+    );
+    process.chdir(tempdir);
+    try {
+      for (const name of ["a", "b"]) {
+        const toolDirectory = path.join(tempdir, `tool-${name}`);
+        await fs.mkdir(toolDirectory, { recursive: true });
+        await fs.writeFile(
+          path.join(toolDirectory, "exo-tool.json"),
+          JSON.stringify({
+            schemaVersion: 1,
+            id: `tool:test/${name}`,
+            module: "tool.ts",
+          }),
+        );
+        await fs.writeFile(path.join(toolDirectory, "tool.ts"), `tool_${name}`);
+      }
+      const validate = async (modulePath: string) => ({
+        toolName: (await fs.readFile(modulePath, "utf8")).trim(),
+      });
+
+      // Without the registry lock, one read-modify-write of tools.lock.json
+      // silently overwrites the other and an install is lost.
+      await Promise.all([
+        installToolSource(
+          { source: { type: "local", path: "tool-a" }, initialization: {} },
+          validate,
+        ),
+        installToolSource(
+          { source: { type: "local", path: "tool-b" }, initialization: {} },
+          validate,
+        ),
+      ]);
+
+      const snapshot = await readToolRegistry();
+      expect(snapshot.installed.map((item) => item.id).sort()).toEqual([
+        "tool:test/a",
+        "tool:test/b",
+      ]);
+      const registryFiles = await fs.readdir(
+        path.join(tempdir, ".exo", "tools"),
+      );
+      expect(registryFiles).not.toContain("registry.lock");
+    } finally {
+      process.chdir(previousCwd);
+      await fs.rm(tempdir, { recursive: true, force: true });
+    }
+  });
+
   it("rejects installing an agent tool whose tool name belongs to another module", async () => {
     const previousCwd = process.cwd();
     const tempdir = await fs.mkdtemp(path.join(os.tmpdir(), "exo-agent-tool-"));
@@ -738,6 +1007,119 @@ describe("agent tool loading", () => {
     ).rejects.toThrow("tool initialization.prefix is required");
   });
 
+  it("rejects agent tool schemas that violate strict mode", async () => {
+    const nonStrictTool = {
+      definition: {
+        name: "non_strict",
+        description: "Tool with an optional property missing from required.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            prompt: { type: "string" },
+            style: { type: ["string", "null"] },
+          },
+          required: ["prompt"],
+        },
+      },
+      initializationParameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {},
+      },
+      initialize() {
+        return {
+          async execute(): Promise<ToolResult> {
+            return { ok: true };
+          },
+        };
+      },
+    } satisfies Tool;
+
+    await expect(
+      initializeTool(nonStrictTool, "agent", {}, fakeTurnContext()),
+    ).rejects.toThrow(
+      "tool definition.parameters.required must list every key in properties for strict mode, missing: style",
+    );
+    await expect(
+      initializeTool(nonStrictTool, "library", {}, fakeTurnContext()),
+    ).resolves.toMatchObject({ source: "library" });
+  });
+
+  it("rejects agent tool schemas with non-strict nested objects", async () => {
+    const nestedTool = {
+      definition: {
+        name: "nested_non_strict",
+        description: "Tool with a nested object missing additionalProperties.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            options: {
+              type: "object",
+              properties: {
+                verbose: { type: "boolean" },
+              },
+              required: ["verbose"],
+            },
+          },
+          required: ["options"],
+        },
+      },
+      initializationParameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {},
+      },
+      initialize() {
+        return {
+          async execute(): Promise<ToolResult> {
+            return { ok: true };
+          },
+        };
+      },
+    } satisfies Tool;
+
+    await expect(
+      initializeTool(nestedTool, "agent", {}, fakeTurnContext()),
+    ).rejects.toThrow(
+      "tool definition.parameters.properties.options.additionalProperties must be false for strict mode",
+    );
+  });
+
+  it("expands ${VAR} environment references in agent tool initialization", async () => {
+    const registry = createToolRegistry(fakeTurnContext());
+    process.env.EXO_TEST_PREFIX = "from-env: ";
+    try {
+      await registerAgentTools(registry, fakeTurnContext(), {
+        tool: uppercaseTool,
+        initialization: { prefix: "${EXO_TEST_PREFIX}" },
+      });
+    } finally {
+      delete process.env.EXO_TEST_PREFIX;
+    }
+
+    await expect(
+      registry
+        .get("uppercase")
+        ?.handler.execute({ text: "hello" }, { context: fakeTurnContext() }),
+    ).resolves.toEqual({ text: "from-env: HELLO" });
+  });
+
+  it("rejects agent tool initialization referencing unset environment variables", async () => {
+    const registry = createToolRegistry(fakeTurnContext());
+    delete process.env.EXO_TEST_MISSING_VAR;
+
+    await expect(
+      registerAgentTools(registry, fakeTurnContext(), {
+        tool: uppercaseTool,
+        initialization: { prefix: "${EXO_TEST_MISSING_VAR}" },
+      }),
+    ).rejects.toThrow(
+      "tool initialization references environment variable EXO_TEST_MISSING_VAR, which is not set",
+    );
+  });
+
   it("rejects generated tools using legacy inputSchema and invoke shapes", async () => {
     const generatedTool = {
       definition: {
@@ -827,6 +1209,14 @@ const reverseTextTool = {
     name: "reverse_text",
     description: "Reverse text.",
     parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        text: { type: "string" },
+      },
+      required: ["text"],
+    },
+    outputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
@@ -949,8 +1339,9 @@ function fakeTurnContext(
     braintrustParent: null,
     exoharness: {
       current: {
-        agent: {},
+        agent: { record: { id: "agent-test" } },
         conversation: {
+          record: { id: "conversation-test" },
           async writeArtifactText(args: { path: string; text: string }) {
             artifactIndex += 1;
             return {
