@@ -254,10 +254,18 @@ function stringifyToolResult(result: ToolResult): string {
   return typeof result === "string" ? result : JSON.stringify(result, null, 2);
 }
 
-function previewText(text: string): string {
-  return text.length > TOOL_RESULT_PREVIEW_CHARS
-    ? `${text.slice(0, TOOL_RESULT_PREVIEW_CHARS)}\n...[truncated]`
-    : text;
+export function previewText(text: string): string {
+  if (text.length <= TOOL_RESULT_PREVIEW_CHARS) {
+    return text;
+  }
+  // Slicing by UTF-16 code units can cut a surrogate pair in half. A lone
+  // high surrogate serializes as an unpaired \ud8xx escape, which strict JSON
+  // parsers downstream reject — a single emoji at the boundary then fails the
+  // whole turn. Drop the dangling half instead of emitting it.
+  const cut = text
+    .slice(0, TOOL_RESULT_PREVIEW_CHARS)
+    .replace(/[\uD800-\uDBFF]$/, "");
+  return `${cut}\n...[truncated]`;
 }
 
 function sanitizePathSegment(value: string): string {
