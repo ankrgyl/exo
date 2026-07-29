@@ -33,19 +33,20 @@ use crate::secrets::{
 use crate::storage::BasicObjectStore;
 use crate::{
     AddEventsRequest, AddEventsResult, AgentHandle, AgentId, AgentRecord, Artifact,
-    ArtifactVersion, BeginTurnRequest, Binding, BindingId, BindingRecord, BindingType,
-    BoxAsyncRead, BoxAsyncWrite, CancelSandboxProcessRequest, CloseSandboxProcessInputRequest,
-    ConversationHandle, ConversationId, ConversationRecord, CreateSandboxRequest,
-    DurableFileSystem, Event, EventData, EventId, EventKind, EventQuery, EventQueryDirection,
-    EventStream, ExoHarness, FileSystemMount, ForkConversationRequest, GetEventsResult,
-    GetSandboxProcessEventsResult, ListConversationsRequest, ListConversationsResult,
-    NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest, Result,
-    RunInSandboxRequest, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEvent,
-    SandboxProcessEventQuery, SandboxProcessId, SandboxProcessMode, SandboxProcessParts,
-    SandboxProcessRecord, SandboxProcessStatus, SandboxProcessStdin, SandboxProvider,
-    SandboxProviderConfig, Secret, SecretId, SecretMetadata, SecretType, SessionId, SnapshotHandle,
-    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord,
-    Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
+    BindingType, BoxAsyncRead, BoxAsyncWrite, CancelSandboxProcessRequest,
+    CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, ConversationRecord,
+    CreateSandboxRequest, DurableFileSystem, Event, EventData, EventId, EventKind, EventQuery,
+    EventQueryDirection, EventStream, ExoHarness, FileSystemMount, ForkConversationRequest,
+    GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
+    ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
+    ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId,
+    SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessId,
+    SandboxProcessMode, SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus,
+    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, Secret, SecretId, SecretMetadata,
+    SecretType, SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
+    StartSandboxRequest, TurnHandle, TurnId, TurnRecord, Uuid7, WaitSandboxProcessRequest,
+    WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const SANDBOX_PROVIDER_STATE_EVENT: &str = "sandbox_provider_state";
@@ -1072,6 +1073,14 @@ where
         self.sandbox_handle().create_sandbox(request).await
     }
 
+    async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {
+        self.sandbox_handle().attach_sandbox(request).await
+    }
+
+    async fn detach_sandbox(&self, id: SandboxId) -> Result<SandboxAttachment> {
+        self.sandbox_handle().detach_sandbox(id).await
+    }
+
     async fn stop_sandbox(&self, id: SandboxId) -> Result<()> {
         self.sandbox_handle().stop_sandbox(id).await
     }
@@ -1217,7 +1226,7 @@ impl AgentHandle for BasicAgentHandle {
             None,
             None,
             None,
-            vec![EventData::ConversationCreated {
+            vec![EventData::ThreadCreated {
                 slug: record.slug.clone(),
                 name: record.name.clone(),
             }],
@@ -1263,7 +1272,7 @@ impl AgentHandle for BasicAgentHandle {
                 None,
                 None,
                 record.latest_event_id,
-                vec![EventData::ConversationDeleted],
+                vec![EventData::ThreadDeleted],
                 &mut record,
             )
             .await?;
@@ -1586,6 +1595,85 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         self.create_new_sandbox_locked(prepared).await
     }
 
+    async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {
+        self.ensure_full_sandbox_scope("attach_sandbox")?;
+        let sandbox_id = format!("sandbox-{}", Uuid7::now());
+        let provider = request.attachment.provider();
+        let sandbox = StoredSandbox {
+            id: sandbox_id.clone(),
+            name: None,
+            provider,
+            image: String::new(),
+            requested_image: None,
+            default_workdir: Some(request.default_workdir.unwrap_or_default()),
+            file_system_mounts: Vec::new(),
+            durable_file_systems: Vec::new(),
+            enable_networking: true,
+            idle_seconds: 0,
+            running: true,
+            latest_snapshot_id: None,
+            attachment: Some(request.attachment),
+        };
+        let (sandbox_handle, provider_state_event) = create_sandbox_handle(
+            self.harness,
+            &self.owner_dir,
+            self.owner,
+            &sandbox_id,
+            &sandbox,
+        )
+        .await?;
+        let _guard = self.harness.inner.write_lock.lock().await;
+        self.persist_attached_sandbox_locked(sandbox, sandbox_handle, provider_state_event)
+            .await
+    }
+
+    async fn detach_sandbox(&self, sandbox_id: SandboxId) -> Result<SandboxAttachment> {
+        self.ensure_full_sandbox_scope("detach_sandbox")?;
+        let mut sandbox = self.load_sandbox(&sandbox_id).await?;
+        if !sandbox.running {
+            if let Some(attachment) = sandbox.attachment {
+                return Ok(attachment);
+            }
+            bail!("sandbox is not running: {sandbox_id}");
+        }
+        let (sandbox_handle, provider_state_event) = active_sandbox_handle(
+            self.harness,
+            &self.owner_dir,
+            self.owner,
+            &sandbox_id,
+            &sandbox,
+        )
+        .await?;
+        let attachment = sandbox_handle.detach().await?;
+        let _guard = self.harness.inner.write_lock.lock().await;
+        self.harness
+            .inner
+            .running_sandboxes
+            .lock()
+            .await
+            .remove(&sandbox_id);
+        sandbox.running = false;
+        sandbox.attachment = Some(attachment.clone());
+        self.harness
+            .inner
+            .storage
+            .put_json(
+                self.sandboxes_dir().join(format!("{sandbox_id}.json")),
+                &sandbox,
+            )
+            .await?;
+        let mut events = Vec::new();
+        if let Some(event) = provider_state_event {
+            events.push(event);
+        }
+        events.push(EventData::SandboxDetached {
+            sandbox_id,
+            attachment: attachment.clone(),
+        });
+        self.append_events_locked(events).await?;
+        Ok(attachment)
+    }
+
     async fn snapshot_sandbox(&self, id: SandboxId) -> Result<SnapshotId> {
         let (snapshot_id, event) =
             snapshot_sandbox_side_effect(self.harness, &self.owner_dir, id).await?;
@@ -1602,6 +1690,10 @@ impl<'a> BasicScopedSandboxHandle<'a> {
 
     async fn stop_sandbox(&self, id: SandboxId) -> Result<()> {
         self.ensure_full_sandbox_scope("stop_sandbox")?;
+        let stored = self.load_sandbox(&id).await?;
+        if stored.attachment.is_some() {
+            bail!("attached sandboxes must be detached, not stopped");
+        }
         let sandbox_handle = self
             .harness
             .inner
@@ -1859,6 +1951,44 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 snapshot_id: None,
             },
         ];
+        if let Some(event) = provider_state_event {
+            events.push(event);
+        }
+        self.append_events_locked(events).await?;
+        Ok(sandbox_id)
+    }
+
+    async fn persist_attached_sandbox_locked(
+        &self,
+        sandbox: StoredSandbox,
+        sandbox_handle: Arc<dyn ManagedSandboxHandle>,
+        provider_state_event: Option<EventData>,
+    ) -> Result<SandboxId> {
+        let sandbox_id = sandbox.id.clone();
+        let attachment = sandbox
+            .attachment
+            .clone()
+            .expect("attached sandbox has an attachment descriptor");
+        let default_workdir = sandbox.default_workdir.clone().unwrap_or_default();
+        self.harness
+            .inner
+            .storage
+            .put_json(
+                self.sandboxes_dir().join(format!("{sandbox_id}.json")),
+                &sandbox,
+            )
+            .await?;
+        self.harness
+            .inner
+            .running_sandboxes
+            .lock()
+            .await
+            .insert(sandbox_id.clone(), sandbox_handle);
+        let mut events = vec![EventData::SandboxAttached {
+            sandbox_id: sandbox_id.clone(),
+            attachment,
+            default_workdir,
+        }];
         if let Some(event) = provider_state_event {
             events.push(event);
         }
@@ -2162,7 +2292,10 @@ impl ConversationHandle for BasicConversationHandle {
                 events.retain(|event| event.turn_id == Some(turn_id));
             }
             if let Some(types) = query.types {
-                events.retain(|event| types.contains(&event.data.kind()));
+                events.retain(|event| {
+                    let event_kind = event.data.kind();
+                    types.iter().any(|kind| kind.matches(&event_kind))
+                });
             }
             match query.direction.unwrap_or(EventQueryDirection::Asc) {
                 EventQueryDirection::Asc => {
@@ -2285,7 +2418,7 @@ impl ConversationHandle for BasicConversationHandle {
         for mut event in events {
             let new_event_id = Uuid7::now();
             event.id = new_event_id;
-            event.conversation_id = record.id;
+            event.thread_id = record.id;
             event.created_at = new_event_id.timestamp().expect("uuid7 timestamp");
             latest_event_id = Some(new_event_id);
             self.harness
@@ -2309,8 +2442,8 @@ impl ConversationHandle for BasicConversationHandle {
             None,
             None,
             fork_record.latest_event_id,
-            vec![EventData::ConversationForked {
-                source_conversation_id: self.record.id,
+            vec![EventData::ThreadForked {
+                source_thread_id: self.record.id,
                 up_to_inclusive: request.up_to_inclusive,
             }],
             &mut fork_record,
@@ -2592,6 +2725,10 @@ async fn snapshot_sandbox_side_effect(
     owner_dir: &Path,
     id: SandboxId,
 ) -> Result<(SnapshotId, EventData)> {
+    let sandbox = load_stored_sandbox(harness, owner_dir, &id).await?;
+    if sandbox.attachment.is_some() {
+        bail!("attached sandboxes cannot be snapshotted");
+    }
     // Capture the payload before taking the write lock. Backends may need to
     // talk to docker or pause the container, which can be slow.
     let handle = harness
@@ -2646,6 +2783,10 @@ async fn start_sandbox_side_effect(
     owner: SandboxOwner,
     request: StartSandboxRequest,
 ) -> Result<EventData> {
+    let existing = load_stored_sandbox(harness, owner_dir, &request.id).await?;
+    if existing.attachment.is_some() {
+        bail!("attached sandboxes cannot be started from snapshots");
+    }
     // Load the snapshot payload before acquiring the write lock. It can be
     // large, and we don't want to block writers while we read.
     let snapshot_dir = owner_dir
@@ -2901,17 +3042,15 @@ async fn create_sandbox_handle(
         &state_key,
     )
     .await?;
-    let handle = harness
+    let backend = harness
         .inner
         .sandbox_backend_for_provider(sandbox.provider)
-        .await?
-        .acquire(sandbox_request(
-            owner,
-            sandbox_id,
-            sandbox,
-            previous_state.clone(),
-        ))
         .await?;
+    let request = sandbox_request(owner, sandbox_id, sandbox, previous_state.clone());
+    let handle = match &sandbox.attachment {
+        Some(attachment) => backend.attach(request, attachment.clone()).await?,
+        None => backend.acquire(request).await?,
+    };
     let provider_state_event = sandbox_provider_state_event(
         sandbox_id,
         sandbox.provider,
@@ -3200,6 +3339,8 @@ struct StoredSandbox {
     idle_seconds: u64,
     running: bool,
     latest_snapshot_id: Option<SnapshotId>,
+    #[serde(default)]
+    attachment: Option<SandboxAttachment>,
 }
 
 #[derive(Debug, Clone)]
@@ -3229,6 +3370,7 @@ impl PreparedSandboxRequest {
             idle_seconds: self.idle_seconds,
             running: true,
             latest_snapshot_id: None,
+            attachment: None,
         }
     }
 }
@@ -3748,7 +3890,7 @@ async fn append_events_to_conversation(
         let id = Uuid7::now();
         let event = Event {
             id,
-            conversation_id,
+            thread_id: conversation_id,
             session_id,
             turn_id,
             created_at: id.timestamp().expect("uuid7 timestamp"),

@@ -36,6 +36,7 @@ async fn rlm_send_executes_repl_steps_and_persists_final_answer() {
             tool_calls: vec![PendingToolCall {
                 tool_call_id: "repl-1".to_string(),
                 request: ToolRequest {
+                    namespace: None,
                     function_name: "repl_execute".to_string(),
                     arguments: Map::from_iter([(
                         "code".to_string(),
@@ -145,6 +146,7 @@ async fn rlm_subquery_variable_can_store_final_answer() {
             tool_calls: vec![PendingToolCall {
                 tool_call_id: "repl-1".to_string(),
                 request: ToolRequest {
+                    namespace: None,
                     function_name: "repl_execute".to_string(),
                     arguments: Map::from_iter([(
                         "code".to_string(),
@@ -164,6 +166,7 @@ async fn rlm_subquery_variable_can_store_final_answer() {
             tool_calls: vec![PendingToolCall {
                 tool_call_id: "sub-1".to_string(),
                 request: ToolRequest {
+                    namespace: None,
                     function_name: "subquery_variable".to_string(),
                     arguments: Map::from_iter([
                         (
@@ -358,6 +361,7 @@ async fn rlm_exposes_history_via_get_messages() {
             tool_calls: vec![PendingToolCall {
                 tool_call_id: "repl-1".to_string(),
                 request: ToolRequest {
+                    namespace: None,
                     function_name: "repl_execute".to_string(),
                     arguments: Map::from_iter([(
                         "code".to_string(),
@@ -458,6 +462,7 @@ async fn rlm_can_finish_by_setting_final_in_repl() {
         tool_calls: vec![PendingToolCall {
             tool_call_id: "repl-1".to_string(),
             request: ToolRequest {
+                namespace: None,
                 function_name: "repl_execute".to_string(),
                 arguments: Map::from_iter([(
                     "code".to_string(),

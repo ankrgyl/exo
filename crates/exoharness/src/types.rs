@@ -42,6 +42,8 @@ pub trait SnapshotHandle: Send + Sync {
 #[async_trait]
 pub trait SandboxHandle: SnapshotHandle {
     async fn create_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId>;
+    async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId>;
+    async fn detach_sandbox(&self, id: SandboxId) -> Result<SandboxAttachment>;
     async fn stop_sandbox(&self, id: SandboxId) -> Result<()>;
     async fn start_sandbox_process(
         &self,
@@ -75,6 +77,22 @@ pub trait SandboxHandle: SnapshotHandle {
 pub trait AgentHandle: SandboxHandle {
     fn record(&self) -> &AgentRecord;
 
+    async fn list_threads(
+        &self,
+        request: ListThreadsRequest,
+    ) -> Result<ListThreadsResult<Arc<dyn ThreadHandle>>> {
+        Ok(self.list_conversations(request).await?.into())
+    }
+    async fn get_thread(&self, id: &ThreadId) -> Result<Option<Arc<dyn ThreadHandle>>> {
+        self.get_conversation(id).await
+    }
+    async fn new_thread(&self, request: NewThreadRequest) -> Result<Arc<dyn ThreadHandle>> {
+        self.new_conversation(request).await
+    }
+    async fn delete_thread(&self, id: &ThreadId) -> Result<bool> {
+        self.delete_conversation(id).await
+    }
+
     async fn list_conversations(
         &self,
         request: ListConversationsRequest,
@@ -103,14 +121,14 @@ pub trait AgentHandle: SandboxHandle {
 }
 
 #[async_trait]
-pub trait ConversationHandle: SandboxHandle {
-    fn record(&self) -> &ConversationRecord;
+pub trait ThreadHandle: SandboxHandle {
+    fn record(&self) -> &ThreadRecord;
 
     async fn start_session(&self) -> Result<SessionId>;
     async fn end_session(&self, id: SessionId) -> Result<()>;
     async fn begin_turn(&self, request: BeginTurnRequest) -> Result<Arc<dyn TurnHandle>>;
     /// Rebuilds the local TurnHandle facade for an already-created turn.
-    /// The durable identity is the agent, conversation, session, and turn ids;
+    /// The durable identity is the agent, thread, session, and turn ids;
     /// this method only bundles those ids back into the trait object API.
     async fn turn_handle(&self, record: TurnRecord) -> Result<Arc<dyn TurnHandle>>;
 
@@ -118,7 +136,7 @@ pub trait ConversationHandle: SandboxHandle {
     async fn watch_events(&self, after_exclusive: Bound<EventId>) -> Result<EventStream>;
     async fn get_event(&self, id: EventId) -> Result<Option<Event>>;
     async fn add_events(&self, request: AddEventsRequest) -> Result<AddEventsResult>;
-    async fn fork(&self, request: ForkConversationRequest) -> Result<Arc<dyn ConversationHandle>>;
+    async fn fork(&self, request: ForkThreadRequest) -> Result<Arc<dyn ThreadHandle>>;
 
     async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion>;
     async fn read_artifact(&self, request: ReadArtifactRequest) -> Result<Option<Artifact>>;
@@ -132,6 +150,9 @@ pub trait ConversationHandle: SandboxHandle {
     async fn put_secret(&self, request: PutSecretRequest) -> Result<SecretId>;
     async fn get_secret(&self, id: &SecretId) -> Result<Option<Secret>>;
 }
+
+/// Compatibility name for [`ThreadHandle`].
+pub use ThreadHandle as ConversationHandle;
 
 #[async_trait]
 pub trait TurnHandle: SnapshotHandle {
@@ -156,21 +177,21 @@ pub struct NewAgentRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ConversationRecord {
-    pub id: ConversationId,
+pub struct ThreadRecord {
+    pub id: ThreadId,
     pub slug: String,
     pub name: String,
     pub latest_event_id: Option<EventId>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NewConversationRequest {
+pub struct NewThreadRequest {
     pub slug: Option<String>,
     pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ListConversationsRequest {
+pub struct ListThreadsRequest {
     pub cursor: Option<EventId>,
     pub limit: Option<usize>,
 }
@@ -180,6 +201,37 @@ pub struct ListConversationsResult<T> {
     pub conversations: Vec<T>,
     pub next_cursor: Option<EventId>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListThreadsResult<T> {
+    pub threads: Vec<T>,
+    pub next_cursor: Option<EventId>,
+}
+
+impl<T> From<ListConversationsResult<T>> for ListThreadsResult<T> {
+    fn from(result: ListConversationsResult<T>) -> Self {
+        Self {
+            threads: result.conversations,
+            next_cursor: result.next_cursor,
+        }
+    }
+}
+
+impl<T> From<ListThreadsResult<T>> for ListConversationsResult<T> {
+    fn from(result: ListThreadsResult<T>) -> Self {
+        Self {
+            conversations: result.threads,
+            next_cursor: result.next_cursor,
+        }
+    }
+}
+
+/// Compatibility name for [`ThreadRecord`].
+pub type ConversationRecord = ThreadRecord;
+/// Compatibility name for [`NewThreadRequest`].
+pub type NewConversationRequest = NewThreadRequest;
+/// Compatibility name for [`ListThreadsRequest`].
+pub type ListConversationsRequest = ListThreadsRequest;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TurnRecord {
@@ -217,6 +269,10 @@ pub struct EventQuery {
 pub struct EventKind(Cow<'static, str>);
 
 impl EventKind {
+    pub const THREAD_CREATED: EventKind = EventKind(Cow::Borrowed("thread_created"));
+    pub const THREAD_UPDATED: EventKind = EventKind(Cow::Borrowed("thread_updated"));
+    pub const THREAD_DELETED: EventKind = EventKind(Cow::Borrowed("thread_deleted"));
+    pub const THREAD_FORKED: EventKind = EventKind(Cow::Borrowed("thread_forked"));
     pub const CONVERSATION_CREATED: EventKind = EventKind(Cow::Borrowed("conversation_created"));
     pub const CONVERSATION_UPDATED: EventKind = EventKind(Cow::Borrowed("conversation_updated"));
     pub const CONVERSATION_DELETED: EventKind = EventKind(Cow::Borrowed("conversation_deleted"));
@@ -234,6 +290,8 @@ impl EventKind {
     pub const SANDBOX_CREATED: EventKind = EventKind(Cow::Borrowed("sandbox_created"));
     pub const SANDBOX_STARTED: EventKind = EventKind(Cow::Borrowed("sandbox_started"));
     pub const SANDBOX_STOPPED: EventKind = EventKind(Cow::Borrowed("sandbox_stopped"));
+    pub const SANDBOX_ATTACHED: EventKind = EventKind(Cow::Borrowed("sandbox_attached"));
+    pub const SANDBOX_DETACHED: EventKind = EventKind(Cow::Borrowed("sandbox_detached"));
     pub const SANDBOX_SNAPSHOTTED: EventKind = EventKind(Cow::Borrowed("sandbox_snapshotted"));
     pub const SANDBOX_PROCESS_STARTED: EventKind =
         EventKind(Cow::Borrowed("sandbox_process_started"));
@@ -247,6 +305,20 @@ impl EventKind {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn matches(&self, other: &Self) -> bool {
+        canonical_event_kind(self.as_str()) == canonical_event_kind(other.as_str())
+    }
+}
+
+fn canonical_event_kind(kind: &str) -> &str {
+    match kind {
+        "conversation_created" => "thread_created",
+        "conversation_updated" => "thread_updated",
+        "conversation_deleted" => "thread_deleted",
+        "conversation_forked" => "thread_forked",
+        kind => kind,
     }
 }
 
@@ -277,11 +349,14 @@ pub struct AddEventsResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ForkConversationRequest {
+pub struct ForkThreadRequest {
     pub up_to_inclusive: Option<EventId>,
     pub slug: Option<String>,
     pub name: Option<String>,
 }
+
+/// Compatibility name for [`ForkThreadRequest`].
+pub type ForkConversationRequest = ForkThreadRequest;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct UsageRecord {
@@ -311,27 +386,39 @@ pub struct UsageRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub id: EventId,
-    pub conversation_id: ConversationId,
+    #[serde(alias = "conversation_id")]
+    pub thread_id: ThreadId,
     pub session_id: Option<SessionId>,
     pub turn_id: Option<TurnId>,
     pub created_at: DateTimeUtc,
     pub data: EventData,
 }
 
+impl Event {
+    pub fn conversation_id(&self) -> ConversationId {
+        self.thread_id
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
-    ConversationCreated {
+    #[serde(alias = "conversation_created")]
+    ThreadCreated {
         slug: String,
         name: String,
     },
-    ConversationUpdated {
+    #[serde(alias = "conversation_updated")]
+    ThreadUpdated {
         slug: Option<String>,
         name: Option<String>,
     },
-    ConversationDeleted,
-    ConversationForked {
-        source_conversation_id: ConversationId,
+    #[serde(alias = "conversation_deleted")]
+    ThreadDeleted,
+    #[serde(alias = "conversation_forked")]
+    ThreadForked {
+        #[serde(alias = "source_conversation_id")]
+        source_thread_id: ThreadId,
         up_to_inclusive: Option<EventId>,
     },
     SessionStarted,
@@ -388,6 +475,15 @@ pub enum EventData {
     SandboxStopped {
         sandbox_id: SandboxId,
     },
+    SandboxAttached {
+        sandbox_id: SandboxId,
+        attachment: SandboxAttachment,
+        default_workdir: String,
+    },
+    SandboxDetached {
+        sandbox_id: SandboxId,
+        attachment: SandboxAttachment,
+    },
     SandboxSnapshotted {
         sandbox_id: SandboxId,
         snapshot_id: SnapshotId,
@@ -428,10 +524,10 @@ impl EventData {
     /// `EventQuery::types` filter on `get_events`.
     pub fn kind(&self) -> EventKind {
         match self {
-            Self::ConversationCreated { .. } => EventKind::CONVERSATION_CREATED,
-            Self::ConversationUpdated { .. } => EventKind::CONVERSATION_UPDATED,
-            Self::ConversationDeleted => EventKind::CONVERSATION_DELETED,
-            Self::ConversationForked { .. } => EventKind::CONVERSATION_FORKED,
+            Self::ThreadCreated { .. } => EventKind::THREAD_CREATED,
+            Self::ThreadUpdated { .. } => EventKind::THREAD_UPDATED,
+            Self::ThreadDeleted => EventKind::THREAD_DELETED,
+            Self::ThreadForked { .. } => EventKind::THREAD_FORKED,
             Self::SessionStarted => EventKind::SESSION_STARTED,
             Self::SessionEnded => EventKind::SESSION_ENDED,
             Self::TurnStarted => EventKind::TURN_STARTED,
@@ -445,6 +541,8 @@ impl EventData {
             Self::SandboxCreated { .. } => EventKind::SANDBOX_CREATED,
             Self::SandboxStarted { .. } => EventKind::SANDBOX_STARTED,
             Self::SandboxStopped { .. } => EventKind::SANDBOX_STOPPED,
+            Self::SandboxAttached { .. } => EventKind::SANDBOX_ATTACHED,
+            Self::SandboxDetached { .. } => EventKind::SANDBOX_DETACHED,
             Self::SandboxSnapshotted { .. } => EventKind::SANDBOX_SNAPSHOTTED,
             Self::SandboxProcessStarted { .. } => EventKind::SANDBOX_PROCESS_STARTED,
             Self::SandboxProcessStateUpdated { .. } => EventKind::SANDBOX_PROCESS_STATE_UPDATED,
@@ -458,6 +556,11 @@ impl EventData {
 pub struct ToolRequest {
     pub function_name: String,
     pub arguments: ToolArguments,
+    /// Namespace the tool lives in, for providers with namespaced tools (e.g.
+    /// the OpenAI Responses API requires function_call items to be replayed
+    /// with their namespace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -522,6 +625,26 @@ pub struct CreateSandboxRequest {
     pub durable_file_systems: Option<Vec<DurableFileSystem>>,
     pub enable_networking: Option<bool>,
     pub idle_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachSandboxRequest {
+    pub attachment: SandboxAttachment,
+    pub default_workdir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SandboxAttachment {
+    DockerContainer { container_id: String },
+}
+
+impl SandboxAttachment {
+    pub fn provider(&self) -> SandboxProvider {
+        match self {
+            Self::DockerContainer { .. } => SandboxProvider::Docker,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -934,7 +1057,9 @@ pub enum Secret {
 }
 
 pub type AgentId = Uuid7;
-pub type ConversationId = Uuid7;
+pub type ThreadId = Uuid7;
+/// Compatibility name for [`ThreadId`].
+pub type ConversationId = ThreadId;
 pub type SessionId = Uuid7;
 pub type TurnId = Uuid7;
 pub type EventId = Uuid7;
@@ -954,7 +1079,7 @@ pub type BoxAsyncWrite = Pin<Box<dyn AsyncWrite + Send + Unpin>>;
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<Event>> + Send>>;
 
 crate::impl_has_uuid7_id!(AgentRecord, id);
-crate::impl_has_uuid7_id!(ConversationRecord, id);
+crate::impl_has_uuid7_id!(ThreadRecord, id);
 crate::impl_has_uuid7_id!(TurnRecord, id);
 crate::impl_has_uuid7_id!(Event, id);
 crate::impl_has_uuid7_id!(BindingRecord, id);
@@ -972,6 +1097,74 @@ mod tests {
             value.get("type").and_then(Value::as_str),
             Some("session_started")
         );
+    }
+
+    #[test]
+    fn thread_event_kinds_match_legacy_conversation_filters() {
+        assert_eq!(EventKind::THREAD_CREATED.as_str(), "thread_created");
+        assert!(EventKind::THREAD_CREATED.matches(&EventKind::CONVERSATION_CREATED));
+        assert!(EventKind::THREAD_UPDATED.matches(&EventKind::CONVERSATION_UPDATED));
+        assert!(EventKind::THREAD_DELETED.matches(&EventKind::CONVERSATION_DELETED));
+        assert!(EventKind::THREAD_FORKED.matches(&EventKind::CONVERSATION_FORKED));
+    }
+
+    #[test]
+    fn thread_events_read_legacy_schema_and_write_canonical_schema() {
+        let event_id = Uuid7::now();
+        let thread_id = Uuid7::now();
+        let event = Event {
+            id: event_id,
+            thread_id,
+            session_id: None,
+            turn_id: None,
+            created_at: event_id.timestamp().expect("uuid7 timestamp"),
+            data: EventData::ThreadCreated {
+                slug: "thread".to_string(),
+                name: "Thread".to_string(),
+            },
+        };
+        let mut value = serde_json::to_value(event).expect("thread event should serialize");
+        assert_eq!(value["thread_id"], serde_json::json!(thread_id));
+        assert!(value.get("conversation_id").is_none());
+        assert_eq!(value["data"]["type"], "thread_created");
+
+        let object = value.as_object_mut().expect("event should be an object");
+        let serialized_thread_id = object.remove("thread_id").expect("thread id should exist");
+        object.insert("conversation_id".to_string(), serialized_thread_id);
+        value["data"]["type"] = Value::String("conversation_created".to_string());
+        let event: Event = serde_json::from_value(value).expect("legacy event should deserialize");
+        assert_eq!(event.thread_id, thread_id);
+        assert!(matches!(event.data, EventData::ThreadCreated { .. }));
+    }
+
+    #[test]
+    fn thread_fork_event_reads_legacy_source_id() {
+        let source_thread_id = Uuid7::now();
+        let event: EventData = serde_json::from_value(serde_json::json!({
+            "type": "conversation_forked",
+            "source_conversation_id": source_thread_id,
+            "up_to_inclusive": null,
+        }))
+        .expect("legacy fork event should deserialize");
+        assert!(matches!(
+            event,
+            EventData::ThreadForked {
+                source_thread_id: actual,
+                up_to_inclusive: None,
+            } if actual == source_thread_id
+        ));
+
+        let value = serde_json::to_value(EventData::ThreadForked {
+            source_thread_id,
+            up_to_inclusive: None,
+        })
+        .expect("thread fork event should serialize");
+        assert_eq!(value["type"], "thread_forked");
+        assert_eq!(
+            value["source_thread_id"],
+            serde_json::json!(source_thread_id)
+        );
+        assert!(value.get("source_conversation_id").is_none());
     }
 
     #[test]

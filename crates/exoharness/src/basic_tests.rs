@@ -23,8 +23,8 @@ use crate::{
     BoxAsyncWrite, CloseSandboxProcessInputRequest, CreateSandboxRequest, DurableFileSystem,
     EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness, FileSystemMountMode,
     ForkConversationRequest, ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest,
-    NewConversationRequest, PutSecretRequest, RunInSandboxRequest, SandboxCommand,
-    SandboxCommandOutput, SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy,
+    NewConversationRequest, PutSecretRequest, RunInSandboxRequest, SandboxAttachment,
+    SandboxCommand, SandboxCommandOutput, SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy,
     SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
     SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec,
     Secret, SnapshotKind, SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
@@ -44,6 +44,17 @@ async fn basic_backend_supports_agent_and_conversation_crud() {
             .expect("harness should initialize"),
     );
     crate::contract_tests::supports_agent_and_conversation_crud(harness).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn basic_backend_supports_thread_and_conversation_apis() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let harness: std::sync::Arc<dyn ExoHarness> = std::sync::Arc::new(
+        BasicExoHarness::new(local_test_config(tempdir.path()))
+            .await
+            .expect("harness should initialize"),
+    );
+    crate::contract_tests::supports_thread_api_and_conversation_compatibility(harness).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -824,7 +835,7 @@ async fn conversation_scope_overrides_agent_scope_and_fork_copies_local_state() 
     assert!(
         events
             .iter()
-            .any(|event| matches!(event.data, EventData::ConversationForked { .. }))
+            .any(|event| matches!(event.data, EventData::ThreadForked { .. }))
     );
 }
 
@@ -1800,6 +1811,14 @@ impl ManagedSandboxBackend for TestProviderStateBackend {
         }))
     }
 
+    async fn attach(
+        &self,
+        _request: SandboxRequest,
+        _attachment: SandboxAttachment,
+    ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        bail!("test provider-state backend does not support attachment")
+    }
+
     async fn acquire_from_snapshot(
         &self,
         _request: SandboxRequest,
@@ -1835,6 +1854,10 @@ impl ManagedSandboxHandle for TestProviderStateHandle {
         Ok(())
     }
 
+    async fn detach(&self) -> crate::Result<SandboxAttachment> {
+        bail!("test provider-state handle does not support detachment")
+    }
+
     async fn snapshot(&self) -> crate::Result<SnapshotPayload> {
         bail!("test provider-state handle does not support snapshots")
     }
@@ -1861,6 +1884,14 @@ impl ManagedSandboxBackend for TestSandboxBackend {
         Ok(Arc::new(TestSandboxHandle {
             process: Arc::clone(&self.process),
         }))
+    }
+
+    async fn attach(
+        &self,
+        _request: SandboxRequest,
+        _attachment: SandboxAttachment,
+    ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        bail!("test sandbox backend does not support attachment")
     }
 
     async fn acquire_from_snapshot(
@@ -1903,6 +1934,10 @@ impl ManagedSandboxHandle for TestSandboxHandle {
 
     async fn stop(&self) -> crate::Result<()> {
         Ok(())
+    }
+
+    async fn detach(&self) -> crate::Result<SandboxAttachment> {
+        bail!("test sandbox handle does not support detachment")
     }
 
     async fn snapshot(&self) -> crate::Result<SnapshotPayload> {
@@ -2061,6 +2096,14 @@ impl ManagedSandboxBackend for RestoreImageTestBackend {
         }))
     }
 
+    async fn attach(
+        &self,
+        _request: SandboxRequest,
+        _attachment: SandboxAttachment,
+    ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        bail!("restore-image test backend does not support attachment")
+    }
+
     async fn acquire_from_snapshot(
         &self,
         _request: SandboxRequest,
@@ -2098,6 +2141,10 @@ impl ManagedSandboxHandle for RestoreImageTestHandle {
 
     async fn stop(&self) -> crate::Result<()> {
         Ok(())
+    }
+
+    async fn detach(&self) -> crate::Result<SandboxAttachment> {
+        bail!("restore-image test handle does not support detachment")
     }
 
     async fn snapshot(&self) -> crate::Result<SnapshotPayload> {

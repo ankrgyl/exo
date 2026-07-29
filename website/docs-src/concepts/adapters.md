@@ -27,6 +27,10 @@ They are deliberately separate from [tools](./tools):
 
 ## Workers and durable state
 
+For how the adapter runner supervises workers, drains/restarts, and how
+create → enable → disable → delete interacts with conversations, see
+[Lifecycles → Adapters](./lifecycles#adapter-lifecycle).
+
 Adapters run as supervised worker processes. The host owns lifecycle, routing,
 durable inbox/outbox records, retries, and conversation wakeups. Each worker
 owns its protocol-specific connection, event normalization, and

@@ -6,15 +6,15 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use exoharness::{
     AddEventsRequest, AddEventsResult, AgentHandle, AgentId, AgentRecord, Artifact,
-    ArtifactVersion, BeginTurnRequest, Binding, BindingRecord, BindingType, ConversationHandle,
-    ConversationId, ConversationRecord, CreateSandboxRequest, Event, EventData, EventQuery,
-    EventQueryDirection, EventStream, ExoHarness, ForkConversationRequest, GetEventsResult,
-    NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest, Result,
-    RunInSandboxRequest, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery,
-    SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus, Secret, SecretMetadata,
-    SecretType, SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
-    StartSandboxRequest, ToolRequest, ToolResult, TurnHandle, TurnId, TurnRecord, Uuid7,
-    WriteArtifactRequest,
+    ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingRecord, BindingType,
+    ConversationHandle, ConversationId, ConversationRecord, CreateSandboxRequest, Event, EventData,
+    EventQuery, EventQueryDirection, EventStream, ExoHarness, ForkConversationRequest,
+    GetEventsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
+    ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId,
+    SandboxProcess, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessRecord,
+    SandboxProcessStatus, Secret, SecretMetadata, SecretType, SessionId, SnapshotHandle,
+    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, ToolRequest, ToolResult,
+    TurnHandle, TurnId, TurnRecord, Uuid7, WriteArtifactRequest,
 };
 use futures::FutureExt;
 use futures::io::Cursor;
@@ -137,6 +137,7 @@ async fn send_executes_tool_round_trip() {
             tool_calls: vec![PendingToolCall {
                 tool_call_id: tool_call_id.clone(),
                 request: ToolRequest {
+                    namespace: None,
                     function_name: "shell".to_string(),
                     arguments: Map::new(),
                 },
@@ -258,6 +259,7 @@ async fn send_records_tool_result_when_tool_execution_fails() {
             tool_calls: vec![PendingToolCall {
                 tool_call_id: tool_call_id.clone(),
                 request: ToolRequest {
+                    namespace: None,
                     function_name: "shell".to_string(),
                     arguments: Map::new(),
                 },
@@ -808,6 +810,14 @@ impl SandboxHandle for FakeAgentHandle {
         Ok("agent-sandbox".to_string())
     }
 
+    async fn attach_sandbox(&self, _request: AttachSandboxRequest) -> Result<SandboxId> {
+        Err(anyhow!("not implemented"))
+    }
+
+    async fn detach_sandbox(&self, _id: SandboxId) -> Result<SandboxAttachment> {
+        Err(anyhow!("not implemented"))
+    }
+
     async fn stop_sandbox(&self, _id: SandboxId) -> Result<()> {
         Ok(())
     }
@@ -1001,7 +1011,7 @@ impl ConversationHandle for FakeConversationHandle {
             let created_at = event_id.timestamp().expect("uuid7 timestamp");
             let event = Event {
                 id: event_id,
-                conversation_id: state.conversation.record.id,
+                thread_id: state.conversation.record.id,
                 session_id: request.session_id,
                 turn_id: request.turn_id,
                 created_at,
@@ -1077,6 +1087,14 @@ impl SnapshotHandle for FakeConversationHandle {
 #[async_trait]
 impl SandboxHandle for FakeConversationHandle {
     async fn create_sandbox(&self, _request: CreateSandboxRequest) -> Result<SandboxId> {
+        Err(anyhow!("not implemented"))
+    }
+
+    async fn attach_sandbox(&self, _request: AttachSandboxRequest) -> Result<SandboxId> {
+        Err(anyhow!("not implemented"))
+    }
+
+    async fn detach_sandbox(&self, _id: SandboxId) -> Result<SandboxAttachment> {
         Err(anyhow!("not implemented"))
     }
 
@@ -1226,7 +1244,7 @@ fn append_event(
     state.conversation.record.latest_event_id = Some(event_id);
     state.conversation.events.push(Event {
         id: event_id,
-        conversation_id,
+        thread_id: conversation_id,
         session_id: Some(session_id),
         turn_id,
         created_at,

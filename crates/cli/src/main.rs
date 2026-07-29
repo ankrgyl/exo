@@ -25,20 +25,20 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow, bail};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use executor::{
-    AgentHarnessKind, BasicExoHarness, BasicExoHarnessConfig, BasicHarness, BasicToolRuntime,
-    Binding, BraintrustProject, BraintrustRuntimeConfig, BraintrustTracingConfig,
+    AgentHarnessKind, AttachSandboxRequest, BasicExoHarness, BasicExoHarnessConfig, BasicHarness,
+    BasicToolRuntime, Binding, BraintrustProject, BraintrustRuntimeConfig, BraintrustTracingConfig,
     ConversationModelConfig, CreateAgentRequest, CreateConversationRequest, DaytonaBackendSpec,
     E2bBackendSpec, EventKind, EventQuery, EventQueryDirection, ExoHarness,
     ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount, FileSystemMountMode,
     ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART, HTTP_EXOHARNESS_TRACING_TARGET,
     Harness, HarnessAgent, HarnessConversation, HttpExoHarness, LocalSandboxExoHarness,
-    PutSecretRequest, RlmHarness, SANDBOX_MAIN_MOUNT_DIR, SandboxBackendRegistration,
-    SandboxProvider, SandboxProviderConfig, SandboxScope, Secret, SecretBackendChoice,
-    SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness, TypeScriptHarnessConfig,
-    Uuid7, VercelBackendSpec, default_aws_agentcore_image, default_daytona_image,
-    default_docker_image, default_e2b_template, default_vercel_image, effective_sandbox_scope,
-    finalize_rebuild_update_file, load_agent_config, record_host_event, send_conversation_wakeup,
-    serve_exoharness_http_listener_with_options,
+    PutSecretRequest, RlmHarness, SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment,
+    SandboxBackendRegistration, SandboxProvider, SandboxProviderConfig, SandboxScope, Secret,
+    SecretBackendChoice, SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness,
+    TypeScriptHarnessConfig, Uuid7, VercelBackendSpec, default_aws_agentcore_image,
+    default_daytona_image, default_docker_image, default_e2b_template, default_vercel_image,
+    effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config, record_host_event,
+    send_conversation_wakeup, serve_exoharness_http_listener_with_options,
 };
 use serde::Deserialize;
 use tabwriter::TabWriter;
@@ -646,6 +646,21 @@ enum ConversationCommands {
 
 #[derive(Debug, Subcommand)]
 enum ConversationSandboxCommands {
+    Attach {
+        agent: String,
+        conversation: String,
+        #[arg(long, value_enum)]
+        provider: SandboxProviderArg,
+        #[arg(long)]
+        external_id: String,
+        #[arg(long)]
+        default_workdir: Option<String>,
+    },
+    Detach {
+        agent: String,
+        conversation: String,
+        sandbox_id: String,
+    },
     Run {
         agent: String,
         conversation: String,
@@ -1716,6 +1731,55 @@ async fn main() -> Result<()> {
                 }
             },
             ConversationCommands::Sandbox { command } => match command {
+                ConversationSandboxCommands::Attach {
+                    agent,
+                    conversation,
+                    provider,
+                    external_id,
+                    default_workdir,
+                } => {
+                    let attachment = match SandboxProvider::from(provider) {
+                        SandboxProvider::Docker => SandboxAttachment::DockerContainer {
+                            container_id: external_id,
+                        },
+                        provider => bail!(
+                            "sandbox provider {} does not support external attachments",
+                            provider.as_str()
+                        ),
+                    };
+                    let conversation =
+                        must_get_conversation(harness.as_ref(), &agent, &conversation).await?;
+                    let sandbox_id = conversation
+                        .exoharness_handle()
+                        .attach_sandbox(AttachSandboxRequest {
+                            attachment,
+                            default_workdir,
+                        })
+                        .await?;
+                    println!(
+                        "attached Docker container as sandbox {} for {}",
+                        sandbox_id,
+                        conversation.record().slug
+                    );
+                }
+                ConversationSandboxCommands::Detach {
+                    agent,
+                    conversation,
+                    sandbox_id,
+                } => {
+                    let conversation =
+                        must_get_conversation(harness.as_ref(), &agent, &conversation).await?;
+                    let attachment = conversation
+                        .exoharness_handle()
+                        .detach_sandbox(sandbox_id.clone())
+                        .await?;
+                    println!(
+                        "detached sandbox {} from {}: {}",
+                        sandbox_id,
+                        conversation.record().slug,
+                        serde_json::to_string(&attachment)?
+                    );
+                }
                 ConversationSandboxCommands::Run {
                     agent,
                     conversation,
@@ -2190,7 +2254,9 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
                 | ConversationMountCommands::Remove { agent, .. } => Some(agent.as_str()),
             },
             ConversationCommands::Sandbox { command } => match command {
-                ConversationSandboxCommands::Run { agent, .. } => Some(agent.as_str()),
+                ConversationSandboxCommands::Attach { agent, .. }
+                | ConversationSandboxCommands::Detach { agent, .. }
+                | ConversationSandboxCommands::Run { agent, .. } => Some(agent.as_str()),
             },
             ConversationCommands::CompleteRebuildUpdate { .. } => None,
         },
@@ -2833,6 +2899,7 @@ async fn run_sandbox_shell_command(
             &agent_config,
             &config,
             &ToolRequest {
+                namespace: None,
                 function_name: "shell".to_string(),
                 arguments,
             },
@@ -3109,6 +3176,43 @@ mod create_tests {
                     },
                 }
             } if agent == "agent" && conversation == "conv" && command == "pwd && git status"
+        ));
+    }
+
+    #[test]
+    fn conversation_sandbox_attach_command_parses() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from([
+            "exo",
+            "conversation",
+            "sandbox",
+            "attach",
+            "agent",
+            "conv",
+            "--provider",
+            "docker",
+            "--external-id",
+            "harbor-task",
+            "--default-workdir",
+            "/task",
+        ])
+        .expect("conversation sandbox attach parses");
+        assert!(matches!(
+            cli.command,
+            super::Commands::Conversation {
+                command: super::ConversationCommands::Sandbox {
+                    command: super::ConversationSandboxCommands::Attach {
+                        agent,
+                        conversation,
+                        provider: super::SandboxProviderArg::Docker,
+                        external_id,
+                        default_workdir: Some(default_workdir),
+                    },
+                }
+            } if agent == "agent"
+                && conversation == "conv"
+                && external_id == "harbor-task"
+                && default_workdir == "/task"
         ));
     }
 

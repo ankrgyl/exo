@@ -26,6 +26,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use url::Url;
 
+use crate::SandboxAttachment;
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput,
     SandboxRequest, SandboxSpec, SnapshotKind, SnapshotPayload, WARM_SANDBOX_KEY_LABEL,
@@ -179,6 +180,14 @@ impl ManagedSandboxBackend for SpritesSandboxBackend {
         }))
     }
 
+    async fn attach(
+        &self,
+        _request: SandboxRequest,
+        _attachment: SandboxAttachment,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        bail!("Sprites sandbox backend does not support external attachments")
+    }
+
     async fn acquire_from_snapshot(
         &self,
         request: SandboxRequest,
@@ -282,6 +291,10 @@ impl ManagedSandboxHandle for SpritesSandboxHandle {
         // Sprites hibernate when idle; do not DELETE — the next session resumes the
         // same sprite by deterministic name via `acquire`.
         Ok(())
+    }
+
+    async fn detach(&self) -> Result<SandboxAttachment> {
+        bail!("Sprites sandboxes cannot be detached")
     }
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {

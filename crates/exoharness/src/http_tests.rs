@@ -11,11 +11,11 @@ use crate::test_support::local_test_config;
 use crate::{
     BasicExoHarness, BeginTurnRequest, CreateSandboxRequest, EventData, EventKind, EventQuery,
     EventQueryDirection, ExoHarness, HttpExoHarness, ManagedSandboxBackend, ManagedSandboxHandle,
-    RunInSandboxRequest, SandboxCommand, SandboxCommandOutput, SandboxProcessEvent,
-    SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin,
-    SandboxProvider, SandboxRequest, SnapshotKind, SnapshotPayload, StartSandboxProcessRequest,
-    StartSandboxRequest, WaitSandboxProcessRequest, WriteSandboxProcessInputRequest,
-    serve_exoharness_http_listener,
+    RunInSandboxRequest, SandboxAttachment, SandboxCommand, SandboxCommandOutput,
+    SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
+    SandboxProcessStdin, SandboxProvider, SandboxRequest, SnapshotKind, SnapshotPayload,
+    StartSandboxProcessRequest, StartSandboxRequest, WaitSandboxProcessRequest,
+    WriteSandboxProcessInputRequest, serve_exoharness_http_listener,
 };
 
 struct HttpHarnessFixture {
@@ -73,6 +73,15 @@ async fn http_harness_with_sandbox_backend(
 async fn http_exoharness_supports_agent_and_conversation_crud() {
     let fixture = http_harness().await;
     crate::contract_tests::supports_agent_and_conversation_crud(Arc::clone(&fixture.harness)).await;
+}
+
+#[actix_web::test]
+async fn http_exoharness_supports_thread_and_conversation_apis() {
+    let fixture = http_harness().await;
+    crate::contract_tests::supports_thread_api_and_conversation_compatibility(Arc::clone(
+        &fixture.harness,
+    ))
+    .await;
 }
 
 #[actix_web::test]
@@ -424,6 +433,14 @@ impl ManagedSandboxBackend for SnapshotTestSandboxBackend {
         Ok(Arc::new(SnapshotTestSandboxHandle))
     }
 
+    async fn attach(
+        &self,
+        _request: SandboxRequest,
+        _attachment: SandboxAttachment,
+    ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        bail!("snapshot test backend does not support attachment")
+    }
+
     async fn acquire_from_snapshot(
         &self,
         _request: SandboxRequest,
@@ -452,6 +469,10 @@ impl ManagedSandboxHandle for SnapshotTestSandboxHandle {
 
     async fn stop(&self) -> crate::Result<()> {
         Ok(())
+    }
+
+    async fn detach(&self) -> crate::Result<SandboxAttachment> {
+        bail!("snapshot test handle does not support detachment")
     }
 
     async fn snapshot(&self) -> crate::Result<SnapshotPayload> {

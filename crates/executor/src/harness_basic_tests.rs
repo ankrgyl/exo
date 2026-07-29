@@ -7,9 +7,9 @@ use crate::{
 use anyhow::anyhow;
 use async_trait::async_trait;
 use exoharness::{
-    BasicExoHarness, Binding, EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness,
-    FileSystemMount, FileSystemMountMode, PutSecretRequest, Result, SandboxProvider, Secret,
-    ToolRequest, Uuid7,
+    AddEventsRequest, BasicExoHarness, Binding, EventData, EventKind, EventQuery,
+    EventQueryDirection, ExoHarness, FileSystemMount, FileSystemMountMode, PutSecretRequest,
+    Result, SandboxAttachment, SandboxProvider, Secret, ToolRequest, Uuid7,
 };
 use lingua::universal::{AssistantContent, UserContent};
 use lingua::{Message, UniversalStreamChunk, UniversalUsage};
@@ -753,6 +753,7 @@ async fn send_executes_shell_tool_when_enabled() {
             tool_calls: vec![PendingToolCall {
                 tool_call_id: "call-1".to_string(),
                 request: ToolRequest {
+                    namespace: None,
                     function_name: "shell".to_string(),
                     arguments: shell_command_arguments("printf hello"),
                 },
@@ -922,7 +923,7 @@ async fn harness_exposes_raw_exoharness_handles() {
     assert!(
         events
             .iter()
-            .all(|event| event.conversation_id == conversation.record().id)
+            .all(|event| event.thread_id == conversation.record().id)
     );
 }
 
@@ -945,6 +946,7 @@ async fn updating_mounts_recreates_conversation_sandbox() {
             tool_calls: vec![PendingToolCall {
                 tool_call_id: "call-1".to_string(),
                 request: ToolRequest {
+                    namespace: None,
                     function_name: "shell".to_string(),
                     arguments: shell_command_arguments("printf first"),
                 },
@@ -971,6 +973,7 @@ async fn updating_mounts_recreates_conversation_sandbox() {
             tool_calls: vec![PendingToolCall {
                 tool_call_id: "call-2".to_string(),
                 request: ToolRequest {
+                    namespace: None,
                     function_name: "shell".to_string(),
                     arguments: shell_command_arguments("printf second"),
                 },
@@ -1187,6 +1190,58 @@ async fn updating_sandbox_image_recreates_shell_sandbox_without_shell_program() 
         &sandbox_events[1].data,
         EventData::SandboxCreated { image, .. } if image == "second-image"
     ));
+
+    let attached_sandbox_id = "borrowed-docker-sandbox".to_string();
+    conversation
+        .exoharness_handle()
+        .add_events(AddEventsRequest {
+            session_id: None,
+            turn_id: None,
+            data: vec![EventData::SandboxAttached {
+                sandbox_id: attached_sandbox_id.clone(),
+                attachment: SandboxAttachment::DockerContainer {
+                    container_id: "docker-container".to_string(),
+                },
+                default_workdir: "/workspace".to_string(),
+            }],
+        })
+        .await
+        .expect("sandbox attachment event should be recorded");
+    assert_eq!(
+        ensure_shell_sandbox(
+            conversation.exoharness_handle().as_ref(),
+            &agent_config,
+            &conversation_config,
+        )
+        .await
+        .expect("attached sandbox should be selected"),
+        attached_sandbox_id
+    );
+
+    conversation
+        .exoharness_handle()
+        .add_events(AddEventsRequest {
+            session_id: None,
+            turn_id: None,
+            data: vec![EventData::SandboxDetached {
+                sandbox_id: attached_sandbox_id,
+                attachment: SandboxAttachment::DockerContainer {
+                    container_id: "docker-container".to_string(),
+                },
+            }],
+        })
+        .await
+        .expect("sandbox detachment event should be recorded");
+    assert_eq!(
+        ensure_shell_sandbox(
+            conversation.exoharness_handle().as_ref(),
+            &agent_config,
+            &conversation_config,
+        )
+        .await
+        .expect("previous sandbox should be selected after detachment"),
+        second_sandbox_id
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
