@@ -12,6 +12,11 @@ export const DEFAULT_TOOL_REGISTRY_DIRECTORY = ".exo/tools";
 export const TOOL_MANIFEST_FILE = "exo-tool.json";
 const LOCK_SCHEMA_VERSION = 1;
 const MANIFEST_SCHEMA_VERSION = 1;
+// Advisory lock for lockfile read-modify-write sections. Locks older than
+// this are treated as leftovers from a crashed holder and stolen.
+const REGISTRY_LOCK_STALE_MS = 60_000;
+const REGISTRY_LOCK_ACQUIRE_TIMEOUT_MS = 10_000;
+const REGISTRY_LOCK_RETRY_DELAY_MS = 100;
 
 export type ToolSource =
   | { type: "local"; path: string; subdirectory?: string }
@@ -100,71 +105,76 @@ export async function installToolSource(
     const modulePath = resolveManifestModule(sourceRoot, manifest.module);
     await assertContainedFile(sourceRoot, modulePath);
     const validation = await validate(modulePath, request.initialization);
-    const snapshot = await readToolRegistry(registryDirectory);
-    const existing =
-      snapshot.installed.find((item) => item.id === manifest.id) ?? null;
-    for (const item of snapshot.installed) {
-      if (item.id === manifest.id) {
-        continue;
+    // Everything from the snapshot read to the lockfile write is a
+    // read-modify-write of the whole lockfile; hold the registry lock so a
+    // concurrent install/remove cannot be silently reverted.
+    return await withToolRegistryLock(registryDirectory, async () => {
+      const snapshot = await readToolRegistry(registryDirectory);
+      const existing =
+        snapshot.installed.find((item) => item.id === manifest.id) ?? null;
+      for (const item of snapshot.installed) {
+        if (item.id === manifest.id) {
+          continue;
+        }
+        let existingValidation: InstallValidation;
+        try {
+          existingValidation = await validate(
+            await installedToolModulePath(item),
+            item.initialization,
+          );
+        } catch (error) {
+          console.error(
+            `skipping broken installed tool ${item.id}: ${errorMessage(error)}`,
+          );
+          continue;
+        }
+        if (existingValidation.toolName === validation.toolName) {
+          throw new Error(
+            `tool name ${validation.toolName} is already installed by ${item.id}`,
+          );
+        }
       }
-      let existingValidation: InstallValidation;
-      try {
-        existingValidation = await validate(
-          await installedToolModulePath(item),
-          item.initialization,
-        );
-      } catch (error) {
-        console.error(
-          `skipping broken installed tool ${item.id}: ${errorMessage(error)}`,
-        );
-        continue;
-      }
-      if (existingValidation.toolName === validation.toolName) {
-        throw new Error(
-          `tool name ${validation.toolName} is already installed by ${item.id}`,
-        );
-      }
-    }
 
-    installPath = path.join(
-      registryRoot,
-      "store",
-      safePathSegment(manifest.id),
-      randomUUID(),
-    );
-    await fs.mkdir(path.dirname(installPath), { recursive: true });
-    await fs.rename(sourceRoot, installPath);
-    await fs.rm(stagingPath, { recursive: true, force: true });
-
-    const installed: InstalledTool = {
-      id: manifest.id,
-      source: request.source,
-      initialization: request.initialization,
-      installPath,
-    };
-    const nextTools = snapshot.installed.filter(
-      (item) => item.id !== manifest.id,
-    );
-    nextTools.push(installed);
-    try {
-      await writeToolLockfile(
-        { schemaVersion: LOCK_SCHEMA_VERSION, tools: nextTools },
-        registryDirectory,
+      installPath = path.join(
+        registryRoot,
+        "store",
+        safePathSegment(manifest.id),
+        randomUUID(),
       );
-    } catch (error) {
-      await fs.rm(installPath, { recursive: true, force: true });
-      throw error;
-    }
-    if (existing) {
+      await fs.mkdir(path.dirname(installPath), { recursive: true });
+      await fs.rename(sourceRoot, installPath);
+      await fs.rm(stagingPath, { recursive: true, force: true });
+
+      const installed: InstalledTool = {
+        id: manifest.id,
+        source: request.source,
+        initialization: request.initialization,
+        installPath,
+      };
+      const nextTools = snapshot.installed.filter(
+        (item) => item.id !== manifest.id,
+      );
+      nextTools.push(installed);
       try {
-        await fs.rm(existing.installPath, { recursive: true, force: true });
-      } catch (error) {
-        console.error(
-          `unable to delete replaced tool store ${existing.installPath}: ${errorMessage(error)}`,
+        await writeToolLockfile(
+          { schemaVersion: LOCK_SCHEMA_VERSION, tools: nextTools },
+          registryDirectory,
         );
+      } catch (error) {
+        await fs.rm(installPath, { recursive: true, force: true });
+        throw error;
       }
-    }
-    return installed;
+      if (existing) {
+        try {
+          await fs.rm(existing.installPath, { recursive: true, force: true });
+        } catch (error) {
+          console.error(
+            `unable to delete replaced tool store ${existing.installPath}: ${errorMessage(error)}`,
+          );
+        }
+      }
+      return installed;
+    });
   } catch (error) {
     await fs.rm(stagingPath, { recursive: true, force: true });
     if (installPath !== null) {
@@ -178,20 +188,22 @@ export async function removeInstalledTool(
   id: string,
   registryDirectory = DEFAULT_TOOL_REGISTRY_DIRECTORY,
 ): Promise<InstalledTool | null> {
-  const snapshot = await readToolRegistry(registryDirectory);
-  const installed = snapshot.installed.find((item) => item.id === id) ?? null;
-  if (!installed) {
-    return null;
-  }
-  await writeToolLockfile(
-    {
-      schemaVersion: LOCK_SCHEMA_VERSION,
-      tools: snapshot.installed.filter((item) => item.id !== id),
-    },
-    registryDirectory,
-  );
-  await fs.rm(installed.installPath, { recursive: true, force: true });
-  return installed;
+  return withToolRegistryLock(registryDirectory, async () => {
+    const snapshot = await readToolRegistry(registryDirectory);
+    const installed = snapshot.installed.find((item) => item.id === id) ?? null;
+    if (!installed) {
+      return null;
+    }
+    await writeToolLockfile(
+      {
+        schemaVersion: LOCK_SCHEMA_VERSION,
+        tools: snapshot.installed.filter((item) => item.id !== id),
+      },
+      registryDirectory,
+    );
+    await fs.rm(installed.installPath, { recursive: true, force: true });
+    return installed;
+  });
 }
 
 export async function readInstalledToolManifest(
@@ -415,6 +427,72 @@ function parseInstalledTool(value: unknown, label: string): InstalledTool {
     ),
     installPath: requiredUnknownString(item, "installPath", label),
   };
+}
+
+/// Cross-process advisory lock serializing lockfile read-modify-write
+/// sections. Acquired by atomically creating `registry.lock` (O_EXCL); locks
+/// older than the stale threshold are stolen so a crashed holder cannot wedge
+/// the registry forever.
+async function withToolRegistryLock<T>(
+  registryDirectory: string,
+  action: () => Promise<T>,
+): Promise<T> {
+  const lockPath = path.join(path.resolve(registryDirectory), "registry.lock");
+  await fs.mkdir(path.dirname(lockPath), { recursive: true });
+  const deadline = Date.now() + REGISTRY_LOCK_ACQUIRE_TIMEOUT_MS;
+  for (;;) {
+    try {
+      const handle = await fs.open(lockPath, "wx");
+      try {
+        await handle.writeFile(`${process.pid}\n`, "utf8");
+      } finally {
+        await handle.close();
+      }
+      break;
+    } catch (error) {
+      if (!isAlreadyExistsError(error)) {
+        throw error;
+      }
+      try {
+        const stat = await fs.stat(lockPath);
+        if (Date.now() - stat.mtimeMs > REGISTRY_LOCK_STALE_MS) {
+          await fs.rm(lockPath, { force: true });
+          continue;
+        }
+      } catch (statError) {
+        if (!isNotFoundError(statError)) {
+          throw statError;
+        }
+        // Holder released between our open and stat; try again immediately.
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `timed out waiting for tool registry lock ${lockPath}; ` +
+            "another install or removal may be in progress",
+        );
+      }
+      await sleep(REGISTRY_LOCK_RETRY_DELAY_MS);
+    }
+  }
+  try {
+    return await action();
+  } finally {
+    await fs.rm(lockPath, { force: true });
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isAlreadyExistsError(error: unknown): boolean {
+  return (
+    error !== null &&
+    typeof error === "object" &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "EEXIST"
+  );
 }
 
 async function writeToolLockfile(

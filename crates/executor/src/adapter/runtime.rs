@@ -17,8 +17,7 @@ use super::store::{AdapterStore, stable_target_key};
 use super::tools::download_attachment;
 use super::types::{
     AdapterAttachment, AdapterAttachmentKind, AdapterConfig, AdapterDeliveryStatus,
-    AdapterEventType, AdapterOutboundMessageRecord, AdapterRecord, AdapterTargetConversationRecord,
-    now_ms,
+    AdapterEventType, AdapterRecord, AdapterTargetConversationRecord, now_ms,
 };
 use super::worker::{WorkerCommand, WorkerEvent, run_worker_loop};
 use crate::conversation_events::{
@@ -380,7 +379,7 @@ pub async fn send_adapter_message_with_handles(
     text: &str,
     target: Option<&str>,
     attachments: Vec<AdapterAttachment>,
-) -> Result<AdapterOutboundMessageRecord> {
+) -> Result<String> {
     if !adapter.enabled {
         bail!("adapter is disabled: {}", adapter.id);
     }
@@ -419,7 +418,7 @@ pub async fn send_adapter_message_with_handles(
         )
         .await?;
     notify_adapter_outbound(&adapter.id);
-    Ok(message)
+    Ok(message.id)
 }
 
 async fn run_adapter_loop(
@@ -476,7 +475,6 @@ async fn run_adapter_loop(
                     .into_iter()
                     .map(|message| WorkerCommand::SendMessage {
                         id: message.id,
-                        attempt: message.attempt,
                         target: message.target,
                         text: message.text,
                         attachments: message.attachments,

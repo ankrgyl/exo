@@ -912,7 +912,7 @@ pub async fn execute_send_adapter_message_tool(
         attachments,
     )
     .await?;
-    let message = send_adapter_message_with_handles(
+    let message_id = send_adapter_message_with_handles(
         agent,
         conversation,
         store,
@@ -926,7 +926,7 @@ pub async fn execute_send_adapter_message_tool(
         "ok": true,
         "adapterId": args.adapter_id,
         "queued": true,
-        "messageId": message.id,
+        "messageId": message_id,
     }))
 }
 

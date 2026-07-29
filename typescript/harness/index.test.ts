@@ -29,7 +29,7 @@ import {
 } from "./index";
 import { ircTool } from "../../examples/typescript/tools/irc";
 import { uppercaseTool } from "../../examples/typescript/tools/uppercase";
-import { readToolRegistry } from "./tool-registry";
+import { installToolSource, readToolRegistry } from "./tool-registry";
 
 describe("HarnessToolRegistry", () => {
   it("returns registered tool definitions", () => {
@@ -837,6 +837,58 @@ describe("agent tool loading", () => {
       ).toBe(lockfile);
       expect((await fs.readdir(tempdir)).sort()).toEqual(["tools.lock.json"]);
     } finally {
+      await fs.rm(tempdir, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes concurrent installs so neither lockfile update is lost", async () => {
+    const previousCwd = process.cwd();
+    const tempdir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "exo-tool-registry-race-"),
+    );
+    process.chdir(tempdir);
+    try {
+      for (const name of ["a", "b"]) {
+        const toolDirectory = path.join(tempdir, `tool-${name}`);
+        await fs.mkdir(toolDirectory, { recursive: true });
+        await fs.writeFile(
+          path.join(toolDirectory, "exo-tool.json"),
+          JSON.stringify({
+            schemaVersion: 1,
+            id: `tool:test/${name}`,
+            module: "tool.ts",
+          }),
+        );
+        await fs.writeFile(path.join(toolDirectory, "tool.ts"), `tool_${name}`);
+      }
+      const validate = async (modulePath: string) => ({
+        toolName: (await fs.readFile(modulePath, "utf8")).trim(),
+      });
+
+      // Without the registry lock, one read-modify-write of tools.lock.json
+      // silently overwrites the other and an install is lost.
+      await Promise.all([
+        installToolSource(
+          { source: { type: "local", path: "tool-a" }, initialization: {} },
+          validate,
+        ),
+        installToolSource(
+          { source: { type: "local", path: "tool-b" }, initialization: {} },
+          validate,
+        ),
+      ]);
+
+      const snapshot = await readToolRegistry();
+      expect(snapshot.installed.map((item) => item.id).sort()).toEqual([
+        "tool:test/a",
+        "tool:test/b",
+      ]);
+      const registryFiles = await fs.readdir(
+        path.join(tempdir, ".exo", "tools"),
+      );
+      expect(registryFiles).not.toContain("registry.lock");
+    } finally {
+      process.chdir(previousCwd);
       await fs.rm(tempdir, { recursive: true, force: true });
     }
   });

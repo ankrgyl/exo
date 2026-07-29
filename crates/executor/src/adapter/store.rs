@@ -257,9 +257,9 @@ impl AdapterStore {
     ) -> Result<AdapterOutboundMessageRecord> {
         let message =
             AdapterOutboundMessageRecord::new(adapter_id, text, target, attachments, now_ms())?;
-        let queued = count_json_files(&self.outbox_dir(&message.adapter_id)).await?
-            + count_json_files(&self.inflight_dir(&message.adapter_id)).await?;
-        if queued >= MAX_QUEUED_MESSAGES_PER_ADAPTER {
+        if self.count_pending_messages(&message.adapter_id).await?
+            >= MAX_QUEUED_MESSAGES_PER_ADAPTER
+        {
             anyhow::bail!(
                 "adapter outbound queue is full (maximum {MAX_QUEUED_MESSAGES_PER_ADAPTER} messages)"
             );
@@ -273,6 +273,15 @@ impl AdapterStore {
             )
         })?;
         Ok(message)
+    }
+
+    /// Number of outbound messages that are queued or in flight for an
+    /// adapter. Best-effort: the two directories are scanned without a lock,
+    /// so concurrent enqueues or claims can skew the count by a few. The
+    /// queue cap that uses this is soft backpressure, not a hard invariant.
+    async fn count_pending_messages(&self, adapter_id: &str) -> Result<usize> {
+        Ok(count_json_files(&self.outbox_dir(adapter_id)).await?
+            + count_json_files(&self.inflight_dir(adapter_id)).await?)
     }
 
     pub async fn claim_outbound_messages(

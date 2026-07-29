@@ -17,7 +17,6 @@ use super::types::{AdapterAttachment, AdapterConfig};
 pub enum WorkerCommand {
     SendMessage {
         id: String,
-        attempt: u32,
         #[serde(default)]
         target: Option<String>,
         text: String,
@@ -129,6 +128,9 @@ where
         take_outbound_messages,
     ));
 
+    // Once a stop request is observed it is latched: the loop stops reading
+    // new worker events and exits as soon as already-accepted events finish.
+    let mut stopping = false;
     let result = loop {
         tokio::select! {
             status = child.wait() => {
@@ -137,7 +139,7 @@ where
                     Err(error) => Err(error.into()),
                 };
             }
-            line = lines.next_line() => {
+            line = lines.next_line(), if !stopping => {
                 let line = match line {
                     Ok(Some(line)) => line,
                     Ok(None) => break Err(anyhow!("adapter worker closed stdout")),
@@ -161,9 +163,14 @@ where
                 }
             }
             _ = stop_interval.tick() => {
-                // Only honor a stop request between events so an in-flight
-                // wakeup turn is not cancelled halfway through.
-                if pending_events.load(Ordering::SeqCst) == 0 && should_stop().await? {
+                // Latch the stop request even while events are pending so a
+                // steady inbound stream cannot defer shutdown forever; only
+                // exit between events so an in-flight wakeup turn is not
+                // cancelled halfway through.
+                if !stopping && should_stop().await? {
+                    stopping = true;
+                }
+                if stopping && pending_events.load(Ordering::SeqCst) == 0 {
                     break Ok(());
                 }
             }
@@ -359,6 +366,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stops_busy_worker_once_accepted_events_drain() {
+        let config = AdapterConfig {
+            adapter_type: "test".to_string(),
+            worker_command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                // Emit events faster than the handler drains them so the
+                // pending-event count stays nonzero at stop-check ticks.
+                "while true; do printf '%s\\n' '{\"type\":\"message\",\"target\":\"t\",\"text\":\"hi\"}'; sleep 0.05; done".to_string(),
+            ],
+            initialization: json!({}),
+            state_dir: None,
+            secret_env: Vec::new(),
+        };
+        let outbound_notify = Arc::new(Notify::new());
+        let stop_checks = Arc::new(AtomicUsize::new(0));
+
+        // The stop request arrives only after a backlog has built up. Without
+        // latching, the loop would keep accepting new events and never observe
+        // an idle tick, deferring shutdown forever.
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_worker_loop(
+                "adapter",
+                &config,
+                Vec::new(),
+                outbound_notify,
+                |_event| async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok(())
+                },
+                || async { Ok(Vec::new()) },
+                move || {
+                    let stop_checks = Arc::clone(&stop_checks);
+                    async move { Ok(stop_checks.fetch_add(1, Ordering::SeqCst) >= 2) }
+                },
+            ),
+        )
+        .await
+        .expect("worker loop did not honor the stop request");
+        result.unwrap();
+    }
+
+    #[tokio::test]
     async fn dispatches_outbound_commands_while_event_handler_is_busy() {
         let tempdir = TempDir::new().unwrap();
         let output_path = tempdir.path().join("command.json");
@@ -423,7 +474,6 @@ mod tests {
         event_started_rx.await.unwrap();
         outbound.lock().unwrap().push(WorkerCommand::SendMessage {
             id: "command".to_string(),
-            attempt: 1,
             target: Some("target".to_string()),
             text: "pong".to_string(),
             attachments: Vec::new(),
