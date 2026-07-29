@@ -398,8 +398,12 @@ export default defineHarness({
   async runTurn(context) {
     await runResponsesHarnessTurn(context, {
       // Exo's tools + the game tools, one registry.
-      async registerTools(tools: HarnessToolRegistry, ctx: TurnContext) {
-        await registerExoTools(tools, ctx);
+      async registerTools(
+        tools: HarnessToolRegistry,
+        ctx: TurnContext,
+        model: string,
+      ) {
+        await registerExoTools(tools, ctx, model);
         await registerLibraryTools(tools, ctx, gameboyTools(emulator));
       },
 
