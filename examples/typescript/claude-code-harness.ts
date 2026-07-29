@@ -22,6 +22,7 @@ import {
   systemTextMessage,
   toJsonValue,
   turnMetadata,
+  type HarnessToolRegistry,
   type JsonValue,
   type Message,
   type PendingToolCall,
@@ -46,6 +47,8 @@ import {
   sandboxCwd,
   type ResolvedLlmBinding,
 } from "./shared";
+import { registryMcpServer } from "./registry-tools";
+import { createDefaultToolRegistry } from "./turn-loop";
 
 const DEFAULT_CLAUDE_CODE_SANDBOX_EXECUTABLE = "/usr/local/bin/claude-code";
 const CLAUDE_RESULT_GRACE_MS = 5_000;
@@ -85,6 +88,9 @@ async function runClaudeCodeTurn(
   modelBinding: ResolvedLlmBinding,
 ): Promise<string | null> {
   const systemPrompt = claudeSystemPrompt(context);
+  // No built-ins: Claude Code brings its own shell and edit tools. The
+  // registry carries tool-module and agent-created tools, exposed over MCP.
+  const registry = await createDefaultToolRegistry(context, []);
   const state: ClaudeTraceState = {
     startedAt: Date.now(),
     finalText: "",
@@ -121,7 +127,12 @@ async function runClaudeCodeTurn(
         await consumeClaudeQuery(
           query({
             prompt: claudePromptInput(claudePrompt(state.promptMessages)),
-            options: claudeOptions(context, state.systemPrompt, modelBinding),
+            options: claudeOptions(
+              context,
+              state.systemPrompt,
+              modelBinding,
+              registry,
+            ),
           }),
           context,
           turnParent,
@@ -283,6 +294,7 @@ function claudeOptions(
   context: TurnContext,
   systemPrompt: string | null,
   modelBinding: ResolvedLlmBinding,
+  registry: HarnessToolRegistry,
 ): Options {
   const options: Options = {
     model: modelBinding.model,
@@ -294,6 +306,13 @@ function claudeOptions(
     spawnClaudeCodeProcess: (options) =>
       new SandboxClaudeCodeProcess(context, options),
   };
+  if (registry.definitions().length > 0) {
+    // The MCP server runs in this host process, so registry tools execute on
+    // the host while the CLI runs in the sandbox.
+    options.mcpServers = {
+      exo: { type: "sdk", name: "exo", instance: registryMcpServer(registry) },
+    };
+  }
   if (systemPrompt) {
     return { ...options, systemPrompt };
   }

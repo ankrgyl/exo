@@ -26,6 +26,9 @@ importers:
       '@discordjs/voice':
         specifier: ^0.19.0
         version: 0.19.2(@emnapi/core@1.9.1)(@emnapi/runtime@1.9.1)(opusscript@0.1.1)
+      '@modelcontextprotocol/sdk':
+        specifier: ^1.29.0
+        version: 1.29.0(zod@4.3.6)
       '@mozilla/readability':
         specifier: ^0.6.0
         version: 0.6.0

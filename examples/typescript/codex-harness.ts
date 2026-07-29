@@ -10,6 +10,7 @@ import {
   toolResultEvent,
   turnMetadata,
   type EventData,
+  type HarnessToolRegistry,
   type JsonObject,
   type JsonValue,
   type Message,
@@ -51,6 +52,8 @@ import {
   WarmResourceCache,
   type ResolvedLlmBinding,
 } from "./shared";
+import { callRegistryTool, injectedToolDefinitions } from "./registry-tools";
+import { createDefaultToolRegistry } from "./turn-loop";
 
 const CODEX_SHELL_TOOL = "codex.shell";
 const CODEX_WEB_SEARCH_TOOL = "codex.web_search";
@@ -82,6 +85,7 @@ interface CodexWarmTurnScope {
   context: TurnContext;
   protocolLog: CodexProtocolEventBuffer;
   turnParent: TraceParent;
+  registry: HarnessToolRegistry;
 }
 
 interface PriorResponseItems {
@@ -189,6 +193,7 @@ class CodexWarmSession {
     return handleCodexServerRequest(
       current.context,
       current.turnParent,
+      current.registry,
       request,
     );
   }
@@ -218,7 +223,15 @@ async function runCodexTurn(
 
   const { turn } = context.exoharness.current;
   const protocolLog = new CodexProtocolEventBuffer(context);
-  const scope: CodexWarmTurnScope = { context, protocolLog, turnParent };
+  // No built-ins: codex brings its own shell. The registry carries tool-module
+  // and agent-created tools, exposed to codex as dynamic tools.
+  const registry = await createDefaultToolRegistry(context, []);
+  const scope: CodexWarmTurnScope = {
+    context,
+    protocolLog,
+    turnParent,
+    registry,
+  };
   const sessionKey = codexWarmSessionKey(context, modelBinding);
   const sandboxRuntime = codexSandboxRuntimeKey(context);
   const { resource: session, reused: appServerReused } = await traceCodexTask(
@@ -259,7 +272,7 @@ async function runCodexTurn(
           cwd: codexAppServerCwd(context),
           external_sandbox: useCodexExternalSandbox(),
         },
-        () => startCodexThread(session.server, context, modelBinding),
+        () => startCodexThread(session.server, context, modelBinding, registry),
       ));
     session.threadId = threadId;
     await recordCodexWarmSession(
@@ -501,6 +514,7 @@ async function startCodexThread(
   codex: CodexAppServer,
   context: TurnContext,
   modelBinding: ResolvedLlmBinding,
+  registry: HarnessToolRegistry,
 ): Promise<string> {
   const developerInstructions = codexDeveloperInstructions(context);
   const request: JsonObject = {
@@ -509,7 +523,7 @@ async function startCodexThread(
     cwd: codexAppServerCwd(context),
     approvalPolicy: "on-request",
     sandbox: "read-only",
-    dynamicTools: buildCodexDynamicTools(context),
+    dynamicTools: buildCodexDynamicTools(context, registry),
     ephemeral: true,
     experimentalRawEvents: true,
     persistFullHistory: true,
@@ -599,6 +613,7 @@ function codexWarmSessionRecord(
 async function handleCodexServerRequest(
   context: TurnContext,
   turnParent: TraceParent,
+  registry: HarnessToolRegistry,
   request: CodexServerRequest,
 ): Promise<JsonValue | undefined> {
   if (
@@ -610,18 +625,31 @@ async function handleCodexServerRequest(
   if (request.method !== "item/tool/call") {
     return undefined;
   }
-  return executeDynamicToolCall(context, turnParent, asRecord(request.params));
+  return executeDynamicToolCall(
+    context,
+    turnParent,
+    registry,
+    asRecord(request.params),
+  );
 }
 
 async function executeDynamicToolCall(
   context: TurnContext,
   turnParent: TraceParent,
+  registry: HarnessToolRegistry,
   params: Record<string, unknown>,
 ): Promise<JsonValue> {
   const callId = stringOrNull(params.callId) ?? "dynamic-tool-call";
   const toolName = stringOrNull(params.tool);
   if (toolName !== EXO_SHELL_DYNAMIC_TOOL) {
-    return dynamicToolErrorResponse(`unsupported dynamic tool: ${toolName}`);
+    return executeRegistryDynamicToolCall(
+      context,
+      turnParent,
+      registry,
+      callId,
+      toolName,
+      asRecord(params.arguments),
+    );
   }
 
   const args = asRecord(params.arguments);
@@ -657,6 +685,37 @@ async function executeDynamicToolCall(
     ]);
     return dynamicToolErrorResponse(message);
   }
+}
+
+async function executeRegistryDynamicToolCall(
+  context: TurnContext,
+  turnParent: TraceParent,
+  registry: HarnessToolRegistry,
+  callId: string,
+  toolName: string | null,
+  args: Record<string, unknown>,
+): Promise<JsonValue> {
+  if (!toolName || !registry.get(toolName)) {
+    return dynamicToolErrorResponse(`unsupported dynamic tool: ${toolName}`);
+  }
+  const toolCall: PendingToolCall = {
+    toolCallId: callId,
+    request: {
+      functionName: toolName,
+      arguments: objectArgs(args),
+    },
+  };
+  await appendEvents(context, [toolRequestedEvent(toolCall)]);
+  const { result, ok, events } = await callRegistryTool(registry, toolCall);
+  await appendEvents(context, events);
+  await traceObservedToolCall(
+    context,
+    turnParent,
+    toolCall,
+    result,
+    "codex_dynamic_tool",
+  );
+  return dynamicToolResultResponse(stringifyValue(result), { success: ok });
 }
 
 async function handleCodexNotification(
@@ -995,14 +1054,21 @@ function codexDeveloperInstructions(context: TurnContext): string | null {
   return instructionsText(context.agentConfig.instructions) || null;
 }
 
-function buildCodexDynamicTools(context: TurnContext): JsonValue[] {
+function buildCodexDynamicTools(
+  context: TurnContext,
+  registry: HarnessToolRegistry,
+): JsonValue[] {
+  const registryTools = injectedToolDefinitions(registry).map((definition) =>
+    toJsonValue({ ...definition }),
+  );
   if (useCodexExternalSandbox()) {
-    return [];
+    return registryTools;
   }
   if (!context.conversationConfig.shellProgram) {
-    return [];
+    return registryTools;
   }
   return [
+    ...registryTools,
     {
       name: EXO_SHELL_DYNAMIC_TOOL,
       description: `Run a shell command through the exoharness sandbox. Commands execute from ${sandboxCwd(context)}. Use this for command execution in exo conversations.`,
