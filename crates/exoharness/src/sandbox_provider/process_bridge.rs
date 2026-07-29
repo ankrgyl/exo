@@ -335,13 +335,10 @@ pub fn process_parts(client: Arc<dyn Client>) -> crate::SandboxProcessParts {
         error_tx.clone(),
     );
     let stdin_forwarder = spawn_stdin_forwarder(client, stdin_reader, error_tx);
-    let task_owner = ProcessTaskOwner {
-        output_poller,
-        stdin_forwarder,
-    };
+    let tasks = AbortOnDrop([output_poller, stdin_forwarder]);
 
     let wait: BoxFuture<'static, crate::Result<i32>> = Box::pin(async move {
-        let _task_owner = task_owner;
+        let _tasks = tasks;
         tokio::pin!(wait_rx);
         let mut errors_open = true;
         loop {
@@ -368,15 +365,13 @@ pub fn process_parts(client: Arc<dyn Client>) -> crate::SandboxProcessParts {
     }
 }
 
-struct ProcessTaskOwner {
-    output_poller: JoinHandle<()>,
-    stdin_forwarder: JoinHandle<()>,
-}
+struct AbortOnDrop([JoinHandle<()>; 2]);
 
-impl Drop for ProcessTaskOwner {
+impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        self.output_poller.abort();
-        self.stdin_forwarder.abort();
+        for task in &self.0 {
+            task.abort();
+        }
     }
 }
 
@@ -505,16 +500,9 @@ mod tests {
         responses: Mutex<VecDeque<Response>>,
     }
 
-    struct BlockingRecvClient {
-        recv_events: mpsc::UnboundedSender<()>,
-    }
-
-    struct DropNotify(mpsc::UnboundedSender<()>);
-
-    impl Drop for DropNotify {
-        fn drop(&mut self) {
-            self.0.send(()).expect("receive recv-drop notification");
-        }
+    struct BlockingClient {
+        recv_started: mpsc::UnboundedSender<()>,
+        recv_request: Mutex<Option<oneshot::Receiver<()>>>,
     }
 
     #[async_trait]
@@ -539,14 +527,20 @@ mod tests {
     }
 
     #[async_trait]
-    impl Client for BlockingRecvClient {
+    impl Client for BlockingClient {
         async fn request(&self, request: Request) -> Result<Response> {
             assert_eq!(request.kind, "recv");
-            self.recv_events
+            self.recv_started
                 .send(())
                 .expect("receive recv-start notification");
-            let _drop_notify = DropNotify(self.recv_events.clone());
-            std::future::pending().await
+            self.recv_request
+                .lock()
+                .await
+                .take()
+                .expect("recv request should only start once")
+                .await
+                .expect("recv request should remain blocked");
+            unreachable!("recv request unexpectedly completed")
         }
     }
 
@@ -588,23 +582,24 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_wait_cancels_output_polling() {
-        let (recv_events_tx, mut recv_events_rx) = mpsc::unbounded_channel();
-        let client = Arc::new(BlockingRecvClient {
-            recv_events: recv_events_tx,
+        let (recv_started_tx, mut recv_started_rx) = mpsc::unbounded_channel();
+        let (mut recv_request_tx, recv_request_rx) = oneshot::channel();
+        let client = Arc::new(BlockingClient {
+            recv_started: recv_started_tx,
+            recv_request: Mutex::new(Some(recv_request_rx)),
         });
         let parts = process_parts(client.clone());
 
-        tokio::time::timeout(Duration::from_secs(1), recv_events_rx.recv())
+        tokio::time::timeout(Duration::from_secs(1), recv_started_rx.recv())
             .await
             .expect("output poll should start")
-            .expect("recv-events channel should remain open");
+            .expect("recv-start channel should remain open");
         drop(parts.wait);
-        tokio::time::timeout(Duration::from_secs(1), recv_events_rx.recv())
+        tokio::time::timeout(Duration::from_secs(1), recv_request_tx.closed())
             .await
-            .expect("in-flight recv should be cancelled")
-            .expect("recv-events channel should remain open");
+            .expect("in-flight recv should be cancelled");
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), recv_events_rx.recv())
+            tokio::time::timeout(Duration::from_millis(100), recv_started_rx.recv())
                 .await
                 .is_err(),
             "output poller started another recv request"
