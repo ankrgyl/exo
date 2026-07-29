@@ -39,16 +39,17 @@ import {
   appendEvents,
   appendAndTraceObservedToolEvents,
   asRecord,
+  instructionsText,
   markFirstTextDelta,
   pickEnv,
   pickEnvFrom,
   projectAnthropicMessageToolEvents,
   resolveLlmBinding,
   sandboxCwd,
+  type CodingExecutorTurnOptions,
   type ResolvedLlmBinding,
 } from "./shared";
-import { registryMcpServer } from "./registry-tools";
-import { createDefaultToolRegistry } from "./turn-loop";
+import { injectedToolRegistry, registryMcpServer } from "./registry-tools";
 
 const DEFAULT_CLAUDE_CODE_SANDBOX_EXECUTABLE = "/usr/local/bin/claude-code";
 const CLAUDE_RESULT_GRACE_MS = 5_000;
@@ -71,26 +72,36 @@ interface ClaudeTraceState {
 
 export default defineHarness({
   async runTurn(context) {
-    const modelBinding = await resolveLlmBinding(context);
-    const runtime = ResponsesRuntime.fromModelBinding(
-      context.agentConfig,
-      modelBinding,
-    );
-    await runtime.runTurn(context, (turnParent) =>
-      runClaudeCodeTurn(context, turnParent, modelBinding),
-    );
+    await runClaudeCodeHarnessTurn(context);
   },
 });
+
+// Exported so other harnesses can run the Claude Code executor with their own
+// instructions and tools (see coding-executor-harness).
+export async function runClaudeCodeHarnessTurn(
+  context: TurnContext,
+  options: CodingExecutorTurnOptions = {},
+): Promise<void> {
+  const modelBinding = await resolveLlmBinding(context);
+  const runtime = ResponsesRuntime.fromModelBinding(
+    context.agentConfig,
+    modelBinding,
+  );
+  await runtime.runTurn(context, (turnParent) =>
+    runClaudeCodeTurn(context, turnParent, modelBinding, options),
+  );
+}
 
 async function runClaudeCodeTurn(
   context: TurnContext,
   turnParent: TraceParent,
   modelBinding: ResolvedLlmBinding,
+  options: CodingExecutorTurnOptions,
 ): Promise<string | null> {
-  const systemPrompt = claudeSystemPrompt(context);
-  // No built-ins: Claude Code brings its own shell and edit tools. The
-  // registry carries tool-module and agent-created tools, exposed over MCP.
-  const registry = await createDefaultToolRegistry(context, []);
+  const systemPrompt = options.instructions
+    ? instructionsText(await options.instructions(context)) || null
+    : claudeSystemPrompt(context);
+  const registry = await injectedToolRegistry(context, options.registerTools);
   const state: ClaudeTraceState = {
     startedAt: Date.now(),
     finalText: "",

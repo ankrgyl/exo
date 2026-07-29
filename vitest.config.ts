@@ -14,6 +14,12 @@ export default defineConfig({
       "@exo/model-runtime/responses": fileURLToPath(
         new URL("./typescript/model-runtime/responses.ts", import.meta.url),
       ),
+      "@exo/model-runtime/cost": fileURLToPath(
+        new URL("./typescript/model-runtime/cost.ts", import.meta.url),
+      ),
+      "@exo/codex/app-server": fileURLToPath(
+        new URL("./typescript/codex/app-server.ts", import.meta.url),
+      ),
     },
   },
 });

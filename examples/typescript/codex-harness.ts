@@ -50,10 +50,14 @@ import {
   traceExoharnessToolCall,
   traceObservedToolCall,
   WarmResourceCache,
+  type CodingExecutorTurnOptions,
   type ResolvedLlmBinding,
 } from "./shared";
-import { callRegistryTool, injectedToolDefinitions } from "./registry-tools";
-import { createDefaultToolRegistry } from "./turn-loop";
+import {
+  callRegistryTool,
+  injectedToolDefinitions,
+  injectedToolRegistry,
+} from "./registry-tools";
 
 const CODEX_SHELL_TOOL = "codex.shell";
 const CODEX_WEB_SEARCH_TOOL = "codex.web_search";
@@ -203,29 +207,41 @@ const codexSessions = new WarmResourceCache<CodexWarmSession>();
 
 export default defineHarness({
   async runTurn(context) {
-    const modelBinding = await resolveLlmBinding(context);
-    const runtime = ResponsesRuntime.fromModelBinding(
-      context.agentConfig,
-      modelBinding,
-    );
-    await runtime.runTurn(context, (turnParent) =>
-      runCodexTurn(context, turnParent, modelBinding),
-    );
+    await runCodexHarnessTurn(context);
   },
 });
+
+// Exported so other harnesses can run the codex executor with their own
+// instructions and tools (see coding-executor-harness). A reused warm thread
+// keeps the instructions and dynamic tools it was started with.
+export async function runCodexHarnessTurn(
+  context: TurnContext,
+  options: CodingExecutorTurnOptions = {},
+): Promise<void> {
+  const modelBinding = await resolveLlmBinding(context);
+  const runtime = ResponsesRuntime.fromModelBinding(
+    context.agentConfig,
+    modelBinding,
+  );
+  await runtime.runTurn(context, (turnParent) =>
+    runCodexTurn(context, turnParent, modelBinding, options),
+  );
+}
 
 async function runCodexTurn(
   context: TurnContext,
   turnParent: TraceParent,
   modelBinding: ResolvedLlmBinding,
+  options: CodingExecutorTurnOptions,
 ): Promise<string | null> {
   await requireCodexSandboxNetworking(context);
 
   const { turn } = context.exoharness.current;
   const protocolLog = new CodexProtocolEventBuffer(context);
-  // No built-ins: codex brings its own shell. The registry carries tool-module
-  // and agent-created tools, exposed to codex as dynamic tools.
-  const registry = await createDefaultToolRegistry(context, []);
+  const registry = await injectedToolRegistry(context, options.registerTools);
+  const developerInstructions = options.instructions
+    ? instructionsText(await options.instructions(context)) || null
+    : codexDeveloperInstructions(context);
   const scope: CodexWarmTurnScope = {
     context,
     protocolLog,
@@ -272,7 +288,14 @@ async function runCodexTurn(
           cwd: codexAppServerCwd(context),
           external_sandbox: useCodexExternalSandbox(),
         },
-        () => startCodexThread(session.server, context, modelBinding, registry),
+        () =>
+          startCodexThread(
+            session.server,
+            context,
+            modelBinding,
+            registry,
+            developerInstructions,
+          ),
       ));
     session.threadId = threadId;
     await recordCodexWarmSession(
@@ -515,8 +538,8 @@ async function startCodexThread(
   context: TurnContext,
   modelBinding: ResolvedLlmBinding,
   registry: HarnessToolRegistry,
+  developerInstructions: string | null,
 ): Promise<string> {
-  const developerInstructions = codexDeveloperInstructions(context);
   const request: JsonObject = {
     model: modelBinding.model,
     modelProvider: "openai",

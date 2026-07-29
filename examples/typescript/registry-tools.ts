@@ -6,13 +6,17 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import type {
-  EventData,
-  HarnessToolRegistry,
-  JsonObject,
-  PendingToolCall,
-  ToolResult,
+import {
+  createToolRegistry,
+  type EventData,
+  type HarnessToolRegistry,
+  type JsonObject,
+  type PendingToolCall,
+  type ToolResult,
+  type TurnContext,
 } from "@exo/harness";
+
+import { createDefaultToolRegistry } from "./turn-loop";
 
 // Exposes harness registry tools inside the native coding-agent runtimes:
 // codex takes them as dynamic tools, Claude Code as an in-process MCP server.
@@ -24,6 +28,24 @@ export type ToolRegistryHandle = Pick<
   HarnessToolRegistry,
   "definitions" | "get" | "executePending"
 >;
+
+// The registry a coding harness injects: the given hook's registrations, or
+// by default the tool modules + agent-created tools (no built-ins — the
+// native runtimes bring their own shell).
+export async function injectedToolRegistry(
+  context: TurnContext,
+  registerTools?: (
+    tools: HarnessToolRegistry,
+    context: TurnContext,
+  ) => Promise<void> | void,
+): Promise<HarnessToolRegistry> {
+  if (!registerTools) {
+    return createDefaultToolRegistry(context, []);
+  }
+  const tools = createToolRegistry(context);
+  await registerTools(tools, context);
+  return tools;
+}
 
 export interface InjectedToolDefinition {
   name: string;
