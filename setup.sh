@@ -16,6 +16,8 @@ SETUP_ARGS=()
 DEFAULT_EXO_CHAT_BASE_URL="https://exoharness.ai"
 DEFAULT_OPENROUTER_BASE_URL="https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL="z-ai/glm-5.2"
+DEFAULT_ORCAROUTER_BASE_URL="https://api.orcarouter.ai/v1"
+DEFAULT_ORCAROUTER_MODEL="z-ai/glm-5.2"
 
 die() {
   echo "error: $*" >&2
@@ -45,7 +47,7 @@ Environment overrides:
   EXO_REPO_URL, EXO_REPO_REF, EXO_INSTALL_DIR, EXO_MODEL_PROVIDER, EXO_MODEL,
   EXO_UPSTREAM_MODEL, EXO_AGENT_NAME, EXO_USER_NAME, EXO_CHAT_BASE_URL,
   EXO_LOCAL_PROMPT_FILE, EXO_SETUP_FORCE, EXO_SETUP_INSTALL_DEPS,
-  OPENAI_API_KEY, OPENROUTER_API_KEY
+  OPENAI_API_KEY, OPENROUTER_API_KEY, ORCAROUTER_API_KEY
 EOF
 }
 
@@ -463,13 +465,15 @@ choose_model_provider() {
   echo "Choose the API provider Exo should use:" >&2
   echo "1) OpenAI" >&2
   echo "2) OpenRouter" >&2
+  echo "3) OrcaRouter" >&2
   local choice
   while true; do
-    read -r -p "Provider [1-2, default 1]: " choice
+    read -r -p "Provider [1-3, default 1]: " choice
     case "${choice:-1}" in
       1) printf '%s' openai; return ;;
       2) printf '%s' openrouter; return ;;
-      *) echo "Please choose 1 or 2." >&2 ;;
+      3) printf '%s' orcarouter; return ;;
+      *) echo "Please choose 1, 2, or 3." >&2 ;;
     esac
   done
 }
@@ -489,9 +493,15 @@ configure_model_provider() {
       MODEL_BASE_URL="$DEFAULT_OPENROUTER_BASE_URL"
       DEFAULT_UPSTREAM_MODEL="$DEFAULT_OPENROUTER_MODEL"
       ;;
+    orcarouter)
+      MODEL_PROVIDER_LABEL="OrcaRouter"
+      MODEL_API_KEY_ENV="ORCAROUTER_API_KEY"
+      MODEL_BASE_URL="$DEFAULT_ORCAROUTER_BASE_URL"
+      DEFAULT_UPSTREAM_MODEL="$DEFAULT_ORCAROUTER_MODEL"
+      ;;
     *)
       die "unsupported model provider: $provider" \
-        "(expected openai or openrouter)"
+        "(expected openai, openrouter, or orcarouter)"
       ;;
   esac
 }
@@ -789,8 +799,8 @@ main() {
   echo "Using $MODEL_PROVIDER_LABEL."
 
   if [[ -z "$UPSTREAM_MODEL" ]]; then
-    if [[ "$MODEL_PROVIDER" == "openrouter" ]]; then
-      UPSTREAM_MODEL="$(prompt_text "OpenRouter model id" \
+    if [[ "$MODEL_PROVIDER" == "openrouter" || "$MODEL_PROVIDER" == "orcarouter" ]]; then
+      UPSTREAM_MODEL="$(prompt_text "$MODEL_PROVIDER_LABEL model id" \
         "$DEFAULT_UPSTREAM_MODEL")"
     else
       UPSTREAM_MODEL="$DEFAULT_UPSTREAM_MODEL"

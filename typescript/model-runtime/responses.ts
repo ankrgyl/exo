@@ -297,6 +297,11 @@ export function runtimeFromModelBinding(
   if (isOpenRouterBinding(binding)) {
     return ChatCompletionsRuntime.fromModelBinding(agentConfig, binding);
   }
+  // OrcaRouter is OpenAI-compatible; its /v1/responses endpoint serves a
+  // different model set than chat completions, so force the chat path too.
+  if (isOrcaRouterBinding(binding)) {
+    return ChatCompletionsRuntime.fromModelBinding(agentConfig, binding);
+  }
   return modelRequiresResponsesApi(model)
     ? ResponsesRuntime.fromModelBinding(agentConfig, binding)
     : ChatCompletionsRuntime.fromModelBinding(agentConfig, binding);
@@ -313,6 +318,13 @@ export function isAnthropicModel(model: string): boolean {
 // model name isn't a reliable signal), mirroring the Rust runtime.
 export function isOpenRouterBinding(binding: ResponsesModelBinding): boolean {
   return (binding.baseUrl ?? "").includes("openrouter.ai");
+}
+
+// OrcaRouter is selected by its base URL for the same reason as OpenRouter: it
+// aggregates many vendors, so the model name isn't a reliable signal. Mirrors
+// the Rust runtime.
+export function isOrcaRouterBinding(binding: ResponsesModelBinding): boolean {
+  return (binding.baseUrl ?? "").includes("orcarouter.ai");
 }
 
 export function modelRequiresResponsesApi(model: string): boolean {
