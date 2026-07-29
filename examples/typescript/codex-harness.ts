@@ -9,6 +9,7 @@ import {
   toolRequestedEvent,
   toolResultEvent,
   turnMetadata,
+  type Conversation,
   type EventData,
   type HarnessToolRegistry,
   type JsonObject,
@@ -127,6 +128,10 @@ class CodexWarmSession {
     readonly process: SandboxProcess,
     initialScope: CodexWarmTurnScope,
     threadId: string | null,
+    // The newest sandbox_started event id when this session was created; a
+    // later one means the sandbox was rewound and this session's process is
+    // dead.
+    readonly sandboxEpoch: string | null,
   ) {
     this.current = initialScope;
     this.threadId = threadId;
@@ -136,6 +141,7 @@ class CodexWarmSession {
     scope: CodexWarmTurnScope,
     modelBinding: ResolvedLlmBinding,
     sessionKey: string,
+    sandboxEpoch: string | null,
   ): Promise<CodexWarmSession> {
     let session: CodexWarmSession | null = null;
     const pendingProtocol: CodexProtocolLogEntry[] = [];
@@ -167,6 +173,7 @@ class CodexWarmSession {
       process,
       scope,
       process.reused ? (warmRecord?.threadId ?? null) : null,
+      sandboxEpoch,
     );
     for (const entry of pendingProtocol) {
       session.recordProtocol(entry);
@@ -257,6 +264,16 @@ async function runCodexTurn(
   };
   const sessionKey = codexWarmSessionKey(context, modelBinding);
   const sandboxRuntime = codexSandboxRuntimeKey(context);
+  // A rewind restarts the sandbox and kills every process in it, which the
+  // warm cache cannot see; a cached session would fail mid-turn. Compare
+  // against the newest sandbox_started event and start fresh when it moved.
+  // (A rewind from another conversation is invisible here; the error path
+  // below still recovers on the following turn.)
+  const sandboxEpoch = await latestSandboxStartedEventId(
+    context.exoharness.current.conversation,
+  );
+  const startSession = () =>
+    CodexWarmSession.start(scope, modelBinding, sessionKey, sandboxEpoch);
   const { resource: session, reused: appServerReused } = await traceCodexTask(
     turnParent,
     "codex_app_server_ready",
@@ -266,10 +283,20 @@ async function runCodexTurn(
       sandbox_runtime: sandboxRuntime,
       warm_session_key: sessionKey,
     },
-    () =>
-      codexSessions.get(sessionKey, () =>
-        CodexWarmSession.start(scope, modelBinding, sessionKey),
-      ),
+    async () => {
+      const cached = await codexSessions.get(sessionKey, startSession);
+      if (cached.resource.sandboxEpoch === sandboxEpoch) {
+        return cached;
+      }
+      await appendCustomEvent(turn, "codex_warm_session_invalidated", {
+        metadata: turnMetadata(context),
+        warm_session_key: sessionKey,
+        stale_epoch: cached.resource.sandboxEpoch,
+        sandbox_epoch: sandboxEpoch,
+      });
+      codexSessions.delete(sessionKey, (stale) => stale.close());
+      return codexSessions.get(sessionKey, startSession);
+    },
   );
   session.setTurnScope(scope);
 
@@ -567,6 +594,18 @@ async function startCodexThread(
     throw new Error("codex thread/start response did not include thread.id");
   }
   return thread.id;
+}
+
+// Exported for tests.
+export async function latestSandboxStartedEventId(
+  conversation: Pick<Conversation, "getEvents">,
+): Promise<string | null> {
+  const result = await conversation.getEvents({
+    direction: "desc",
+    limit: 1,
+    types: ["sandbox_started"],
+  });
+  return result.events[0]?.id ?? null;
 }
 
 async function latestCodexWarmSession(
