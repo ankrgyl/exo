@@ -9,6 +9,7 @@ use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 const PROCESS_PIPE_BUFFER_SIZE: usize = 64 * 1024;
@@ -326,16 +327,21 @@ pub fn process_parts(client: Arc<dyn Client>) -> crate::SandboxProcessParts {
     let (wait_tx, wait_rx) = oneshot::channel();
     let (error_tx, mut error_rx) = mpsc::unbounded_channel();
 
-    spawn_output_poller(
+    let output_poller = spawn_output_poller(
         Arc::clone(&client),
         stdout_writer,
         stderr_writer,
         wait_tx,
         error_tx.clone(),
     );
-    spawn_stdin_forwarder(client, stdin_reader, error_tx);
+    let stdin_forwarder = spawn_stdin_forwarder(client, stdin_reader, error_tx);
+    let task_owner = ProcessTaskOwner {
+        output_poller,
+        stdin_forwarder,
+    };
 
     let wait: BoxFuture<'static, crate::Result<i32>> = Box::pin(async move {
+        let _task_owner = task_owner;
         tokio::pin!(wait_rx);
         let mut errors_open = true;
         loop {
@@ -362,34 +368,46 @@ pub fn process_parts(client: Arc<dyn Client>) -> crate::SandboxProcessParts {
     }
 }
 
+struct ProcessTaskOwner {
+    output_poller: JoinHandle<()>,
+    stdin_forwarder: JoinHandle<()>,
+}
+
+impl Drop for ProcessTaskOwner {
+    fn drop(&mut self) {
+        self.output_poller.abort();
+        self.stdin_forwarder.abort();
+    }
+}
+
 fn spawn_output_poller(
     client: Arc<dyn Client>,
     stdout_writer: tokio::io::DuplexStream,
     stderr_writer: tokio::io::DuplexStream,
     wait_tx: oneshot::Sender<i32>,
     error_tx: mpsc::UnboundedSender<anyhow::Error>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(error) = poll_output(client, stdout_writer, stderr_writer, wait_tx).await
             && error_tx.send(error).is_err()
         {
             tracing::debug!("process bridge waiter stopped before output error could be reported");
         }
-    });
+    })
 }
 
 fn spawn_stdin_forwarder(
     client: Arc<dyn Client>,
     stdin_reader: tokio::io::DuplexStream,
     error_tx: mpsc::UnboundedSender<anyhow::Error>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(error) = forward_stdin(client, stdin_reader).await
             && error_tx.send(error).is_err()
         {
             tracing::debug!("process bridge waiter stopped before stdin error could be reported");
         }
-    });
+    })
 }
 
 async fn poll_output(
@@ -487,6 +505,18 @@ mod tests {
         responses: Mutex<VecDeque<Response>>,
     }
 
+    struct BlockingRecvClient {
+        recv_events: mpsc::UnboundedSender<()>,
+    }
+
+    struct DropNotify(mpsc::UnboundedSender<()>);
+
+    impl Drop for DropNotify {
+        fn drop(&mut self) {
+            self.0.send(()).expect("receive recv-drop notification");
+        }
+    }
+
     #[async_trait]
     impl Client for FakeClient {
         async fn request(&self, request: Request) -> Result<Response> {
@@ -505,6 +535,18 @@ mod tests {
                 events: Vec::new(),
                 error: None,
             }))
+        }
+    }
+
+    #[async_trait]
+    impl Client for BlockingRecvClient {
+        async fn request(&self, request: Request) -> Result<Response> {
+            assert_eq!(request.kind, "recv");
+            self.recv_events
+                .send(())
+                .expect("receive recv-start notification");
+            let _drop_notify = DropNotify(self.recv_events.clone());
+            std::future::pending().await
         }
     }
 
@@ -542,6 +584,31 @@ mod tests {
 
         assert_eq!(exit_code, 0);
         assert_eq!(output, "hello world");
+    }
+
+    #[tokio::test]
+    async fn dropping_wait_cancels_output_polling() {
+        let (recv_events_tx, mut recv_events_rx) = mpsc::unbounded_channel();
+        let client = Arc::new(BlockingRecvClient {
+            recv_events: recv_events_tx,
+        });
+        let parts = process_parts(client.clone());
+
+        tokio::time::timeout(Duration::from_secs(1), recv_events_rx.recv())
+            .await
+            .expect("output poll should start")
+            .expect("recv-events channel should remain open");
+        drop(parts.wait);
+        tokio::time::timeout(Duration::from_secs(1), recv_events_rx.recv())
+            .await
+            .expect("in-flight recv should be cancelled")
+            .expect("recv-events channel should remain open");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), recv_events_rx.recv())
+                .await
+                .is_err(),
+            "output poller started another recv request"
+        );
     }
 
     #[tokio::test]
