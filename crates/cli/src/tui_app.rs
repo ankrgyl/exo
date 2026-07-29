@@ -706,6 +706,22 @@ impl TuiApp {
                 *self.watch_after.lock().expect("watch cursor poisoned") =
                     Some(result.latest_event_id);
             }
+            // A cancelled turn still advances the cursor.
+            //
+            // `Cancelled` carries the same `SendResult` as `Completed` because
+            // the turn really did happen up to the point it was stopped: the
+            // events it produced are in the durable log, and a watch resuming
+            // from the old cursor would replay them. The transcript says so
+            // rather than ending mid-line with no explanation.
+            ExecutionStreamEvent::Cancelled(result) => {
+                self.open_assistant = None;
+                self.assistant_prefixed = false;
+                self.transcript
+                    .push(style_transcript_line("cancelled".to_string()));
+                self.session_id = Some(result.session_id);
+                *self.watch_after.lock().expect("watch cursor poisoned") =
+                    Some(result.latest_event_id);
+            }
         }
     }
 

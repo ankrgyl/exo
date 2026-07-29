@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::OwnedMutexGuard;
 use tokio_stream::{Stream, wrappers::UnboundedReceiverStream};
+use tokio_util::sync::CancellationToken;
 
 use crate::braintrust::BraintrustTracingConfig;
 
@@ -244,19 +245,58 @@ pub struct SendResult {
 pub struct ExecutionStreamHandle {
     event_stream: UnboundedReceiverStream<Result<ExecutionStreamEvent>>,
     _send_guard: Option<OwnedMutexGuard<()>>,
+    cancellation: ExecutionCancellation,
 }
 
 impl ExecutionStreamHandle {
     pub fn new(event_stream: UnboundedReceiverStream<Result<ExecutionStreamEvent>>) -> Self {
+        Self::with_cancellation(event_stream, ExecutionCancellation::new())
+    }
+
+    pub(crate) fn with_cancellation(
+        event_stream: UnboundedReceiverStream<Result<ExecutionStreamEvent>>,
+        cancellation: ExecutionCancellation,
+    ) -> Self {
         Self {
             event_stream,
             _send_guard: None,
+            cancellation,
         }
     }
 
     pub(crate) fn with_send_guard(mut self, send_guard: OwnedMutexGuard<()>) -> Self {
         self._send_guard = Some(send_guard);
         self
+    }
+
+    /// Return a handle that can cancel this turn without dropping its durable
+    /// finalization path.
+    pub fn cancellation(&self) -> ExecutionCancellation {
+        self.cancellation.clone()
+    }
+}
+
+/// A cloneable cancellation signal for one streamed turn.
+#[derive(Clone, Debug)]
+pub struct ExecutionCancellation(CancellationToken);
+
+impl ExecutionCancellation {
+    pub fn new() -> Self {
+        Self(CancellationToken::new())
+    }
+
+    pub fn cancel(&self) {
+        self.0.cancel();
+    }
+
+    pub async fn cancelled(&self) {
+        self.0.cancelled().await;
+    }
+}
+
+impl Default for ExecutionCancellation {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -276,6 +316,8 @@ pub enum ExecutionStreamEvent {
         result: ToolResult,
     },
     Completed(SendResult),
+    /// The turn was cancelled cooperatively and its durable log was closed.
+    Cancelled(SendResult),
 }
 
 impl Stream for ExecutionStreamHandle {

@@ -452,6 +452,9 @@ async fn send_stream_emits_chunks_and_persists_final_response() {
             ExecutionStreamEvent::Completed(_) => {
                 panic!("executor stream should not emit completion")
             }
+            ExecutionStreamEvent::Cancelled(_) => {
+                panic!("executor stream should not emit cancellation")
+            }
         }
     }
 
@@ -478,6 +481,93 @@ async fn send_stream_emits_chunks_and_persists_final_response() {
             _ => false,
         }
     }));
+}
+
+struct TestExecutionTracer;
+
+#[async_trait]
+impl crate::execution_tracing::ExecutionTracer for TestExecutionTracer {
+    async fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_turn(
+        &self,
+        _config: Option<&BraintrustTracingConfig>,
+        _agent: &AgentRecord,
+        _conversation: &ConversationRecord,
+        _agent_config: &AgentConfig,
+        _session_id: SessionId,
+        _turn_id: TurnId,
+        _streamed: bool,
+    ) -> Option<Box<dyn crate::execution_tracing::TurnExecutionTrace>> {
+        None
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelling_a_stream_closes_the_durable_turn() {
+    let agent_id = Uuid7::now();
+    let conversation_id = Uuid7::now();
+    let exoharness = Arc::new(FakeExoHarness::new(agent_id, conversation_id));
+    let agent = exoharness
+        .get_agent(&agent_id)
+        .await
+        .expect("get agent should succeed")
+        .expect("agent should exist");
+    let conversation = agent
+        .get_conversation(&conversation_id)
+        .await
+        .expect("get conversation should succeed")
+        .expect("conversation should exist");
+    let turn = conversation
+        .begin_turn(BeginTurnRequest {
+            session_id: None,
+            input: vec![user_message("wait")],
+        })
+        .await
+        .expect("begin turn should succeed");
+    let cancellation = ExecutionCancellation::new();
+    let mut stream = crate::shared::spawn_prepared_turn_stream(
+        Arc::new(TestExecutionTracer),
+        agent,
+        conversation.clone(),
+        turn,
+        default_agent_config(),
+        cancellation.clone(),
+        |_trace, _events| Box::pin(std::future::pending()),
+    );
+
+    cancellation.cancel();
+    let cancelled = stream
+        .next()
+        .await
+        .expect("cancellation event")
+        .expect("cancellation succeeds");
+    assert!(matches!(cancelled, ExecutionStreamEvent::Cancelled(_)));
+
+    let events = conversation
+        .get_events(Some(EventQuery {
+            cursor: None,
+            direction: Some(EventQueryDirection::Asc),
+            limit: None,
+            session_id: None,
+            turn_id: None,
+            types: None,
+        }))
+        .await
+        .expect("read events")
+        .events;
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.data,
+            EventData::Custom { event_type, .. } if event_type == "turn_cancelled"
+        )
+    }));
+    assert!(matches!(
+        events.last().map(|event| &event.data),
+        Some(EventData::TurnEnded)
+    ));
 }
 
 struct FakeModelClient {
