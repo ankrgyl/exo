@@ -57,6 +57,7 @@ Commands:
   logs [scheduler|adapters] Print recent service logs
 
 Options:
+  --harness <harness>       Agent harness used by the adapter runner: exo or codex
   --env-file <path>         Env file to read if present (default: .env)
   --exo-bin <path>          exo binary path (default: ./target/debug/exo)
   --scheduler-bin <path>    Scheduler runner path
@@ -93,6 +94,7 @@ write_config() {
   {
     echo "# Exo guardian host-side launch settings."
     echo "# This file is local state and should not be committed."
+    quote_var "HARNESS" "$HARNESS"
     quote_var "EXO_BIN" "$EXO_BIN"
     quote_var "SCHEDULER_BIN" "$SCHEDULER_BIN"
     quote_var "ENV_FILE" "$ENV_FILE"
@@ -448,6 +450,14 @@ RESTART_REASON="restart-services"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --harness)
+      HARNESS="${2:-}"
+      case "$HARNESS" in
+        exo|codex) ;;
+        *) die "--harness must be exo or codex" ;;
+      esac
+      shift 2
+      ;;
     --env-file)
       ENV_FILE="${2:-}"
       [[ -n "$ENV_FILE" ]] || die "--env-file requires a value"

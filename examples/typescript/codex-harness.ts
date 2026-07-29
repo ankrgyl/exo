@@ -1,20 +1,30 @@
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { mkdir, readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 import {
   appendCustomEvent,
   assistantTextMessage,
+  createToolRegistry,
   defineHarness,
   messageText,
   messagesEvent,
+  registerAdapterTools,
   stringifyValue,
   toJsonValue,
   toolRequestedEvent,
   toolResultEvent,
   turnMetadata,
   type EventData,
+  type HarnessToolRegistry,
   type JsonObject,
   type JsonValue,
   type Message,
   type PendingToolCall,
   type SandboxProcess,
+  type ToolResult,
   type TurnContext,
 } from "@exo/harness";
 import {
@@ -26,7 +36,7 @@ import {
 import { responsesMessagesToLingua } from "@braintrust/lingua";
 import {
   errorMessage,
-  ResponsesRuntime,
+  traceExecutorTurn,
   tracedUnderParent,
   type TraceParent,
 } from "@exo/model-runtime/responses";
@@ -105,6 +115,25 @@ interface CodexWarmSessionRecord {
   threadId: string;
 }
 
+type CodexCredential =
+  | {
+      kind: "api_key";
+      token: string;
+      fingerprint: string;
+    }
+  | {
+      kind: "chatgpt";
+      token: string;
+      accountId: string;
+      fingerprint: string;
+    };
+
+interface CodexAuthStatus {
+  authMethod: string | null;
+  authToken: string | null;
+  requiresOpenaiAuth: boolean | null;
+}
+
 class CodexWarmSession {
   threadId: string | null;
   private current: CodexWarmTurnScope | null;
@@ -122,13 +151,14 @@ class CodexWarmSession {
   static async start(
     scope: CodexWarmTurnScope,
     modelBinding: ResolvedLlmBinding,
+    credential: CodexCredential,
     sessionKey: string,
   ): Promise<CodexWarmSession> {
     let session: CodexWarmSession | null = null;
     const pendingProtocol: CodexProtocolLogEntry[] = [];
     const process = await scope.context.startSandboxProcess({
       command: codexSandboxCommand(scope.context),
-      env: codexSandboxEnv(modelBinding),
+      env: codexSandboxEnv(modelBinding, credential),
       reuseKey: sessionKey,
     });
     const warmRecord = process.reused
@@ -149,6 +179,9 @@ class CodexWarmSession {
     const server = process.reused
       ? await CodexAppServer.attachToSandbox(options)
       : await CodexAppServer.startInSandbox(options);
+    if (credential.kind === "chatgpt") {
+      await loginCodexWithChatgptCredential(server, credential);
+    }
     session = new CodexWarmSession(
       server,
       process,
@@ -182,6 +215,9 @@ class CodexWarmSession {
   private handleServerRequest(
     request: CodexServerRequest,
   ): Promise<JsonValue | undefined> | JsonValue | undefined {
+    if (request.method === "account/chatgptAuthTokens/refresh") {
+      return refreshCodexChatgptCredential();
+    }
     const current = this.current;
     if (!current) {
       return undefined;
@@ -195,31 +231,214 @@ class CodexWarmSession {
 }
 
 const codexSessions = new WarmResourceCache<CodexWarmSession>();
+const codexSessionKeys = new Map<string, string>();
+let codexHostAuthBroker: Promise<CodexAppServer> | null = null;
 
 export default defineHarness({
   async runTurn(context) {
     const modelBinding = await resolveLlmBinding(context);
-    const runtime = ResponsesRuntime.fromModelBinding(
-      context.agentConfig,
-      modelBinding,
-    );
-    await runtime.runTurn(context, (turnParent) =>
-      runCodexTurn(context, turnParent, modelBinding),
+    const credential = await resolveCodexCredential(modelBinding);
+    await traceExecutorTurn(context, (turnParent) =>
+      runCodexTurn(context, turnParent, modelBinding, credential),
     );
   },
 });
+
+export async function resolveCodexCredential(
+  modelBinding: ResolvedLlmBinding,
+): Promise<CodexCredential> {
+  if (modelBinding.apiKey) {
+    return {
+      kind: "api_key",
+      token: modelBinding.apiKey,
+      fingerprint: credentialFingerprint("api_key", modelBinding.apiKey),
+    };
+  }
+  if (modelBinding.baseUrl) {
+    throw new Error(
+      `Codex model ${modelBinding.name} has a custom base URL but no API-key secret; ChatGPT subscription auth only supports the built-in OpenAI provider`,
+    );
+  }
+  const credential = await codexChatgptCredential();
+  return {
+    kind: "chatgpt",
+    token: credential.token,
+    accountId: credential.accountId,
+    fingerprint: credentialFingerprint("chatgpt", credential.token),
+  };
+}
+
+export function credentialFingerprint(
+  kind: CodexCredential["kind"],
+  token: string,
+) {
+  return createHash("sha256").update(`${kind}\0${token}`).digest("hex");
+}
+
+async function codexChatgptCredential(): Promise<{
+  token: string;
+  accountId: string;
+}> {
+  const broker = await getCodexHostAuthBroker();
+  try {
+    const status = await broker.request<CodexAuthStatus & JsonObject>(
+      "getAuthStatus",
+      {
+        includeToken: true,
+        refreshToken: true,
+      },
+    );
+    if (
+      !status.authMethod?.toLowerCase().startsWith("chatgpt") ||
+      !status.authToken
+    ) {
+      throw new Error(
+        "Exo is not signed in to ChatGPT; run `exo codex login` and retry",
+      );
+    }
+    const accountId = await codexChatgptAccountId();
+    return { token: status.authToken, accountId };
+  } catch (error) {
+    codexHostAuthBroker = null;
+    broker.close();
+    throw error;
+  }
+}
+
+async function codexChatgptAccountId(): Promise<string> {
+  const authPath = join(exoCodexHome(), "auth.json");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(authPath, "utf8")) as unknown;
+  } catch (error) {
+    throw new Error(
+      `Could not read the ChatGPT account ID from ${authPath}: ${errorMessage(error)}`,
+    );
+  }
+  const tokens = asRecord(asRecord(parsed).tokens);
+  const accountId = stringOrNull(tokens.account_id);
+  if (!accountId) {
+    throw new Error(
+      `The Codex login in ${authPath} does not include a ChatGPT account ID; run \`exo codex login\` again`,
+    );
+  }
+  return accountId;
+}
+
+async function loginCodexWithChatgptCredential(
+  server: CodexAppServer,
+  credential: Extract<CodexCredential, { kind: "chatgpt" }>,
+): Promise<void> {
+  await server.request(
+    "account/login/start",
+    codexChatgptLoginParams(credential.token, credential.accountId),
+  );
+}
+
+export function codexChatgptLoginParams(
+  accessToken: string,
+  accountId: string,
+): JsonObject {
+  return {
+    type: "chatgptAuthTokens",
+    accessToken,
+    chatgptAccountId: accountId,
+  };
+}
+
+async function refreshCodexChatgptCredential(): Promise<JsonValue> {
+  const credential = await codexChatgptCredential();
+  return {
+    accessToken: credential.token,
+    chatgptAccountId: credential.accountId,
+    chatgptPlanType: null,
+  };
+}
+
+async function getCodexHostAuthBroker(): Promise<CodexAppServer> {
+  codexHostAuthBroker ??= startCodexHostAuthBroker().catch((error: unknown) => {
+    codexHostAuthBroker = null;
+    throw error;
+  });
+  return codexHostAuthBroker;
+}
+
+async function startCodexHostAuthBroker(): Promise<CodexAppServer> {
+  const codexHome = exoCodexHome();
+  await mkdir(codexHome, { recursive: true, mode: 0o700 });
+  return CodexAppServer.start({
+    executable: hostCodexExecutable(),
+    env: {
+      CODEX_HOME: codexHome,
+      CODEX_ACCESS_TOKEN: undefined,
+      OPENAI_API_KEY: undefined,
+    },
+    configOverrides: ['cli_auth_credentials_store="file"'],
+  });
+}
+
+function exoCodexHome(): string {
+  const configured = process.env.EXO_CODEX_HOME?.trim();
+  if (configured) {
+    return configured;
+  }
+  const home = homedir();
+  if (process.platform === "darwin") {
+    return join(home, "Library", "Application Support", "exo", "codex");
+  }
+  if (process.platform === "win32") {
+    return join(
+      process.env.LOCALAPPDATA ?? join(home, "AppData", "Local"),
+      "exo",
+      "codex",
+    );
+  }
+  return join(
+    process.env.XDG_DATA_HOME ?? join(home, ".local", "share"),
+    "exo",
+    "codex",
+  );
+}
+
+function hostCodexExecutable(): string {
+  const configured =
+    process.env.EXO_HOST_CODEX_BIN?.trim() ?? process.env.CODEX_BIN?.trim();
+  if (configured) {
+    return configured;
+  }
+  const bundled = join(
+    process.cwd(),
+    "node_modules",
+    ".bin",
+    process.platform === "win32" ? "codex.cmd" : "codex",
+  );
+  return existsSync(bundled) ? bundled : "codex";
+}
 
 async function runCodexTurn(
   context: TurnContext,
   turnParent: TraceParent,
   modelBinding: ResolvedLlmBinding,
+  credential: CodexCredential,
 ): Promise<string | null> {
   await requireCodexSandboxNetworking(context);
 
   const { turn } = context.exoharness.current;
   const protocolLog = new CodexProtocolEventBuffer(context);
   const scope: CodexWarmTurnScope = { context, protocolLog, turnParent };
-  const sessionKey = codexWarmSessionKey(context, modelBinding);
+  const sessionKey = codexWarmSessionKey(
+    context,
+    modelBinding,
+    credential.fingerprint,
+  );
+  const sessionScope = codexSessionScope(context);
+  const previousSessionKey = codexSessionKeys.get(sessionScope);
+  if (previousSessionKey && previousSessionKey !== sessionKey) {
+    await codexSessions.delete(previousSessionKey, (session) =>
+      session.close(),
+    );
+  }
+  codexSessionKeys.set(sessionScope, sessionKey);
   const sandboxRuntime = codexSandboxRuntimeKey(context);
   const { resource: session, reused: appServerReused } = await traceCodexTask(
     turnParent,
@@ -232,7 +451,7 @@ async function runCodexTurn(
     },
     () =>
       codexSessions.get(sessionKey, () =>
-        CodexWarmSession.start(scope, modelBinding, sessionKey),
+        CodexWarmSession.start(scope, modelBinding, credential, sessionKey),
       ),
   );
   session.setTurnScope(scope);
@@ -620,6 +839,50 @@ async function executeDynamicToolCall(
 ): Promise<JsonValue> {
   const callId = stringOrNull(params.callId) ?? "dynamic-tool-call";
   const toolName = stringOrNull(params.tool);
+  if (!toolName) {
+    return dynamicToolErrorResponse("dynamic tool request omitted tool name");
+  }
+
+  const adapterTool = codexAdapterToolRegistry(context).get(toolName);
+  if (adapterTool) {
+    const args = objectArgs(asRecord(params.arguments));
+    const toolCall: PendingToolCall = {
+      toolCallId: callId,
+      request: {
+        functionName: toolName,
+        arguments: args,
+      },
+    };
+    await appendEvents(context, [toolRequestedEvent(toolCall)]);
+    try {
+      const result = await adapterTool.handler.execute(args, {
+        context,
+        toolCallId: callId,
+      });
+      await appendEvents(context, [toolResultEvent(callId, result)]);
+      await traceObservedToolCall(
+        context,
+        turnParent,
+        toolCall,
+        result,
+        "codex_dynamic_tool",
+      );
+      return codexDynamicToolResult(result);
+    } catch (error) {
+      const message = errorMessage(error);
+      const result = toJsonValue({ ok: false, error: message });
+      await appendEvents(context, [toolResultEvent(callId, result)]);
+      await traceObservedToolCall(
+        context,
+        turnParent,
+        toolCall,
+        result,
+        "codex_dynamic_tool",
+      );
+      return dynamicToolErrorResponse(message);
+    }
+  }
+
   if (toolName !== EXO_SHELL_DYNAMIC_TOOL) {
     return dynamicToolErrorResponse(`unsupported dynamic tool: ${toolName}`);
   }
@@ -995,15 +1258,18 @@ function codexDeveloperInstructions(context: TurnContext): string | null {
   return instructionsText(context.agentConfig.instructions) || null;
 }
 
-function buildCodexDynamicTools(context: TurnContext): JsonValue[] {
-  if (useCodexExternalSandbox()) {
-    return [];
-  }
-  if (!context.conversationConfig.shellProgram) {
-    return [];
-  }
-  return [
-    {
+export function buildCodexDynamicTools(context: TurnContext): JsonValue[] {
+  const tools = codexAdapterToolRegistry(context)
+    .definitions()
+    .map((definition) => ({
+      type: "function",
+      name: definition.name,
+      description: definition.description,
+      inputSchema: definition.parameters,
+    }));
+  if (!useCodexExternalSandbox() && context.conversationConfig.shellProgram) {
+    tools.push({
+      type: "function",
       name: EXO_SHELL_DYNAMIC_TOOL,
       description: `Run a shell command through the exoharness sandbox. Commands execute from ${sandboxCwd(context)}. Use this for command execution in exo conversations.`,
       inputSchema: {
@@ -1017,8 +1283,15 @@ function buildCodexDynamicTools(context: TurnContext): JsonValue[] {
         },
         required: ["command"],
       },
-    },
-  ];
+    });
+  }
+  return tools;
+}
+
+function codexAdapterToolRegistry(context: TurnContext): HarnessToolRegistry {
+  const tools = createToolRegistry(context);
+  registerAdapterTools(tools);
+  return tools;
 }
 
 function codexNativeSandboxPolicy(): JsonValue {
@@ -1068,7 +1341,7 @@ function codexEffectiveNetworking(context: TurnContext): boolean {
   return context.agentConfig.sandbox.enableNetworking;
 }
 
-function codexSandboxCommand(context: TurnContext): string[] {
+export function codexSandboxCommand(context: TurnContext): string[] {
   const shell = context.conversationConfig.shellProgram ?? "/bin/bash";
   const command = [
     "set -e;",
@@ -1076,30 +1349,32 @@ function codexSandboxCommand(context: TurnContext): string[] {
     'if [ -n "${OPENAI_API_KEY:-}" ] && [ ! -f "${CODEX_HOME:-/tmp/exo-codex-home}/auth.json" ]; then',
     'printf "%s" "$OPENAI_API_KEY" | codex login --with-api-key >/dev/null 2>/tmp/codex-login.stderr;',
     "fi;",
-    "exec codex app-server --listen stdio:// 2>/tmp/codex-app-server.stderr",
+    "exec codex -c",
+    `'shell_environment_policy.exclude=["OPENAI_API_KEY","CODEX_ACCESS_TOKEN"]'`,
+    "app-server --listen stdio:// 2>/tmp/codex-app-server.stderr",
   ].join(" ");
   return [shell, "-lc", command];
 }
 
-function codexSandboxEnv(
+export function codexSandboxEnv(
   modelBinding: ResolvedLlmBinding,
+  credential: CodexCredential,
 ): Record<string, string> {
   const env: Record<string, string> = {
-    ...pickEnv(
-      (key) =>
-        [
-          "BRAINTRUST_API_KEY",
-          "BRAINTRUST_APP_URL",
-          "OPENAI_ORG_ID",
-          "OPENAI_ORGANIZATION",
-          "OPENAI_PROJECT",
-        ].includes(key) || key.startsWith("CODEX_"),
+    ...pickEnv((key) =>
+      [
+        "BRAINTRUST_API_KEY",
+        "BRAINTRUST_APP_URL",
+        "OPENAI_ORG_ID",
+        "OPENAI_ORGANIZATION",
+        "OPENAI_PROJECT",
+      ].includes(key),
     ),
-    CODEX_HOME: "/tmp/exo-codex-home",
+    CODEX_HOME: `/tmp/exo-codex-home-${credential.fingerprint.slice(0, 16)}`,
     HOME: "/tmp/exo-home",
   };
-  if (modelBinding.apiKey) {
-    env.OPENAI_API_KEY = modelBinding.apiKey;
+  if (credential.kind === "api_key") {
+    env.OPENAI_API_KEY = credential.token;
   }
   if (modelBinding.baseUrl) {
     env.OPENAI_BASE_URL = modelBinding.baseUrl;
@@ -1119,6 +1394,13 @@ function dynamicToolResultResponse(
 
 function dynamicToolErrorResponse(message: string): JsonValue {
   return dynamicToolResultResponse(`Error: ${message}`, { success: false });
+}
+
+function codexDynamicToolResult(result: ToolResult): JsonValue {
+  const record = asRecord(result);
+  return dynamicToolResultResponse(stringifyValue(result), {
+    success: record.ok !== false,
+  });
 }
 
 function codexAppServerCwd(context: TurnContext): string {
@@ -1163,6 +1445,7 @@ function codexSandboxRuntimeKey(context: TurnContext): JsonValue {
 function codexWarmSessionKey(
   context: TurnContext,
   modelBinding: ResolvedLlmBinding,
+  authFingerprint: string,
 ): string {
   return JSON.stringify({
     agent_id: context.exoharness.current.agent.record.id,
@@ -1170,8 +1453,16 @@ function codexWarmSessionKey(
     model_binding: modelBinding.name,
     model: modelBinding.model,
     base_url: modelBinding.baseUrl ?? null,
+    auth_fingerprint: authFingerprint,
     sandbox_runtime: codexSandboxRuntimeKey(context),
   });
+}
+
+function codexSessionScope(context: TurnContext): string {
+  return [
+    context.exoharness.current.agent.record.id,
+    context.exoharness.current.conversation.record.id,
+  ].join(":");
 }
 
 function notificationItem(

@@ -42,6 +42,19 @@ scheduler and adapter runner, sets up the ExoChat adapter, prints a browser
 chat URL using the hosted control plane at `https://exoharness.ai`, and drops
 you into a REPL.
 
+To use the ChatGPT subscription-backed Codex harness with the same launcher
+and ExoChat path, complete the
+[Codex setup](../../docs/coding-agent-harnesses.md#codex), then run:
+
+```bash
+./exo.sh --harness codex
+```
+
+Codex owns the model and sandbox tool loop in this mode. Exo continues to own
+the persisted agent/conversation, adapter runner, inbound wake-up, and ExoChat
+delivery path. The Codex preset exposes Exo's adapter tools, not the complete
+tool and prompt surface of this Exo harness.
+
 For developer testing with IRC and Discord instead, use the `dev` template:
 
 ```bash

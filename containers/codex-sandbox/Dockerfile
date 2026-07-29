@@ -1,6 +1,6 @@
 FROM node:22-bookworm-slim
 
-ARG CODEX_PACKAGE=@openai/codex
+ARG CODEX_PACKAGE=@openai/codex@0.144.6
 
 ENV CODEX_HOME=/home/exo/.codex
 ENV HOME=/home/exo

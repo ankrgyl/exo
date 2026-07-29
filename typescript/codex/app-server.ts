@@ -27,6 +27,7 @@ export interface CodexAppServerOptions {
   executable?: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  configOverrides?: string[];
   onProtocolMessage?: CodexProtocolLogger;
   onServerRequest?: CodexServerRequestHandler;
 }
@@ -89,11 +90,25 @@ export class CodexAppServer {
     options: CodexAppServerOptions = {},
   ): Promise<CodexAppServer> {
     const executable = options.executable ?? process.env.CODEX_BIN ?? "codex";
-    const child = spawn(executable, ["app-server", "--listen", "stdio://"], {
-      cwd: options.cwd,
-      env: { ...process.env, ...options.env },
-      stdio: "pipe",
-    }) as ChildProcessWithoutNullStreams;
+    const configArgs = (options.configOverrides ?? []).flatMap((override) => [
+      "-c",
+      override,
+    ]);
+    const childEnv = { ...process.env, ...options.env };
+    for (const [key, value] of Object.entries(childEnv)) {
+      if (value === undefined) {
+        delete childEnv[key];
+      }
+    }
+    const child = spawn(
+      executable,
+      [...configArgs, "app-server", "--listen", "stdio://"],
+      {
+        cwd: options.cwd,
+        env: childEnv,
+        stdio: "pipe",
+      },
+    ) as ChildProcessWithoutNullStreams;
     const server = new CodexAppServer(
       {
         stdout: nodeStreamChunks(child.stdout),

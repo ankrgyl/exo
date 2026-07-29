@@ -40,21 +40,50 @@ For upgrades, downgrades, uninstall instructions, and building from source, see
 
 ## Codex
 
-Register an OpenAI model:
+Sign Exo in with ChatGPT, then register a secretless model binding. This uses
+the Codex access included with your ChatGPT plan rather than API billing:
+
+```bash
+./target/debug/exo codex login
+./target/debug/exo model register gpt-5.5
+```
+
+The Exo login is isolated from the Codex CLI and VS Code extension. Use
+`exo codex status` to inspect it, `exo codex logout` to remove it, and
+`exo codex login --device-auth` on a headless machine. Set `EXO_CODEX_HOME`
+to override Exo's platform-specific credential directory.
+
+To use API billing instead, register the model with an API-key secret:
 
 ```bash
 ./target/debug/exo secret set openai --env OPENAI_API_KEY
 ./target/debug/exo model register gpt-5.5 --secret openai
 ```
 
+ChatGPT subscription authentication is available only to the Codex harness.
+The basic, RLM, and direct Responses API harnesses still require API credentials.
+
 Build the sandbox image:
 
 ```bash
-container build \
+docker build \
   --platform linux/arm64 \
   -t exo-codex-sandbox:latest \
   containers/codex-sandbox
 ```
+
+To launch the normal Exo stack with the Codex harness, including Docker,
+ExoChat, the adapter runner, and the CLI chat, run:
+
+```bash
+./exo.sh --harness codex
+```
+
+The Codex harness owns the model turn and sandbox tool loop. Exo still owns
+agent and conversation state, sandbox lifecycle, adapter persistence, inbound
+wake-ups, and ExoChat delivery. The Codex preset currently exposes Exo's
+adapter tools; it does not combine the Codex loop with every tool and prompt
+from `examples/exo/harness.ts`.
 
 Create the agent and start a conversation:
 

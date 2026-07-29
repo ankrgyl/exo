@@ -57,8 +57,10 @@ Exo was designed to be incredibly simple to use. With just a few commands you
 should have a fully functional agent who can do standard agent tasks (computer
 use, research, coding etc.) but can also extend itself as needed.
 
-To use Exo as an agent, you'll need an OpenAI or OpenRouter API key. If you
-have that, simply do the following:
+To use Exo as an agent, you'll usually need an OpenAI or OpenRouter API key.
+The Codex harness can instead use the Codex access included with your ChatGPT
+subscription; see [Coding agent harnesses](docs/coding-agent-harnesses.md#codex).
+Then simply do the following:
 
 ```
 curl -fsSL https://raw.githubusercontent.com/exoharness/exo/main/setup.sh -o setup.sh
@@ -112,6 +114,7 @@ the command line.
 
 ```
 ./exo.sh                # start the full stack (Docker sandbox, ExoChat) and open the CLI chat interface
+./exo.sh --harness codex # use ChatGPT subscription-backed Codex with ExoChat
 ./exo.sh list           # list agents and conversations
 ./exo.sh stop-all       # stop the scheduler and adapter runners; state is preserved
 ./exo.sh fresh          # rebuild, delete all agents/conversations, start clean
@@ -128,6 +131,12 @@ mounted at `/workspace/exo`, and ExoChat for remote access. Pass
 `--template dev` for a developer variant that sets up IRC and Discord instead
 of ExoChat, or `--template minimal` for a bare REPL with no Docker defaults or
 adapter setup.
+
+The Codex launch requires an Exo-scoped ChatGPT login, a registered model, and
+the Codex sandbox image. See
+[Coding agent harnesses](docs/coding-agent-harnesses.md#codex) for the one-time
+setup. In this mode Codex runs the model/tool loop while Exo supplies persisted
+agents, conversations, sandbox lifecycle, and adapters such as ExoChat.
 
 ## Understanding Exo
 
