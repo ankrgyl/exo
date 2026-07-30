@@ -6,6 +6,7 @@ import {
   ChatCompletionsRuntime,
   isAnthropicModel,
   isOpenRouterBinding,
+  isVeniceBinding,
   modelRequiresResponsesApi,
   responseToLinguaEvents,
   responseToolCalls,
@@ -76,6 +77,25 @@ describe("model runtime dispatch", () => {
         model: "openai/gpt-5-pro",
         apiKey: "key",
         baseUrl: "https://openrouter.ai/api/v1",
+      }),
+    ).toBeInstanceOf(ChatCompletionsRuntime);
+  });
+
+  it("routes Venice bindings through chat completions by base URL", () => {
+    expect(
+      isVeniceBinding({ baseUrl: "https://api.venice.ai/api/v1" }),
+    ).toBe(true);
+    expect(isVeniceBinding({ baseUrl: null })).toBe(false);
+    expect(isVeniceBinding({ baseUrl: "not a URL" })).toBe(false);
+    expect(
+      isVeniceBinding({ baseUrl: "https://api.venice.ai.example.com/api/v1" }),
+    ).toBe(false);
+    // A native-provider-looking model name over Venice still uses Venice.
+    expect(
+      runtimeFromModelBinding(undefined, {
+        model: "claude-opus-4-8",
+        apiKey: "key",
+        baseUrl: "https://api.venice.ai/api/v1",
       }),
     ).toBeInstanceOf(ChatCompletionsRuntime);
   });
