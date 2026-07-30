@@ -129,6 +129,38 @@ mounted at `/workspace/exo`, and ExoChat for remote access. Pass
 of ExoChat, or `--template minimal` for a bare REPL with no Docker defaults or
 adapter setup.
 
+## Basic Debugging and Visibility
+
+To see what the agent is doing, follow its durable event stream from another
+terminal:
+
+```bash
+pnpm events:tail
+```
+
+This shows recent messages, tool calls and results, and turn boundaries, then
+continues following new events. It defaults to the `exo-agent` agent and `dev`
+conversation. Pass different slugs when needed, or change how much history is
+shown:
+
+```bash
+pnpm events:tail exo-agent dev --history 50
+pnpm events:tail exo-agent dev --history 0  # new events only
+```
+
+Press `Ctrl-C` to stop following events.
+
+The scheduler and adapter services have separate host-side logs:
+
+```bash
+tail -F .exo/exo-scheduler.log  # scheduled task execution
+tail -F .exo/exo-adapters.log   # adapter startup, delivery, and failures
+```
+
+These logs and the canonical event history remain available across ordinary
+restarts. `./exo.sh fresh` deletes agent and conversation state, so preserve
+anything needed for debugging before using it.
+
 ## Understanding Exo
 
 There are only a few key components you need to know about to understand how
@@ -187,6 +219,20 @@ There are a number of prompt files that Exo uses during runtime. You can edit th
 
 After changing prompt files, ask Exo to rebuild/restart itself for them to go in
 use.
+
+## Human-created Exos
+
+Beyond built-in capabilities, Exo also supports human-authored extensions that
+add explicit, task-specific functionality, as shown in these examples:
+
+- [ExoWorker](https://github.com/exoharness/exo/tree/exo-worker/examples/exo-worker)
+  is a long-running autonomous worker with task-tree planning, durable memory,
+  adapters, scheduling, and host-injected tools.
+- [Gameboy Agent](examples/gameboy-agent/) gives Exo an emulator sidecar and
+  tools for playing Game Boy games.
+
+Building your own Exo? Share it with us on
+[Discord](https://discord.gg/8x23hdBJU6).
 
 ## Ongoing Work
 

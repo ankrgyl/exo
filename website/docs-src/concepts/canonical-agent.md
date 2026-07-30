@@ -10,6 +10,7 @@ The [setup script](../getting-started/installation) launches exo's
 lives at `examples/exo/`) that demonstrates the full
 recursive-self-improvement loop. You can use it without knowing these
 internals, but a basic map helps when you want to guide its evolution.
+For how each piece starts, stays up, and stops, see [Lifecycles](./lifecycles).
 
 ## The pieces
 
@@ -32,9 +33,9 @@ rebuild and restart itself and its services. This is what makes *every*
 aspect of the agent modifiable.
 
 **Guardian.** A host-side control surface for maintenance that must happen
-outside the sandbox. Through `guardian_action` the agent can build Exo,
-inspect service status and logs, and restart the scheduler or adapter
-runners — all while preserving `.exo` state.
+outside the sandbox. The agent uses `rebuild_and_restart_exo` for its fixed
+self-update path. Operators use the guardian CLI for service status, logs, and
+targeted service control — all while preserving `.exo` state.
 
 **Scheduler.** A task-scheduling process for recurring sandbox work (e.g.
 hourly). The agent can create, list, cancel, and delete scheduled tasks;
@@ -49,7 +50,10 @@ conversations.
 Core:
 
 - Host control: `shell`
-- Tool management: `install_agent_tool`, `uninstall_agent_tool`
+- Tool discovery and management: `inspect_tools`, `manage_tool`
+- Self-maintenance: `rebuild_and_restart_exo`
+- Legacy compatibility, when explicitly enabled: `install_agent_tool`,
+  `uninstall_agent_tool`
 
 Agent:
 
@@ -59,7 +63,6 @@ Agent:
 - Scheduler: `schedule_sandbox_task`, `list_scheduled_tasks`,
   `cancel_scheduled_task`, `delete_scheduled_task`
 - Sandbox: `list_sandbox_snapshots`, `snapshot_sandbox`, `rewind_sandbox`
-- Self-maintenance: `guardian_action`
 - Memory: `remember`, `forget`
 
 Tool definitions are registered fresh each model round, so tools the agent

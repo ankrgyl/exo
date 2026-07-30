@@ -25,15 +25,16 @@ new snapshots, and rewind the sandbox when it needs to back out risky changes.
 ### Guardian
 
 The guardian is a host-side control surface for maintenance that should happen
-outside the sandbox. The agent can call it through `guardian_action` to build
-Exo, inspect service status and logs, and restart the scheduler or adapter
-runners while preserving `.exo` state.
+outside the sandbox. The agent calls `rebuild_and_restart_exo` for the fixed
+self-update path. Operators use the guardian CLI to inspect service status and
+logs or perform targeted service control while preserving `.exo` state.
 
 ### Tools
 
-Tools are functions the model can call during a turn. Core tools expose shell
-access and agent-created tool installation; Exo adds tools for adapters,
-scheduling, sandbox snapshots, memory, introspection, and guardian maintenance.
+Tools are functions the model can call during a turn. The bootstrap surface is
+`shell`, `inspect_tools`, `manage_tool`, and `rebuild_and_restart_exo`; the
+practical profile adds tools for adapters, scheduling, sandbox snapshots,
+memory, and introspection. Legacy agent-tool creation is opt-in.
 Tool definitions are registered each model round, so the agent sees the current
 tool list as part of the model request.
 
@@ -64,24 +65,26 @@ conversations.
 
 ## Tools
 
-Exo has the following minimal set of tools to control and interact with its environme and to evolve itself.
+Exo has the following minimal set of tools to control and interact with its environment and to evolve itself.
 
 ### Core
 
-- host control : `shell`
-- Tool management :`install_agent_tool`, `uninstall_agent_tool`
+- Host control: `shell`
+- Tool discovery and management: `inspect_tools`, `manage_tool`
+- Self-maintenance: `rebuild_and_restart_exo`
+- Legacy compatibility, when explicitly enabled: `install_agent_tool`,
+  `uninstall_agent_tool`
 
 ### Agent
 
-- Adapter tools: `create_adapter`, `list_adapters`, `disable_adapter`,
-  `delete_adapter`, `send_adapter_message`.
+- Adapter tools: `create_adapter`, `list_adapters`, `enable_adapter`,
+  `disable_adapter`, `delete_adapter`, `send_adapter_message`.
 - Adapter/event introspection: `list_adapter_events`,
   `list_conversation_events`.
 - Scheduler tools: `schedule_sandbox_task`, `list_scheduled_tasks`,
   `cancel_scheduled_task`, `delete_scheduled_task`.
 - Sandbox tools: `list_sandbox_snapshots`, `snapshot_sandbox`,
-  `rewind_sandbox`.
-- Self-maintenance: `guardian_action`.
+  `rewind_sandbox`, `get_sandbox_status`.
 - Memory: `remember`, `forget`.
 
 ## Adapters
@@ -93,4 +96,5 @@ Supported adapters:
 - `whatsapp`: a WhatsApp linked-device adapter using Baileys.
 - `signal`: a Signal linked-device adapter using `signal-cli`.
 - `discord`: a Discord bot adapter with message and attachment support.
+- `slack`: a Slack bot adapter with channel, thread, and DM support.
 - `agent-cli`: a local shell adapter for sending prompts from any directory.

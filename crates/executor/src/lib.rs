@@ -41,6 +41,11 @@ pub use adapter::{
 };
 pub use adapter::{AdapterRunOptions, run_adapters_watch};
 pub use braintrust::{BraintrustProject, BraintrustRuntimeConfig, BraintrustTracingConfig};
+pub use conversation_events::{
+    HOST_EVENT_ADAPTER_RUNNER_DRAINING, HOST_EVENT_ADAPTER_RUNNER_STARTED, HOST_EVENT_REBOOT,
+    HOST_EVENT_REBUILD_AND_RESTART, RebuildUpdateRecord, complete_rebuild_and_restart_update,
+    finalize_rebuild_update_file, record_host_event,
+};
 pub use conversation_wakeup::send_conversation_wakeup;
 pub use executor_types::{
     AgentConfig, AgentHarnessKind, AgentSandboxConfig, ConversationConfig, ConversationModelConfig,

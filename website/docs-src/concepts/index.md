@@ -52,6 +52,8 @@ agent was never at risk.
   exists and what it buys you.
 - [Data Model](./data-model) — agents, conversations, sessions, turns,
   events, and artifacts.
+- [Lifecycles](./lifecycles) — how agents, conversations, sandboxes, and
+  adapters start, stay up, change, and stop.
 - [Time Travel](./time-travel) — fork and rewind from any point in the
   event log.
 - [Sandboxes](./sandboxes) — backends, scope, and snapshots.

@@ -9,7 +9,9 @@ use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio_util::task::AbortOnDropHandle;
 
 const PROCESS_PIPE_BUFFER_SIZE: usize = 64 * 1024;
 pub const PATH: &str = "/tmp/exo-process-bridge.py";
@@ -326,16 +328,18 @@ pub fn process_parts(client: Arc<dyn Client>) -> crate::SandboxProcessParts {
     let (wait_tx, wait_rx) = oneshot::channel();
     let (error_tx, mut error_rx) = mpsc::unbounded_channel();
 
-    spawn_output_poller(
+    let output_poller = spawn_output_poller(
         Arc::clone(&client),
         stdout_writer,
         stderr_writer,
         wait_tx,
         error_tx.clone(),
     );
-    spawn_stdin_forwarder(client, stdin_reader, error_tx);
+    let stdin_forwarder = spawn_stdin_forwarder(client, stdin_reader, error_tx);
+    let tasks = [output_poller, stdin_forwarder].map(AbortOnDropHandle::new);
 
     let wait: BoxFuture<'static, crate::Result<i32>> = Box::pin(async move {
+        let _tasks = tasks;
         tokio::pin!(wait_rx);
         let mut errors_open = true;
         loop {
@@ -368,28 +372,28 @@ fn spawn_output_poller(
     stderr_writer: tokio::io::DuplexStream,
     wait_tx: oneshot::Sender<i32>,
     error_tx: mpsc::UnboundedSender<anyhow::Error>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(error) = poll_output(client, stdout_writer, stderr_writer, wait_tx).await
             && error_tx.send(error).is_err()
         {
             tracing::debug!("process bridge waiter stopped before output error could be reported");
         }
-    });
+    })
 }
 
 fn spawn_stdin_forwarder(
     client: Arc<dyn Client>,
     stdin_reader: tokio::io::DuplexStream,
     error_tx: mpsc::UnboundedSender<anyhow::Error>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(error) = forward_stdin(client, stdin_reader).await
             && error_tx.send(error).is_err()
         {
             tracing::debug!("process bridge waiter stopped before stdin error could be reported");
         }
-    });
+    })
 }
 
 async fn poll_output(
@@ -487,6 +491,11 @@ mod tests {
         responses: Mutex<VecDeque<Response>>,
     }
 
+    struct BlockingClient {
+        recv_started: mpsc::UnboundedSender<()>,
+        recv_request: Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
     #[async_trait]
     impl Client for FakeClient {
         async fn request(&self, request: Request) -> Result<Response> {
@@ -505,6 +514,24 @@ mod tests {
                 events: Vec::new(),
                 error: None,
             }))
+        }
+    }
+
+    #[async_trait]
+    impl Client for BlockingClient {
+        async fn request(&self, request: Request) -> Result<Response> {
+            assert_eq!(request.kind, "recv");
+            self.recv_started
+                .send(())
+                .expect("receive recv-start notification");
+            self.recv_request
+                .lock()
+                .await
+                .take()
+                .expect("recv request should only start once")
+                .await
+                .expect("recv request should remain blocked");
+            unreachable!("recv request unexpectedly completed")
         }
     }
 
@@ -542,6 +569,32 @@ mod tests {
 
         assert_eq!(exit_code, 0);
         assert_eq!(output, "hello world");
+    }
+
+    #[tokio::test]
+    async fn dropping_wait_cancels_output_polling() {
+        let (recv_started_tx, mut recv_started_rx) = mpsc::unbounded_channel();
+        let (mut recv_request_tx, recv_request_rx) = oneshot::channel();
+        let client = Arc::new(BlockingClient {
+            recv_started: recv_started_tx,
+            recv_request: Mutex::new(Some(recv_request_rx)),
+        });
+        let parts = process_parts(client.clone());
+
+        tokio::time::timeout(Duration::from_secs(1), recv_started_rx.recv())
+            .await
+            .expect("output poll should start")
+            .expect("recv-start channel should remain open");
+        drop(parts.wait);
+        tokio::time::timeout(Duration::from_secs(1), recv_request_tx.closed())
+            .await
+            .expect("in-flight recv should be cancelled");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), recv_started_rx.recv())
+                .await
+                .is_err(),
+            "output poller started another recv request"
+        );
     }
 
     #[tokio::test]

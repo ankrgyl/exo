@@ -836,7 +836,7 @@ function toAgentConfig(raw: RawAgentConfig): AgentConfig {
           toolModulePaths: raw.typescript.tool_module_paths ?? [],
         }
       : null,
-    enableAgentToolCreation: raw.enable_agent_tool_creation ?? true,
+    enableAgentToolCreation: raw.enable_agent_tool_creation ?? false,
     sandbox: {
       image: raw.sandbox.image ?? null,
       provider: raw.sandbox.provider,

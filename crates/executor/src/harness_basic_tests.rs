@@ -923,7 +923,7 @@ async fn harness_exposes_raw_exoharness_handles() {
     assert!(
         events
             .iter()
-            .all(|event| event.conversation_id == conversation.record().id)
+            .all(|event| event.thread_id == conversation.record().id)
     );
 }
 

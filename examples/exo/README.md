@@ -169,12 +169,12 @@ examples/exo/scripts/exo-service-guardian configure --sandbox-backend docker
 The service guardian manages only the scheduler and adapter runners. Start or
 reconnect an interactive REPL with `./exo.sh`.
 
-Exo can call the same host-side surface through the `guardian_action` tool.
-That tool exposes only allowlisted actions such as `status`, `build`,
-`restart_adapters`, `restart_scheduler`, `restart_all`, and `logs`.
-Restart actions are handed off to a detached guardian process after a short
-delay so the current agent turn can finish before services stop. Detached
-restart output is written to `.exo/exo-service-guardian-actions.log`.
+Exo can call `rebuild_and_restart_exo` after changing itself. That narrow tool
+validates and builds Exo, then hands a restart to the guardian after a short
+delay so the current agent turn can finish before services stop. Operators use
+the guardian CLI commands above for status, logs, and targeted service control.
+Detached restart output is written to
+`.exo/exo-service-guardian-actions.log`.
 
 When `./exo.sh --control` is running, it also acts
 as the foreground REPL supervisor. Guardian builds write
@@ -201,11 +201,31 @@ different local prompt path, set `EXO_LOCAL_PROMPT_FILE` or pass
 
 ## Tools
 
-Exo includes the normal minimal tools:
+Exo's bootstrap profile includes:
 
 - `shell`
-- `install_agent_tool` when agent tool creation is enabled
-- configured library tools
+- `inspect_tools`
+- `manage_tool`
+- `rebuild_and_restart_exo`
+
+`manage_tool` is the only tool-management write surface. It installs or removes
+workspace-local tools from workspace-relative directories or exact pinned Git
+commits; an install replaces any existing entry with the same stable manifest
+id. When creating a tool with sandbox `shell`, write it under
+`/workspace/exo/.exo/tool-sources/<name>` and give `manage_tool` the relative
+path `.exo/tool-sources/<name>`, not an absolute sandbox path.
+`inspect_tools` lists or gets active and installed tools. Changes are available
+on the next model round.
+
+Installable tools live in `.exo/tools/`. Their `exo-tool.json` contains exactly
+`schemaVersion`, `id`, and `module`; the TypeScript module owns the model
+definition, schemas, handler, and initialization contract. Lockfile entries
+contain only `id`, `source`, `initialization`, and `installPath`.
+
+The `exo tools list` and `exo tools get <id>` operator commands are read-only.
+Configured library modules remain supported. The legacy `install_agent_tool`,
+`uninstall_agent_tool`, and `.exo/agent-tools/` paths require
+`enable_agent_tool_creation: true`, which is off by default.
 
 It also adds scheduler tools:
 

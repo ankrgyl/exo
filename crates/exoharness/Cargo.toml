@@ -63,7 +63,7 @@ tokio-tungstenite = { version = "0.26.2", default-features = false, features = [
   "connect",
   "rustls-tls-webpki-roots",
 ], optional = true }
-tokio-util = { workspace = true, optional = true, features = ["compat"] }
+tokio-util = { workspace = true, optional = true, features = ["compat", "rt"] }
 tracing = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["serde", "v4", "v7", "js"] }

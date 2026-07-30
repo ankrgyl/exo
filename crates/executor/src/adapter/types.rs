@@ -8,8 +8,18 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdapterSource {
-    BuiltIn,
+    #[serde(alias = "built_in")]
     Library,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterLifecycleState {
+    #[default]
+    Starting,
+    Running,
+    Disabled,
+    Error,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,10 +77,14 @@ pub struct AdapterRecord {
     pub name: String,
     pub source: AdapterSource,
     pub enabled: bool,
+    #[serde(default)]
+    pub lifecycle_state: AdapterLifecycleState,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub config: AdapterConfig,
+    #[serde(default)]
     pub last_connected_at_ms: Option<u64>,
+    #[serde(default)]
     pub last_error: Option<String>,
 }
 
@@ -102,6 +116,26 @@ pub struct AdapterOutboundMessageRecord {
     pub target: Option<String>,
     #[serde(default)]
     pub attachments: Vec<AdapterAttachment>,
+    #[serde(default)]
+    pub status: AdapterDeliveryStatus,
+    #[serde(default)]
+    pub attempt: u32,
+    #[serde(default)]
+    pub updated_at_ms: u64,
+    #[serde(default)]
+    pub completed_at_ms: Option<u64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterDeliveryStatus {
+    #[default]
+    Queued,
+    InFlight,
+    Delivered,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -162,6 +196,7 @@ impl AdapterRecord {
             name: request.name,
             source: request.source,
             enabled: true,
+            lifecycle_state: AdapterLifecycleState::Starting,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             config: request.config,
@@ -216,8 +251,20 @@ impl AdapterOutboundMessageRecord {
         attachments: Vec<AdapterAttachment>,
         now_ms: u64,
     ) -> Result<Self> {
+        const MAX_TEXT_BYTES: usize = 64 * 1024;
+        const MAX_TARGET_BYTES: usize = 4 * 1024;
+        const MAX_ATTACHMENTS: usize = 8;
+        if text.len() > MAX_TEXT_BYTES {
+            bail!("adapter message text exceeds {MAX_TEXT_BYTES} bytes");
+        }
         if let Some(target) = &target {
             non_empty_ref("target", target)?;
+            if target.len() > MAX_TARGET_BYTES {
+                bail!("adapter message target exceeds {MAX_TARGET_BYTES} bytes");
+            }
+        }
+        if attachments.len() > MAX_ATTACHMENTS {
+            bail!("adapter message has more than {MAX_ATTACHMENTS} attachments");
         }
         for attachment in &attachments {
             attachment.validate()?;
@@ -229,6 +276,11 @@ impl AdapterOutboundMessageRecord {
             text: non_empty("text", text)?,
             target,
             attachments,
+            status: AdapterDeliveryStatus::Queued,
+            attempt: 0,
+            updated_at_ms: now_ms,
+            completed_at_ms: None,
+            last_error: None,
         })
     }
 }

@@ -44,6 +44,15 @@ creation with `conversation create --sandbox-scope <agent|conversation>`.
 Long-running personal agents like the canonical exo agent typically use an
 agent-scoped sandbox so installed tools persist across conversations.
 
+## Lifecycle
+
+Sandboxes move through create → start/run → snapshot/stop, or through
+**attach / detach** when Exo borrows an externally created environment
+(for example a Docker container started by another system). Attached
+sandboxes must be detached, not stopped. For the full state machine,
+candidate selection during a turn, and how agent vs conversation scope
+behaves over time, see [Lifecycles → Sandbox](./lifecycles#sandbox-lifecycle).
+
 ## Snapshots
 
 Snapshotting a sandbox writes a snapshot id to the event log, tying

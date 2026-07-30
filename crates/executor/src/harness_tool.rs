@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use crate::adapter::AdapterStore;
 use crate::adapter::tools::{
     AdapterCreationOptions, execute_create_adapter_tool, execute_delete_adapter_tool,
-    execute_disable_adapter_tool, execute_list_adapter_events_tool, execute_list_adapters_tool,
-    execute_send_adapter_message_tool,
+    execute_disable_adapter_tool, execute_enable_adapter_tool, execute_list_adapter_events_tool,
+    execute_list_adapters_tool, execute_send_adapter_message_tool,
 };
 use crate::agent_sandbox::{current_agent_sandbox, ensure_agent_sandbox};
 use crate::conversation_events::execute_list_conversation_events_tool;
@@ -177,6 +177,9 @@ impl ToolRuntime for ExoToolRuntime {
                 execute_disable_adapter_tool(conversation, agent, &self.adapter_store, request)
                     .await
             }
+            "enable_adapter" => {
+                execute_enable_adapter_tool(conversation, agent, &self.adapter_store, request).await
+            }
             "delete_adapter" => {
                 execute_delete_adapter_tool(conversation, agent, &self.adapter_store, request).await
             }
@@ -190,6 +193,10 @@ impl ToolRuntime for ExoToolRuntime {
                     request,
                 )
                 .await
+            }
+            "get_sandbox_status" => {
+                execute_get_sandbox_status_tool(agent, conversation, agent_config, config, request)
+                    .await
             }
             "list_sandbox_snapshots" => {
                 execute_list_sandbox_snapshots_tool(
@@ -473,6 +480,44 @@ async fn execute_delete_scheduled_task_tool(
         "taskId": args.task_id,
         "deleted": true,
         "runsDeleted": true,
+    }))
+}
+
+async fn execute_get_sandbox_status_tool(
+    agent: &dyn AgentHandle,
+    conversation: &dyn ConversationHandle,
+    agent_config: &AgentConfig,
+    config: &ConversationConfig,
+    request: &ToolRequest,
+) -> Result<ToolResult> {
+    let args =
+        serde_json::from_value::<SandboxScopeArguments>(Value::Object(request.arguments.clone()))?;
+    let scope = SandboxControlScope::resolve(args.scope, agent_config, config);
+    let (sandbox_id, owner_conversation_id) = match scope {
+        SandboxControlScope::Agent => (
+            current_agent_sandbox(agent)
+                .await?
+                .map(|handle| handle.sandbox_id),
+            None,
+        ),
+        SandboxControlScope::Conversation => {
+            let spec = conversation_sandbox_spec(agent_config, config);
+            let sandbox_id = conversation_sandboxes(conversation)
+                .await?
+                .into_iter()
+                .find(|sandbox| sandbox.matches_spec(&spec))
+                .map(|sandbox| sandbox.id);
+            (sandbox_id, Some(conversation.record().id.to_string()))
+        }
+    };
+    Ok(serde_json::json!({
+        "ok": true,
+        "scope": scope.as_str(),
+        "exists": sandbox_id.is_some(),
+        "sandboxId": sandbox_id,
+        "ownerConversationId": owner_conversation_id,
+        "provider": config.effective_sandbox_provider(agent_config),
+        "image": config.effective_sandbox_image(agent_config),
     }))
 }
 
