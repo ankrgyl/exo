@@ -55,7 +55,15 @@ function createScheduleSandboxTaskTool(): ToolInstance {
           schedule: {
             type: "string",
             description:
-              "Schedule as '@every 10m', '@every 1h', or a simple cron interval like '*/30 * * * *'.",
+              "Schedule as '@every 10m', '@every 1h', a simple cron interval like '*/30 * * * *', or '@at 2026-07-26T17:00:00Z' for a one-shot. Recurring fires land on the schedule's own grid rather than on when the last run finished, so a slow run does not push later fires later. A one-shot fires once, is then marked completed, and stays listed without ever running again.",
+          },
+          missed: {
+            anyOf: [
+              { type: "string", enum: ["skip", "once", "all"] },
+              { type: "null" },
+            ],
+            description:
+              "What a host that was down owes this task once it comes back. Use 'skip' to drop every missed slot and resume at the next future one, 'once' or null to fire a single catch-up run and then resume on the grid, or 'all' to fire each missed slot in order, capped at 100.",
           },
           command: {
             type: "array",
@@ -98,6 +106,7 @@ function createScheduleSandboxTaskTool(): ToolInstance {
         required: [
           "name",
           "schedule",
+          "missed",
           "command",
           "sandboxMode",
           "setupCommand",
@@ -123,7 +132,7 @@ function createListScheduledTasksTool(): ToolInstance {
     definition: {
       name: "list_scheduled_tasks",
       description:
-        "List scheduled sandbox tasks for this conversation. Disabled tasks are hidden unless includeDisabled is true.",
+        "List scheduled sandbox tasks for this conversation. Disabled tasks are hidden unless includeDisabled is true. Each task carries its missed-fire policy as 'missed', the last missed-fire evaluation as 'last_missed_fire', and 'completed_at_ms' once a one-shot has fired.",
       parameters: {
         type: "object",
         additionalProperties: false,

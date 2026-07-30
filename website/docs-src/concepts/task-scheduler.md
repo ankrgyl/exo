@@ -28,11 +28,13 @@ The agent has four tools:
 
 Each task records:
 
-- **schedule** — `@every 10m`, `@every 1h`, or a simple cron interval like
-  `*/30 * * * *`
+- **schedule** — `@every 10m`, `@every 1h`, a simple cron interval like
+  `*/30 * * * *`, or `@at 2026-07-26T17:00:00Z` for a one-shot (see below)
 - **command** — the argv to run (e.g. `["bash", "-lc", "curl -fsSL …"]`)
 - **setupCommand** — optional argv run before each run (install deps, etc.)
 - **sandboxMode** — where it runs (see below)
+- **missed** — what to do about slots that elapsed while nothing was running
+  (see below)
 - **reportPrompt** — how to summarize each completed run back to the user
 - **maxOutputBytes** — how much output to retain before truncating
 
@@ -43,6 +45,55 @@ Each task records:
 | `agent` | The shared, persistent agent [sandbox](./sandboxes) (default) |
 | `conversation` | This conversation's sandbox |
 | `task_fresh` | A separate sandbox created for the task and reused across its runs |
+
+## When a task fires
+
+A recurring task has a **grid**: fires land on `anchor + n × interval`, where
+the anchor is when the task was created. The grid is fixed, so a run that
+takes longer than its own interval does not push the next fire out — the
+schedule never drifts away from the times the user asked for. A task whose
+command outlives its interval simply runs back to back.
+
+### Missed fires
+
+If the host is down — or the scheduler runner is stopped — slots elapse with
+nothing running. The task's `missed` policy decides what it is owed when the
+runner comes back:
+
+| Policy | On coming back |
+|:-------|:---------------|
+| `skip` | Fire nothing; resume at the next future slot. For work whose value expired with its slot |
+| `once` | Fire one catch-up run, then resume on the grid (default) |
+| `all` | Fire every missed slot in order, capped at 100 |
+
+The policy only applies to a real backlog. A task that is merely a little
+late — the normal case, since the runner polls — always fires exactly once,
+whatever its policy. Each evaluation is recorded on the task, so a listing
+shows that runs were skipped rather than leaving the agent to infer it from
+gaps.
+
+### One-shots
+
+`@at <rfc3339>` schedules a single fire at an absolute time, e.g.
+`@at 2026-07-26T17:00:00Z`. A timestamp already in the past is accepted and
+fires as soon as the runner sees it — the task was still owed, just late.
+Once it has fired, the task is stamped `completed_at_ms` and is never due
+again. It stays visible in listings, so the agent can see that the thing it
+promised to do did happen.
+
+## Durability
+
+Waking the conversation is the only thing that tells it a run happened, and
+nothing retries a machine-sent event. So the scheduler records the fire —
+prompt included — before it attempts the wakeup, and clears it only once the
+wakeup lands. On startup the runner redelivers anything still outstanding, so
+a process that dies between finishing the command and waking the conversation
+does not swallow the result. Delivery is at-least-once, keyed by
+`(task, slot)`, which bounds a crash mid-delivery to one repeated wakeup
+rather than a loop.
+
+Task records are versioned and migrated forward on read, so state written by
+an older build is upgraded rather than silently reinterpreted.
 
 ## How a run reports back
 

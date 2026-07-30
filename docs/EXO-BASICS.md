@@ -51,7 +51,11 @@ default and prints a browser URL for it.
 Exo also includes a task scheduling process that manages recurring sandbox work
 (for example, once an hour). The agent can create, list, cancel, and delete
 scheduled tasks, and each completed run can wake the conversation with a compact
-result.
+result. A task can also be a one-shot (`@at <rfc3339>`), which fires once and is
+then marked completed while staying visible in listings. Recurring fires land on
+the schedule's own grid rather than on when the last run finished, and every task
+carries a missed-fire policy saying what a host that was down owes it: drop the
+missed slots, fire one catch-up, or fire all of them.
 
 ### Memory
 

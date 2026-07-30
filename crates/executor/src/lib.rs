@@ -74,10 +74,14 @@ pub use harness_types::{
 };
 pub use local_sandbox::LocalSandboxExoHarness;
 pub use rlm::RlmHarness;
-pub use scheduler_runtime::{SchedulerRunOptions, run_due_tasks, run_task};
+pub use scheduler_runtime::{
+    SchedulerRunOptions, redeliver_pending_wakes, run_due_tasks, run_task,
+};
 pub use scheduler_store::SchedulerStore;
 pub use scheduler_types::{
-    DEFAULT_MAX_OUTPUT_BYTES, NewScheduledTask, ScheduledTaskRecord, ScheduledTaskRunRecord, now_ms,
+    DEFAULT_MAX_OUTPUT_BYTES, MAX_MISSED_FIRE_CATCHUP, MissedFireOutcome, MissedFirePlan,
+    MissedPolicy, NewScheduledTask, ScheduledFireRecord, ScheduledTaskRecord,
+    ScheduledTaskRunRecord, now_ms,
 };
 pub use typescript::TypeScriptHarness;
 
