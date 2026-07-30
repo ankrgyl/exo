@@ -98,7 +98,7 @@ export function agentToolCreationInstruction(): Message {
   };
 }
 
-async function runResponsesTurnLoop(
+export async function runResponsesTurnLoop(
   runtime: ResponsesRuntimeLike,
   context: TurnContext,
   turnParent: TraceParent,
@@ -108,6 +108,13 @@ async function runResponsesTurnLoop(
   const { conversation } = context.exoharness.current;
   const maxToolRoundTrips = context.agentConfig.maxToolRoundTrips;
   let latestEventId: string | null = null;
+  let emptyRetries = 0;
+  const MAX_EMPTY_RETRIES = 2;
+  // Duplicate-send guard: weak models can loop on send_adapter_message, blasting
+  // the user with near-identical variants of the same reply. Track whether a
+  // reply has already gone out with no real work since — a second send with
+  // nothing done in between is a duplicate and is skipped.
+  let repliedSinceWork = false;
 
   for (let round = 0; ; round += 1) {
     if (
@@ -168,10 +175,39 @@ async function runResponsesTurnLoop(
       if (hasSyntheticToolResult) {
         continue;
       }
+      // Empty completion: nothing at all this round — no text, no tool call.
+      // Weak models and busy endpoints do this intermittently; it is not a real
+      // end of turn, so retry a bounded number of times rather than silently
+      // ending (which for an adapter turn means the user got no reply at all).
+      if (
+        shouldRetryEmptyCompletion(
+          events,
+          toolCalls,
+          emptyRetries,
+          MAX_EMPTY_RETRIES,
+        )
+      ) {
+        emptyRetries += 1;
+        round -= 1; // a retry must not consume the tool-round-trip budget
+        continue;
+      }
       return latestEventId;
     }
+    emptyRetries = 0; // a productive round clears the empty-retry counter
 
+    let sends = 0;
+    let sendsSkipped = 0;
     for (const toolCall of toolCalls) {
+      const isSend = toolCall.request.functionName === "send_adapter_message";
+      if (isSend) {
+        sends += 1;
+        if (repliedSinceWork) {
+          // Already replied this turn with no work since — skip the duplicate
+          // instead of blasting the user with another variant of the reply.
+          sendsSkipped += 1;
+          continue;
+        }
+      }
       const toolResultEvents = await runtime.traceToolCall(
         turnParent,
         context,
@@ -182,6 +218,14 @@ async function runResponsesTurnLoop(
       if (toolResultEvents.length > 0) {
         latestEventId = await appendTurnEvents(context, toolResultEvents);
       }
+      // A send marks "already replied"; any real tool resets it, so a genuine
+      // acknowledge → do work → report-result sequence stays allowed.
+      repliedSinceWork = isSend;
+    }
+    // Every send this round was a duplicate — the model is just repeating its
+    // reply, so end the turn instead of looping into further repeats.
+    if (sends > 0 && sends === sendsSkipped) {
+      return latestEventId;
     }
   }
 }
@@ -191,4 +235,20 @@ async function appendTurnEvents(
   data: EventData[],
 ): Promise<string> {
   return (await context.exoharness.current.turn.addEvents(data)).latestEventId;
+}
+
+// An empty completion is a round that produced nothing at all — no text, no
+// tool call. Weak models and busy endpoints do this intermittently; it is not a
+// real end of turn, so the loop retries a bounded number of times.
+export function shouldRetryEmptyCompletion(
+  events: readonly EventData[],
+  toolCalls: readonly unknown[],
+  emptyRetries: number,
+  maxEmptyRetries: number,
+): boolean {
+  return (
+    toolCalls.length === 0 &&
+    events.length === 0 &&
+    emptyRetries < maxEmptyRetries
+  );
 }
