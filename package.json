@@ -7,7 +7,7 @@
   "scripts": {
     "check": "pnpm lint && pnpm typecheck && pnpm test",
     "e2e:agent-harnesses": "tsx exoharness/scripts/agent-harness-e2e.ts",
-    "events:tail": "node scripts/tail-agent-events.mjs",
+    "events:tail": "node exo/scripts/tail-agent-events.mjs",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint --deny-warnings .",
