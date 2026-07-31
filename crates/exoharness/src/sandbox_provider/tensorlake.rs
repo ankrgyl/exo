@@ -250,6 +250,34 @@ impl ManagedSandboxBackend for TensorlakeSandboxBackend {
         // sandbox; there is no Tensorlake variant to accept yet.
         bail!("Tensorlake sandbox backend does not support external attachments")
     }
+
+    async fn terminate(&self, request: SandboxRequest) -> Result<()> {
+        // Ephemeral sandboxes are addressable only through the handle that
+        // created them, so there is nothing a request-keyed lookup can reclaim.
+        let Some(name) = sandbox_name_for_request(&request) else {
+            return Ok(());
+        };
+        self.handle_backend().delete_sandbox(&name).await
+    }
+
+    async fn fork_sandbox(&self, source: SandboxRequest, target: SandboxRequest) -> Result<bool> {
+        reject_unsupported_mounts(&target)?;
+        // Both sides must be resumable for a copy to be useful. Ephemeral
+        // sandboxes have no stable name to copy from or resume under.
+        let (Some(source_name), Some(target_name)) = (
+            sandbox_name_for_request(&source),
+            sandbox_name_for_request(&target),
+        ) else {
+            return Ok(false);
+        };
+
+        let backend = self.handle_backend();
+        if backend.get_sandbox(&source_name).await?.is_none() {
+            return Ok(false);
+        }
+        backend.copy_sandbox(&source_name, &target_name).await?;
+        Ok(true)
+    }
 }
 
 /// A sandbox that is running and reachable: its platform id plus the proxy base
@@ -462,6 +490,32 @@ impl TensorlakeBackendHandle {
             sandbox_id: info.id.clone(),
             base_url,
         })
+    }
+
+    async fn copy_sandbox(&self, source_name: &str, target_name: &str) -> Result<String> {
+        let response = self
+            .client
+            .post(self.api_endpoint(&format!("/sandboxes/{source_name}/copy")))
+            .query(&[("times", "1"), ("name", target_name)])
+            .send()
+            .await
+            .with_context(|| format!("copying Tensorlake sandbox {source_name}"))?;
+        let copied: CopySandboxResponse =
+            decode_json_response(response, "Tensorlake copy-sandbox").await?;
+        let copy = copied.sandboxes.into_iter().next().ok_or_else(|| {
+            anyhow!("Tensorlake copy-sandbox returned no sandboxes for {source_name}")
+        })?;
+        if !matches!(copy.status, SandboxStatus::Running) {
+            bail!(
+                "Tensorlake copy of {source_name} did not come up: {:?}{}",
+                copy.status,
+                copy.pending_reason
+                    .as_deref()
+                    .map(|reason| format!(" ({reason})"))
+                    .unwrap_or_default()
+            );
+        }
+        Ok(copy.sandbox_id)
     }
 
     async fn snapshot_sandbox(&self, sandbox_id: &str) -> Result<String> {
@@ -1248,6 +1302,19 @@ struct SnapshotInfo {
 #[derive(Debug, Deserialize)]
 struct CreateSandboxResponse {
     sandbox_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CopySandboxResponse {
+    sandboxes: Vec<CopiedSandbox>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CopiedSandbox {
+    sandbox_id: String,
+    status: SandboxStatus,
+    #[serde(default)]
+    pending_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

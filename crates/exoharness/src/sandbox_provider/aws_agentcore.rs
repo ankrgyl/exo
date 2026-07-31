@@ -124,6 +124,21 @@ impl ManagedSandboxBackend for AwsAgentCoreSandboxBackend {
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         bail!("restoring an AgentCore sandbox from a snapshot is not implemented yet");
     }
+
+    async fn terminate(&self, request: SandboxRequest) -> Result<()> {
+        let spec_hash = sandbox_spec_hash(&request.spec);
+        let runtime_session_id = agentcore_runtime_session_id(&request, &spec_hash);
+        stop_runtime_session(
+            &AwsAgentCoreBackendHandle {
+                client: self.client.clone(),
+                runtime_arn: self.runtime_arn.clone(),
+                invoke_target: self.invoke_target.clone(),
+                qualifier: self.qualifier.clone(),
+            },
+            &runtime_session_id,
+        )
+        .await
+    }
 }
 
 #[derive(Clone)]
@@ -174,22 +189,7 @@ impl ManagedSandboxHandle for AwsAgentCoreSandboxHandle {
     }
 
     async fn stop(&self) -> Result<()> {
-        let mut request = self
-            .backend
-            .client
-            .stop_runtime_session()
-            .agent_runtime_arn(self.backend.runtime_arn.clone())
-            .runtime_session_id(self.runtime_session_id.clone());
-        if let Some(qualifier) = &self.backend.qualifier {
-            request = request.qualifier(qualifier.clone());
-        }
-        request.send().await.with_context(|| {
-            format!(
-                "stopping AgentCore runtime session {}",
-                self.runtime_session_id
-            )
-        })?;
-        Ok(())
+        stop_runtime_session(&self.backend, &self.runtime_session_id).await
     }
 
     async fn detach(&self) -> Result<SandboxAttachment> {
@@ -198,6 +198,32 @@ impl ManagedSandboxHandle for AwsAgentCoreSandboxHandle {
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {
         bail!("AgentCore sandbox snapshots are not implemented yet");
+    }
+}
+
+async fn stop_runtime_session(
+    backend: &AwsAgentCoreBackendHandle,
+    runtime_session_id: &str,
+) -> Result<()> {
+    let mut request = backend
+        .client
+        .stop_runtime_session()
+        .agent_runtime_arn(backend.runtime_arn.clone())
+        .runtime_session_id(runtime_session_id.to_string());
+    if let Some(qualifier) = &backend.qualifier {
+        request = request.qualifier(qualifier.clone());
+    }
+    match request.send().await {
+        Ok(_) => Ok(()),
+        Err(error)
+            if error
+                .as_service_error()
+                .is_some_and(|error| error.is_resource_not_found_exception()) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("stopping AgentCore runtime session {runtime_session_id}")),
     }
 }
 

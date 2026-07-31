@@ -893,3 +893,133 @@ async fn acquire_from_snapshot_rejects_a_manifest_from_another_sandbox() {
         "unexpected error: {error}"
     );
 }
+
+#[tokio::test]
+async fn terminate_deletes_the_named_sandbox_without_a_lookup() {
+    let server = MockServer::start().await;
+    let backend = backend_for_mock(&server);
+    let request = make_request("conv-terminate", "sandbox-terminate");
+    let name = expected_sandbox_name(&request);
+    Mock::given(method("DELETE"))
+        .and(path(format!("/sandboxes/{name}")))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    backend.terminate(request).await.expect("terminate");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn terminate_tolerates_an_already_deleted_sandbox() {
+    let server = MockServer::start().await;
+    let backend = backend_for_mock(&server);
+    let request = make_request("conv-absent", "sandbox-absent");
+    let name = expected_sandbox_name(&request);
+    Mock::given(method("DELETE"))
+        .and(path(format!("/sandboxes/{name}")))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    backend.terminate(request).await.expect("terminate");
+}
+
+#[tokio::test]
+async fn terminate_ignores_ephemeral_requests() {
+    let server = MockServer::start().await;
+    let backend = backend_for_mock(&server);
+
+    backend
+        .terminate(make_ephemeral_request(
+            "conv-ephemeral-terminate",
+            "sandbox-ephemeral-terminate",
+        ))
+        .await
+        .expect("terminate");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn fork_sandbox_copies_under_the_target_name() {
+    let server = MockServer::start().await;
+    let backend = backend_for_mock(&server);
+    let source = make_request("conv-parent", "sandbox-1");
+    let target = make_request("conv-fork", "sandbox-1");
+    let source_name = expected_sandbox_name(&source);
+    let target_name = expected_sandbox_name(&target);
+    mount_running_sandbox(&server, &source_name, "sbx-parent").await;
+    Mock::given(method("POST"))
+        .and(path(format!("/sandboxes/{source_name}/copy")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sandboxes": [{ "sandbox_id": "sbx-fork", "status": "running" }],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    assert!(
+        backend
+            .fork_sandbox(source, target)
+            .await
+            .expect("fork sandbox")
+    );
+    let requests = server.received_requests().await.unwrap();
+    let copy = requests
+        .iter()
+        .find(|request| request.url.path().ends_with("/copy"))
+        .expect("copy request");
+    let query: std::collections::HashMap<_, _> = copy.url.query_pairs().into_owned().collect();
+    assert_eq!(query.get("name"), Some(&target_name));
+    assert_eq!(query.get("times"), Some(&"1".to_string()));
+}
+
+#[tokio::test]
+async fn fork_sandbox_starts_cold_when_the_source_does_not_exist() {
+    let server = MockServer::start().await;
+    let backend = backend_for_mock(&server);
+    let source = make_request("conv-cold", "sandbox-1");
+    let target = make_request("conv-cold-fork", "sandbox-1");
+    let source_name = expected_sandbox_name(&source);
+    Mock::given(method("GET"))
+        .and(path(format!("/sandboxes/{source_name}")))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    assert!(!backend.fork_sandbox(source, target).await.unwrap());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn fork_sandbox_rejects_a_copy_that_did_not_start() {
+    let server = MockServer::start().await;
+    let backend = backend_for_mock(&server);
+    let source = make_request("conv-slow", "sandbox-1");
+    let target = make_request("conv-slow-fork", "sandbox-1");
+    let source_name = expected_sandbox_name(&source);
+    mount_running_sandbox(&server, &source_name, "sbx-parent").await;
+    Mock::given(method("POST"))
+        .and(path(format!("/sandboxes/{source_name}/copy")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sandboxes": [{
+                "sandbox_id": "sbx-fork",
+                "status": "pending",
+                "pending_reason": "no_resources_available",
+            }],
+        })))
+        .mount(&server)
+        .await;
+
+    let error = backend
+        .fork_sandbox(source, target)
+        .await
+        .expect_err("pending copy must fail");
+    assert!(
+        error.to_string().contains("no_resources_available"),
+        "unexpected error: {error}"
+    );
+}

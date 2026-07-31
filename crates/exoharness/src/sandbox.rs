@@ -193,6 +193,23 @@ pub trait ManagedSandboxBackend: Send + Sync {
         request: SandboxRequest,
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>>;
+
+    /// Permanently destroy the sandbox addressed by `request`.
+    ///
+    /// Unlike [`ManagedSandboxHandle::stop`], which may preserve a sandbox for
+    /// a later acquire, termination gives up the provider resource and all of
+    /// its retained state. Implementations must be idempotent and must not
+    /// create or resume a sandbox while looking for it.
+    async fn terminate(&self, request: SandboxRequest) -> Result<()>;
+
+    /// Copy the sandbox addressed by `source` to the identity described by
+    /// `target`, leaving the source untouched.
+    ///
+    /// `false` means the source did not exist or this provider does not support
+    /// copying. The caller may then let the target start cold from its image.
+    async fn fork_sandbox(&self, _source: SandboxRequest, _target: SandboxRequest) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 pub const DEFAULT_SANDBOX_IMAGE: &str = crate::sandbox_provider::DEFAULT_DOCKER_IMAGE;
@@ -652,6 +669,23 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
             warm_sandboxes: Arc::clone(&self.warm_sandboxes),
         }))
     }
+
+    async fn terminate(&self, request: SandboxRequest) -> Result<()> {
+        let cached = self.warm_sandboxes.lock().await.remove(&request.key);
+        if let Some(entry) = cached {
+            cleanup_named_container(&self.container_bin, self.cli, &entry.name).await?;
+            return Ok(());
+        }
+        if request.lifecycle.idle_ttl.is_none() {
+            return Ok(());
+        }
+        if let Some(name) =
+            find_running_warm_sandbox(&self.container_bin, self.cli, &request).await?
+        {
+            cleanup_named_container(&self.container_bin, self.cli, &name).await?;
+        }
+        Ok(())
+    }
 }
 
 struct BorrowedDockerSandboxHandle {
@@ -881,6 +915,10 @@ impl ManagedSandboxBackend for LocalProcessSandboxBackend {
         _payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         bail!("restore-from-snapshot is not supported by the local-process sandbox backend")
+    }
+
+    async fn terminate(&self, _request: SandboxRequest) -> Result<()> {
+        Ok(())
     }
 }
 

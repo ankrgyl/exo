@@ -291,6 +291,28 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
             backend: self.handle_backend(),
         }))
     }
+
+    async fn terminate(&self, request: SandboxRequest) -> Result<()> {
+        let spec_hash = sandbox_spec_hash(&request.spec);
+        let Some(sandbox) = self
+            .find_sandbox_by_metadata(&request.key.to_string(), &spec_hash)
+            .await?
+        else {
+            return Ok(());
+        };
+        let response = self
+            .client
+            .delete(self.api_endpoint(&format!("/sandboxes/{}", sandbox.sandbox_id)))
+            .send()
+            .await
+            .with_context(|| format!("deleting E2B sandbox {}", sandbox.sandbox_id))?;
+        if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        bail!("E2B delete-sandbox failed ({status}): {text}")
+    }
 }
 
 #[derive(Clone)]
