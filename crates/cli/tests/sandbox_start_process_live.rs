@@ -5,6 +5,9 @@
 //!
 //! Sprites (set `SPRITES_ORGANIZATION` when your token spans multiple orgs):
 //! `SPRITES_TOKEN=... cargo test -p exo --test sandbox_start_process_live sprites_ -- --ignored --nocapture`
+//!
+//! Tensorlake:
+//! `TENSORLAKE_API_KEY=... cargo test -p exo --test sandbox_start_process_live tensorlake_ -- --ignored --nocapture`
 
 use std::collections::HashMap;
 use std::env;
@@ -14,7 +17,7 @@ use std::time::{Duration, Instant};
 use exoharness::{
     E2bConfig, E2bSandboxBackend, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
     SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxRequest, SandboxSpec,
-    SpritesConfig, SpritesSandboxBackend,
+    SpritesConfig, SpritesSandboxBackend, TensorlakeConfig, TensorlakeSandboxBackend,
 };
 use futures::io::AsyncReadExt;
 use tokio::time::timeout;
@@ -102,6 +105,42 @@ fn make_sprites_request(conversation_id: &str, sandbox_id: &str) -> SandboxReque
     }
 }
 
+fn tensorlake_image() -> String {
+    env::var("TENSORLAKE_IMAGE").unwrap_or_else(|_| exoharness::DEFAULT_TENSORLAKE_IMAGE.into())
+}
+
+fn tensorlake_config_from_env() -> Option<TensorlakeConfig> {
+    Some(TensorlakeConfig {
+        api_key: live_provider_secret("tensorlake", "TENSORLAKE_API_KEY")?,
+        api_url: env::var("TENSORLAKE_API_URL")
+            .unwrap_or_else(|_| exoharness::DEFAULT_TENSORLAKE_API_URL.into()),
+        default_image: tensorlake_image(),
+        cpus: None,
+        memory_mb: None,
+        sandbox_base_url: None,
+    })
+}
+
+fn make_tensorlake_request(conversation_id: &str, sandbox_id: &str) -> SandboxRequest {
+    SandboxRequest {
+        key: SandboxKey::ConversationSandbox {
+            conversation_id: conversation_id.into(),
+            sandbox_id: sandbox_id.into(),
+        },
+        spec: SandboxSpec {
+            image: tensorlake_image(),
+            mounts: Vec::new(),
+            durable_file_systems: Vec::new(),
+            network: SandboxNetworkPolicy::Enabled,
+            default_workdir: "/workspace".into(),
+        },
+        lifecycle: SandboxLifecycleConfig {
+            idle_ttl: Some(Duration::from_secs(300)),
+        },
+        provider_state: None,
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires E2B_API_KEY"]
 async fn e2b_start_process_streams_incrementally() {
@@ -175,6 +214,46 @@ async fn sprites_start_process_contract() {
     )
     .await
     .expect("Sprites start_process contract");
+}
+
+#[tokio::test]
+#[ignore = "requires TENSORLAKE_API_KEY"]
+async fn tensorlake_start_process_streams_incrementally() {
+    let Some(config) = tensorlake_config_from_env() else {
+        return;
+    };
+    let backend = TensorlakeSandboxBackend::new(config).expect("TensorlakeSandboxBackend::new");
+
+    let handle = backend
+        .acquire(make_tensorlake_request(
+            "live-tensorlake-stream",
+            "sandbox-live-stream",
+        ))
+        .await
+        .expect("acquire Tensorlake sandbox");
+    assert_streaming_script(handle, "Tensorlake", "/workspace").await;
+}
+
+#[tokio::test]
+#[ignore = "requires TENSORLAKE_API_KEY"]
+async fn tensorlake_start_process_contract() {
+    let Some(config) = tensorlake_config_from_env() else {
+        return;
+    };
+    let backend = TensorlakeSandboxBackend::new(config).expect("TensorlakeSandboxBackend::new");
+
+    let handle = backend
+        .acquire(make_tensorlake_request(
+            "live-tensorlake-contract",
+            "sandbox-live-contract",
+        ))
+        .await
+        .expect("acquire Tensorlake sandbox");
+    exoharness::contract_tests::sandbox_handle_start_process_supports_interactive_stdio_and_env(
+        handle,
+    )
+    .await
+    .expect("Tensorlake start_process contract");
 }
 
 async fn assert_streaming_script(handle: Arc<dyn ManagedSandboxHandle>, provider: &str, cwd: &str) {

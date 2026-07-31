@@ -298,7 +298,9 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
             SnapshotKind::DockerImageTar => {
                 import_docker_image_tar(&self.handle_backend(), &payload.bytes).await?
             }
-            SnapshotKind::E2bSnapshot | SnapshotKind::SpritesSnapshot => bail!(
+            SnapshotKind::E2bSnapshot
+            | SnapshotKind::SpritesSnapshot
+            | SnapshotKind::TensorlakeSnapshot => bail!(
                 "the Daytona backend cannot restore a {:?} payload; \
                  select the provider that produced the snapshot",
                 payload.kind
@@ -315,6 +317,28 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
             request,
             backend: self.handle_backend(),
         }))
+    }
+
+    async fn terminate(&self, request: SandboxRequest) -> Result<()> {
+        let spec_hash = sandbox_spec_hash(&request.spec);
+        let Some(sandbox) = self
+            .find_sandbox_by_labels(&request.key.to_string(), &spec_hash)
+            .await?
+        else {
+            return Ok(());
+        };
+        let response = self
+            .client
+            .delete(self.api_endpoint(&format!("/sandbox/{}", sandbox.id)))
+            .send()
+            .await
+            .with_context(|| format!("deleting Daytona sandbox {}", sandbox.id))?;
+        if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        bail!("Daytona delete-sandbox failed ({status}): {text}")
     }
 }
 

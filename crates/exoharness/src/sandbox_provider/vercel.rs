@@ -187,6 +187,29 @@ impl ManagedSandboxBackend for VercelSandboxBackend {
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         bail!("restoring a Vercel sandbox from a snapshot is not implemented yet");
     }
+
+    async fn terminate(&self, request: SandboxRequest) -> Result<()> {
+        let spec_hash = sandbox_spec_hash(&request.spec);
+        let sandbox_name = vercel_sandbox_name(&request, &spec_hash);
+        let response = self
+            .client
+            .delete(self.api_endpoint(&format!("/v2/sandboxes/{sandbox_name}")))
+            .query(&[
+                ("teamId", self.team_id.as_str()),
+                ("projectId", self.project_id.as_str()),
+            ])
+            .send()
+            .await
+            .with_context(|| format!("deleting Vercel sandbox {sandbox_name}"))?;
+        if response.status().is_success()
+            || matches!(response.status(), StatusCode::NOT_FOUND | StatusCode::GONE)
+        {
+            return Ok(());
+        }
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        bail!("Vercel delete-sandbox failed ({status}): {text}")
+    }
 }
 
 impl VercelSandboxBackend {

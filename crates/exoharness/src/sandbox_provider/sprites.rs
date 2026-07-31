@@ -225,6 +225,22 @@ impl ManagedSandboxBackend for SpritesSandboxBackend {
             backend: self.handle_backend(),
         }))
     }
+
+    async fn terminate(&self, request: SandboxRequest) -> Result<()> {
+        let sprite_name = sprite_name_for_request(&request);
+        let response = self
+            .client
+            .delete(self.api_endpoint(&format!("/v1/sprites/{sprite_name}")))
+            .send()
+            .await
+            .with_context(|| format!("deleting Sprites sprite {sprite_name}"))?;
+        if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        bail!("Sprites delete-sprite failed ({status}): {text}")
+    }
 }
 
 #[derive(Clone)]

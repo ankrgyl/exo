@@ -20,6 +20,7 @@ plus arbitrary command execution inside them.
 | `daytona` | Remote | [daytona.io](https://www.daytona.io) |
 | `e2b` | Remote | [e2b.dev](https://e2b.dev) |
 | `sprites` | Remote | [sprites.dev](https://sprites.dev) |
+| `tensorlake` | Remote | [Tensorlake Sandboxes](https://docs.tensorlake.ai/sandboxes/introduction) |
 | `vercel` | Remote | [Vercel Sandbox](https://vercel.com/docs/vercel-sandbox) |
 | `aws-agentcore` | Remote | [Amazon Bedrock AgentCore](https://aws.amazon.com/bedrock/agentcore/) |
 

@@ -19,15 +19,16 @@ use tokio::time::{sleep, timeout};
 
 use crate::test_support::{local_test_config, local_test_config_with_daytona};
 use crate::{
-    Artifact, ArtifactVersion, BasicExoHarness, BeginTurnRequest, Binding, BoxAsyncRead,
-    BoxAsyncWrite, CloseSandboxProcessInputRequest, CreateSandboxRequest, DurableFileSystem,
-    EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness, FileSystemMountMode,
-    ForkConversationRequest, ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest,
-    NewConversationRequest, PutSecretRequest, RunInSandboxRequest, SandboxAttachment,
-    SandboxCommand, SandboxCommandOutput, SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy,
-    SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
-    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec,
-    Secret, SnapshotKind, SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
+    Artifact, ArtifactVersion, AttachSandboxRequest, BasicExoHarness, BeginTurnRequest, Binding,
+    BoxAsyncRead, BoxAsyncWrite, CloseSandboxProcessInputRequest, CreateSandboxRequest,
+    DurableFileSystem, EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness,
+    FileSystemMountMode, ForkConversationRequest, ManagedSandboxBackend, ManagedSandboxHandle,
+    NewAgentRequest, NewConversationRequest, PutSecretRequest, RunInSandboxRequest,
+    SandboxAttachment, SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput,
+    SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent,
+    SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin,
+    SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotKind,
+    SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
     WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
@@ -1826,6 +1827,10 @@ impl ManagedSandboxBackend for TestProviderStateBackend {
     ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
         bail!("test provider-state backend does not support snapshot restore")
     }
+
+    async fn terminate(&self, _request: SandboxRequest) -> crate::Result<()> {
+        Ok(())
+    }
 }
 
 struct TestProviderStateHandle {
@@ -1900,6 +1905,10 @@ impl ManagedSandboxBackend for TestSandboxBackend {
         _payload: SnapshotPayload,
     ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
         bail!("test sandbox backend does not support snapshot restore")
+    }
+
+    async fn terminate(&self, _request: SandboxRequest) -> crate::Result<()> {
+        Ok(())
     }
 }
 
@@ -2115,6 +2124,10 @@ impl ManagedSandboxBackend for RestoreImageTestBackend {
             image: "restored-image".to_string(),
         }))
     }
+
+    async fn terminate(&self, _request: SandboxRequest) -> crate::Result<()> {
+        Ok(())
+    }
 }
 
 struct RestoreImageTestHandle {
@@ -2203,4 +2216,283 @@ async fn daytona_sandbox_binding_drives_provider_config() {
     assert_eq!(config.target.as_deref(), Some("experimental"));
     assert_eq!(config.organization_id.as_deref(), Some("org-1"));
     assert_eq!(config.api_url, crate::DEFAULT_DAYTONA_API_URL);
+}
+
+#[derive(Default)]
+struct LifecycleRecordingBackend {
+    acquired: Arc<AsyncMutex<Vec<String>>>,
+    terminated: Arc<AsyncMutex<Vec<String>>>,
+    forked: Arc<AsyncMutex<Vec<(String, String)>>>,
+}
+
+#[async_trait]
+impl ManagedSandboxBackend for LifecycleRecordingBackend {
+    async fn acquire(
+        &self,
+        request: SandboxRequest,
+    ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        self.acquired.lock().await.push(request.key.to_string());
+        Ok(Arc::new(LifecycleRecordingHandle))
+    }
+
+    async fn attach(
+        &self,
+        _request: SandboxRequest,
+        _attachment: SandboxAttachment,
+    ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        Ok(Arc::new(LifecycleRecordingHandle))
+    }
+
+    async fn acquire_from_snapshot(
+        &self,
+        _request: SandboxRequest,
+        _payload: SnapshotPayload,
+    ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        bail!("lifecycle recording backend does not support snapshot restore")
+    }
+
+    async fn terminate(&self, request: SandboxRequest) -> crate::Result<()> {
+        self.terminated.lock().await.push(request.key.to_string());
+        Ok(())
+    }
+
+    async fn fork_sandbox(
+        &self,
+        source: SandboxRequest,
+        target: SandboxRequest,
+    ) -> crate::Result<bool> {
+        self.forked
+            .lock()
+            .await
+            .push((source.key.to_string(), target.key.to_string()));
+        Ok(true)
+    }
+}
+
+struct LifecycleRecordingHandle;
+
+#[async_trait]
+impl ManagedSandboxHandle for LifecycleRecordingHandle {
+    fn id(&self) -> &str {
+        "lifecycle-recording-sandbox"
+    }
+
+    async fn exec(&self, _command: &SandboxCommand) -> crate::Result<SandboxCommandOutput> {
+        bail!("lifecycle recording handle does not support exec")
+    }
+
+    async fn start_process(&self, _command: &SandboxCommand) -> crate::Result<SandboxProcessParts> {
+        bail!("lifecycle recording handle does not support start_process")
+    }
+
+    async fn stop(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    async fn detach(&self) -> crate::Result<SandboxAttachment> {
+        bail!("lifecycle recording handle does not support detach")
+    }
+
+    async fn snapshot(&self) -> crate::Result<SnapshotPayload> {
+        bail!("lifecycle recording handle does not support snapshots")
+    }
+}
+
+fn lifecycle_sandbox_request(name: Option<&str>) -> CreateSandboxRequest {
+    CreateSandboxRequest {
+        name: name.map(ToOwned::to_owned),
+        provider: SandboxProvider::LocalProcess,
+        image: "test-sandbox".to_string(),
+        default_workdir: Some("/".to_string()),
+        file_system_mounts: None,
+        durable_file_systems: None,
+        enable_networking: Some(true),
+        idle_seconds: Some(60),
+    }
+}
+
+#[tokio::test]
+async fn deleting_a_conversation_terminates_its_sandboxes() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let backend = Arc::new(LifecycleRecordingBackend::default());
+    let harness = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        backend.clone(),
+    )
+    .await
+    .expect("harness");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    let sandbox_id = conversation
+        .create_sandbox(lifecycle_sandbox_request(None))
+        .await
+        .expect("sandbox");
+    let conversation_id = conversation.record().id;
+
+    assert!(
+        agent
+            .delete_conversation(&conversation_id)
+            .await
+            .expect("delete conversation")
+    );
+    assert_eq!(
+        backend.terminated.lock().await.as_slice(),
+        [format!("conversation:{conversation_id}:{sandbox_id}")]
+    );
+}
+
+#[tokio::test]
+async fn deleting_an_agent_terminates_agent_and_conversation_sandboxes() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let backend = Arc::new(LifecycleRecordingBackend::default());
+    let harness = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        backend.clone(),
+    )
+    .await
+    .expect("harness");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let agent_id = agent.record().id;
+    let agent_sandbox_id = agent
+        .create_sandbox(lifecycle_sandbox_request(None))
+        .await
+        .expect("agent sandbox");
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    let conversation_id = conversation.record().id;
+    let conversation_sandbox_id = conversation
+        .create_sandbox(lifecycle_sandbox_request(None))
+        .await
+        .expect("conversation sandbox");
+
+    assert!(harness.delete_agent(&agent_id).await.expect("delete agent"));
+    assert_eq!(
+        backend.terminated.lock().await.as_slice(),
+        [
+            format!("agent:{agent_id}:{agent_sandbox_id}"),
+            format!("conversation:{conversation_id}:{conversation_sandbox_id}"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn forking_copies_sandboxes_under_the_target_owner_key() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let backend = Arc::new(LifecycleRecordingBackend::default());
+    let harness = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        backend.clone(),
+    )
+    .await
+    .expect("harness");
+    let conversation = test_conversation(&harness).await;
+    let sandbox_id = conversation
+        .create_sandbox(lifecycle_sandbox_request(Some("shared")))
+        .await
+        .expect("sandbox");
+    let source_id = conversation.record().id;
+
+    let fork = conversation
+        .fork(ForkConversationRequest::default())
+        .await
+        .expect("fork");
+    let fork_id = fork.record().id;
+    assert_eq!(
+        backend.forked.lock().await.as_slice(),
+        [(
+            format!("conversation:{source_id}:{sandbox_id}"),
+            format!("conversation:{fork_id}:{sandbox_id}"),
+        )]
+    );
+
+    assert_eq!(
+        fork.create_sandbox(lifecycle_sandbox_request(Some("shared")))
+            .await
+            .expect("acquire forked sandbox"),
+        sandbox_id
+    );
+    assert_eq!(
+        backend.acquired.lock().await.as_slice(),
+        [
+            format!("conversation:{source_id}:{sandbox_id}"),
+            format!("conversation:{fork_id}:{sandbox_id}"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn attached_sandboxes_are_detached_in_forks_and_never_terminated() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let backend = Arc::new(LifecycleRecordingBackend::default());
+    let mut config = local_test_config(tempdir.path());
+    config.sandbox_default = SandboxProvider::Docker;
+    config.sandbox_backends = vec![SandboxBackendRegistration::from_backend(
+        SandboxProvider::Docker,
+        backend.clone(),
+    )];
+    let harness = BasicExoHarness::new(config).await.expect("harness");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    let attachment = SandboxAttachment::DockerContainer {
+        container_id: "borrowed-container".to_string(),
+    };
+    let sandbox_id = conversation
+        .attach_sandbox(AttachSandboxRequest {
+            attachment: attachment.clone(),
+            default_workdir: Some("/workspace".to_string()),
+        })
+        .await
+        .expect("attach sandbox");
+    let source_id = conversation.record().id;
+    let fork = conversation
+        .fork(ForkConversationRequest::default())
+        .await
+        .expect("fork");
+
+    assert_eq!(
+        fork.detach_sandbox(sandbox_id)
+            .await
+            .expect("forked attachment should already be detached"),
+        attachment
+    );
+    assert!(backend.forked.lock().await.is_empty());
+    assert!(
+        agent
+            .delete_conversation(&source_id)
+            .await
+            .expect("delete source")
+    );
+    assert!(
+        agent
+            .delete_conversation(&fork.record().id)
+            .await
+            .expect("delete fork")
+    );
+    assert!(backend.terminated.lock().await.is_empty());
 }

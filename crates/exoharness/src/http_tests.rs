@@ -449,6 +449,10 @@ impl ManagedSandboxBackend for SnapshotTestSandboxBackend {
         assert_eq!(payload.bytes, Bytes::from_static(b"snapshot"));
         Ok(Arc::new(SnapshotTestSandboxHandle))
     }
+
+    async fn terminate(&self, _request: SandboxRequest) -> crate::Result<()> {
+        Ok(())
+    }
 }
 
 struct SnapshotTestSandboxHandle;
