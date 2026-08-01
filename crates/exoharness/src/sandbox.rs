@@ -173,6 +173,8 @@ pub trait ManagedSandboxHandle: Send + Sync {
 
 #[async_trait]
 pub trait ManagedSandboxBackend: Send + Sync {
+    fn is_local(&self) -> bool;
+
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>>;
     async fn attach(
         &self,
@@ -493,6 +495,10 @@ impl Drop for CliContainerSandboxBackend {
 
 #[async_trait]
 impl ManagedSandboxBackend for CliContainerSandboxBackend {
+    fn is_local(&self) -> bool {
+        true
+    }
+
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let request = self.prepare_request(request).await?;
 
@@ -850,6 +856,10 @@ impl LocalProcessSandboxBackend {
 
 #[async_trait]
 impl ManagedSandboxBackend for LocalProcessSandboxBackend {
+    fn is_local(&self) -> bool {
+        true
+    }
+
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         if !request.spec.durable_file_systems.is_empty() {
             bail!("local-process sandbox backend does not support durable file systems");

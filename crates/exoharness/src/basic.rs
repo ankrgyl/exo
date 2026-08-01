@@ -85,6 +85,7 @@ type SandboxBackendFactory = Arc<
 #[derive(Clone)]
 pub struct SandboxBackendRegistration {
     provider: SandboxProvider,
+    is_local: bool,
     factory: SandboxBackendFactory,
 }
 
@@ -93,40 +94,36 @@ impl SandboxBackendRegistration {
         provider: SandboxProvider,
         backend: Arc<dyn ManagedSandboxBackend>,
     ) -> Self {
-        Self::from_factory(provider, move |_| {
+        let is_local = backend.is_local();
+        Self::from_factory(provider, is_local, move |_| {
             let backend = Arc::clone(&backend);
             Box::pin(async move { Ok(backend) })
         })
     }
 
     pub fn apple_container() -> Self {
-        Self::from_factory(SandboxProvider::AppleContainer, |_| {
-            Box::pin(async {
-                Ok(Arc::new(CliContainerSandboxBackend::apple_container())
-                    as Arc<dyn ManagedSandboxBackend>)
-            })
-        })
+        Self::from_backend(
+            SandboxProvider::AppleContainer,
+            Arc::new(CliContainerSandboxBackend::apple_container()),
+        )
     }
 
     pub fn docker() -> Self {
-        Self::from_factory(SandboxProvider::Docker, |_| {
-            Box::pin(async {
-                Ok(Arc::new(CliContainerSandboxBackend::docker())
-                    as Arc<dyn ManagedSandboxBackend>)
-            })
-        })
+        Self::from_backend(
+            SandboxProvider::Docker,
+            Arc::new(CliContainerSandboxBackend::docker()),
+        )
     }
 
     pub fn local_process() -> Self {
-        Self::from_factory(SandboxProvider::LocalProcess, |_| {
-            Box::pin(async {
-                Ok(Arc::new(LocalProcessSandboxBackend::new()) as Arc<dyn ManagedSandboxBackend>)
-            })
-        })
+        Self::from_backend(
+            SandboxProvider::LocalProcess,
+            Arc::new(LocalProcessSandboxBackend::new()),
+        )
     }
 
     pub fn daytona(spec: DaytonaBackendSpec) -> Self {
-        Self::from_factory(SandboxProvider::Daytona, move |inner| {
+        Self::from_factory(SandboxProvider::Daytona, false, move |inner| {
             let spec = spec.clone();
             Box::pin(async move {
                 let config = match inner.daytona_config_from_binding().await? {
@@ -140,7 +137,7 @@ impl SandboxBackendRegistration {
     }
 
     pub fn e2b(spec: E2bBackendSpec) -> Self {
-        Self::from_factory(SandboxProvider::E2b, move |inner| {
+        Self::from_factory(SandboxProvider::E2b, false, move |inner| {
             let spec = spec.clone();
             Box::pin(async move {
                 let config = match inner.e2b_config_from_binding().await? {
@@ -154,7 +151,7 @@ impl SandboxBackendRegistration {
     }
 
     pub fn sprites(spec: SpritesBackendSpec) -> Self {
-        Self::from_factory(SandboxProvider::Sprites, move |inner| {
+        Self::from_factory(SandboxProvider::Sprites, false, move |inner| {
             let spec = spec.clone();
             Box::pin(async move {
                 let config = match inner.sprites_config_from_binding().await? {
@@ -168,7 +165,7 @@ impl SandboxBackendRegistration {
     }
 
     pub fn vercel(spec: VercelBackendSpec) -> Self {
-        Self::from_factory(SandboxProvider::Vercel, move |inner| {
+        Self::from_factory(SandboxProvider::Vercel, false, move |inner| {
             let spec = spec.clone();
             Box::pin(async move {
                 let config = match inner.vercel_config_from_binding().await? {
@@ -182,7 +179,7 @@ impl SandboxBackendRegistration {
     }
 
     pub fn aws_agentcore() -> Self {
-        Self::from_factory(SandboxProvider::AwsAgentCore, |_inner| {
+        Self::from_factory(SandboxProvider::AwsAgentCore, false, |_inner| {
             Box::pin(async move {
                 #[cfg(feature = "aws-agentcore")]
                 {
@@ -210,7 +207,11 @@ impl SandboxBackendRegistration {
         self.provider.clone()
     }
 
-    fn from_factory<F>(provider: SandboxProvider, factory: F) -> Self
+    pub fn is_local(&self) -> bool {
+        self.is_local
+    }
+
+    fn from_factory<F>(provider: SandboxProvider, is_local: bool, factory: F) -> Self
     where
         F: for<'a> Fn(
                 &'a BasicExoHarnessInner,
@@ -221,6 +222,7 @@ impl SandboxBackendRegistration {
     {
         Self {
             provider,
+            is_local,
             factory: Arc::new(factory),
         }
     }

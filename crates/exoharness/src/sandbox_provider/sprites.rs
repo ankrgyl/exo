@@ -168,6 +168,10 @@ impl SpritesSandboxBackend {
 
 #[async_trait]
 impl ManagedSandboxBackend for SpritesSandboxBackend {
+    fn is_local(&self) -> bool {
+        false
+    }
+
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_host_mounts(&request)?;
         let sprite_name = sprite_name_for_request(&request);

@@ -648,14 +648,8 @@ impl SandboxAttachment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(try_from = "String", into = "String")]
+#[serde(transparent)]
 pub struct SandboxProvider(Cow<'static, str>);
-
-impl Default for SandboxProvider {
-    fn default() -> Self {
-        Self::Daytona
-    }
-}
 
 #[allow(non_upper_case_globals)]
 impl SandboxProvider {
@@ -663,30 +657,17 @@ impl SandboxProvider {
     pub const E2b: Self = Self::from_static("e2b");
     pub const Sprites: Self = Self::from_static("sprites");
     pub const Vercel: Self = Self::from_static("vercel");
-    pub const AwsAgentCore: Self = Self::from_static("aws-agentcore");
-    pub const AppleContainer: Self = Self::from_static("apple-container");
+    pub const AwsAgentCore: Self = Self::from_static("aws_agentcore");
+    pub const AppleContainer: Self = Self::from_static("apple_container");
     pub const Docker: Self = Self::from_static("docker");
-    pub const LocalProcess: Self = Self::from_static("local-process");
+    pub const LocalProcess: Self = Self::from_static("local_process");
 
     pub const fn from_static(provider: &'static str) -> Self {
         Self(Cow::Borrowed(provider))
     }
 
-    pub fn is_local(&self) -> bool {
-        self == &Self::AppleContainer || self == &Self::Docker || self == &Self::LocalProcess
-    }
-
     pub fn as_str(&self) -> &str {
         self.0.as_ref()
-    }
-
-    fn serialized_name(&self) -> &str {
-        match self.as_str() {
-            "aws-agentcore" => "aws_agentcore",
-            "apple-container" => "apple_container",
-            "local-process" => "local_process",
-            provider => provider,
-        }
     }
 }
 
@@ -700,35 +681,7 @@ impl FromStr for SandboxProvider {
     type Err = crate::Error;
 
     fn from_str(value: &str) -> Result<Self> {
-        let provider = value.trim().replace('_', "-").to_ascii_lowercase();
-        let provider = match provider.as_str() {
-            "local" => "local-process".to_string(),
-            _ => provider,
-        };
-        if provider.is_empty()
-            || provider.starts_with('-')
-            || provider.ends_with('-')
-            || !provider
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        {
-            return Err(anyhow::anyhow!("invalid sandbox provider: {value}"));
-        }
-        Ok(Self(Cow::Owned(provider)))
-    }
-}
-
-impl TryFrom<String> for SandboxProvider {
-    type Error = crate::Error;
-
-    fn try_from(provider: String) -> Result<Self> {
-        provider.parse()
-    }
-}
-
-impl From<SandboxProvider> for String {
-    fn from(provider: SandboxProvider) -> Self {
-        provider.serialized_name().to_string()
+        Ok(Self(Cow::Owned(value.to_string())))
     }
 }
 
@@ -1257,35 +1210,33 @@ mod tests {
     }
 
     #[test]
-    fn parses_and_formats_sandbox_providers() {
-        assert_eq!(
-            "apple-container".parse::<SandboxProvider>().unwrap(),
-            SandboxProvider::AppleContainer
-        );
+    fn preserves_sandbox_provider_names() {
         assert_eq!(
             "apple_container".parse::<SandboxProvider>().unwrap(),
             SandboxProvider::AppleContainer
         );
         assert_eq!(
-            "local".parse::<SandboxProvider>().unwrap(),
-            SandboxProvider::LocalProcess
-        );
-        assert_eq!(
-            "vercel".parse::<SandboxProvider>().unwrap(),
-            SandboxProvider::Vercel
-        );
-        assert_eq!(
-            "smolvm".parse::<SandboxProvider>().unwrap().as_str(),
-            "smolvm"
-        );
-        assert!("bad provider".parse::<SandboxProvider>().is_err());
-        assert_eq!(
-            SandboxProvider::AppleContainer.to_string(),
+            "apple-container"
+                .parse::<SandboxProvider>()
+                .unwrap()
+                .as_str(),
             "apple-container"
         );
+        assert_eq!(
+            "local".parse::<SandboxProvider>().unwrap().as_str(),
+            "local"
+        );
+        assert_eq!(
+            "Bad Provider".parse::<SandboxProvider>().unwrap().as_str(),
+            "Bad Provider"
+        );
+        assert_eq!(
+            SandboxProvider::AppleContainer.to_string(),
+            "apple_container"
+        );
         assert_eq!(SandboxProvider::Vercel.to_string(), "vercel");
-        assert_eq!(SandboxProvider::AwsAgentCore.to_string(), "aws-agentcore");
-        assert_eq!(SandboxProvider::LocalProcess.to_string(), "local-process");
+        assert_eq!(SandboxProvider::AwsAgentCore.to_string(), "aws_agentcore");
+        assert_eq!(SandboxProvider::LocalProcess.to_string(), "local_process");
         assert_eq!(
             serde_json::to_value(SandboxProvider::AppleContainer).unwrap(),
             Value::String("apple_container".to_string())

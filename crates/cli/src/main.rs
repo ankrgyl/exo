@@ -2367,14 +2367,22 @@ async fn instantiate_exoharness(
     bearer_token: Option<String>,
 ) -> Result<Arc<dyn ExoHarness>> {
     if let Some(http_url) = http_url {
+        let local_sandbox_providers = exo_config
+            .sandbox_backends
+            .iter()
+            .filter(|backend| backend.is_local())
+            .map(SandboxBackendRegistration::provider)
+            .collect::<Vec<_>>();
         let mut harness = HttpExoHarness::new(http_url)?;
         if let Some(bearer_token) = bearer_token {
             harness = harness.with_bearer_token(bearer_token);
         }
         let remote: Arc<dyn ExoHarness> = Arc::new(harness);
         let local: Arc<dyn ExoHarness> = Arc::new(BasicExoHarness::new(exo_config.clone()).await?);
-        return Ok(Arc::new(LocalSandboxExoHarness::new_with_force_local(
-            remote, local, false,
+        return Ok(Arc::new(LocalSandboxExoHarness::new_with_local_providers(
+            remote,
+            local,
+            local_sandbox_providers,
         )));
     }
     Ok(Arc::new(BasicExoHarness::new(exo_config.clone()).await?))
