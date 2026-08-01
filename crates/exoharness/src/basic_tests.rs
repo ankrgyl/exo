@@ -44,6 +44,29 @@ fn sandbox_backend_registration_uses_backend_locality() {
     assert!(!SandboxBackendRegistration::daytona(crate::DaytonaBackendSpec::default()).is_local());
 }
 
+#[test]
+fn sandbox_backend_registration_resolves_builtin_providers() {
+    for provider in [
+        SandboxProvider::AppleContainer,
+        SandboxProvider::AwsAgentCore,
+        SandboxProvider::Daytona,
+        SandboxProvider::Docker,
+        SandboxProvider::E2b,
+        SandboxProvider::LocalProcess,
+        SandboxProvider::Sprites,
+        SandboxProvider::Vercel,
+    ] {
+        let registration =
+            SandboxBackendRegistration::from_builtin_provider(provider.clone()).unwrap();
+        assert_eq!(registration.provider(), provider);
+    }
+
+    assert!(
+        SandboxBackendRegistration::from_builtin_provider(SandboxProvider::from_static("custom"))
+            .is_err()
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn basic_backend_supports_agent_and_conversation_crud() {
     let tempdir = TempDir::new().expect("tempdir");

@@ -90,6 +90,22 @@ pub struct SandboxBackendRegistration {
 }
 
 impl SandboxBackendRegistration {
+    pub fn from_builtin_provider(provider: SandboxProvider) -> Result<Self> {
+        match provider.as_str() {
+            "apple_container" => Ok(Self::apple_container()),
+            "aws_agentcore" => Ok(Self::aws_agentcore()),
+            "daytona" => Ok(Self::daytona(
+                DaytonaBackendSpec::with_conventional_secrets(),
+            )),
+            "docker" => Ok(Self::docker()),
+            "e2b" => Ok(Self::e2b(E2bBackendSpec::default())),
+            "local_process" => Ok(Self::local_process()),
+            "sprites" => Ok(Self::sprites(SpritesBackendSpec::default())),
+            "vercel" => Ok(Self::vercel(VercelBackendSpec::with_conventional_secrets())),
+            _ => bail!("sandbox provider {provider} is not built into exoharness"),
+        }
+    }
+
     pub fn from_backend(
         provider: SandboxProvider,
         backend: Arc<dyn ManagedSandboxBackend>,
