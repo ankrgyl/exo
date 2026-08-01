@@ -206,7 +206,7 @@ pub(crate) async fn conversation_sandboxes(
 // config alone.
 pub(crate) fn agent_sandbox_spec(agent_config: &AgentConfig) -> ConversationSandboxSpec {
     ConversationSandboxSpec {
-        provider: agent_config.sandbox.provider,
+        provider: agent_config.sandbox.provider.clone(),
         image: agent_config
             .sandbox
             .image

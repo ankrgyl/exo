@@ -207,7 +207,7 @@ impl SandboxBackendRegistration {
     }
 
     pub fn provider(&self) -> SandboxProvider {
-        self.provider
+        self.provider.clone()
     }
 
     fn from_factory<F>(provider: SandboxProvider, factory: F) -> Self
@@ -804,7 +804,7 @@ impl BasicExoHarness {
         let mut registry = HashMap::new();
         for choice in sandbox_backends {
             let provider = choice.provider();
-            if registry.insert(provider, choice).is_some() {
+            if registry.insert(provider.clone(), choice).is_some() {
                 bail!("duplicate sandbox provider {provider:?} in sandbox_backends");
             }
         }
@@ -814,7 +814,7 @@ impl BasicExoHarness {
 
         let mut cache = HashMap::new();
         if let Some(backend) = seed {
-            cache.insert(sandbox_default, backend);
+            cache.insert(sandbox_default.clone(), backend);
         }
 
         let storage = BasicObjectStore::local_filesystem(&root).await?;
@@ -2820,7 +2820,7 @@ async fn start_sandbox_side_effect(
     // teleport a Docker snapshot up to Daytona). Set before routing so the
     // restore targets the new backend and the new provider is persisted;
     // unsupported providers / snapshot kinds error in the calls below.
-    let previous_provider = sandbox.provider;
+    let previous_provider = sandbox.provider.clone();
     if let Some(provider) = request.provider {
         sandbox.provider = provider;
     }
@@ -2839,7 +2839,7 @@ async fn start_sandbox_side_effect(
     let sandbox_handle = if cross_provider {
         let sandbox_handle = harness
             .inner
-            .sandbox_backend_for_provider(sandbox.provider)
+            .sandbox_backend_for_provider(sandbox.provider.clone())
             .await?
             .acquire_from_snapshot(sandbox_request(owner, &request.id, &sandbox, None), payload)
             .await?;
@@ -2874,7 +2874,7 @@ async fn start_sandbox_side_effect(
         }
         harness
             .inner
-            .sandbox_backend_for_provider(sandbox.provider)
+            .sandbox_backend_for_provider(sandbox.provider.clone())
             .await?
             .acquire_from_snapshot(sandbox_request(owner, &request.id, &sandbox, None), payload)
             .await?
@@ -2938,7 +2938,7 @@ async fn prepare_sandbox_request(
         request.image.clone()
     } else if let Some(default) = harness
         .inner
-        .binding_default_image(request.provider)
+        .binding_default_image(request.provider.clone())
         .await?
     {
         default
@@ -3038,13 +3038,13 @@ async fn create_sandbox_handle(
         owner_dir,
         owner,
         sandbox_id,
-        sandbox.provider,
+        sandbox.provider.clone(),
         &state_key,
     )
     .await?;
     let backend = harness
         .inner
-        .sandbox_backend_for_provider(sandbox.provider)
+        .sandbox_backend_for_provider(sandbox.provider.clone())
         .await?;
     let request = sandbox_request(owner, sandbox_id, sandbox, previous_state.clone());
     let handle = match &sandbox.attachment {
@@ -3053,7 +3053,7 @@ async fn create_sandbox_handle(
     };
     let provider_state_event = sandbox_provider_state_event(
         sandbox_id,
-        sandbox.provider,
+        sandbox.provider.clone(),
         state_key,
         previous_state,
         &handle,
@@ -3360,7 +3360,7 @@ impl PreparedSandboxRequest {
         StoredSandbox {
             id,
             name: self.name.clone(),
-            provider: self.provider,
+            provider: self.provider.clone(),
             image: self.image.clone(),
             requested_image: None,
             default_workdir: self.default_workdir.clone(),

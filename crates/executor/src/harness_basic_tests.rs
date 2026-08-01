@@ -849,11 +849,11 @@ async fn send_executes_shell_tool_when_enabled() {
     assert!(matches!(
         &sandbox_events[0].data,
         EventData::SandboxCreated {
-            provider: SandboxProvider::LocalProcess,
+            provider,
             image,
             enable_networking: true,
             ..
-        } if image == "conversation-image"
+        } if provider == &SandboxProvider::LocalProcess && image == "conversation-image"
     ));
 }
 

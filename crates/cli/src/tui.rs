@@ -556,7 +556,7 @@ impl ChatRepl {
                 id: sandbox_id.clone(),
                 snapshot_id,
                 idle_seconds: None,
-                provider: Some(provider),
+                provider: Some(provider.clone()),
             })
             .await?;
         Ok((sandbox_id, provider))
@@ -1066,7 +1066,7 @@ async fn teleport_sandbox(
             id: sandbox_id.clone(),
             snapshot_id,
             idle_seconds: None,
-            provider: Some(provider),
+            provider: Some(provider.clone()),
         })
         .await?;
     Ok((sandbox_id, provider))
