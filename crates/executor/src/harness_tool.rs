@@ -972,7 +972,7 @@ pub(crate) async fn ensure_shell_sandbox(
     let desired_image = requested_image.map(str::to_string).unwrap_or_default();
     let desired_enable_networking = agent_config.sandbox.enable_networking;
 
-    if let Some(sandbox) = latest_shell_sandbox(conversation, desired_provider).await? {
+    if let Some(sandbox) = latest_shell_sandbox(conversation, &desired_provider).await? {
         // When no image was requested, the stored sandbox holds the provider's
         // resolved default — don't treat that as a mismatch.
         let image_matches = requested_image.is_none_or(|img| sandbox.image == img);
@@ -1043,13 +1043,13 @@ struct ShellSandboxInfo {
 
 async fn latest_shell_sandbox(
     conversation: &dyn ConversationHandle,
-    desired_provider: SandboxProvider,
+    desired_provider: &SandboxProvider,
 ) -> Result<Option<ShellSandboxInfo>> {
     let Some(sandbox) = conversation_sandboxes(conversation)
         .await?
         .into_iter()
         .rev()
-        .find(|sandbox| sandbox.provider == desired_provider)
+        .find(|sandbox| &sandbox.provider == desired_provider)
     else {
         return Ok(None);
     };

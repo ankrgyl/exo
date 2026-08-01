@@ -145,7 +145,8 @@ impl ConversationConfig {
 
     pub fn effective_sandbox_provider(&self, agent_config: &AgentConfig) -> SandboxProvider {
         self.sandbox_provider
-            .unwrap_or(agent_config.sandbox.provider)
+            .clone()
+            .unwrap_or_else(|| agent_config.sandbox.provider.clone())
     }
 }
 

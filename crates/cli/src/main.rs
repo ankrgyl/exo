@@ -1423,7 +1423,7 @@ async fn main() -> Result<()> {
                 );
                 println!(
                     "sandbox_provider: {}",
-                    format_sandbox_provider(config.sandbox.provider)
+                    format_sandbox_provider(&config.sandbox.provider)
                 );
                 println!(
                     "sandbox_scope: {}",
@@ -1738,14 +1738,16 @@ async fn main() -> Result<()> {
                     external_id,
                     default_workdir,
                 } => {
-                    let attachment = match SandboxProvider::from(provider) {
-                        SandboxProvider::Docker => SandboxAttachment::DockerContainer {
+                    let provider = SandboxProvider::from(provider);
+                    let attachment = if provider == SandboxProvider::Docker {
+                        SandboxAttachment::DockerContainer {
                             container_id: external_id,
-                        },
-                        provider => bail!(
+                        }
+                    } else {
+                        bail!(
                             "sandbox provider {} does not support external attachments",
                             provider.as_str()
-                        ),
+                        )
                     };
                     let conversation =
                         must_get_conversation(harness.as_ref(), &agent, &conversation).await?;
@@ -1864,12 +1866,13 @@ async fn main() -> Result<()> {
                     "sandbox_provider: {}",
                     config
                         .sandbox_provider
+                        .as_ref()
                         .map(format_sandbox_provider)
                         .unwrap_or("inherit")
                 );
                 println!(
                     "effective_sandbox_provider: {}",
-                    format_sandbox_provider(config.effective_sandbox_provider(&agent_config))
+                    format_sandbox_provider(&config.effective_sandbox_provider(&agent_config))
                 );
                 println!(
                     "model_override: {}",
@@ -2364,14 +2367,22 @@ async fn instantiate_exoharness(
     bearer_token: Option<String>,
 ) -> Result<Arc<dyn ExoHarness>> {
     if let Some(http_url) = http_url {
+        let local_sandbox_providers = exo_config
+            .sandbox_backends
+            .iter()
+            .filter(|backend| backend.is_local())
+            .map(SandboxBackendRegistration::provider)
+            .collect::<Vec<_>>();
         let mut harness = HttpExoHarness::new(http_url)?;
         if let Some(bearer_token) = bearer_token {
             harness = harness.with_bearer_token(bearer_token);
         }
         let remote: Arc<dyn ExoHarness> = Arc::new(harness);
         let local: Arc<dyn ExoHarness> = Arc::new(BasicExoHarness::new(exo_config.clone()).await?);
-        return Ok(Arc::new(LocalSandboxExoHarness::new_with_force_local(
-            remote, local, false,
+        return Ok(Arc::new(LocalSandboxExoHarness::new_with_local_providers(
+            remote,
+            local,
+            local_sandbox_providers,
         )));
     }
     Ok(Arc::new(BasicExoHarness::new(exo_config.clone()).await?))
@@ -2443,7 +2454,7 @@ fn format_harness_kind(kind: AgentHarnessKind) -> &'static str {
     }
 }
 
-fn format_sandbox_provider(provider: SandboxProvider) -> &'static str {
+fn format_sandbox_provider(provider: &SandboxProvider) -> &str {
     provider.as_str()
 }
 

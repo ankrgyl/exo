@@ -218,6 +218,10 @@ impl E2bSandboxBackend {
 
 #[async_trait]
 impl ManagedSandboxBackend for E2bSandboxBackend {
+    fn is_local(&self) -> bool {
+        false
+    }
+
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_host_mounts(&request)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
