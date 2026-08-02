@@ -145,6 +145,8 @@ fn resolve_runtime_config(
         resolve_anthropic_config(request, env)
     } else if is_openrouter_request(request) {
         resolve_openrouter_config(request, env)
+    } else if is_orcarouter_request(request) {
+        resolve_orcarouter_config(request, env)
     } else {
         resolve_openai_config(request, env)
     }
@@ -178,6 +180,49 @@ fn resolve_openrouter_config(
     Ok(ResolvedRuntimeConfig {
         provider_alias: "openrouter".to_string(),
         // OpenRouter speaks the OpenAI Chat Completions wire format, so reuse
+        // the OpenAI provider but force Chat Completions (not Responses).
+        provider_kind: "openai".to_string(),
+        format: ProviderFormat::ChatCompletions,
+        endpoint,
+        endpoint_template: None,
+        metadata: HashMap::new(),
+        auth: AuthConfig::ApiKey {
+            key,
+            header: Some("authorization".to_string()),
+            prefix: Some("Bearer".to_string()),
+        },
+    })
+}
+
+/// OrcaRouter is an OpenAI-compatible aggregator selected by its base URL, for
+/// the same reason as OpenRouter: it fronts many vendors, so the model name
+/// carries a vendor prefix (`openai/gpt-5.5`) rather than identifying the API
+/// dialect. Its `/v1/responses` endpoint serves a different model set than
+/// `/v1/chat/completions`, so bindings route through Chat Completions.
+fn is_orcarouter_request(request: &ModelRequest) -> bool {
+    request
+        .base_url
+        .as_deref()
+        .is_some_and(|url| url.contains("orcarouter.ai"))
+}
+
+fn resolve_orcarouter_config(
+    request: &ModelRequest,
+    env: &HashMap<String, String>,
+) -> Result<ResolvedRuntimeConfig> {
+    let key = request
+        .api_key
+        .clone()
+        .or_else(|| optional_env(env, "ORCAROUTER_API_KEY"))
+        .ok_or_else(|| anyhow::anyhow!("model request is missing an API key"))?;
+    let endpoint = request
+        .base_url
+        .clone()
+        .map(|raw| Url::parse(&raw))
+        .transpose()?;
+    Ok(ResolvedRuntimeConfig {
+        provider_alias: "orcarouter".to_string(),
+        // OrcaRouter speaks the OpenAI Chat Completions wire format, so reuse
         // the OpenAI provider but force Chat Completions (not Responses).
         provider_kind: "openai".to_string(),
         format: ProviderFormat::ChatCompletions,
@@ -466,6 +511,44 @@ mod tests {
             AuthConfig::ApiKey { ref header, ref prefix, .. }
                 if header.as_deref() == Some("authorization")
                     && prefix.as_deref() == Some("Bearer")
+        ));
+    }
+
+    #[test]
+    fn orcarouter_bindings_use_openai_chat_completions() {
+        let mut request = model_request();
+        request.model = "openai/gpt-5.5".to_string();
+        request.api_key = Some("sk-orca-test".to_string());
+        request.base_url = Some("https://api.orcarouter.ai/v1".to_string());
+
+        let config = resolve_runtime_config(&request, &HashMap::new()).unwrap();
+
+        assert_eq!(config.provider_alias, "orcarouter");
+        assert_eq!(config.provider_kind, "openai");
+        assert_eq!(config.format, ProviderFormat::ChatCompletions);
+        assert!(matches!(
+            config.auth,
+            AuthConfig::ApiKey { ref header, ref prefix, .. }
+                if header.as_deref() == Some("authorization")
+                    && prefix.as_deref() == Some("Bearer")
+        ));
+    }
+
+    #[test]
+    fn orcarouter_bindings_fall_back_to_the_env_api_key() {
+        let mut request = model_request();
+        request.model = "openai/gpt-5.5".to_string();
+        request.base_url = Some("https://api.orcarouter.ai/v1".to_string());
+        let env = HashMap::from([(
+            "ORCAROUTER_API_KEY".to_string(),
+            "sk-orca-from-env".to_string(),
+        )]);
+
+        let config = resolve_runtime_config(&request, &env).unwrap();
+
+        assert!(matches!(
+            config.auth,
+            AuthConfig::ApiKey { ref key, .. } if key == "sk-orca-from-env"
         ));
     }
 

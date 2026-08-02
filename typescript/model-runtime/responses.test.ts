@@ -6,6 +6,7 @@ import {
   ChatCompletionsRuntime,
   isAnthropicModel,
   isOpenRouterBinding,
+  isOrcaRouterBinding,
   modelRequiresResponsesApi,
   responseToLinguaEvents,
   responseToolCalls,
@@ -76,6 +77,21 @@ describe("model runtime dispatch", () => {
         model: "openai/gpt-5-pro",
         apiKey: "key",
         baseUrl: "https://openrouter.ai/api/v1",
+      }),
+    ).toBeInstanceOf(ChatCompletionsRuntime);
+  });
+
+  it("routes OrcaRouter bindings through chat completions by base URL", () => {
+    expect(
+      isOrcaRouterBinding({ baseUrl: "https://api.orcarouter.ai/v1" }),
+    ).toBe(true);
+    expect(isOrcaRouterBinding({ baseUrl: null })).toBe(false);
+    // A Responses-looking model name over OrcaRouter still uses chat completions.
+    expect(
+      runtimeFromModelBinding(undefined, {
+        model: "openai/gpt-5-pro",
+        apiKey: "key",
+        baseUrl: "https://api.orcarouter.ai/v1",
       }),
     ).toBeInstanceOf(ChatCompletionsRuntime);
   });
