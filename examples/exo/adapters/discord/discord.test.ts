@@ -4,11 +4,67 @@ import {
   attachmentKindForContentType,
   createResilienceHandlers,
   describeCloseCode,
+  discordMessagePayloads,
+  discordNonce,
   errorMessage,
   inboundAttachments,
   splitDiscordContent,
   startConnectionWatchdog,
 } from "./discord";
+
+describe("discordNonce", () => {
+  const commandId = "0198c4f1-7b2a-7c3d-8e4f-5a6b7c8d9e0f";
+
+  it("is deterministic across restarts", () => {
+    // A retry after a crash must derive the same nonce as the attempt that
+    // crashed, or Discord sees an unrelated message.
+    expect(discordNonce(commandId, 0)).toBe(discordNonce(commandId, 0));
+  });
+
+  it("fits inside Discord's 25 character limit", () => {
+    for (const part of [0, 1, 42, 1000]) {
+      expect(discordNonce(commandId, part).length).toBe(25);
+    }
+  });
+
+  it("differs per chunk so a long message is not swallowed", () => {
+    const nonces = [0, 1, 2].map((part) => discordNonce(commandId, part));
+    expect(new Set(nonces).size).toBe(3);
+  });
+
+  it("differs per command", () => {
+    expect(discordNonce("command-a", 0)).not.toBe(discordNonce("command-b", 0));
+  });
+
+  it("does not collide across the id/part boundary", () => {
+    expect(discordNonce("a-1", 0)).not.toBe(discordNonce("a", 10));
+  });
+});
+
+describe("discordMessagePayloads", () => {
+  it("puts an enforced nonce on every chunk", () => {
+    const payloads = discordMessagePayloads("cmd-1", ["one", "two"], []);
+    expect(payloads.map((payload) => payload.content)).toEqual(["one", "two"]);
+    for (const payload of payloads) {
+      expect(payload.enforceNonce).toBe(true);
+    }
+    expect(payloads[0]?.nonce).toBe(discordNonce("cmd-1", 0));
+    expect(payloads[1]?.nonce).toBe(discordNonce("cmd-1", 1));
+    expect(payloads[0]?.nonce).not.toBe(payloads[1]?.nonce);
+  });
+
+  it("attaches files to the first chunk only", () => {
+    const payloads = discordMessagePayloads("cmd-1", ["one", "two"], ["file"]);
+    expect(payloads[0]?.files).toEqual(["file"]);
+    expect(payloads[1]?.files).toEqual([]);
+  });
+
+  it("derives the same payloads on a retry of the same command", () => {
+    expect(discordMessagePayloads("cmd-1", ["one"], [])).toEqual(
+      discordMessagePayloads("cmd-1", ["one"], []),
+    );
+  });
+});
 
 describe("attachmentKindForContentType", () => {
   it("classifies media mime types", () => {

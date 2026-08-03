@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type { AdapterAttachment, WorkerInboundEvent } from "../protocol";
 
 export type DiscordAttachmentLike = {
@@ -7,6 +9,43 @@ export type DiscordAttachmentLike = {
 };
 
 const DISCORD_CONTENT_LIMIT = 2_000;
+// Discord rejects a nonce longer than this.
+const DISCORD_NONCE_LIMIT = 25;
+
+// Discord's idempotency key: with `enforceNonce`, a repeat inside its window
+// returns the existing message rather than posting a second one. Hashing fits a
+// UUIDv7 command id under the limit and keeps the nonce deterministic, so a
+// retry presents the same key as the attempt that crashed.
+export function discordNonce(commandId: string, part: number): string {
+  return createHash("sha256")
+    .update(commandId)
+    .update("\0")
+    .update(String(part))
+    .digest("hex")
+    .slice(0, DISCORD_NONCE_LIMIT);
+}
+
+export type DiscordMessagePayload<File> = {
+  content: string;
+  files: readonly File[];
+  nonce: string;
+  enforceNonce: true;
+};
+
+// One create per content chunk, keyed per chunk: they are separate messages
+// that each have to survive, so a shared nonce would swallow all but the first.
+export function discordMessagePayloads<File>(
+  commandId: string,
+  chunks: string[],
+  files: readonly File[],
+): DiscordMessagePayload<File>[] {
+  return chunks.map((content, index) => ({
+    content,
+    files: index === 0 ? files : [],
+    nonce: discordNonce(commandId, index),
+    enforceNonce: true,
+  }));
+}
 
 export function splitDiscordContent(
   text: string,
