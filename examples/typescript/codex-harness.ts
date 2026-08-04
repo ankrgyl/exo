@@ -9,7 +9,9 @@ import {
   toolRequestedEvent,
   toolResultEvent,
   turnMetadata,
+  type Conversation,
   type EventData,
+  type HarnessToolRegistry,
   type JsonObject,
   type JsonValue,
   type Message,
@@ -49,8 +51,18 @@ import {
   traceExoharnessToolCall,
   traceObservedToolCall,
   WarmResourceCache,
+  type CodingExecutorTurnOptions,
   type ResolvedLlmBinding,
 } from "./shared";
+import {
+  callRegistryTool,
+  injectedToolDefinitions,
+  injectedToolRegistry,
+} from "./registry-tools";
+import {
+  codexApprovalDecision,
+  type CodingApprovalPolicy,
+} from "./executor-approvals";
 
 const CODEX_SHELL_TOOL = "codex.shell";
 const CODEX_WEB_SEARCH_TOOL = "codex.web_search";
@@ -82,6 +94,8 @@ interface CodexWarmTurnScope {
   context: TurnContext;
   protocolLog: CodexProtocolEventBuffer;
   turnParent: TraceParent;
+  registry: HarnessToolRegistry;
+  approvals: CodingApprovalPolicy;
 }
 
 interface PriorResponseItems {
@@ -114,6 +128,10 @@ class CodexWarmSession {
     readonly process: SandboxProcess,
     initialScope: CodexWarmTurnScope,
     threadId: string | null,
+    // The newest sandbox_started event id when this session was created; a
+    // later one means the sandbox was rewound and this session's process is
+    // dead.
+    readonly sandboxEpoch: string | null,
   ) {
     this.current = initialScope;
     this.threadId = threadId;
@@ -123,6 +141,7 @@ class CodexWarmSession {
     scope: CodexWarmTurnScope,
     modelBinding: ResolvedLlmBinding,
     sessionKey: string,
+    sandboxEpoch: string | null,
   ): Promise<CodexWarmSession> {
     let session: CodexWarmSession | null = null;
     const pendingProtocol: CodexProtocolLogEntry[] = [];
@@ -154,6 +173,7 @@ class CodexWarmSession {
       process,
       scope,
       process.reused ? (warmRecord?.threadId ?? null) : null,
+      sandboxEpoch,
     );
     for (const entry of pendingProtocol) {
       session.recordProtocol(entry);
@@ -189,6 +209,8 @@ class CodexWarmSession {
     return handleCodexServerRequest(
       current.context,
       current.turnParent,
+      current.registry,
+      current.approvals,
       request,
     );
   }
@@ -198,29 +220,60 @@ const codexSessions = new WarmResourceCache<CodexWarmSession>();
 
 export default defineHarness({
   async runTurn(context) {
-    const modelBinding = await resolveLlmBinding(context);
-    const runtime = ResponsesRuntime.fromModelBinding(
-      context.agentConfig,
-      modelBinding,
-    );
-    await runtime.runTurn(context, (turnParent) =>
-      runCodexTurn(context, turnParent, modelBinding),
-    );
+    await runCodexHarnessTurn(context);
   },
 });
+
+// Exported so other harnesses can run the codex executor with their own
+// instructions and tools (see coding-executor-harness). A reused warm thread
+// keeps the instructions and dynamic tools it was started with.
+export async function runCodexHarnessTurn(
+  context: TurnContext,
+  options: CodingExecutorTurnOptions = {},
+): Promise<void> {
+  const modelBinding = await resolveLlmBinding(context);
+  const runtime = ResponsesRuntime.fromModelBinding(
+    context.agentConfig,
+    modelBinding,
+  );
+  await runtime.runTurn(context, (turnParent) =>
+    runCodexTurn(context, turnParent, modelBinding, options),
+  );
+}
 
 async function runCodexTurn(
   context: TurnContext,
   turnParent: TraceParent,
   modelBinding: ResolvedLlmBinding,
+  options: CodingExecutorTurnOptions,
 ): Promise<string | null> {
   await requireCodexSandboxNetworking(context);
 
   const { turn } = context.exoharness.current;
   const protocolLog = new CodexProtocolEventBuffer(context);
-  const scope: CodexWarmTurnScope = { context, protocolLog, turnParent };
+  const registry = await injectedToolRegistry(context, options.registerTools);
+  const developerInstructions = options.instructions
+    ? instructionsText(await options.instructions(context)) || null
+    : codexDeveloperInstructions(context);
+  const scope: CodexWarmTurnScope = {
+    context,
+    protocolLog,
+    turnParent,
+    registry,
+    approvals: options.approvals ?? "auto",
+  };
   const sessionKey = codexWarmSessionKey(context, modelBinding);
   const sandboxRuntime = codexSandboxRuntimeKey(context);
+  // A rewind restarts the sandbox and kills every process in it, which the
+  // warm cache cannot see; a cached session would fail mid-turn. Compare
+  // against the newest sandbox_started event and start fresh when it moved.
+  // (A rewind from another conversation is invisible here; the error path
+  // below still recovers on the following turn.)
+  const sandboxEpoch = await latestSandboxStartedEventId(
+    context.exoharness.current.conversation,
+  );
+  const startSession = () =>
+    CodexWarmSession.start(scope, modelBinding, sessionKey, sandboxEpoch);
   const { resource: session, reused: appServerReused } = await traceCodexTask(
     turnParent,
     "codex_app_server_ready",
@@ -230,10 +283,20 @@ async function runCodexTurn(
       sandbox_runtime: sandboxRuntime,
       warm_session_key: sessionKey,
     },
-    () =>
-      codexSessions.get(sessionKey, () =>
-        CodexWarmSession.start(scope, modelBinding, sessionKey),
-      ),
+    async () => {
+      const cached = await codexSessions.get(sessionKey, startSession);
+      if (cached.resource.sandboxEpoch === sandboxEpoch) {
+        return cached;
+      }
+      await appendCustomEvent(turn, "codex_warm_session_invalidated", {
+        metadata: turnMetadata(context),
+        warm_session_key: sessionKey,
+        stale_epoch: cached.resource.sandboxEpoch,
+        sandbox_epoch: sandboxEpoch,
+      });
+      codexSessions.delete(sessionKey, (stale) => stale.close());
+      return codexSessions.get(sessionKey, startSession);
+    },
   );
   session.setTurnScope(scope);
 
@@ -259,7 +322,14 @@ async function runCodexTurn(
           cwd: codexAppServerCwd(context),
           external_sandbox: useCodexExternalSandbox(),
         },
-        () => startCodexThread(session.server, context, modelBinding),
+        () =>
+          startCodexThread(
+            session.server,
+            context,
+            modelBinding,
+            registry,
+            developerInstructions,
+          ),
       ));
     session.threadId = threadId;
     await recordCodexWarmSession(
@@ -501,15 +571,16 @@ async function startCodexThread(
   codex: CodexAppServer,
   context: TurnContext,
   modelBinding: ResolvedLlmBinding,
+  registry: HarnessToolRegistry,
+  developerInstructions: string | null,
 ): Promise<string> {
-  const developerInstructions = codexDeveloperInstructions(context);
   const request: JsonObject = {
     model: modelBinding.model,
     modelProvider: "openai",
     cwd: codexAppServerCwd(context),
     approvalPolicy: "on-request",
     sandbox: "read-only",
-    dynamicTools: buildCodexDynamicTools(context),
+    dynamicTools: buildCodexDynamicTools(context, registry),
     ephemeral: true,
     experimentalRawEvents: true,
     persistFullHistory: true,
@@ -523,6 +594,18 @@ async function startCodexThread(
     throw new Error("codex thread/start response did not include thread.id");
   }
   return thread.id;
+}
+
+// Exported for tests.
+export async function latestSandboxStartedEventId(
+  conversation: Pick<Conversation, "getEvents">,
+): Promise<string | null> {
+  const result = await conversation.getEvents({
+    direction: "desc",
+    limit: 1,
+    types: ["sandbox_started"],
+  });
+  return result.events[0]?.id ?? null;
 }
 
 async function latestCodexWarmSession(
@@ -599,29 +682,49 @@ function codexWarmSessionRecord(
 async function handleCodexServerRequest(
   context: TurnContext,
   turnParent: TraceParent,
+  registry: HarnessToolRegistry,
+  approvals: CodingApprovalPolicy,
   request: CodexServerRequest,
 ): Promise<JsonValue | undefined> {
-  if (
-    useCodexExternalSandbox() &&
-    request.method === "item/commandExecution/requestApproval"
-  ) {
-    return { decision: "accept" };
+  const decision = codexApprovalDecision(approvals, request.method);
+  if (decision !== undefined) {
+    await appendCustomEvent(context.exoharness.current.turn, "codex_approval", {
+      metadata: turnMetadata(context),
+      method: request.method,
+      params: toJsonValue(request.params ?? null),
+      policy: approvals,
+      response: decision,
+    });
+    return decision;
   }
   if (request.method !== "item/tool/call") {
     return undefined;
   }
-  return executeDynamicToolCall(context, turnParent, asRecord(request.params));
+  return executeDynamicToolCall(
+    context,
+    turnParent,
+    registry,
+    asRecord(request.params),
+  );
 }
 
 async function executeDynamicToolCall(
   context: TurnContext,
   turnParent: TraceParent,
+  registry: HarnessToolRegistry,
   params: Record<string, unknown>,
 ): Promise<JsonValue> {
   const callId = stringOrNull(params.callId) ?? "dynamic-tool-call";
   const toolName = stringOrNull(params.tool);
   if (toolName !== EXO_SHELL_DYNAMIC_TOOL) {
-    return dynamicToolErrorResponse(`unsupported dynamic tool: ${toolName}`);
+    return executeRegistryDynamicToolCall(
+      context,
+      turnParent,
+      registry,
+      callId,
+      toolName,
+      asRecord(params.arguments),
+    );
   }
 
   const args = asRecord(params.arguments);
@@ -657,6 +760,37 @@ async function executeDynamicToolCall(
     ]);
     return dynamicToolErrorResponse(message);
   }
+}
+
+async function executeRegistryDynamicToolCall(
+  context: TurnContext,
+  turnParent: TraceParent,
+  registry: HarnessToolRegistry,
+  callId: string,
+  toolName: string | null,
+  args: Record<string, unknown>,
+): Promise<JsonValue> {
+  if (!toolName || !registry.get(toolName)) {
+    return dynamicToolErrorResponse(`unsupported dynamic tool: ${toolName}`);
+  }
+  const toolCall: PendingToolCall = {
+    toolCallId: callId,
+    request: {
+      functionName: toolName,
+      arguments: objectArgs(args),
+    },
+  };
+  await appendEvents(context, [toolRequestedEvent(toolCall)]);
+  const { result, ok, events } = await callRegistryTool(registry, toolCall);
+  await appendEvents(context, events);
+  await traceObservedToolCall(
+    context,
+    turnParent,
+    toolCall,
+    result,
+    "codex_dynamic_tool",
+  );
+  return dynamicToolResultResponse(stringifyValue(result), { success: ok });
 }
 
 async function handleCodexNotification(
@@ -995,14 +1129,21 @@ function codexDeveloperInstructions(context: TurnContext): string | null {
   return instructionsText(context.agentConfig.instructions) || null;
 }
 
-function buildCodexDynamicTools(context: TurnContext): JsonValue[] {
+function buildCodexDynamicTools(
+  context: TurnContext,
+  registry: HarnessToolRegistry,
+): JsonValue[] {
+  const registryTools = injectedToolDefinitions(registry).map((definition) =>
+    toJsonValue({ ...definition }),
+  );
   if (useCodexExternalSandbox()) {
-    return [];
+    return registryTools;
   }
   if (!context.conversationConfig.shellProgram) {
-    return [];
+    return registryTools;
   }
   return [
+    ...registryTools,
     {
       name: EXO_SHELL_DYNAMIC_TOOL,
       description: `Run a shell command through the exoharness sandbox. Commands execute from ${sandboxCwd(context)}. Use this for command execution in exo conversations.`,

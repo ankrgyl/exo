@@ -5,6 +5,7 @@ import {
   toJsonValue,
   turnMetadata,
   type EventData,
+  type HarnessToolRegistry,
   type JsonObject,
   type JsonValue,
   type Message,
@@ -19,6 +20,19 @@ import {
 } from "@exo/model-runtime/responses";
 
 export { projectAnthropicMessageToolEvents } from "@exo/harness";
+
+// Options for the coding-agent harness entry points. `instructions` replaces
+// agentConfig.instructions as the executor's system/developer prompt;
+// `registerTools` replaces the default tool-module registry. Codex warm
+// threads snapshot both at thread start. `approvals` defaults to "auto".
+export interface CodingExecutorTurnOptions {
+  instructions?: (context: TurnContext) => Message[] | Promise<Message[]>;
+  registerTools?: (
+    tools: HarnessToolRegistry,
+    context: TurnContext,
+  ) => Promise<void> | void;
+  approvals?: import("./executor-approvals").CodingApprovalPolicy;
+}
 
 export interface TextDeltaTraceState {
   startedAt: number;

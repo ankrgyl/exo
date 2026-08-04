@@ -22,6 +22,7 @@ import {
   systemTextMessage,
   toJsonValue,
   turnMetadata,
+  type HarnessToolRegistry,
   type JsonValue,
   type Message,
   type PendingToolCall,
@@ -38,14 +39,21 @@ import {
   appendEvents,
   appendAndTraceObservedToolEvents,
   asRecord,
+  instructionsText,
   markFirstTextDelta,
   pickEnv,
   pickEnvFrom,
   projectAnthropicMessageToolEvents,
   resolveLlmBinding,
   sandboxCwd,
+  type CodingExecutorTurnOptions,
   type ResolvedLlmBinding,
 } from "./shared";
+import { injectedToolRegistry, registryMcpServer } from "./registry-tools";
+import {
+  claudePermissionResult,
+  type CodingApprovalPolicy,
+} from "./executor-approvals";
 
 const DEFAULT_CLAUDE_CODE_SANDBOX_EXECUTABLE = "/usr/local/bin/claude-code";
 const CLAUDE_RESULT_GRACE_MS = 5_000;
@@ -68,23 +76,36 @@ interface ClaudeTraceState {
 
 export default defineHarness({
   async runTurn(context) {
-    const modelBinding = await resolveLlmBinding(context);
-    const runtime = ResponsesRuntime.fromModelBinding(
-      context.agentConfig,
-      modelBinding,
-    );
-    await runtime.runTurn(context, (turnParent) =>
-      runClaudeCodeTurn(context, turnParent, modelBinding),
-    );
+    await runClaudeCodeHarnessTurn(context);
   },
 });
+
+// Exported so other harnesses can run the Claude Code executor with their own
+// instructions and tools (see coding-executor-harness).
+export async function runClaudeCodeHarnessTurn(
+  context: TurnContext,
+  options: CodingExecutorTurnOptions = {},
+): Promise<void> {
+  const modelBinding = await resolveLlmBinding(context);
+  const runtime = ResponsesRuntime.fromModelBinding(
+    context.agentConfig,
+    modelBinding,
+  );
+  await runtime.runTurn(context, (turnParent) =>
+    runClaudeCodeTurn(context, turnParent, modelBinding, options),
+  );
+}
 
 async function runClaudeCodeTurn(
   context: TurnContext,
   turnParent: TraceParent,
   modelBinding: ResolvedLlmBinding,
+  options: CodingExecutorTurnOptions,
 ): Promise<string | null> {
-  const systemPrompt = claudeSystemPrompt(context);
+  const systemPrompt = options.instructions
+    ? instructionsText(await options.instructions(context)) || null
+    : claudeSystemPrompt(context);
+  const registry = await injectedToolRegistry(context, options.registerTools);
   const state: ClaudeTraceState = {
     startedAt: Date.now(),
     finalText: "",
@@ -121,7 +142,13 @@ async function runClaudeCodeTurn(
         await consumeClaudeQuery(
           query({
             prompt: claudePromptInput(claudePrompt(state.promptMessages)),
-            options: claudeOptions(context, state.systemPrompt, modelBinding),
+            options: claudeOptions(
+              context,
+              state.systemPrompt,
+              modelBinding,
+              registry,
+              options.approvals ?? "auto",
+            ),
           }),
           context,
           turnParent,
@@ -283,6 +310,8 @@ function claudeOptions(
   context: TurnContext,
   systemPrompt: string | null,
   modelBinding: ResolvedLlmBinding,
+  registry: HarnessToolRegistry,
+  approvals: CodingApprovalPolicy,
 ): Options {
   const options: Options = {
     model: modelBinding.model,
@@ -293,7 +322,35 @@ function claudeOptions(
     pathToClaudeCodeExecutable: claudeSandboxExecutable(),
     spawnClaudeCodeProcess: (options) =>
       new SandboxClaudeCodeProcess(context, options),
+    // Without a handler a permission prompt stalls the CLI until the startup
+    // timeout. Denies are recorded; allows are already visible as observed
+    // tool events.
+    permissionMode: "default",
+    canUseTool: async (toolName, _input, { toolUseID }) => {
+      const result = claudePermissionResult(approvals, toolName);
+      if (result.behavior === "deny") {
+        await appendCustomEvent(
+          context.exoharness.current.turn,
+          "claude_tool_permission",
+          {
+            metadata: turnMetadata(context),
+            tool: toolName,
+            tool_use_id: toolUseID,
+            policy: approvals,
+            decision: result.behavior,
+          },
+        );
+      }
+      return result;
+    },
   };
+  if (registry.definitions().length > 0) {
+    // The MCP server runs in this host process, so registry tools execute on
+    // the host while the CLI runs in the sandbox.
+    options.mcpServers = {
+      exo: { type: "sdk", name: "exo", instance: registryMcpServer(registry) },
+    };
+  }
   if (systemPrompt) {
     return { ...options, systemPrompt };
   }
