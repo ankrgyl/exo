@@ -86,6 +86,39 @@ export function computeCostUsd(
   );
 }
 
+// Why a usage record does or does not carry a cost. Recorded alongside the
+// usage so an absent `cost_usd` is diagnosable: without it, "the table never
+// loaded", "the model is not in the table", and "this call was free" all look
+// identical after the fact.
+export type CostStatus =
+  | "priced"
+  | "table_unavailable"
+  | "model_not_found"
+  | "model_not_priced";
+
+export interface PricedUsage {
+  costUsd: number | null;
+  status: CostStatus;
+}
+
+export function priceUsage(
+  table: PricingTable | null,
+  model: string,
+  tokens: TokenCounts,
+): PricedUsage {
+  if (!table) {
+    return { costUsd: null, status: "table_unavailable" };
+  }
+  const entry = lookup(table, model);
+  if (!entry) {
+    return { costUsd: null, status: "model_not_found" };
+  }
+  const costUsd = computeCostUsd(table, model, tokens);
+  return costUsd == null
+    ? { costUsd: null, status: "model_not_priced" }
+    : { costUsd, status: "priced" };
+}
+
 function isAdditive(provider?: string): boolean {
   return (
     provider != null &&

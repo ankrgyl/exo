@@ -36,7 +36,7 @@ import {
   type ToolDefinition,
   type TurnContext,
 } from "../harness";
-import { computeCostUsd, getTable } from "./cost";
+import { getTable, priceUsage } from "./cost";
 import type {
   ChatCompletion,
   ChatCompletionChunk,
@@ -1170,7 +1170,7 @@ export function responseToLinguaEvents(response: Response): EventData[] {
 }
 
 // Policy: attach raw usage + cost to the messages event. cost_usd is filled from
-// the shared price cache; left unset if the cache is unavailable.
+// the shared price cache; cost_status always records why it is or is not there.
 function usageRecord(response: Response): JsonObject | undefined {
   const usage = response.usage;
   if (!usage) return undefined;
@@ -1178,17 +1178,19 @@ function usageRecord(response: Response): JsonObject | undefined {
   const completion = usage.output_tokens;
   const cached = usage.input_tokens_details?.cached_tokens;
   const reasoning = usage.output_tokens_details?.reasoning_tokens;
-  const table = getTable();
-  const cost = table
-    ? computeCostUsd(table, response.model, { prompt, completion, cached })
-    : null;
+  const { costUsd, status } = priceUsage(getTable(), response.model, {
+    prompt,
+    completion,
+    cached,
+  });
 
   const record: JsonObject = { model: response.model };
   if (prompt != null) record.prompt_tokens = prompt;
   if (completion != null) record.completion_tokens = completion;
   if (cached != null) record.prompt_cached_tokens = cached;
   if (reasoning != null) record.completion_reasoning_tokens = reasoning;
-  if (cost != null) record.cost_usd = cost;
+  if (costUsd != null) record.cost_usd = costUsd;
+  record.cost_status = status;
   return record;
 }
 

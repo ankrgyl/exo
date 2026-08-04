@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { computeCostUsd, lookup, parseTable } from "./cost";
+import { computeCostUsd, lookup, parseTable, priceUsage } from "./cost";
 
 const FIXTURE = `{
   "sample_spec": { "comment": "ignored" },
@@ -71,5 +71,52 @@ describe("cost", () => {
     expect(
       computeCostUsd(table, "acme-llm-9000", { prompt: 100, completion: 50 }),
     ).toBeNull();
+  });
+});
+
+const UNPRICED = parseTable(`{
+  "listed-but-unpriced": { "litellm_provider": "openai" },
+  "openrouter/xiaomi/mimo-v2.5-pro": {
+    "litellm_provider": "openrouter", "input_cost_per_token": 1e-07,
+    "output_cost_per_token": 4e-07
+  }
+}`);
+
+describe("priceUsage", () => {
+  const tokens = { prompt: 100, completion: 50 };
+
+  it("prices a known model", () => {
+    const priced = priceUsage(table, "gpt-4o-mini", tokens);
+    expect(priced.status).toBe("priced");
+    expect(priced.costUsd).toBeGreaterThan(0);
+  });
+
+  it("reports an unavailable table separately from a miss", () => {
+    expect(priceUsage(null, "gpt-4o-mini", tokens)).toEqual({
+      costUsd: null,
+      status: "table_unavailable",
+    });
+    expect(priceUsage(table, "acme-llm-9000", tokens)).toEqual({
+      costUsd: null,
+      status: "model_not_found",
+    });
+  });
+
+  it("reports a listed model with no input rate", () => {
+    expect(priceUsage(UNPRICED, "listed-but-unpriced", tokens)).toEqual({
+      costUsd: null,
+      status: "model_not_priced",
+    });
+  });
+
+  it("does not match a bare name against a provider-qualified key", () => {
+    // lookup is prefix-based, so a locally registered alias never resolves to
+    // the provider-qualified entry that actually carries the rate.
+    expect(priceUsage(UNPRICED, "mimo-v2.5-pro", tokens).status).toBe(
+      "model_not_found",
+    );
+    expect(
+      priceUsage(UNPRICED, "openrouter/xiaomi/mimo-v2.5-pro", tokens).status,
+    ).toBe("priced");
   });
 });
