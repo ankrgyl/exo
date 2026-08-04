@@ -53,6 +53,7 @@ import {
 } from "../protocol";
 import {
   type FeishuTriggerPolicy,
+  feishuSendUuid,
   parseInboundEvent,
   receiveIdTypeForTarget,
 } from "./feishu";
@@ -170,7 +171,7 @@ for await (const line of input) {
         "the Feishu adapter does not support attachments yet; send text only",
       );
     }
-    await sendText(target, command.text);
+    await sendText(target, command.text, command.id);
     writeWorkerEvent({ type: "command_ack", command_id: command.id });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -215,13 +216,23 @@ function feishuTrigger(value: string): FeishuTriggerPolicy {
   return value;
 }
 
-async function sendText(target: string, text: string): Promise<void> {
+// Outbound delivery is at-least-once: a message claimed but not acked before
+// the worker dies is requeued and sent again. The runtime keeps the same
+// message id across those attempts, and Feishu dedupes by `uuid` for an hour,
+// so passing the id through turns a redelivery into a no-op on their side
+// instead of a second message in the chat.
+async function sendText(
+  target: string,
+  text: string,
+  deliveryId: string,
+): Promise<void> {
   const response = await client.im.message.create({
     params: { receive_id_type: receiveIdTypeForTarget(target) },
     data: {
       receive_id: target,
       msg_type: "text",
       content: JSON.stringify({ text }),
+      uuid: feishuSendUuid(deliveryId),
     },
   });
   if ((response.code ?? 0) !== 0) {

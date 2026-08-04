@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { parseInboundEvent, receiveIdTypeForTarget } from "./feishu";
+import {
+  feishuSendUuid,
+  parseInboundEvent,
+  receiveIdTypeForTarget,
+} from "./feishu";
 
 function textMessage(
   overrides: Record<string, unknown> = {},
@@ -124,5 +128,22 @@ describe("Feishu outbound targets", () => {
   it("picks the receive id type from the target prefix", () => {
     expect(receiveIdTypeForTarget("ou_alice")).toBe("open_id");
     expect(receiveIdTypeForTarget("oc_group")).toBe("chat_id");
+  });
+});
+
+describe("Feishu send idempotency key", () => {
+  it("passes a delivery id through unchanged", () => {
+    const deliveryId = "019f6453-6208-7a41-9c2e-4f1d3b8a5c07";
+    expect(feishuSendUuid(deliveryId)).toBe(deliveryId);
+  });
+
+  it("is stable for the same delivery id, so a redelivery reuses the key", () => {
+    expect(feishuSendUuid("019f6453-6208-7a41-9c2e-4f1d3b8a5c07")).toBe(
+      feishuSendUuid("019f6453-6208-7a41-9c2e-4f1d3b8a5c07"),
+    );
+  });
+
+  it("stays inside Feishu's 50-character limit", () => {
+    expect(feishuSendUuid("x".repeat(80))).toHaveLength(50);
   });
 });

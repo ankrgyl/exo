@@ -65,6 +65,16 @@ export function receiveIdTypeForTarget(target: string): "open_id" | "chat_id" {
   return target.startsWith("ou_") ? "open_id" : "chat_id";
 }
 
+// Feishu's idempotency key for message sends. Requests sharing a uuid deliver
+// at most one message per hour, which is what makes a redelivery safe. The
+// runtime's outbound message id is stable across delivery attempts, so it is
+// the right value; Feishu caps the field at 50 characters.
+const FEISHU_SEND_UUID_MAX_CHARS = 50;
+
+export function feishuSendUuid(deliveryId: string): string {
+  return deliveryId.slice(0, FEISHU_SEND_UUID_MAX_CHARS);
+}
+
 function extractText(message: Record<string, unknown>): string | null {
   // Text messages carry message.content as a JSON string like
   // {"text":"hello @_user_1 world"}. Mention placeholders are left in the text
