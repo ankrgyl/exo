@@ -871,6 +871,7 @@ pub enum BindingType {
     Env,
     Mcp,
     Llm,
+    Provider,
     Sandbox,
 }
 
@@ -913,12 +914,87 @@ pub enum Binding {
         model: String,
         base_url: Option<String>,
         secret_id: Option<SecretId>,
+        /// Name of a `Binding::Provider` this model routes through. When set,
+        /// the provider record supplies the base URL, credential, and wire
+        /// format unless overridden on this binding.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
+    /// A registered model provider: an OpenAI-compatible gateway or vendor
+    /// endpoint described entirely as data, so support for it does not have
+    /// to live in harness code.
+    Provider {
+        name: String,
+        base_url: String,
+        secret_id: Option<SecretId>,
+        /// Wire format the provider speaks.
+        format: WireFormat,
+        /// How the credential is sent. Absent = derived from the wire format
+        /// (`x-api-key` for anthropic, `Bearer` otherwise). Auth scheme and
+        /// wire format are independent: e.g. some gateways speak the
+        /// Anthropic format but authenticate with `Bearer`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<AuthScheme>,
+        /// Models the provider serves. Validated (with suggestions) when a
+        /// model binding is registered; the provider stays authoritative at
+        /// request time.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        models: Vec<String>,
+        /// Path under the response `usage` object where the provider reports
+        /// authoritative spend in USD (cost is not part of the standard chat
+        /// completions schema, so each provider extends it differently —
+        /// e.g. `["cost"]` for OpenRouter, `["opper", "cost", "total"]` for
+        /// Opper).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usage_path: Option<Vec<String>>,
     },
     /// How to reach a remote sandbox provider.
     Sandbox {
         name: String,
         config: SandboxProviderConfig,
     },
+}
+
+impl Binding {
+    /// Invariants that hold regardless of which surface created the binding
+    /// (CLI, HTTP API, or harness protocol).
+    pub fn validate(&self) -> Result<()> {
+        if let Binding::Provider {
+            base_url,
+            format: WireFormat::Anthropic,
+            ..
+        } = self
+            && base_url.trim_end_matches('/').ends_with("/v1")
+        {
+            anyhow::bail!(
+                "for the anthropic format, register the provider root without /v1 \
+                 (clients append their own /v1/... path)"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Wire format a registered model provider speaks.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WireFormat {
+    #[default]
+    ChatCompletions,
+    Responses,
+    Anthropic,
+}
+
+/// How a registered model provider authenticates requests.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthScheme {
+    /// `Authorization: Bearer <key>`.
+    Bearer,
+    /// `x-api-key: <key>` (native Anthropic style).
+    XApiKey,
+    /// No credential is sent (e.g. a local endpoint).
+    None,
 }
 
 /// Per-provider sandbox config for a `Binding::Sandbox`.

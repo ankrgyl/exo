@@ -726,8 +726,15 @@ function claudeSandboxBaseEnv(
       key === "BRAINTRUST_API_URL"
     );
   });
-  if (modelBinding.apiKey) {
-    env.ANTHROPIC_API_KEY = modelBinding.apiKey;
+  // Honor the provider's declared auth scheme: bearer credentials go to
+  // ANTHROPIC_AUTH_TOKEN (e.g. gateways like Opper), x-api-key credentials to
+  // ANTHROPIC_API_KEY, and an unauthenticated provider exports neither.
+  if (modelBinding.apiKey && modelBinding.auth !== "none") {
+    if (modelBinding.auth === "bearer") {
+      env.ANTHROPIC_AUTH_TOKEN = modelBinding.apiKey;
+    } else {
+      env.ANTHROPIC_API_KEY = modelBinding.apiKey;
+    }
   }
   if (modelBinding.baseUrl) {
     env.ANTHROPIC_BASE_URL = modelBinding.baseUrl;

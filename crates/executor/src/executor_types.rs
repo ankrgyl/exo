@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use exoharness::{
-    AgentHandle, ConversationHandle, DurableFileSystem, EventId, FileSystemMount, ResponseId,
-    Result, SandboxProvider, SessionId, ToolArguments, ToolCallId, ToolRequest, ToolResult,
-    TurnHandle, TurnId,
+    AgentHandle, AuthScheme, ConversationHandle, DurableFileSystem, EventId, FileSystemMount,
+    ResponseId, Result, SandboxProvider, SessionId, ToolArguments, ToolCallId, ToolRequest,
+    ToolResult, TurnHandle, TurnId, WireFormat,
 };
 use lingua::{Message, UniversalStreamChunk, UniversalUsage};
 use serde::{Deserialize, Serialize};
@@ -190,9 +190,26 @@ pub struct ModelRequest {
     pub model: String,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
+    /// Registered provider this request routes through, when the model binding
+    /// references one. Its declared wire format is authoritative and skips the
+    /// model-name / base-URL detection heuristics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ModelRequestProvider>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
     pub max_output_tokens: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelRequestProvider {
+    pub name: String,
+    pub format: WireFormat,
+    /// Auth scheme override; absent = derived from the wire format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthScheme>,
+    /// Where the provider reports spend under the response `usage` object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usage_path: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

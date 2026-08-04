@@ -2248,3 +2248,86 @@ async fn daytona_sandbox_binding_drives_provider_config() {
     assert_eq!(config.organization_id.as_deref(), Some("org-1"));
     assert_eq!(config.api_url, crate::DEFAULT_DAYTONA_API_URL);
 }
+
+#[test]
+fn provider_binding_serde_round_trips_with_stable_wire_shape() {
+    let binding = crate::Binding::Provider {
+        name: "opper".to_string(),
+        base_url: "https://api.opper.ai/v3/compat".to_string(),
+        secret_id: None,
+        format: crate::WireFormat::ChatCompletions,
+        auth: Some(crate::AuthScheme::Bearer),
+        models: vec!["openai/gpt-5.6-terra".to_string()],
+        cost_usage_path: Some(vec![
+            "opper".to_string(),
+            "cost".to_string(),
+            "total".to_string(),
+        ]),
+    };
+
+    let serialized = serde_json::to_value(&binding).expect("provider binding serializes");
+    assert_eq!(serialized["type"], "provider");
+    assert_eq!(serialized["format"], "chat-completions");
+    assert_eq!(serialized["auth"], "bearer");
+    assert_eq!(serialized["cost_usage_path"][2], "total");
+    assert_eq!(serialized["models"][0], "openai/gpt-5.6-terra");
+
+    let deserialized: crate::Binding =
+        serde_json::from_value(serialized).expect("provider binding deserializes");
+    assert_eq!(deserialized, binding);
+
+    // Model bindings without the new provider field keep deserializing.
+    let legacy: crate::Binding = serde_json::from_str(
+        r#"{"type":"llm","name":"m","model":"m","base_url":null,"secret_id":null}"#,
+    )
+    .expect("legacy llm binding deserializes");
+    let crate::Binding::Llm { provider, .. } = legacy else {
+        panic!("expected llm binding");
+    };
+    assert!(provider.is_none());
+}
+
+#[test]
+fn provider_binding_validation_rejects_v1_suffixed_anthropic_roots() {
+    let binding = |base_url: &str, format: crate::WireFormat| crate::Binding::Provider {
+        name: "p".to_string(),
+        base_url: base_url.to_string(),
+        secret_id: None,
+        format,
+        auth: Some(crate::AuthScheme::Bearer),
+        models: Vec::new(),
+        cost_usage_path: None,
+    };
+
+    // Enforced at the binding boundary, so programmatic PutBinding (HTTP or
+    // harness protocol) cannot store a record the runtimes would mangle.
+    let error = binding(
+        "https://api.opper.ai/v3/compat/v1",
+        crate::WireFormat::Anthropic,
+    )
+    .validate()
+    .expect_err("v1-suffixed anthropic root should be rejected");
+    assert!(error.to_string().contains("without /v1"));
+    assert!(
+        binding(
+            "https://api.opper.ai/v3/compat/v1/",
+            crate::WireFormat::Anthropic
+        )
+        .validate()
+        .is_err()
+    );
+
+    // Roots pass, and /v1 is fine for non-anthropic formats (e.g. OpenRouter).
+    binding(
+        "https://api.opper.ai/v3/compat",
+        crate::WireFormat::Anthropic,
+    )
+    .validate()
+    .expect("root should validate");
+    binding(
+        "https://openrouter.ai/api/v1",
+        crate::WireFormat::ChatCompletions,
+    )
+    .validate()
+    .expect("openai-format /v1 roots are legitimate");
+}

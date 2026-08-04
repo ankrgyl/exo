@@ -14,6 +14,7 @@ use lingua::universal::{
 use serde::{Deserialize, Serialize};
 
 use crate::ConversationModelConfig;
+use crate::executor_types::ModelRequestProvider;
 
 pub(crate) const CONVERSATION_MODEL_CONFIG_EVENT_TYPE: &str = "conversation_model_config";
 
@@ -192,17 +193,18 @@ pub(crate) struct ResolvedModelBinding {
     pub(crate) model: String,
     pub(crate) api_key: Option<String>,
     pub(crate) base_url: Option<String>,
+    pub(crate) provider: Option<ModelRequestProvider>,
 }
 
 pub(crate) async fn resolve_model_binding(
     conversation: &dyn ConversationHandle,
     name: &str,
 ) -> Result<ResolvedModelBinding> {
-    let binding_record = conversation
-        .list_bindings()
-        .await?
-        .into_iter()
+    let bindings = conversation.list_bindings().await?;
+    let binding_record = bindings
+        .iter()
         .find(|binding| binding.name == name)
+        .cloned()
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "model is not registered: {name}; run `exo model register {name} --secret <secret>`"
@@ -212,10 +214,50 @@ pub(crate) async fn resolve_model_binding(
         model,
         base_url,
         secret_id,
+        provider,
         ..
     } = binding_record.binding
     else {
         return Err(anyhow::anyhow!("binding is not a model: {name}"));
+    };
+    // A referenced provider record supplies base URL, credential, and wire
+    // format; explicit values on the model binding win over the provider's.
+    let (base_url, secret_id, provider) = match provider {
+        Some(provider_name) => {
+            let mut found = None;
+            for record in bindings {
+                if record.name == provider_name
+                    && let Binding::Provider {
+                        base_url,
+                        secret_id,
+                        format,
+                        auth,
+                        cost_usage_path,
+                        ..
+                    } = record.binding
+                {
+                    found = Some((base_url, secret_id, format, auth, cost_usage_path));
+                }
+            }
+            let (provider_base_url, provider_secret_id, format, auth, cost_usage_path) = found
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "model {name} references provider {provider_name}, which is not \
+                         registered; run `exo model provider register {provider_name} ...`"
+                    )
+                })?;
+            (
+                base_url.or(Some(provider_base_url)),
+                secret_id.or(provider_secret_id),
+                Some(ModelRequestProvider {
+                    name: provider_name,
+                    format,
+                    auth,
+                    cost_usage_path,
+                }),
+            )
+        }
+        None => (base_url, secret_id, None),
     };
     let api_key = match secret_id {
         Some(secret_id) => {
@@ -238,6 +280,7 @@ pub(crate) async fn resolve_model_binding(
         model,
         api_key,
         base_url,
+        provider,
     })
 }
 

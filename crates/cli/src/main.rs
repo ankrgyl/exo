@@ -6,6 +6,8 @@ mod env_tests;
 mod mount_tests;
 #[cfg(test)]
 mod naming_tests;
+#[cfg(test)]
+mod provider_tests;
 mod render;
 #[cfg(test)]
 mod repl_tests;
@@ -25,20 +27,20 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow, bail};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use executor::{
-    AgentHarnessKind, AttachSandboxRequest, BasicExoHarness, BasicExoHarnessConfig, BasicHarness,
-    BasicToolRuntime, Binding, BraintrustProject, BraintrustRuntimeConfig, BraintrustTracingConfig,
-    ConversationModelConfig, CreateAgentRequest, CreateConversationRequest, DaytonaBackendSpec,
-    E2bBackendSpec, EventKind, EventQuery, EventQueryDirection, ExoHarness,
-    ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount, FileSystemMountMode,
-    ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART, HTTP_EXOHARNESS_TRACING_TARGET,
-    Harness, HarnessAgent, HarnessConversation, HttpExoHarness, LocalSandboxExoHarness,
-    PutSecretRequest, RlmHarness, SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment,
-    SandboxBackendRegistration, SandboxProvider, SandboxProviderConfig, SandboxScope, Secret,
-    SecretBackendChoice, SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness,
-    TypeScriptHarnessConfig, Uuid7, VercelBackendSpec, default_aws_agentcore_image,
-    default_daytona_image, default_docker_image, default_e2b_template, default_vercel_image,
-    effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config, record_host_event,
-    send_conversation_wakeup, serve_exoharness_http_listener_with_options,
+    AgentHarnessKind, AttachSandboxRequest, AuthScheme, BasicExoHarness, BasicExoHarnessConfig,
+    BasicHarness, BasicToolRuntime, Binding, BraintrustProject, BraintrustRuntimeConfig,
+    BraintrustTracingConfig, ConversationModelConfig, CreateAgentRequest,
+    CreateConversationRequest, DaytonaBackendSpec, E2bBackendSpec, EventKind, EventQuery,
+    EventQueryDirection, ExoHarness, ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount,
+    FileSystemMountMode, ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART,
+    HTTP_EXOHARNESS_TRACING_TARGET, Harness, HarnessAgent, HarnessConversation, HttpExoHarness,
+    LocalSandboxExoHarness, PutSecretRequest, RlmHarness, SANDBOX_MAIN_MOUNT_DIR,
+    SandboxAttachment, SandboxBackendRegistration, SandboxProvider, SandboxProviderConfig,
+    SandboxScope, Secret, SecretBackendChoice, SpritesBackendSpec, ToolRequest, ToolRuntime,
+    TypeScriptHarness, TypeScriptHarnessConfig, Uuid7, VercelBackendSpec, WireFormat,
+    default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
+    default_vercel_image, effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config,
+    record_host_event, send_conversation_wakeup, serve_exoharness_http_listener_with_options,
 };
 use serde::Deserialize;
 use tabwriter::TabWriter;
@@ -687,11 +689,99 @@ enum ModelCommands {
         name: String,
         #[arg(long)]
         model: Option<String>,
+        /// Secret holding the API key. Optional when --provider is set (the
+        /// provider's credential is used).
         #[arg(long)]
-        secret: String,
+        secret: Option<String>,
         #[arg(long)]
         base_url: Option<String>,
+        /// Registered model provider to route through (see `exo model provider`).
+        #[arg(long)]
+        provider: Option<String>,
     },
+    /// Register and list model providers (gateways/vendors described as data).
+    Provider {
+        #[command(subcommand)]
+        command: ModelProviderCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelProviderCommands {
+    List,
+    Register {
+        name: String,
+        #[arg(long)]
+        base_url: String,
+        /// Secret (by name) holding the provider API key. Required unless
+        /// --auth none.
+        #[arg(long)]
+        secret: Option<String>,
+        /// Wire format the provider speaks.
+        #[arg(long, value_enum, default_value = "chat-completions")]
+        format: WireFormatArg,
+        /// How the credential is sent (default: the format's native scheme —
+        /// x-api-key for anthropic, bearer otherwise). Auth and wire format
+        /// are independent: some gateways speak the Anthropic format but
+        /// authenticate with Bearer.
+        #[arg(long, value_enum)]
+        auth: Option<AuthSchemeArg>,
+        /// Comma-separated model ids the provider serves. Validated (with
+        /// suggestions) when registering a model; the provider stays
+        /// authoritative at request time.
+        #[arg(long, value_delimiter = ',')]
+        models: Vec<String>,
+        /// Fetch the provider's model list from {base_url}/models (the
+        /// standard OpenAI-compatible discovery endpoint).
+        #[arg(long)]
+        discover: bool,
+        /// Dot-separated path under the response `usage` object where the
+        /// provider reports spend in USD (e.g. `cost`, or `opper.cost.total`).
+        #[arg(long)]
+        cost_usage_path: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AuthSchemeArg {
+    Bearer,
+    XApiKey,
+    None,
+}
+
+impl From<AuthSchemeArg> for AuthScheme {
+    fn from(value: AuthSchemeArg) -> Self {
+        match value {
+            AuthSchemeArg::Bearer => AuthScheme::Bearer,
+            AuthSchemeArg::XApiKey => AuthScheme::XApiKey,
+            AuthSchemeArg::None => AuthScheme::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum WireFormatArg {
+    ChatCompletions,
+    Responses,
+    Anthropic,
+}
+
+impl From<WireFormatArg> for WireFormat {
+    fn from(value: WireFormatArg) -> Self {
+        match value {
+            WireFormatArg::ChatCompletions => WireFormat::ChatCompletions,
+            WireFormatArg::Responses => WireFormat::Responses,
+            WireFormatArg::Anthropic => WireFormat::Anthropic,
+        }
+    }
+}
+
+fn wire_format_label(format: WireFormat) -> &'static str {
+    match format {
+        WireFormat::ChatCompletions => "chat-completions",
+        WireFormat::Responses => "responses",
+        WireFormat::Anthropic => "anthropic",
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -2036,7 +2126,7 @@ async fn main() -> Result<()> {
             ModelCommands::List => {
                 let models = list_model_bindings(harness.exoharness_handle().as_ref()).await?;
                 print_table(
-                    &["MODEL", "UPSTREAM_MODEL", "SECRET", "BASE_URL"],
+                    &["MODEL", "UPSTREAM_MODEL", "SECRET", "BASE_URL", "PROVIDER"],
                     models
                         .into_iter()
                         .map(|model| {
@@ -2045,6 +2135,7 @@ async fn main() -> Result<()> {
                                 model.model,
                                 model.secret_name.unwrap_or_else(|| "none".to_string()),
                                 model.base_url.unwrap_or_else(|| "default".to_string()),
+                                model.provider.unwrap_or_else(|| "none".to_string()),
                             ]
                         })
                         .collect(),
@@ -2055,22 +2146,168 @@ async fn main() -> Result<()> {
                 model,
                 secret,
                 base_url,
+                provider,
             } => {
-                let secret_id = find_secret_id(harness.exoharness_handle().as_ref(), &secret)
-                    .await?
-                    .ok_or_else(|| anyhow!("secret not found: {secret}"))?;
+                let handle = harness.exoharness_handle();
+                if secret.is_none() && provider.is_none() {
+                    bail!("pass --secret, or --provider to use a registered provider's credential");
+                }
+                let secret_id = match &secret {
+                    Some(secret_name) => Some(
+                        find_secret_id(handle.as_ref(), secret_name)
+                            .await?
+                            .ok_or_else(|| anyhow!("secret not found: {secret_name}"))?,
+                    ),
+                    None => None,
+                };
                 let upstream_model = model.unwrap_or_else(|| name.clone());
-                let id = harness
-                    .exoharness_handle()
+                if let Some(provider_name) = &provider {
+                    let record = find_provider_binding(handle.as_ref(), provider_name)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "provider not registered: {provider_name}; \
+                                 register it with `exo model provider register`"
+                            )
+                        })?;
+                    if let Binding::Provider { models, .. } = &record
+                        && !models.is_empty()
+                        && !models.iter().any(|m| m == &upstream_model)
+                    {
+                        let suggestions = suggest_models(models, &upstream_model);
+                        let hint = if suggestions.is_empty() {
+                            "re-run `exo model provider register --discover` to refresh \
+                             the provider's model list"
+                                .to_string()
+                        } else {
+                            format!("close matches: {}", suggestions.join(", "))
+                        };
+                        bail!(
+                            "model {upstream_model} is not in provider {provider_name}'s \
+                             model list ({} models); {hint}",
+                            models.len()
+                        );
+                    }
+                }
+                let id = handle
                     .put_binding(Binding::Llm {
                         name: name.clone(),
                         model: upstream_model,
                         base_url,
-                        secret_id: Some(secret_id),
+                        secret_id,
+                        provider,
                     })
                     .await?;
                 println!("registered model {} ({})", name, id);
             }
+            ModelCommands::Provider { command } => match command {
+                ModelProviderCommands::List => {
+                    let providers =
+                        list_provider_bindings(harness.exoharness_handle().as_ref()).await?;
+                    print_table(
+                        &["PROVIDER", "FORMAT", "SECRET", "BASE_URL", "MODELS"],
+                        providers
+                            .into_iter()
+                            .map(|provider| {
+                                vec![
+                                    provider.name,
+                                    wire_format_label(provider.format).to_string(),
+                                    provider.secret_name.unwrap_or_else(|| "none".to_string()),
+                                    provider.base_url,
+                                    provider.model_count.to_string(),
+                                ]
+                            })
+                            .collect(),
+                    )?;
+                }
+                ModelProviderCommands::Register {
+                    name,
+                    base_url,
+                    secret,
+                    format,
+                    auth,
+                    models,
+                    discover,
+                    cost_usage_path,
+                } => {
+                    if discover && !models.is_empty() {
+                        bail!("pass either --models or --discover, not both");
+                    }
+                    let auth = auth.map(AuthScheme::from);
+                    // A provider either authenticates with its own secret or is
+                    // explicitly unauthenticated — never with ambient
+                    // environment credentials.
+                    if secret.is_none() && auth != Some(AuthScheme::None) {
+                        bail!("pass --secret, or --auth none for an unauthenticated provider");
+                    }
+                    if secret.is_some() && auth == Some(AuthScheme::None) {
+                        bail!("--auth none is contradictory with --secret; drop one");
+                    }
+                    // Base-URL contract: the record stores the provider root and
+                    // each client appends its own path (the Anthropic clients add
+                    // /v1/... themselves).
+                    if matches!(WireFormat::from(format), WireFormat::Anthropic)
+                        && base_url.trim_end_matches('/').ends_with("/v1")
+                    {
+                        bail!(
+                            "for the anthropic format, register the provider root \
+                             without /v1 (clients append their own /v1/... path)"
+                        );
+                    }
+                    let handle = harness.exoharness_handle();
+                    let secret_id = match &secret {
+                        Some(secret_name) => Some(
+                            find_secret_id(handle.as_ref(), secret_name)
+                                .await?
+                                .ok_or_else(|| anyhow!("secret not found: {secret_name}"))?,
+                        ),
+                        None => None,
+                    };
+                    let models = if discover {
+                        let api_key = match secret_id {
+                            Some(secret_id) => match handle.get_secret(&secret_id).await? {
+                                Some(Secret::Key { value }) => Some(value),
+                                Some(Secret::Oauth { .. }) => {
+                                    bail!("oauth secrets are not supported for model providers")
+                                }
+                                None => bail!("provider secret does not exist"),
+                            },
+                            None => None,
+                        };
+                        let scheme = auth.unwrap_or(match WireFormat::from(format) {
+                            WireFormat::Anthropic => AuthScheme::XApiKey,
+                            _ => AuthScheme::Bearer,
+                        });
+                        let discovered =
+                            discover_provider_models(&base_url, api_key.as_deref(), scheme).await?;
+                        println!(
+                            "discovered {} models from {}",
+                            discovered.len(),
+                            provider_models_url(&base_url)
+                        );
+                        discovered
+                    } else {
+                        models
+                    };
+                    let cost_usage_path = cost_usage_path.map(|path| {
+                        path.split('.')
+                            .map(|segment| segment.to_string())
+                            .collect::<Vec<_>>()
+                    });
+                    let id = handle
+                        .put_binding(Binding::Provider {
+                            name: name.clone(),
+                            base_url,
+                            secret_id,
+                            format: format.into(),
+                            auth,
+                            models,
+                            cost_usage_path,
+                        })
+                        .await?;
+                    println!("registered provider {} ({})", name, id);
+                }
+            },
         },
         Commands::Provider { command } => match command {
             ProviderCommands::List => {
@@ -2640,6 +2877,7 @@ struct RegisteredModel {
     model: String,
     secret_name: Option<String>,
     base_url: Option<String>,
+    provider: Option<String>,
 }
 
 async fn list_model_bindings(exoharness: &dyn ExoHarness) -> Result<Vec<RegisteredModel>> {
@@ -2651,6 +2889,7 @@ async fn list_model_bindings(exoharness: &dyn ExoHarness) -> Result<Vec<Register
             model,
             base_url,
             secret_id,
+            provider,
         } = metadata.binding
         else {
             continue;
@@ -2666,6 +2905,7 @@ async fn list_model_bindings(exoharness: &dyn ExoHarness) -> Result<Vec<Register
             model,
             secret_name,
             base_url,
+            provider,
         });
     }
     let mut deduped = Vec::<RegisteredModel>::new();
@@ -2680,6 +2920,138 @@ async fn list_model_bindings(exoharness: &dyn ExoHarness) -> Result<Vec<Register
         }
     }
     Ok(deduped)
+}
+
+struct RegisteredProvider {
+    name: String,
+    format: WireFormat,
+    secret_name: Option<String>,
+    base_url: String,
+    model_count: usize,
+}
+
+async fn list_provider_bindings(exoharness: &dyn ExoHarness) -> Result<Vec<RegisteredProvider>> {
+    let secrets = exoharness.list_secrets().await?;
+    let mut providers = Vec::<RegisteredProvider>::new();
+    for metadata in exoharness.list_bindings().await? {
+        let Binding::Provider {
+            name,
+            base_url,
+            secret_id,
+            format,
+            models,
+            ..
+        } = metadata.binding
+        else {
+            continue;
+        };
+        let secret_name = secret_id.and_then(|secret_id| {
+            secrets
+                .iter()
+                .find(|secret| secret.id == secret_id)
+                .map(|secret| secret.name.clone())
+        });
+        let provider = RegisteredProvider {
+            name,
+            format,
+            secret_name,
+            base_url,
+            model_count: models.len(),
+        };
+        // Bindings are listed oldest-first; newest with a given name wins.
+        if let Some(existing) = providers
+            .iter_mut()
+            .find(|existing| existing.name == provider.name)
+        {
+            *existing = provider;
+        } else {
+            providers.push(provider);
+        }
+    }
+    Ok(providers)
+}
+
+/// Finds the newest `Binding::Provider` with the given name.
+async fn find_provider_binding(exoharness: &dyn ExoHarness, name: &str) -> Result<Option<Binding>> {
+    let mut found = None;
+    for record in exoharness.list_bindings().await? {
+        if matches!(record.binding, Binding::Provider { .. }) && record.name == name {
+            found = Some(record.binding);
+        }
+    }
+    Ok(found)
+}
+
+/// Models with an id resembling the requested one, for error hints. Matches on
+/// the last path segment so `gpt-x` finds `openai/gpt-x` on gateways that use
+/// `provider/model` ids.
+fn suggest_models(models: &[String], requested: &str) -> Vec<String> {
+    let needle = requested
+        .rsplit('/')
+        .next()
+        .unwrap_or(requested)
+        .to_ascii_lowercase();
+    models
+        .iter()
+        .filter(|model| model.to_ascii_lowercase().contains(&needle))
+        .take(8)
+        .cloned()
+        .collect()
+}
+
+fn provider_models_url(base_url: &str) -> String {
+    format!("{}/models", base_url.trim_end_matches('/'))
+}
+
+/// Response shape of the standard OpenAI-compatible `GET {base_url}/models`
+/// discovery endpoint. Extra fields are ignored.
+#[derive(Debug, Deserialize)]
+struct DiscoveredModelsResponse {
+    data: Vec<DiscoveredModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscoveredModel {
+    id: String,
+}
+
+fn parse_discovered_models(body: &[u8]) -> Result<Vec<String>> {
+    let response: DiscoveredModelsResponse = serde_json::from_slice(body)?;
+    let mut models = response
+        .data
+        .into_iter()
+        .map(|model| model.id)
+        .collect::<Vec<_>>();
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
+async fn discover_provider_models(
+    base_url: &str,
+    api_key: Option<&str>,
+    scheme: AuthScheme,
+) -> Result<Vec<String>> {
+    let url = provider_models_url(base_url);
+    let client = reqwest::Client::new();
+    let mut request = client.get(&url);
+    // Discovery authenticates the same way the provider itself does.
+    match (scheme, api_key) {
+        (AuthScheme::Bearer, Some(key)) => request = request.bearer_auth(key),
+        (AuthScheme::XApiKey, Some(key)) => request = request.header("x-api-key", key),
+        (AuthScheme::None, _) | (_, None) => {}
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    let body = response.bytes().await?;
+    if !status.is_success() {
+        bail!("model discovery failed: GET {url} returned {status}");
+    }
+    let models = parse_discovered_models(&body)?;
+    if models.is_empty() {
+        bail!("model discovery returned no models from {url}");
+    }
+    Ok(models)
 }
 
 const DEFAULT_REPL_SLUG: &str = "repl";

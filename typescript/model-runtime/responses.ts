@@ -56,17 +56,123 @@ export interface NativeBraintrustOptions {
 }
 
 export interface ResponsesRuntimeOptions {
-  apiKey?: string;
+  apiKey?: string | null;
+  // Bearer credential for the Anthropic SDK (`Authorization: Bearer ...`),
+  // used when a provider speaks the Anthropic format but authenticates with
+  // bearer auth. Pass null to also disable the ANTHROPIC_AUTH_TOKEN fallback.
+  authToken?: string | null;
   baseURL?: string;
   organization?: string;
   project?: string;
+  // A null value omits that header from every request.
+  defaultHeaders?: Record<string, string | null>;
+  // Path under the raw usage object where the provider reports spend in USD.
+  costUsagePath?: string[] | null;
   braintrust?: NativeBraintrustOptions | null;
 }
+
+// Wire format a registered model provider speaks, mirroring the Rust
+// `WireFormat` enum (kebab-case on the wire).
+export type ProviderWireFormat = "chat-completions" | "responses" | "anthropic";
+
+// How a registered provider authenticates, mirroring the Rust `AuthScheme`.
+export type ProviderAuthScheme = "bearer" | "x-api-key" | "none";
 
 export interface ResponsesModelBinding {
   model?: string;
   apiKey?: string;
   baseUrl?: string | null;
+  // Declared wire format from a registered provider binding. When set it is
+  // authoritative and skips the model-name / base-URL heuristics below.
+  format?: ProviderWireFormat | null;
+  // Declared auth scheme; absent = the wire format's native scheme.
+  auth?: ProviderAuthScheme | null;
+  // Where the provider reports spend under the response usage object.
+  costUsagePath?: string[] | null;
+}
+
+// True when the binding came from a registered provider record. Such bindings
+// carry their own credential (or are explicitly unauthenticated) and must
+// never fall back to ambient env keys like OPENAI_API_KEY — with a custom
+// base URL that would leak the ambient credential to the custom endpoint.
+function isProviderDeclared(binding: ResponsesModelBinding): boolean {
+  return binding.format != null || binding.auth != null;
+}
+
+// Placeholder that satisfies the OpenAI SDK's key requirement; the
+// Authorization header itself is suppressed via a null default header, so it
+// is never sent.
+const UNAUTHENTICATED = "unauthenticated";
+
+// Credentials for the OpenAI SDK honoring the provider's declared auth
+// scheme. A null header value tells the SDK to omit that header entirely, so
+// exactly the declared credential is sent — never a placeholder bearer, never
+// both schemes at once.
+export function openAiCredentials(binding: ResponsesModelBinding): {
+  apiKey?: string;
+  defaultHeaders?: Record<string, string | null>;
+} {
+  if (binding.auth === "none") {
+    return {
+      apiKey: UNAUTHENTICATED,
+      defaultHeaders: { authorization: null },
+    };
+  }
+  if (isProviderDeclared(binding) && !binding.apiKey) {
+    // Mirror the Rust runtime: a provider either carries its own credential
+    // or is explicitly unauthenticated — never silently unauthenticated.
+    throw new Error(
+      "model request is missing an API key (the provider has no secret)",
+    );
+  }
+  if (binding.auth === "x-api-key" && binding.apiKey) {
+    return {
+      apiKey: UNAUTHENTICATED,
+      defaultHeaders: { authorization: null, "x-api-key": binding.apiKey },
+    };
+  }
+  return { apiKey: binding.apiKey };
+}
+
+// Reads the provider-reported spend from a raw usage object, following the
+// provider record's declared cost path (cost is a vendor extension, not part
+// of the standard usage schema).
+// The Anthropic SDK strips unknown fields while accumulating the terminal
+// message, so a vendor cost extension (e.g. usage.opper.cost.total) survives
+// only on the raw stream events; capture it from message_start/message_delta.
+export function costFromAnthropicStreamEvent(
+  event: unknown,
+  path: readonly string[],
+): number | null {
+  if (typeof event !== "object" || event === null) {
+    return null;
+  }
+  const record = event as {
+    type?: unknown;
+    usage?: unknown;
+    message?: { usage?: unknown };
+  };
+  if (record.type === "message_start") {
+    return walkUsagePath(record.message?.usage, path);
+  }
+  if (record.type === "message_delta") {
+    return walkUsagePath(record.usage, path);
+  }
+  return null;
+}
+
+export function walkUsagePath(
+  raw: unknown,
+  path: readonly string[],
+): number | null {
+  let node: unknown = raw;
+  for (const segment of path) {
+    if (typeof node !== "object" || node === null) {
+      return null;
+    }
+    node = (node as Record<string, unknown>)[segment];
+  }
+  return typeof node === "number" ? node : null;
 }
 
 export interface NativeResponsesRequest {
@@ -126,19 +232,22 @@ interface NativeLlmTraceOptions extends NativeTraceOptions {
 
 export class ResponsesRuntime implements ResponsesRuntimeLike {
   private readonly client: OpenAI;
+  private readonly costUsagePath: string[] | null;
 
   constructor(options: ResponsesRuntimeOptions = {}) {
     ensureBraintrustLogger(options.braintrust ?? null);
+    this.costUsagePath = options.costUsagePath ?? null;
     // wrapOpenAI auto-instruments chat.completions/responses calls with a
     // braintrust LLM span. Also covers the OpenRouter path (same OpenAI client,
     // just a different base URL) — braintrust's wrapOpenRouter is for their
     // native SDK, not the OpenAI SDK, so it doesn't apply here.
     this.client = wrapOpenAI(
       new OpenAI({
-        apiKey: options.apiKey,
+        apiKey: options.apiKey ?? undefined,
         baseURL: options.baseURL,
         organization: options.organization,
         project: options.project,
+        defaultHeaders: options.defaultHeaders,
       }),
     );
   }
@@ -157,11 +266,14 @@ export class ResponsesRuntime implements ResponsesRuntimeLike {
     agentConfig: AgentConfig | undefined,
     binding: ResponsesModelBinding,
   ): ResponsesRuntime {
+    const credentials = openAiCredentials(binding);
     return new ResponsesRuntime({
-      apiKey: binding.apiKey,
+      apiKey: credentials.apiKey,
       baseURL: binding.baseUrl ?? undefined,
       organization: process.env.OPENAI_ORG_ID,
       project: process.env.OPENAI_PROJECT,
+      defaultHeaders: credentials.defaultHeaders,
+      costUsagePath: binding.costUsagePath ?? null,
       braintrust: braintrustOptionsFromAgentConfig(agentConfig),
     });
   }
@@ -233,13 +345,29 @@ export class ResponsesRuntime implements ResponsesRuntimeLike {
     request: NativeResponsesRequest,
     options: NativeLlmTraceOptions,
   ): Promise<Response> {
-    if (options.streamed) {
-      return this.completeStreamRaw(
-        buildStreamingBody(request),
-        options.handlers,
-      );
+    const response = options.streamed
+      ? await this.completeStreamRaw(
+          buildStreamingBody(request),
+          options.handlers,
+        )
+      : await this.completeRaw(buildNonStreamingBody(request));
+    return this.applyProviderCost(response);
+  }
+
+  // The provider-reported spend rides on the raw usage object at the path the
+  // provider record declares; surface it for usageRecord.
+  private applyProviderCost(response: Response): Response {
+    if (!this.costUsagePath?.length || !response.usage) {
+      return response;
     }
-    return this.completeRaw(buildNonStreamingBody(request));
+    const cost = walkUsagePath(response.usage, this.costUsagePath);
+    if (cost == null) {
+      return response;
+    }
+    return {
+      ...response,
+      usage: { ...response.usage, provider_cost_usd: cost },
+    } as Response;
   }
 
   private async completeRaw(
@@ -288,6 +416,18 @@ export function runtimeFromModelBinding(
   agentConfig: AgentConfig | undefined,
   binding: ResponsesModelBinding,
 ): ResponsesRuntimeLike {
+  // A declared wire format (from a registered provider binding) is
+  // authoritative, mirroring the Rust runtime.
+  switch (binding.format) {
+    case "chat-completions":
+      return ChatCompletionsRuntime.fromModelBinding(agentConfig, binding);
+    case "responses":
+      return ResponsesRuntime.fromModelBinding(agentConfig, binding);
+    case "anthropic":
+      return AnthropicRuntime.fromModelBinding(agentConfig, binding);
+    default:
+      break;
+  }
   const model = binding.model ?? "";
   if (isAnthropicModel(model)) {
     return AnthropicRuntime.fromModelBinding(agentConfig, binding);
@@ -329,19 +469,22 @@ export function modelRequiresResponsesApi(model: string): boolean {
 
 export class ChatCompletionsRuntime implements ResponsesRuntimeLike {
   private readonly client: OpenAI;
+  private readonly costUsagePath: string[] | null;
 
   constructor(options: ResponsesRuntimeOptions = {}) {
     ensureBraintrustLogger(options.braintrust ?? null);
+    this.costUsagePath = options.costUsagePath ?? null;
     // wrapOpenAI auto-instruments chat.completions/responses calls with a
     // braintrust LLM span. Also covers the OpenRouter path (same OpenAI client,
     // just a different base URL) — braintrust's wrapOpenRouter is for their
     // native SDK, not the OpenAI SDK, so it doesn't apply here.
     this.client = wrapOpenAI(
       new OpenAI({
-        apiKey: options.apiKey,
+        apiKey: options.apiKey ?? undefined,
         baseURL: options.baseURL,
         organization: options.organization,
         project: options.project,
+        defaultHeaders: options.defaultHeaders,
       }),
     );
   }
@@ -350,11 +493,14 @@ export class ChatCompletionsRuntime implements ResponsesRuntimeLike {
     agentConfig: AgentConfig | undefined,
     binding: ResponsesModelBinding,
   ): ChatCompletionsRuntime {
+    const credentials = openAiCredentials(binding);
     return new ChatCompletionsRuntime({
-      apiKey: binding.apiKey,
+      apiKey: credentials.apiKey,
       baseURL: binding.baseUrl ?? undefined,
       organization: process.env.OPENAI_ORG_ID,
       project: process.env.OPENAI_PROJECT,
+      defaultHeaders: credentials.defaultHeaders,
+      costUsagePath: binding.costUsagePath ?? null,
       braintrust: braintrustOptionsFromAgentConfig(agentConfig),
     });
   }
@@ -434,6 +580,7 @@ export class ChatCompletionsRuntime implements ResponsesRuntimeLike {
     }
     return chatCompletionToResponse(
       await this.completeRaw(buildChatNonStreamingBody(request)),
+      this.costUsagePath,
     );
   }
 
@@ -450,7 +597,7 @@ export class ChatCompletionsRuntime implements ResponsesRuntimeLike {
     const startedAt = performance.now();
     let sawFirstChunk = false;
     let ttftMs: number | null = null;
-    const accumulator = new ChatCompletionAccumulator();
+    const accumulator = new ChatCompletionAccumulator(this.costUsagePath);
     const stream = await this.client.chat.completions.create(body);
 
     for await (const chunk of stream) {
@@ -480,15 +627,19 @@ const DEFAULT_ANTHROPIC_MAX_TOKENS = 4096;
 // `Response` shape that the rest of the harness consumes.
 export class AnthropicRuntime implements ResponsesRuntimeLike {
   private readonly client: Anthropic;
+  private readonly costUsagePath: string[] | null;
 
   constructor(options: ResponsesRuntimeOptions = {}) {
     ensureBraintrustLogger(options.braintrust ?? null);
+    this.costUsagePath = options.costUsagePath ?? null;
     // wrapAnthropic auto-instruments every messages.create/.stream call with a
     // braintrust LLM span (input/output/usage), so we don't hand-roll spans.
     this.client = wrapAnthropic(
       new Anthropic({
         apiKey: options.apiKey,
+        authToken: options.authToken,
         baseURL: options.baseURL,
+        defaultHeaders: options.defaultHeaders,
       }),
     );
   }
@@ -497,9 +648,52 @@ export class AnthropicRuntime implements ResponsesRuntimeLike {
     agentConfig: AgentConfig | undefined,
     binding: ResponsesModelBinding,
   ): AnthropicRuntime {
+    const baseURL = binding.baseUrl ?? undefined;
+    const costUsagePath = binding.costUsagePath ?? null;
+    if (binding.auth === "none") {
+      // The SDK refuses to construct without a credential unless the auth
+      // headers are explicitly omitted via null default headers.
+      return new AnthropicRuntime({
+        apiKey: null,
+        authToken: null,
+        defaultHeaders: { "x-api-key": null, authorization: null },
+        baseURL,
+        costUsagePath,
+        braintrust: braintrustOptionsFromAgentConfig(agentConfig),
+      });
+    }
+    if (isProviderDeclared(binding) && !binding.apiKey) {
+      // Mirror the Rust runtime: never silently unauthenticated.
+      throw new Error(
+        "model request is missing an API key (the provider has no secret)",
+      );
+    }
+    if (binding.auth === "bearer") {
+      // Anthropic wire format with bearer auth (e.g. gateways like Opper):
+      // the SDK's authToken sends `Authorization: Bearer ...`; null apiKey
+      // disables both the x-api-key header and the env fallbacks.
+      return new AnthropicRuntime({
+        apiKey: null,
+        authToken: binding.apiKey,
+        baseURL,
+        costUsagePath,
+        braintrust: braintrustOptionsFromAgentConfig(agentConfig),
+      });
+    }
+    if (isProviderDeclared(binding)) {
+      // Native x-api-key: null authToken blocks the ANTHROPIC_AUTH_TOKEN env
+      // fallback so only the provider's own credential is ever sent.
+      return new AnthropicRuntime({
+        apiKey: binding.apiKey,
+        authToken: null,
+        baseURL,
+        costUsagePath,
+        braintrust: braintrustOptionsFromAgentConfig(agentConfig),
+      });
+    }
     return new AnthropicRuntime({
       apiKey: binding.apiKey,
-      baseURL: binding.baseUrl ?? undefined,
+      baseURL,
       braintrust: braintrustOptionsFromAgentConfig(agentConfig),
     });
   }
@@ -575,7 +769,10 @@ export class AnthropicRuntime implements ResponsesRuntimeLike {
     if (options.streamed) {
       return this.completeStreamRaw(body, options.handlers);
     }
-    return anthropicMessageToResponse(await this.client.messages.create(body));
+    return anthropicMessageToResponse(
+      await this.client.messages.create(body),
+      this.costUsagePath,
+    );
   }
 
   private async completeStreamRaw(
@@ -587,7 +784,13 @@ export class AnthropicRuntime implements ResponsesRuntimeLike {
     let ttftMs: number | null = null;
     const stream = this.client.messages.stream(body);
 
+    let providerCost: number | null = null;
     for await (const event of stream) {
+      if (this.costUsagePath?.length) {
+        providerCost =
+          costFromAnthropicStreamEvent(event, this.costUsagePath) ??
+          providerCost;
+      }
       if (
         event.type === "content_block_delta" &&
         event.delta.type === "text_delta"
@@ -601,7 +804,17 @@ export class AnthropicRuntime implements ResponsesRuntimeLike {
       }
     }
 
-    return anthropicMessageToResponse(await stream.finalMessage());
+    const response = anthropicMessageToResponse(
+      await stream.finalMessage(),
+      this.costUsagePath,
+    );
+    if (providerCost != null && response.usage) {
+      return {
+        ...response,
+        usage: { ...response.usage, provider_cost_usd: providerCost },
+      } as Response;
+    }
+    return response;
   }
 }
 
@@ -653,7 +866,10 @@ function toolDefinitionsToAnthropicTools(
   }));
 }
 
-function anthropicMessageToResponse(message: Anthropic.Message): Response {
+function anthropicMessageToResponse(
+  message: Anthropic.Message,
+  costUsagePath?: string[] | null,
+): Response {
   const output: unknown[] = [];
   const text = message.content
     .filter((block): block is Anthropic.TextBlock => block.type === "text")
@@ -683,12 +899,13 @@ function anthropicMessageToResponse(message: Anthropic.Message): Response {
     status: "completed",
     model: message.model,
     output,
-    usage: anthropicUsageToResponseUsage(message.usage),
+    usage: anthropicUsageToResponseUsage(message.usage, costUsagePath),
   } as unknown as Response;
 }
 
 function anthropicUsageToResponseUsage(
   usage: Anthropic.Usage | null | undefined,
+  costUsagePath?: string[] | null,
 ): unknown {
   if (!usage) {
     return null;
@@ -696,12 +913,16 @@ function anthropicUsageToResponseUsage(
   const input = usage.input_tokens ?? 0;
   const output = usage.output_tokens ?? 0;
   const cached = usage.cache_read_input_tokens ?? 0;
+  const providerCost = costUsagePath?.length
+    ? walkUsagePath(usage, costUsagePath)
+    : null;
   return {
     input_tokens: input,
     output_tokens: output,
     total_tokens: input + output,
     input_tokens_details: { cached_tokens: cached },
     output_tokens_details: { reasoning_tokens: 0 },
+    ...(providerCost != null ? { provider_cost_usd: providerCost } : {}),
   };
 }
 
@@ -896,7 +1117,10 @@ function toolDefinitionsToChatTools(
   }));
 }
 
-function chatCompletionToResponse(completion: ChatCompletion): Response {
+function chatCompletionToResponse(
+  completion: ChatCompletion,
+  costUsagePath?: string[] | null,
+): Response {
   const choice = completion.choices[0];
   const output: unknown[] = [];
   if (choice?.message.content) {
@@ -916,11 +1140,12 @@ function chatCompletionToResponse(completion: ChatCompletion): Response {
     status: "completed",
     model: completion.model,
     output,
-    usage: chatUsageToResponseUsage(completion.usage),
+    usage: chatUsageToResponseUsage(completion.usage, costUsagePath),
   } as unknown as Response;
 }
 
 class ChatCompletionAccumulator {
+  constructor(private readonly costUsagePath: string[] | null = null) {}
   private id = `chatcmpl_${Date.now()}`;
   private created = Math.floor(Date.now() / 1000);
   private model = "";
@@ -985,7 +1210,7 @@ class ChatCompletionAccumulator {
       status: "completed",
       model: this.model,
       output,
-      usage: chatUsageToResponseUsage(this.usage),
+      usage: chatUsageToResponseUsage(this.usage, this.costUsagePath),
     } as unknown as Response;
   }
 }
@@ -1028,11 +1253,16 @@ function chatUsageToResponseUsage(
     | ChatCompletionChunk["usage"]
     | null
     | undefined,
+  costUsagePath?: string[] | null,
 ): unknown {
   if (!usage) {
     return null;
   }
+  const providerCost = costUsagePath?.length
+    ? walkUsagePath(usage, costUsagePath)
+    : null;
   return {
+    ...(providerCost != null ? { provider_cost_usd: providerCost } : {}),
     input_tokens: usage.prompt_tokens,
     output_tokens: usage.completion_tokens,
     total_tokens: usage.total_tokens,
@@ -1178,10 +1408,15 @@ function usageRecord(response: Response): JsonObject | undefined {
   const completion = usage.output_tokens;
   const cached = usage.input_tokens_details?.cached_tokens;
   const reasoning = usage.output_tokens_details?.reasoning_tokens;
+  const providerCost = (usage as { provider_cost_usd?: unknown })
+    .provider_cost_usd;
   const table = getTable();
-  const cost = table
+  const tableCost = table
     ? computeCostUsd(table, response.model, { prompt, completion, cached })
     : null;
+  // The provider-reported spend is authoritative when the record declares
+  // where to find it; the price table is the estimate fallback.
+  const cost = typeof providerCost === "number" ? providerCost : tableCost;
 
   const record: JsonObject = { model: response.model };
   if (prompt != null) record.prompt_tokens = prompt;
