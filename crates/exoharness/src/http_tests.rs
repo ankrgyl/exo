@@ -426,6 +426,10 @@ struct SnapshotTestSandboxBackend;
 
 #[async_trait]
 impl ManagedSandboxBackend for SnapshotTestSandboxBackend {
+    fn is_local(&self) -> bool {
+        false
+    }
+
     async fn acquire(
         &self,
         _request: SandboxRequest,

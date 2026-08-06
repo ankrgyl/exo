@@ -24,16 +24,48 @@ use crate::{
     EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness, FileSystemMountMode,
     ForkConversationRequest, ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest,
     NewConversationRequest, PutSecretRequest, RunInSandboxRequest, SandboxAttachment,
-    SandboxCommand, SandboxCommandOutput, SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy,
-    SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
-    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec,
-    Secret, SnapshotKind, SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput, SandboxKey,
+    SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent, SandboxProcessEventQuery,
+    SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin, SandboxProvider,
+    SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotKind, SnapshotPayload,
+    StartSandboxProcessRequest, StartSandboxRequest, Uuid7, WaitSandboxProcessRequest,
+    WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const DEFAULT_DURABLE_CONTRACT_MOUNT_PATH: &str = "/home/exo/workspace";
 #[cfg(feature = "aws-agentcore")]
 const DEFAULT_AGENTCORE_DURABLE_CONTRACT_MOUNT_PATH: &str = "/mnt/workspace";
+
+#[test]
+fn sandbox_backend_registration_uses_backend_locality() {
+    assert!(SandboxBackendRegistration::apple_container().is_local());
+    assert!(SandboxBackendRegistration::docker().is_local());
+    assert!(SandboxBackendRegistration::local_process().is_local());
+    assert!(!SandboxBackendRegistration::daytona(crate::DaytonaBackendSpec::default()).is_local());
+}
+
+#[test]
+fn sandbox_backend_registration_resolves_builtin_providers() {
+    for provider in [
+        SandboxProvider::AppleContainer,
+        SandboxProvider::AwsAgentCore,
+        SandboxProvider::Daytona,
+        SandboxProvider::Docker,
+        SandboxProvider::E2b,
+        SandboxProvider::LocalProcess,
+        SandboxProvider::Sprites,
+        SandboxProvider::Vercel,
+    ] {
+        let registration =
+            SandboxBackendRegistration::from_builtin_provider(provider.clone()).unwrap();
+        assert_eq!(registration.provider(), provider);
+    }
+
+    assert!(
+        SandboxBackendRegistration::from_builtin_provider(SandboxProvider::from_static("custom"))
+            .is_err()
+    );
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn basic_backend_supports_agent_and_conversation_crud() {
@@ -1801,6 +1833,10 @@ impl TestProviderStateBackend {
 
 #[async_trait]
 impl ManagedSandboxBackend for TestProviderStateBackend {
+    fn is_local(&self) -> bool {
+        false
+    }
+
     async fn acquire(
         &self,
         request: SandboxRequest,
@@ -1877,6 +1913,10 @@ impl TestSandboxBackend {
 
 #[async_trait]
 impl ManagedSandboxBackend for TestSandboxBackend {
+    fn is_local(&self) -> bool {
+        false
+    }
+
     async fn acquire(
         &self,
         _request: SandboxRequest,
@@ -2083,6 +2123,10 @@ struct RestoreImageTestBackend {
 
 #[async_trait]
 impl ManagedSandboxBackend for RestoreImageTestBackend {
+    fn is_local(&self) -> bool {
+        false
+    }
+
     async fn acquire(
         &self,
         request: SandboxRequest,

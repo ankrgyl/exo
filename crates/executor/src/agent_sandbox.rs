@@ -37,7 +37,7 @@ struct AgentSandboxRecord {
 impl AgentSandboxRecord {
     fn spec(&self) -> ConversationSandboxSpec {
         ConversationSandboxSpec {
-            provider: self.provider,
+            provider: self.provider.clone(),
             image: self.image.clone(),
             default_workdir: self.default_workdir.clone(),
             file_system_mounts: self.file_system_mounts.clone(),
@@ -50,7 +50,7 @@ impl AgentSandboxRecord {
     fn new(sandbox_name: String, spec: ConversationSandboxSpec) -> Self {
         Self {
             sandbox_name,
-            provider: spec.provider,
+            provider: spec.provider.clone(),
             image: spec.image,
             default_workdir: spec.default_workdir,
             file_system_mounts: spec.file_system_mounts,
@@ -112,7 +112,7 @@ async fn attach_agent_sandbox(
     let sandbox_id = agent
         .create_sandbox(CreateSandboxRequest {
             name: Some(sandbox_name),
-            provider: spec.provider,
+            provider: spec.provider.clone(),
             image: spec.image.clone(),
             default_workdir: Some(spec.default_workdir.clone()),
             file_system_mounts: Some(spec.file_system_mounts.clone()),

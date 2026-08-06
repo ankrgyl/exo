@@ -92,6 +92,10 @@ impl AwsAgentCoreSandboxBackend {
 
 #[async_trait]
 impl ManagedSandboxBackend for AwsAgentCoreSandboxBackend {
+    fn is_local(&self) -> bool {
+        false
+    }
+
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_unsupported_request(&request, self.session_storage_mount_path.as_deref())?;
         let spec_hash = sandbox_spec_hash(&request.spec);

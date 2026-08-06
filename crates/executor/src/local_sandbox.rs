@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -11,9 +11,10 @@ use exoharness::{
     GetEventsResult, ListConversationsRequest, ListConversationsResult, NewAgentRequest,
     NewConversationRequest, PutSecretRequest, ReadArtifactRequest, Result, RunInSandboxRequest,
     SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery,
-    SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId, SecretMetadata, SnapshotHandle,
-    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnRecord, Uuid7,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    SandboxProcessRecord, SandboxProcessStatus, SandboxProvider, Secret, SecretId, SecretMetadata,
+    SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle,
+    TurnRecord, Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest,
+    WriteSandboxProcessInputRequest,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -41,17 +42,27 @@ struct LocalSandboxState {
     sandboxes: Mutex<HashMap<SandboxId, SandboxId>>,
     detached_sandboxes: Mutex<HashMap<SandboxId, SandboxAttachment>>,
     force_local: bool,
+    local_providers: HashSet<SandboxProvider>,
 }
 
 impl LocalSandboxExoHarness {
     pub fn new(remote: Arc<dyn ExoHarness>, local: Arc<dyn ExoHarness>) -> Self {
-        Self::new_with_force_local(remote, local, true)
+        Self::new_with_routing(remote, local, true, HashSet::new())
     }
 
-    pub fn new_with_force_local(
+    pub fn new_with_local_providers(
+        remote: Arc<dyn ExoHarness>,
+        local: Arc<dyn ExoHarness>,
+        local_providers: impl IntoIterator<Item = SandboxProvider>,
+    ) -> Self {
+        Self::new_with_routing(remote, local, false, local_providers.into_iter().collect())
+    }
+
+    fn new_with_routing(
         remote: Arc<dyn ExoHarness>,
         local: Arc<dyn ExoHarness>,
         force_local: bool,
+        local_providers: HashSet<SandboxProvider>,
     ) -> Self {
         Self {
             state: Arc::new(LocalSandboxState {
@@ -63,6 +74,7 @@ impl LocalSandboxExoHarness {
                 sandboxes: Mutex::new(HashMap::new()),
                 detached_sandboxes: Mutex::new(HashMap::new()),
                 force_local,
+                local_providers,
             }),
         }
     }
@@ -181,7 +193,7 @@ impl LocalSandboxAgent {
     }
 
     fn wants_local_sandbox(&self, request: &CreateSandboxRequest) -> bool {
-        self.state.force_local || request.provider.is_local()
+        self.state.force_local || self.state.local_providers.contains(&request.provider)
     }
 
     async fn local_sandbox_id(&self, sandbox_id: &SandboxId) -> Result<Option<SandboxId>> {
@@ -645,7 +657,7 @@ impl LocalSandboxConversation {
     }
 
     fn wants_local_sandbox(&self, request: &CreateSandboxRequest) -> bool {
-        self.state.force_local || request.provider.is_local()
+        self.state.force_local || self.state.local_providers.contains(&request.provider)
     }
 
     async fn local_sandbox_id(&self, sandbox_id: &SandboxId) -> Result<Option<SandboxId>> {
@@ -1067,7 +1079,11 @@ mod tests {
         );
         let remote_harness: Arc<dyn ExoHarness> = remote.clone();
         let local_harness: Arc<dyn ExoHarness> = local;
-        let wrapper = LocalSandboxExoHarness::new(remote_harness, local_harness);
+        let wrapper = LocalSandboxExoHarness::new_with_local_providers(
+            remote_harness,
+            local_harness,
+            [SandboxProvider::LocalProcess],
+        );
 
         let agent = wrapper
             .new_agent(NewAgentRequest {
