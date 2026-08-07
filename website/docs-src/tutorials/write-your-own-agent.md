@@ -17,7 +17,7 @@ need:
    the current number without calling a tool.
 
 The finished file lives at
-[`examples/typescript/sysmon-harness.ts`](https://github.com/exoharness/exo/blob/main/examples/typescript/sysmon-harness.ts).
+[`exoharness/examples/typescript/sysmon-harness.ts`](https://github.com/exoharness/exo/blob/main/exoharness/examples/typescript/sysmon-harness.ts).
 
 ## The harness contract
 
@@ -40,7 +40,7 @@ export default defineHarness({
 });
 ```
 
-That's [`examples/typescript/basic-harness.ts`](https://github.com/exoharness/exo/blob/main/examples/typescript/basic-harness.ts)
+That's [`exoharness/examples/typescript/basic-harness.ts`](https://github.com/exoharness/exo/blob/main/exoharness/examples/typescript/basic-harness.ts)
 verbatim. `runResponsesHarnessTurn` accepts two hooks, and they are the whole
 customization surface for this tutorial:
 
@@ -133,7 +133,7 @@ Notes:
 - `initializationParameters` / `initialize(args)` exist so a tool can be
   configured per-agent (an API prefix, a base URL) separately from per-call
   arguments — see
-  [`examples/typescript/tools/uppercase.ts`](https://github.com/exoharness/exo/blob/main/examples/typescript/tools/uppercase.ts)
+  [`exoharness/examples/typescript/tools/uppercase.ts`](https://github.com/exoharness/exo/blob/main/exoharness/examples/typescript/tools/uppercase.ts)
   for a configured example. Ours needs no configuration.
 - Harness code runs on the **host**, so `node:os` reports the host machine.
   For work that belongs in isolation, call the `shell` tool or
@@ -187,7 +187,7 @@ conversation history — see [Data Model](../concepts/data-model) if you
 want the details on why.)
 
 The same pattern scales to anything derivable: the canonical agent's harness
-([`examples/exo/harness.ts`](https://github.com/exoharness/exo/blob/main/examples/exo/harness.ts))
+([`exo/harness.ts`](https://github.com/exoharness/exo/blob/main/exo/harness.ts))
 uses it to splice in an identity prompt, a git-ignored local profile file,
 and the agent's persistent memory block each round.
 
@@ -213,7 +213,7 @@ exo secret set openai --env OPENAI_API_KEY
 exo model register gpt-5.5 --secret openai
 
 exo --harness typescript agent create "Sysmon" \
-  --module examples/typescript/sysmon-harness.ts \
+  --module exoharness/examples/typescript/sysmon-harness.ts \
   --model gpt-5.5
 exo conversation create sysmon "Sysmon Test"
 exo repl --agent sysmon --conversation sysmon-test

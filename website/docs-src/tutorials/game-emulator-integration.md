@@ -9,7 +9,7 @@ description: Wire an agent up to a game or any external stateful system with a s
 
 This tutorial shows how to connect an agent built in the exoharness framework to an external system, with the motivating example being a Game Boy playing Pokemon Red.
 
-The finished code is in [`examples/gameboy-agent`](https://github.com/exoharness/exo/tree/main/examples/gameboy-agent): a ~200-line Python sidecar, a ~100-line TypeScript client, five tools, and a
+The finished code is in [`exoharness/examples/gameboy-agent`](https://github.com/exoharness/exo/tree/main/exoharness/examples/gameboy-agent): a ~200-line Python sidecar, a ~100-line TypeScript client, five tools, and a
 ~90-line exo harness.
 
 ![Architecture: the model talks to the exo turn loop and harness, which drives the emulator sidecar over localhost HTTP](/images/gameboy-agent-architecture.svg)
@@ -20,7 +20,7 @@ if you haven't written an exo harness before, start there.
 ## Step 1: Running the emulator
 
 In this tutorial we use the open source Game Boy emulator, [PyBoy](https://github.com/Baekalfen/PyBoy). It is written in Python, and runs in its own standalone process shown in
-[`emulator/server.py`](https://github.com/exoharness/exo/blob/main/examples/gameboy-agent/emulator/server.py), exposing the following endpoints over localhost HTTP:
+[`emulator/server.py`](https://github.com/exoharness/exo/blob/main/exoharness/examples/gameboy-agent/emulator/server.py), exposing the following endpoints over localhost HTTP:
 
 | Endpoint | Purpose |
 | --- | --- |
@@ -39,7 +39,7 @@ The payload carries two views of the game:
   [pret/pokered disassembly](https://github.com/pret/pokered), with the
   [Data Crystal RAM map](https://datacrystal.tcrf.net/wiki/Pok%C3%A9mon_Red_and_Blue/RAM_map)
   as a readable cross-reference.
-  [`emulator/memory_map.py`](https://github.com/exoharness/exo/blob/main/examples/gameboy-agent/emulator/memory_map.py)
+  [`emulator/memory_map.py`](https://github.com/exoharness/exo/blob/main/exoharness/examples/gameboy-agent/emulator/memory_map.py)
   reads a dozen WRAM addresses and returns facts:
 
 ```json
@@ -55,7 +55,7 @@ The payload carries two views of the game:
 
 ## Step 2: Wrapping the emulator in a client
 
-[`agent/emulator-client.ts`](https://github.com/exoharness/exo/blob/main/examples/gameboy-agent/agent/emulator-client.ts)
+[`agent/emulator-client.ts`](https://github.com/exoharness/exo/blob/main/exoharness/examples/gameboy-agent/agent/emulator-client.ts)
 wraps the HTTP API in a typed client — one method per endpoint, deliberately
 boilerplate. It exists so the tools and harness never touch HTTP or JSON
 shapes directly:
@@ -132,7 +132,7 @@ into the compact text block that tool results and the prompt both use
 
 ## Step 3: Exposing the client via tooling
 
-[`agent/game-tools.ts`](https://github.com/exoharness/exo/blob/main/examples/gameboy-agent/agent/game-tools.ts)
+[`agent/game-tools.ts`](https://github.com/exoharness/exo/blob/main/exoharness/examples/gameboy-agent/agent/game-tools.ts)
 turns the client into exo `Tool` objects — a strict-schema `definition` the
 model sees, and an `initialize()` returning the handler that runs when the
 model calls it. Here is the main one in full:
@@ -210,7 +210,7 @@ accumulate in history (next step).
 
 ## Step 4: Constructing the agent
 
-[`agent/harness.ts`](https://github.com/exoharness/exo/blob/main/examples/gameboy-agent/agent/harness.ts)
+[`agent/harness.ts`](https://github.com/exoharness/exo/blob/main/exoharness/examples/gameboy-agent/agent/harness.ts)
 is the whole agent policy written as an exoharness typescript executor.
 
 ```ts
@@ -225,7 +225,7 @@ import {
 import {
   basicHarnessInstructions,
   runResponsesHarnessTurn,
-} from "../../typescript/turn-loop";
+} from "@exo/model-runtime/turn-loop";
 import { describeState, EmulatorClient } from "./emulator-client";
 import { gameboyTools } from "./game-tools";
 
@@ -280,7 +280,7 @@ The `instructions` hook is where the logic to provide screenshots: it fetches th
 ## Step 5: Running the agent
 
 Now, to run our system, there are two processes of interest: the emulator sidecar, and exo driving turns against it.
-[`run.sh`](https://github.com/exoharness/exo/blob/main/examples/gameboy-agent/run.sh) starts the sidecar (a venv with PyBoy is created on first run):
+[`run.sh`](https://github.com/exoharness/exo/blob/main/exoharness/examples/gameboy-agent/run.sh) starts the sidecar (a venv with PyBoy is created on first run):
 
 ```bash
 #!/usr/bin/env bash
@@ -297,7 +297,7 @@ exec "$VENV/bin/python" emulator/server.py --rom "$ROM" --port "$PORT" --host "$
 ```
 
 ```bash
-cd examples/gameboy-agent
+cd exoharness/examples/gameboy-agent
 mkdir -p roms && cp /path/to/pokemon-red.gb roms/   # ROMs are copyrighted — bring your own
 ./run.sh                       # boots PyBoy on http://127.0.0.1:8777
 ```
@@ -313,7 +313,7 @@ exo secret set openai --env OPENAI_API_KEY          # once
 exo model register gpt-5.5 --secret openai          # once
 
 exo --harness typescript agent create "Gameboy" \
-  --module examples/gameboy-agent/agent/harness.ts \
+  --module exoharness/examples/gameboy-agent/agent/harness.ts \
   --model gpt-5.5 --max-tool-round-trips 20         # once
 exo conversation create gameboy "Play Pokemon"      # once
 
@@ -334,7 +334,7 @@ done
 ```
 
 See the
-[example README](https://github.com/exoharness/exo/tree/main/examples/gameboy-agent)
+[example README](https://github.com/exoharness/exo/tree/main/exoharness/examples/gameboy-agent)
 for the remaining knobs (`GAMEBOY_EMULATOR_URL`, ports, fresh starts).
 
 ## Adapting the pattern
@@ -385,7 +385,7 @@ import {
   type TurnContext,
 } from "@exo/harness";
 
-import { runResponsesHarnessTurn } from "../../typescript/turn-loop";
+import { runResponsesHarnessTurn } from "@exo/model-runtime/turn-loop";
 import { exoInstructions, registerExoTools } from "../../exo/harness";
 import { EmulatorClient, describeState } from "./emulator-client";
 import { gameboyTools } from "./game-tools";
@@ -435,5 +435,5 @@ artifacts, skills, and every conversation — it just gains a live view of the e
 ```bash
 exo agent update exo --module path/to/exo-gameboy-harness.ts
 # ...and back again to un-extend:
-exo agent update exo --module examples/exo/harness.ts
+exo agent update exo --module exo/harness.ts
 ```

@@ -12,7 +12,7 @@ hooks from the [Custom Agent Quickstart](./write-your-own-agent):
 `registerTools` and `instructions`.
 
 The finished file is
-[`examples/typescript/coding-agent-harness.ts`](https://github.com/exoharness/exo/blob/main/examples/typescript/coding-agent-harness.ts).
+[`exoharness/examples/typescript/coding-agent-harness.ts`](https://github.com/exoharness/exo/blob/main/exoharness/examples/typescript/coding-agent-harness.ts).
 
 ## The loop is already there
 
@@ -225,7 +225,7 @@ export default defineHarness({
 
 ```bash
 exo --harness typescript agent create "Coder" \
-  --module examples/typescript/coding-agent-harness.ts \
+  --module exoharness/examples/typescript/coding-agent-harness.ts \
   --model gpt-5.5 \
   --sandbox-image python:3.12-slim
 exo conversation create coder "Build"

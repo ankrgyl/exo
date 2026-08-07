@@ -21,14 +21,14 @@ AGENT="${EXO_AGENT:-exo-agent}"
 AGENT_NAME="${EXO_AGENT_NAME:-Exo Agent}"
 CONVERSATION="${EXO_CONVERSATION:-dev}"
 CONVERSATION_NAME="${EXO_CONVERSATION_NAME:-Dev}"
-MODULE="${EXO_MODULE:-examples/exo/harness.ts}"
+MODULE="${EXO_MODULE:-exo/harness.ts}"
 HARNESS="exo"
 LOCAL_PROMPT_FILE="${EXO_LOCAL_PROMPT_FILE:-$ROOT_DIR/.exo/exo-profile.md}"
 SANDBOX_IMAGE="${EXO_SANDBOX_IMAGE:-ubuntu:24.04}"
 SANDBOX_PROVIDER="${EXO_SANDBOX_PROVIDER:-}"
 SANDBOX_BACKEND="${EXO_SANDBOX_BACKEND:-}"
 SELF_REPO_MOUNT_PATH="${EXO_REPO:-/workspace/exo}"
-SELF_MAP_PATH="$SELF_REPO_MOUNT_PATH/examples/exo/SELF.md"
+SELF_MAP_PATH="$SELF_REPO_MOUNT_PATH/exo/SELF.md"
 AGENT_CLI_MOUNT_ROOT="${EXO_AGENT_CLI_ROOT:-}"
 AGENT_CLI_MOUNT_PATH="${EXO_AGENT_CLI_MOUNT:-/agent-cli}"
 NETWORKING="${EXO_NETWORKING:-enabled}"
@@ -295,7 +295,7 @@ configure_guardian_for_current_launch() {
     return
   fi
 
-  "$ROOT_DIR/examples/exo/scripts/exo-service-guardian" configure \
+  "$ROOT_DIR/exo/scripts/exo-service-guardian" configure \
     --env-file "$ENV_FILE" \
     --exo-bin "$EXO_BIN" \
     --scheduler-bin "$SCHEDULER_BIN" \
@@ -313,7 +313,7 @@ build_exo() {
 build_exo_scheduler() {
   echo "Building Exo scheduler runner..."
   (cd "$ROOT_DIR" && CARGO_TARGET_DIR=target cargo build \
-    --manifest-path examples/exo/scheduler-runner/Cargo.toml \
+    --manifest-path exo/scheduler-runner/Cargo.toml \
     --ignore-rust-version)
 }
 
@@ -358,8 +358,8 @@ scheduler_source_newer_than() {
   local target="$1"
   local path
   for path in \
-    "$ROOT_DIR/examples/exo/scheduler-runner/Cargo.toml" \
-    "$ROOT_DIR/examples/exo/scheduler-runner/src"/*.rs; do
+    "$ROOT_DIR/exo/scheduler-runner/Cargo.toml" \
+    "$ROOT_DIR/exo/scheduler-runner/src"/*.rs; do
     if [[ -e "$path" && "$path" -nt "$target" ]]; then
       return 0
     fi
@@ -471,8 +471,8 @@ adapter_source_newer_than() {
   local target="$1"
   local path
   for path in \
-    "$ROOT_DIR/examples/exo/adapters/protocol.ts" \
-    "$ROOT_DIR/examples/exo/adapters"/*/worker.ts; do
+    "$ROOT_DIR/exo/adapters/protocol.ts" \
+    "$ROOT_DIR/exo/adapters"/*/worker.ts; do
     if [[ -e "$path" && "$path" -nt "$target" ]]; then
       return 0
     fi
@@ -669,8 +669,8 @@ ensure_self_repo_mount() {
   if [[ ! "$SELF_REPO_MOUNT_PATH" = /* ]]; then
     die "self repo mount path must be absolute: $SELF_REPO_MOUNT_PATH"
   fi
-  if [[ ! -f "$ROOT_DIR/examples/exo/SELF.md" ]]; then
-    die "Exo self map is missing: examples/exo/SELF.md"
+  if [[ ! -f "$ROOT_DIR/exo/SELF.md" ]]; then
+    die "Exo self map is missing: exo/SELF.md"
   fi
 
   # Agent-level mounts apply to the shared agent sandbox for every
@@ -751,7 +751,7 @@ stop_adapters() {
     fi
   fi
   pkill -f "exo .*adapters run" >/dev/null 2>&1 || true
-  pkill -f "tsx examples/exo/adapters/.*/worker.ts" >/dev/null 2>&1 || true
+  pkill -f "tsx exo/adapters/.*/worker.ts" >/dev/null 2>&1 || true
   rm -f "$pid_file"
 }
 
@@ -1064,7 +1064,7 @@ adapter_setup_prompt_file() {
   if [[ ! "$adapter" =~ ^[a-zA-Z0-9_-]+$ ]]; then
     die "--setup must be an adapter name, not a path: $adapter"
   fi
-  startup_prompt_file "$ROOT_DIR/examples/exo/adapters/$adapter/setup-prompt.md"
+  startup_prompt_file "$ROOT_DIR/exo/adapters/$adapter/setup-prompt.md"
 }
 
 send_startup_prompt() {
@@ -1414,7 +1414,7 @@ while [[ $# -gt 0 ]]; do
     --self-repo-mount)
       SELF_REPO_MOUNT_PATH="${2:-}"
       [[ -n "$SELF_REPO_MOUNT_PATH" ]] || die "--self-repo-mount requires a value"
-      SELF_MAP_PATH="$SELF_REPO_MOUNT_PATH/examples/exo/SELF.md"
+      SELF_MAP_PATH="$SELF_REPO_MOUNT_PATH/exo/SELF.md"
       shift 2
       ;;
     --agent-cli-mount)

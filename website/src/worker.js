@@ -160,7 +160,7 @@ export default {
 
     if (url.pathname === "/chat" || url.pathname === "/chat/") {
       return new Response(
-        "Create a session with scripts/rendezvous-demo.mjs\n",
+        "Create a session with exo/scripts/rendezvous-demo.mjs\n",
         {
           status: 200,
           headers: {

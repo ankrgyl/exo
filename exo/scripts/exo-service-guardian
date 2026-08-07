@@ -1,0 +1,548 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+STATE_DIR="$ROOT_DIR/.exo"
+CONFIG_FILE="${EXO_SERVICE_GUARDIAN_CONFIG:-$STATE_DIR/exo-service-guardian.env}"
+
+# Match exo.sh: services restarted by the guardian spawn node (harness runner,
+# adapter workers), so put the mise-pinned toolchain on PATH. Without this, a
+# guardian restart inherits whatever ambient node is around (e.g. an old nvm
+# node) and harness turns can crash on missing Web API globals.
+if [[ -x "$HOME/.local/bin/mise" ]] || command -v mise >/dev/null 2>&1; then
+  export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH"
+fi
+if [[ -f "$HOME/.cargo/env" ]]; then
+  # shellcheck disable=SC1091
+  . "$HOME/.cargo/env"
+fi
+
+HARNESS="exo"
+EXO_BIN="${EXO_BIN:-$ROOT_DIR/target/debug/exo}"
+SCHEDULER_BIN="${EXO_SCHEDULER_BIN:-$ROOT_DIR/target/debug/exo-scheduler-runner}"
+ENV_FILE="${EXO_ENV_FILE:-$ROOT_DIR/.env}"
+SANDBOX_BACKEND="${EXO_SANDBOX_BACKEND:-}"
+SCHEDULER_INTERVAL_SECONDS="${EXO_SCHEDULER_INTERVAL_SECONDS:-10}"
+ADAPTER_LIMIT="${EXO_ADAPTER_LIMIT:-50}"
+
+for arg_index in "$@"; do
+  if [[ "${previous_arg:-}" == "--config" ]]; then
+    CONFIG_FILE="$arg_index"
+    break
+  fi
+  previous_arg="$arg_index"
+done
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+fi
+
+usage() {
+  cat <<'EOF'
+Usage:
+  exo/scripts/exo-service-guardian <command> [options]
+
+Commands:
+  status                    Show guardian-managed service status and logs
+  configure [options]       Save launch settings in .exo/exo-service-guardian.env
+  build                     Build exo and the Exo scheduler runner, then ask
+                            the control REPL wrapper to refresh its child
+  start-services            Start scheduler and adapter runners
+  stop-services             Stop scheduler and adapter runners, preserving .exo state
+  restart-services          Restart scheduler and adapter runners
+  restart-adapters          Restart only the adapter runner
+  restart-scheduler         Restart only the scheduler runner
+  restart-all [--build]     Optionally build, then restart scheduler and adapters
+  logs [scheduler|adapters] Print recent service logs
+
+Options:
+  --env-file <path>         Env file to read if present (default: .env)
+  --exo-bin <path>          exo binary path (default: ./target/debug/exo)
+  --scheduler-bin <path>    Scheduler runner path
+  --sandbox-backend <name>  apple-container, docker, or local-process
+  --scheduler-interval <n>  Scheduler polling interval seconds (default: 10)
+  --adapter-limit <n>       Max adapters supervised by the runner (default: 50)
+  --config <path>           Service guardian config path (default: .exo/exo-service-guardian.env)
+  --build                   For restart-all, build before restarting services
+  --help                    Show this help
+
+The service guardian owns host-side services only. It never deletes .exo state, adapter
+pairing data, conversations, artifacts, or sandbox records.
+EOF
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+ensure_state_dir() {
+  mkdir -p "$STATE_DIR"
+}
+
+quote_var() {
+  local name="$1"
+  local value="$2"
+  printf '%s=' "$name"
+  printf '%q\n' "$value"
+}
+
+write_config() {
+  ensure_state_dir
+  {
+    echo "# Exo guardian host-side launch settings."
+    echo "# This file is local state and should not be committed."
+    quote_var "EXO_BIN" "$EXO_BIN"
+    quote_var "SCHEDULER_BIN" "$SCHEDULER_BIN"
+    quote_var "ENV_FILE" "$ENV_FILE"
+    quote_var "SANDBOX_BACKEND" "$SANDBOX_BACKEND"
+    quote_var "SCHEDULER_INTERVAL_SECONDS" "$SCHEDULER_INTERVAL_SECONDS"
+    quote_var "ADAPTER_LIMIT" "$ADAPTER_LIMIT"
+  } >"$CONFIG_FILE"
+  echo "Wrote service guardian config: $CONFIG_FILE"
+}
+
+run_cargo() {
+  if command -v mise >/dev/null 2>&1; then
+    (cd "$ROOT_DIR" && CARGO_TARGET_DIR=target mise exec -- cargo "$@")
+  else
+    (cd "$ROOT_DIR" && CARGO_TARGET_DIR=target cargo "$@")
+  fi
+}
+
+build_all() {
+  echo "Building exo..."
+  run_cargo build -p exo --ignore-rust-version
+  echo "Building Exo scheduler runner..."
+  run_cargo build --manifest-path exo/scheduler-runner/Cargo.toml --ignore-rust-version
+  request_repl_restart
+}
+
+request_repl_restart() {
+  ensure_state_dir
+  {
+    printf 'requested_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'reason=guardian-build\n'
+  } >"$(repl_restart_file)"
+  echo "Requested control REPL child restart: $(repl_restart_file)"
+}
+
+DRAIN_CLAIM_SECONDS="${EXO_DRAIN_CLAIM_SECONDS:-15}"
+DRAIN_GRACE_SECONDS="${EXO_DRAIN_GRACE_SECONDS:-300}"
+
+scheduler_pid_file() {
+  echo "$STATE_DIR/exo-scheduler.pid"
+}
+
+scheduler_restart_file() {
+  echo "$STATE_DIR/exo-scheduler.restart"
+}
+
+adapters_restart_file() {
+  echo "$STATE_DIR/exo-adapters.restart"
+}
+
+adapters_lock_file() {
+  echo "$STATE_DIR/exo-adapters.lock"
+}
+
+reboot_notice_file() {
+  echo "$STATE_DIR/exo-reboot-notice.json"
+}
+
+# Tell the next adapter runner that this start is part of a reboot. The runner
+# claims the notice and wakes the adapter conversations so the agent can
+# announce externally that it is back up.
+write_reboot_notice() {
+  local reason="$1"
+  ensure_state_dir
+  printf '{"requestedAt":"%s","reason":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" >"$(reboot_notice_file)"
+}
+
+scheduler_lock_file() {
+  echo "$STATE_DIR/exo-scheduler.lock"
+}
+
+repl_restart_file() {
+  echo "$STATE_DIR/exo-control.restart"
+}
+
+adapters_pid_file() {
+  echo "$STATE_DIR/exo-adapters.pid"
+}
+
+scheduler_log_file() {
+  echo "$STATE_DIR/exo-scheduler.log"
+}
+
+adapters_log_file() {
+  echo "$STATE_DIR/exo-adapters.log"
+}
+
+kill_process_tree() {
+  local signal="$1"
+  local pid="$2"
+  local child
+  [[ "$pid" =~ ^[0-9]+$ ]] || return
+  if command -v pgrep >/dev/null 2>&1; then
+    while IFS= read -r child; do
+      [[ -n "$child" ]] || continue
+      kill_process_tree "$signal" "$child"
+    done < <(pgrep -P "$pid" 2>/dev/null || true)
+  fi
+  kill "-$signal" "$pid" >/dev/null 2>&1 || true
+}
+
+terminate_process_tree() {
+  local pid="$1"
+  kill_process_tree TERM "$pid"
+  sleep 1
+  kill_process_tree KILL "$pid"
+}
+
+pid_running() {
+  local pid_file="$1"
+  local pid
+  [[ -f "$pid_file" ]] || return 1
+  pid="$(<"$pid_file")"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" >/dev/null 2>&1
+}
+
+exo_global_args() {
+  printf '%s\0' --env-file-if-exists "$ENV_FILE"
+  if [[ -n "$SANDBOX_BACKEND" ]]; then
+    printf '%s\0' --sandbox-backend "$SANDBOX_BACKEND"
+  fi
+}
+
+read_exo_global_args() {
+  EXO_GLOBAL_ARGS=()
+  while IFS= read -r -d '' arg; do
+    EXO_GLOBAL_ARGS+=("$arg")
+  done < <(exo_global_args)
+}
+
+ensure_exo_bin() {
+  if [[ ! -x "$EXO_BIN" ]]; then
+    die "exo binary is not executable: $EXO_BIN; run guardian build first"
+  fi
+}
+
+ensure_scheduler_bin() {
+  if [[ ! -x "$SCHEDULER_BIN" ]]; then
+    die "scheduler runner is not executable: $SCHEDULER_BIN; run guardian build first"
+  fi
+}
+
+start_scheduler() {
+  ensure_state_dir
+  ensure_scheduler_bin
+  local pid_file log_file
+  pid_file="$(scheduler_pid_file)"
+  log_file="$(scheduler_log_file)"
+  if pid_running "$pid_file"; then
+    echo "Scheduler already running: $(<"$pid_file")"
+    return
+  fi
+  rm -f "$(scheduler_lock_file)" "$(scheduler_restart_file)"
+  echo "Starting scheduler..."
+  local scheduler_args=(--env-file-if-exists "$ENV_FILE")
+  if [[ -n "$SANDBOX_BACKEND" ]]; then
+    scheduler_args+=(--sandbox-backend "$SANDBOX_BACKEND")
+  fi
+  nohup "$SCHEDULER_BIN" "${scheduler_args[@]}" run --watch \
+    --interval-seconds "$SCHEDULER_INTERVAL_SECONDS" >>"$log_file" 2>&1 &
+  echo "$!" >"$pid_file"
+  echo "Scheduler log: $log_file"
+}
+
+start_adapters() {
+  ensure_state_dir
+  ensure_exo_bin
+  local pid_file log_file
+  pid_file="$(adapters_pid_file)"
+  log_file="$(adapters_log_file)"
+  if pid_running "$pid_file"; then
+    echo "Adapter runner already running: $(<"$pid_file")"
+    return
+  fi
+  rm -f "$(adapters_restart_file)"
+  read_exo_global_args
+  echo "Starting adapter runner..."
+  nohup "$EXO_BIN" "${EXO_GLOBAL_ARGS[@]}" --harness "$HARNESS" \
+    adapters run \
+      --limit "$ADAPTER_LIMIT" \
+      --lock-file "$(adapters_lock_file)" \
+      --drain-marker "$(adapters_restart_file)" \
+      --reboot-notice "$(reboot_notice_file)" \
+    >>"$log_file" 2>&1 &
+  echo "$!" >"$pid_file"
+  echo "Adapter log: $log_file"
+}
+
+stop_pid_file() {
+  local label="$1"
+  local pid_file="$2"
+  local pid
+  if [[ -f "$pid_file" ]]; then
+    pid="$(<"$pid_file")"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" >/dev/null 2>&1; then
+      echo "Stopping $label..."
+      terminate_process_tree "$pid"
+    fi
+  fi
+  rm -f "$pid_file"
+}
+
+# Ask a runner to drain via its restart marker before falling back to a kill.
+# The runner claims the request by deleting the marker, finishes in-flight
+# work, and exits on its own. A runner that never claims the marker (an old
+# build, or one wedged mid-task) gets the process tree treatment instead.
+drain_pid_file() {
+  local label="$1"
+  local pid_file="$2"
+  local marker="$3"
+  local pid waited
+  if [[ ! -f "$pid_file" ]]; then
+    rm -f "$pid_file"
+    return
+  fi
+  pid="$(<"$pid_file")"
+  if ! [[ "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" >/dev/null 2>&1; then
+    rm -f "$pid_file"
+    return
+  fi
+  echo "Requesting graceful $label drain..."
+  : >"$marker"
+  waited=0
+  while [[ -f "$marker" && "$waited" -lt "$DRAIN_CLAIM_SECONDS" ]]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if [[ -f "$marker" ]]; then
+    rm -f "$marker"
+    echo "$label did not claim the drain request; stopping process tree..."
+    terminate_process_tree "$pid"
+  else
+    waited=0
+    while kill -0 "$pid" >/dev/null 2>&1 && [[ "$waited" -lt "$DRAIN_GRACE_SECONDS" ]]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      echo "$label still running after ${DRAIN_GRACE_SECONDS}s drain grace; stopping process tree..."
+      terminate_process_tree "$pid"
+    else
+      echo "$label drained and exited cleanly."
+    fi
+  fi
+  rm -f "$pid_file"
+}
+
+stop_scheduler() {
+  drain_pid_file "Exo scheduler" "$(scheduler_pid_file)" "$(scheduler_restart_file)"
+  pkill -f "exo-scheduler-runner .*run --watch" >/dev/null 2>&1 || true
+  rm -f "$(scheduler_lock_file)"
+}
+
+stop_adapters() {
+  drain_pid_file "Exo adapter runner" "$(adapters_pid_file)" "$(adapters_restart_file)"
+  pkill -f "exo .*adapters run" >/dev/null 2>&1 || true
+  pkill -f "tsx exo/adapters/.*/worker.ts" >/dev/null 2>&1 || true
+}
+
+start_services() {
+  start_scheduler
+  start_adapters
+}
+
+stop_services() {
+  stop_scheduler
+  stop_adapters
+  echo "Stopped guardian-managed services. State in .exo was preserved."
+}
+
+restart_scheduler() {
+  stop_scheduler
+  start_scheduler
+}
+
+restart_adapters() {
+  stop_adapters
+  write_reboot_notice "restart-adapters"
+  start_adapters
+}
+
+restart_services() {
+  stop_services
+  write_reboot_notice "$RESTART_REASON"
+  start_services
+}
+
+service_status() {
+  local label="$1"
+  local pid_file="$2"
+  local log_file="$3"
+  if pid_running "$pid_file"; then
+    echo "$label: running pid $(<"$pid_file")"
+  else
+    echo "$label: stopped"
+  fi
+  echo "  pid: $pid_file"
+  echo "  log: $log_file"
+}
+
+status() {
+  echo "Service guardian config: $CONFIG_FILE"
+  echo "exo: $EXO_BIN"
+  echo "scheduler: $SCHEDULER_BIN"
+  echo "env file: $ENV_FILE"
+  if [[ -n "$SANDBOX_BACKEND" ]]; then
+    echo "sandbox backend: $SANDBOX_BACKEND"
+  fi
+  service_status "scheduler" "$(scheduler_pid_file)" "$(scheduler_log_file)"
+  service_status "adapters" "$(adapters_pid_file)" "$(adapters_log_file)"
+  if [[ -f "$(repl_restart_file)" ]]; then
+    echo "repl restart: pending ($(repl_restart_file))"
+  else
+    echo "repl restart: none pending"
+  fi
+}
+
+show_logs() {
+  local which="${1:-all}"
+  case "$which" in
+    scheduler)
+      tail -n 80 "$(scheduler_log_file)" 2>/dev/null || true
+      ;;
+    adapters)
+      tail -n 80 "$(adapters_log_file)" 2>/dev/null || true
+      ;;
+    all)
+      echo "== scheduler =="
+      tail -n 40 "$(scheduler_log_file)" 2>/dev/null || true
+      echo "== adapters =="
+      tail -n 40 "$(adapters_log_file)" 2>/dev/null || true
+      ;;
+    *)
+      die "logs target must be scheduler or adapters"
+      ;;
+  esac
+}
+
+COMMAND="${1:-}"
+if [[ -z "$COMMAND" || "$COMMAND" == "--help" || "$COMMAND" == "-h" ]]; then
+  usage
+  if [[ -z "$COMMAND" ]]; then
+    exit 1
+  fi
+  exit 0
+fi
+shift
+
+BUILD_BEFORE_RESTART=false
+RESTART_REASON="restart-services"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --env-file)
+      ENV_FILE="${2:-}"
+      [[ -n "$ENV_FILE" ]] || die "--env-file requires a value"
+      shift 2
+      ;;
+    --exo-bin)
+      EXO_BIN="${2:-}"
+      [[ -n "$EXO_BIN" ]] || die "--exo-bin requires a value"
+      shift 2
+      ;;
+    --scheduler-bin)
+      SCHEDULER_BIN="${2:-}"
+      [[ -n "$SCHEDULER_BIN" ]] || die "--scheduler-bin requires a value"
+      shift 2
+      ;;
+    --sandbox-backend)
+      SANDBOX_BACKEND="${2:-}"
+      case "$SANDBOX_BACKEND" in
+        apple-container|docker|local-process) ;;
+        *) die "--sandbox-backend must be apple-container, docker, or local-process" ;;
+      esac
+      shift 2
+      ;;
+    --scheduler-interval)
+      SCHEDULER_INTERVAL_SECONDS="${2:-}"
+      [[ "$SCHEDULER_INTERVAL_SECONDS" =~ ^[0-9]+$ && "$SCHEDULER_INTERVAL_SECONDS" -gt 0 ]] || die "--scheduler-interval requires a positive integer"
+      shift 2
+      ;;
+    --adapter-limit)
+      ADAPTER_LIMIT="${2:-}"
+      [[ "$ADAPTER_LIMIT" =~ ^[0-9]+$ && "$ADAPTER_LIMIT" -gt 0 ]] || die "--adapter-limit requires a positive integer"
+      shift 2
+      ;;
+    --config)
+      CONFIG_FILE="${2:-}"
+      [[ -n "$CONFIG_FILE" ]] || die "--config requires a value"
+      shift 2
+      ;;
+    --build)
+      BUILD_BEFORE_RESTART=true
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      if [[ "$COMMAND" == "logs" && "${LOG_TARGET:-}" == "" ]]; then
+        LOG_TARGET="$1"
+        shift
+      else
+        die "unknown argument: $1"
+      fi
+      ;;
+  esac
+done
+
+case "$COMMAND" in
+  status)
+    status
+    ;;
+  configure)
+    write_config
+    ;;
+  build)
+    build_all
+    ;;
+  start-services)
+    start_services
+    ;;
+  stop-services)
+    stop_services
+    ;;
+  restart-services)
+    restart_services
+    ;;
+  restart-adapters)
+    restart_adapters
+    ;;
+  restart-scheduler)
+    restart_scheduler
+    ;;
+  restart-all)
+    if [[ "$BUILD_BEFORE_RESTART" == true ]]; then
+      build_all
+      RESTART_REASON="restart-all with fresh build"
+    else
+      RESTART_REASON="restart-all"
+    fi
+    restart_services
+    ;;
+  logs)
+    show_logs "${LOG_TARGET:-all}"
+    ;;
+  *)
+    die "unknown command: $COMMAND"
+    ;;
+esac

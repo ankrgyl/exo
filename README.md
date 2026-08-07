@@ -12,7 +12,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg?logo=rust)](Cargo.toml)
 [![TypeScript](https://img.shields.io/badge/typescript-5.x-3178c6.svg?logo=typescript&logoColor=white)](tsconfig.json)
 
-[Documentation](https://exoharness.ai/docs) · [Examples](examples/) · [Discord](https://discord.gg/8x23hdBJU6)
+[Documentation](https://exoharness.ai/docs) · [Discord](https://discord.gg/8x23hdBJU6)
 
 </div>
 
@@ -47,7 +47,7 @@ In short, we think this is the best way to take advantage of the growing power
 of AI models when building long-lived agents.
 
 For a more complete description of the architectural philosophy read
-[A Systems View of Recursive Self Improvement](docs/RSI.md)
+[A Systems View of Recursive Self Improvement](exo/docs/RSI.md)
 
 <!-- ![Exo playinb pokemon go](docs/images/exo_playing.gif) -->
 
@@ -167,7 +167,7 @@ There are only a few key components you need to know about to understand how
 Exo works. You can use Exo like any agent without understanding these internals.
 But having a basic idea will help you more effectively guide Exo if you want it
 to evolve itself. For a deeper dive into these concepts, see
-[`docs/EXO-BASICS.md`](docs/EXO-BASICS.md).
+[`exo/docs/EXO-BASICS.md`](exo/docs/EXO-BASICS.md).
 
 **Basic Loop** Exo runs a host-side loop that receives user messages and adapter
 events, builds the model context, exposes the active tools, executes tool calls,
@@ -208,12 +208,12 @@ While there are many, the most obvious is that right now there isn't a simple wa
 
 There are a number of prompt files that Exo uses during runtime. You can edit these directly or ask Exo to.
 
-- `examples/exo/prompts/me.md`: the committed core identity and operating
+- `exo/prompts/me.md`: the committed core identity and operating
   rules for the default Exo agent.
 - `.exo/exo-profile.md`: local, git-ignored profile instructions such as
   your name and machine-specific preferences. Create or update it with
   `./exo.sh setup-profile`.
-- `examples/exo/harness.ts`: assembles the full prompt sent each turn,
+- `exo/harness.ts`: assembles the full prompt sent each turn,
   including dynamic instructions about tools, adapters, memory, sandbox behavior,
   and self-maintenance.
 
