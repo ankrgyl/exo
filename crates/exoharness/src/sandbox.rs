@@ -457,7 +457,7 @@ impl CliContainerSandboxBackend {
         })
     }
 
-    async fn reap_expired_warm_sandboxes(&self) -> Result<()> {
+    async fn reap_expired_warm_sandboxes(&self) {
         let now = Instant::now();
         let expired = {
             let mut warm_sandboxes = self.warm_sandboxes.lock().await;
@@ -476,12 +476,8 @@ impl CliContainerSandboxBackend {
         };
 
         for entry in expired {
-            if entry.owned {
-                cleanup_named_container(&self.container_bin, self.cli, &entry.name).await?;
-            }
+            schedule_cleanup_named_container(self.container_bin.clone(), self.cli, entry.name);
         }
-
-        Ok(())
     }
 }
 
@@ -510,7 +506,7 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
             }));
         }
 
-        self.reap_expired_warm_sandboxes().await?;
+        self.reap_expired_warm_sandboxes().await;
 
         let replaced = {
             let mut warm_sandboxes = self.warm_sandboxes.lock().await;
