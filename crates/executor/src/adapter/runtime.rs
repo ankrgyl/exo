@@ -25,7 +25,7 @@ use crate::conversation_events::{
     record_host_event,
 };
 use crate::conversation_wakeup::{send_conversation_wakeup, send_conversation_wakeup_content};
-use crate::{CreateConversationRequest, Harness, HarnessAgent, HarnessConversation};
+use crate::{CreateConversationRequest, Harness, HarnessAgent, HarnessConversation, SandboxScope};
 
 const INITIAL_RESTART_DELAY: Duration = Duration::from_secs(5);
 const MAX_RESTART_DELAY: Duration = Duration::from_secs(300);
@@ -708,6 +708,7 @@ async fn resolve_message_conversation(
         .create_conversation(CreateConversationRequest {
             slug: Some(slug.clone()),
             name: Some(name),
+            sandbox_scope: Some(SandboxScope::Conversation),
             ..Default::default()
         })
         .await

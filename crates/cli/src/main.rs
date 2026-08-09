@@ -1508,13 +1508,9 @@ async fn main() -> Result<()> {
                             .sandbox_provider
                             .map(SandboxProvider::from),
                         shell_program: sandbox_runtime.shell_program,
+                        sandbox_scope: sandbox_scope.map(Into::into),
                     })
                     .await?;
-                if let Some(sandbox_scope) = sandbox_scope {
-                    let mut config = conversation.config().await?;
-                    config.sandbox_scope = Some(sandbox_scope.into());
-                    conversation.put_config(config).await?;
-                }
                 println!(
                     "created conversation {} ({})",
                     conversation.record().slug,
