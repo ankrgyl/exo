@@ -98,7 +98,12 @@ class EvalScriptTest(unittest.TestCase):
         )
         self.assertEqual(
             sorted(path.name for path in dataset.iterdir()),
-            ["01-install-tool", "02-reuse-tool", "03-restart-policy"],
+            [
+                "01-install-tool",
+                "02-reuse-tool",
+                "03-restart-policy",
+                "04-timeout-trajectory",
+            ],
         )
 
     def test_terminal_bench_easy_selects_three_tasks(self) -> None:
