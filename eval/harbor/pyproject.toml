@@ -1,0 +1,22 @@
+[project]
+name = "exo-harbor"
+version = "0.1.0"
+description = "Run Exo as a Harbor external agent"
+requires-python = ">=3.12"
+dependencies = [
+  # Pinned to the minor. The integration depends on the JobPlugin protocol
+  # and the TrialEvent.END hook payload, both of which are young enough to
+  # move between minors.
+  "harbor>=0.20,<0.21",
+]
+
+[project.entry-points."harbor.plugins"]
+# Lets runs say `--plugin exo-session` instead of the full import path.
+exo-session = "exo_harbor.plugin:ExoSessionPlugin"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
