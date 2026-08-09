@@ -551,6 +551,19 @@ function adapterConfigSchema(): ToolDefinition["parameters"] {
         },
         required: ["type", "socketPath", "mountRoot", "mountPath"],
       },
+      {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          type: { type: "string", enum: ["trial"] },
+          socketPath: {
+            type: "string",
+            description:
+              "Absolute host unix socket path on which an evaluation runner submits containerized trials.",
+          },
+        },
+        required: ["type", "socketPath"],
+      },
     ],
   } as ToolDefinition["parameters"];
 }
@@ -572,7 +585,8 @@ function validateAdapterSource(source: string, type: string): void {
       type === "whatsapp" ||
       type === "signal" ||
       type === "discord" ||
-      type === "slack") &&
+      type === "slack" ||
+      type === "trial") &&
     source !== "library"
   ) {
     throw new Error(`${type} adapters must use source 'library'`);

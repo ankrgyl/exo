@@ -1,6 +1,7 @@
 pub(crate) mod runtime;
 pub(crate) mod store;
 pub(crate) mod tools;
+mod trial;
 pub(crate) mod types;
 pub(crate) mod worker;
 

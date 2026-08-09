@@ -14,6 +14,7 @@ use tokio::fs;
 
 use super::runtime::send_adapter_message_with_handles;
 use super::store::AdapterStore;
+use super::trial::finalize_trial_completion;
 use super::types::{
     AdapterAttachment, AdapterConfig, AdapterEventType, AdapterSource, NewAdapter,
     WorkerSecretEnvVar,
@@ -100,6 +101,7 @@ enum AdapterCreationConfig {
     Slack(SlackAdapterCreationConfig),
     Exochat(ExochatAdapterCreationConfig),
     AgentCli(AgentCliAdapterCreationConfig),
+    Trial(TrialAdapterCreationConfig),
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,6 +203,21 @@ struct AgentCliAdapterCreationConfig {
     socket_path: Option<String>,
     mount_root: String,
     mount_path: Option<String>,
+}
+
+/// Receives containerized evaluation trials over a local Unix socket.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TrialAdapterCreationConfig {
+    #[serde(rename = "type")]
+    _adapter_type: TrialAdapterType,
+    socket_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TrialAdapterType {
+    Trial,
 }
 
 #[derive(Debug, Deserialize)]
@@ -324,6 +341,7 @@ impl AdapterCreationConfig {
             Self::Slack(_) => "slack",
             Self::Exochat(_) => "exochat",
             Self::AgentCli(_) => "agent-cli",
+            Self::Trial(_) => "trial",
         }
     }
 
@@ -519,6 +537,22 @@ impl AdapterCreationConfig {
                         "socketPath": config.socket_path,
                         "mountRoot": config.mount_root,
                         "mountPath": mount_path,
+                    }),
+                    state_dir: None,
+                    secret_env: Vec::new(),
+                })
+            }
+            Self::Trial(config) => {
+                require_source(source, AdapterSource::Library, "trial")?;
+                if !config.socket_path.starts_with('/') {
+                    bail!("trial socketPath must be an absolute host path");
+                }
+                Ok(AdapterConfig {
+                    adapter_type: "trial".to_string(),
+                    worker_command: options.worker_command("trial"),
+                    initialization: serde_json::json!({
+                        "socketPath": config.socket_path,
+                        "conversationScope": "target",
                     }),
                     state_dir: None,
                     secret_env: Vec::new(),
@@ -891,6 +925,14 @@ pub async fn execute_send_adapter_message_tool(
         scoped_target.as_deref(),
         args.target.as_deref(),
     )?;
+    let text = if adapter.config.adapter_type == "trial" {
+        let target = target
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("trial completion requires its inbound target"))?;
+        finalize_trial_completion(&args.text, target, &conversation.record().id.to_string())?
+    } else {
+        args.text
+    };
     let attachments = args.attachments.unwrap_or_default();
     if !attachments.is_empty()
         && adapter.config.adapter_type != "whatsapp"
@@ -917,7 +959,7 @@ pub async fn execute_send_adapter_message_tool(
         conversation,
         store,
         &adapter,
-        &args.text,
+        &text,
         target.as_deref(),
         attachments,
     )
@@ -1565,6 +1607,27 @@ mod tests {
             .into_adapter_config(AdapterSource::Library, &test_creation_options())
             .unwrap_err();
         assert!(error.to_string().contains("absolute host path"));
+    }
+
+    #[test]
+    fn trial_config_uses_target_scoped_conversations() {
+        let config: AdapterCreationConfig = serde_json::from_value(serde_json::json!({
+            "type": "trial",
+            "socketPath": "/tmp/trial.sock",
+        }))
+        .unwrap();
+        let adapter_config = config
+            .into_adapter_config(AdapterSource::Library, &test_creation_options())
+            .unwrap();
+        assert_eq!(adapter_config.adapter_type, "trial");
+        assert!(adapter_config.worker_command[2].ends_with("/tmp/exo-adapters/trial/worker.ts"));
+        assert_eq!(
+            adapter_config.initialization,
+            serde_json::json!({
+                "socketPath": "/tmp/trial.sock",
+                "conversationScope": "target",
+            })
+        );
     }
 
     #[test]

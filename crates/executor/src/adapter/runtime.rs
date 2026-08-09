@@ -15,6 +15,7 @@ use lingua::universal::{TextContentPart, UserContent, UserContentPart};
 
 use super::store::{AdapterStore, stable_target_key};
 use super::tools::download_attachment;
+use super::trial::prepare_trial_run;
 use super::types::{
     AdapterAttachment, AdapterAttachmentKind, AdapterConfig, AdapterDeliveryStatus,
     AdapterEventType, AdapterRecord, AdapterTargetConversationRecord, now_ms,
@@ -585,6 +586,9 @@ async fn handle_worker_event(
                 &metadata,
             )
             .await?;
+            if config.adapter_type == "trial" {
+                prepare_trial_run(conversation.as_ref(), metadata.clone()).await?;
+            }
             handle_worker_message(
                 store,
                 conversation.as_ref(),
