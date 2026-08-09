@@ -18,6 +18,15 @@ export type TrialComplete = {
   summary?: string | null;
 };
 
+export type TrialStarted = {
+  type: "trial_started";
+  request_id: string;
+  target: string;
+  conversation_id: string;
+};
+
+export type TrialResponse = TrialStarted | TrialComplete;
+
 export function defaultSocketPath(homedir: string = os.homedir()): string {
   return path.join(homedir, ".exo", "trial.sock");
 }
@@ -37,10 +46,10 @@ export function parseTrialRun(value: unknown): TrialRun {
   };
 }
 
-export function parseTrialComplete(
+export function parseTrialResponse(
   text: string,
   request: TrialRun,
-): TrialComplete {
+): TrialResponse {
   let value: unknown;
   try {
     value = JSON.parse(text);
@@ -48,8 +57,8 @@ export function parseTrialComplete(
     throw new Error("trial response must be a JSON object");
   }
   const record = objectValue(value, "trial response");
-  if (record.type !== "trial_complete") {
-    throw new Error("response type must be trial_complete");
+  if (record.type !== "trial_started" && record.type !== "trial_complete") {
+    throw new Error("response type must be trial_started or trial_complete");
   }
   const requestId = stringValue(record.request_id, "request_id");
   if (requestId !== request.request_id) {
@@ -63,11 +72,20 @@ export function parseTrialComplete(
       `response target ${target} does not match ${request.target}`,
     );
   }
+  const conversationId = stringValue(record.conversation_id, "conversation_id");
+  if (record.type === "trial_started") {
+    return {
+      type: "trial_started",
+      request_id: requestId,
+      target,
+      conversation_id: conversationId,
+    };
+  }
   return {
     type: "trial_complete",
     request_id: requestId,
     target,
-    conversation_id: stringValue(record.conversation_id, "conversation_id"),
+    conversation_id: conversationId,
     summary: nullableString(record.summary, "summary"),
   };
 }

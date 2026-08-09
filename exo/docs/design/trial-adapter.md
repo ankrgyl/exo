@@ -38,7 +38,18 @@ The initial protocol has one request.
 one delivery and makes retrying a request idempotent. A target may have only one
 active phase at a time.
 
-The successful response is:
+Once the conversation exists and the container is attached, the adapter emits:
+
+```json
+{
+  "type": "trial_started",
+  "request_id": "unique delivery id",
+  "target": "stable trial id",
+  "conversation_id": "Exo conversation id"
+}
+```
+
+The final successful response is:
 
 ```json
 {
@@ -77,11 +88,12 @@ For `trial_run`, the adapter:
 
 1. Creates a new conversation for the trial.
 2. Attaches the supplied container as that conversation's sandbox.
-3. Wakes the conversation with the supplied instructions and the explicit
+3. Returns `trial_started` so the evaluator can retain the conversation id.
+4. Wakes the conversation with the supplied instructions and the explicit
    completion protocol.
-4. Continues waking the same conversation after an Exo rebuild until the agent
+5. Continues waking the same conversation after an Exo rebuild until the agent
    calls `send_adapter_message` to declare completion.
-5. Returns `trial_complete` to the waiting evaluator.
+6. Returns `trial_complete` to the waiting evaluator.
 
 In a later version, `trial_feedback` would:
 
@@ -109,10 +121,11 @@ active request id and deadline (when active)
 completed request ids and responses
 ```
 
-The current worker persists active requests and completed responses in its
-adapter state directory. The runtime durably maps each target to its trial
-conversation. A restarted worker can therefore replay a pending wake or return
-an already-completed response after Exo rebuilds.
+The current worker persists active requests, started responses, and completed
+responses in its adapter state directory. The runtime durably maps each target
+to its trial conversation. A restarted worker can therefore replay
+`trial_started`, replay a pending wake, or return an already-completed response
+after Exo rebuilds.
 
 ## Learning across trials
 
@@ -151,9 +164,10 @@ the existing conversation.
 
 ## Trajectory export
 
-Every completion response includes `conversation_id`. That is the stable source
-for exporting the trial's model messages, tool calls, results, and rebuild
-continuations.
+Both responses include `conversation_id`. The evaluator retains it from
+`trial_started`, making it possible to export model messages, tool calls,
+results, and rebuild continuations even when the trial times out before
+`trial_complete`.
 
 ATIF conversion should be a separate exporter over the canonical conversation
 log rather than part of the adapter protocol. A benchmark bridge can export the

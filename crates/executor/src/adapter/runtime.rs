@@ -15,7 +15,7 @@ use lingua::universal::{TextContentPart, UserContent, UserContentPart};
 
 use super::store::{AdapterStore, stable_target_key};
 use super::tools::download_attachment;
-use super::trial::prepare_trial_run;
+use super::trial::{prepare_trial_run, trial_started};
 use super::types::{
     AdapterAttachment, AdapterAttachmentKind, AdapterConfig, AdapterDeliveryStatus,
     AdapterEventType, AdapterRecord, AdapterTargetConversationRecord, now_ms,
@@ -381,6 +381,16 @@ pub async fn send_adapter_message_with_handles(
     target: Option<&str>,
     attachments: Vec<AdapterAttachment>,
 ) -> Result<String> {
+    queue_adapter_message(store, adapter, text, target, attachments).await
+}
+
+async fn queue_adapter_message(
+    store: &AdapterStore,
+    adapter: &AdapterRecord,
+    text: &str,
+    target: Option<&str>,
+    attachments: Vec<AdapterAttachment>,
+) -> Result<String> {
     if !adapter.enabled {
         bail!("adapter is disabled: {}", adapter.id);
     }
@@ -587,7 +597,12 @@ async fn handle_worker_event(
             )
             .await?;
             if config.adapter_type == "trial" {
-                prepare_trial_run(conversation.as_ref(), metadata.clone()).await?;
+                let prepared = prepare_trial_run(conversation.as_ref(), metadata.clone()).await?;
+                let conversation_id = conversation.record().id.to_string();
+                let started = trial_started(&prepared, &target, &conversation_id)?;
+                // Publish the conversation id before entering the potentially
+                // long-running wakeup turn so evaluators can retain it on timeout.
+                queue_adapter_message(store, adapter, &started, Some(&target), Vec::new()).await?;
             }
             handle_worker_message(
                 store,

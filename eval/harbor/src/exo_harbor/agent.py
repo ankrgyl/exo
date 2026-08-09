@@ -36,7 +36,7 @@ from harbor.models.agent.context import AgentContext
 from exo_harbor import conventions
 from exo_harbor.docker import resolve_main_container
 from exo_harbor.exo import ExoClient
-from exo_harbor.protocol import TrialRun, send_trial_run
+from exo_harbor.protocol import TrialRun, TrialStarted, send_trial_run
 from exo_harbor.trajectory import export_trial_trajectory
 
 logger = logging.getLogger(__name__)
@@ -127,29 +127,45 @@ class ExoAgent(BaseAgent):
         if self._container_id is None:
             raise RuntimeError("ExoAgent.run called before setup")
 
-        response = await send_trial_run(
-            conventions.socket_path(self._exo_root),
-            TrialRun(
-                request_id=str(uuid4()),
-                target=str(self.context_id),
-                container_id=self._container_id,
-                instructions=instruction,
-            ),
-            timeout_sec=self._task_timeout_sec,
-        )
+        conversation_id: str | None = None
+
+        def trial_started(started: TrialStarted) -> None:
+            nonlocal conversation_id
+            conversation_id = started.conversation_id
+            logger.info(
+                "trial %s started in conversation %s",
+                self.context_id,
+                conversation_id,
+            )
+
         try:
-            await export_trial_trajectory(
-                self._client,
-                response.conversation_id,
-                str(self.context_id),
-                instruction,
-                self._model,
-                self.logs_dir / "trajectory.json",
+            response = await send_trial_run(
+                conventions.socket_path(self._exo_root),
+                TrialRun(
+                    request_id=str(uuid4()),
+                    target=str(self.context_id),
+                    container_id=self._container_id,
+                    instructions=instruction,
+                ),
+                timeout_sec=self._task_timeout_sec,
+                on_started=trial_started,
             )
-        except Exception:
-            logger.exception(
-                "failed to export Harbor trajectory for %s", self.context_id
-            )
+            conversation_id = response.conversation_id
+        finally:
+            if conversation_id is not None:
+                try:
+                    await export_trial_trajectory(
+                        self._client,
+                        conversation_id,
+                        str(self.context_id),
+                        instruction,
+                        self._model,
+                        self.logs_dir / "trajectory.json",
+                    )
+                except Exception:
+                    logger.exception(
+                        "failed to export Harbor trajectory for %s", self.context_id
+                    )
 
         if response.summary:
             logger.info("trial %s complete: %s", self.context_id, response.summary)

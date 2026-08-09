@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from exo_harbor.protocol import TrialRun, send_trial_run
+from exo_harbor.protocol import TrialRun, TrialStarted, send_trial_run
 
 
 class TrialProtocolTest(unittest.IsolatedAsyncioTestCase):
@@ -56,6 +56,7 @@ class TrialProtocolTest(unittest.IsolatedAsyncioTestCase):
             instructions="Fix it",
         )
         received: list[dict] = []
+        started: list[TrialStarted] = []
 
         with tempfile.TemporaryDirectory() as directory:
             socket_path = Path(directory) / "trial.sock"
@@ -64,12 +65,34 @@ class TrialProtocolTest(unittest.IsolatedAsyncioTestCase):
                 reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             ) -> None:
                 received.append(json.loads(await reader.readline()))
+                writer.write(
+                    (
+                        json.dumps(
+                            {
+                                "type": "event",
+                                "event": {
+                                    "type": "trial_started",
+                                    "request_id": "request-1",
+                                    "target": "trial-1",
+                                    "conversation_id": "conversation-1",
+                                },
+                            }
+                        )
+                        + "\n"
+                    ).encode()
+                )
+                await writer.drain()
                 writer.close()
                 await writer.wait_closed()
 
             first = await asyncio.start_unix_server(disconnect, path=socket_path)
             task = asyncio.create_task(
-                send_trial_run(socket_path, request, timeout_sec=5)
+                send_trial_run(
+                    socket_path,
+                    request,
+                    timeout_sec=5,
+                    on_started=started.append,
+                )
             )
             while not received:
                 await asyncio.sleep(0.01)
@@ -81,22 +104,29 @@ class TrialProtocolTest(unittest.IsolatedAsyncioTestCase):
                 reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             ) -> None:
                 received.append(json.loads(await reader.readline()))
+                messages = [
+                    {
+                        "type": "event",
+                        "event": {
+                            "type": "trial_started",
+                            "request_id": "request-1",
+                            "target": "trial-1",
+                            "conversation_id": "conversation-1",
+                        },
+                    },
+                    {
+                        "type": "response",
+                        "event": {
+                            "type": "trial_complete",
+                            "request_id": "request-1",
+                            "target": "trial-1",
+                            "conversation_id": "conversation-1",
+                            "summary": "done",
+                        },
+                    },
+                ]
                 writer.write(
-                    (
-                        json.dumps(
-                            {
-                                "type": "response",
-                                "event": {
-                                    "type": "trial_complete",
-                                    "request_id": "request-1",
-                                    "target": "trial-1",
-                                    "conversation_id": "conversation-1",
-                                    "summary": "done",
-                                },
-                            }
-                        )
-                        + "\n"
-                    ).encode()
+                    "".join(f"{json.dumps(message)}\n" for message in messages).encode()
                 )
                 await writer.drain()
                 writer.close()
@@ -108,8 +138,67 @@ class TrialProtocolTest(unittest.IsolatedAsyncioTestCase):
             await second.wait_closed()
 
         self.assertEqual(received, [request.payload(), request.payload()])
+        self.assertEqual(
+            started,
+            [
+                TrialStarted(
+                    request_id="request-1",
+                    target="trial-1",
+                    conversation_id="conversation-1",
+                )
+            ],
+        )
         self.assertEqual(response.conversation_id, "conversation-1")
         self.assertEqual(response.summary, "done")
+
+    async def test_timeout_retains_started_conversation(self) -> None:
+        started: list[TrialStarted] = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "trial.sock"
+
+            async def start_only(
+                reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+            ) -> None:
+                await reader.readline()
+                writer.write(
+                    (
+                        json.dumps(
+                            {
+                                "type": "event",
+                                "event": {
+                                    "type": "trial_started",
+                                    "request_id": "request-1",
+                                    "target": "trial-1",
+                                    "conversation_id": "conversation-1",
+                                },
+                            }
+                        )
+                        + "\n"
+                    ).encode()
+                )
+                await writer.drain()
+                await reader.read()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_unix_server(start_only, path=socket_path)
+            with self.assertRaises(asyncio.TimeoutError):
+                await send_trial_run(
+                    socket_path,
+                    TrialRun(
+                        request_id="request-1",
+                        target="trial-1",
+                        container_id="container-1",
+                        instructions="Fix it",
+                    ),
+                    timeout_sec=0.05,
+                    on_started=started.append,
+                )
+            server.close()
+            await server.wait_closed()
+
+        self.assertEqual(started[0].conversation_id, "conversation-1")
 
 
 if __name__ == "__main__":

@@ -15,10 +15,11 @@ import {
 import {
   composeTrialPrompt,
   defaultSocketPath,
-  parseTrialComplete,
+  parseTrialResponse,
   parseTrialRun,
   type TrialComplete,
   type TrialRun,
+  type TrialStarted,
 } from "./trial";
 
 type PendingTrial = {
@@ -27,8 +28,13 @@ type PendingTrial = {
 };
 
 type CompletedTrial = {
-  commandId: string;
+  commandIds: string[];
   response: TrialComplete;
+};
+
+type StartedTrial = {
+  commandIds: string[];
+  response: TrialStarted;
 };
 
 const config = adapterConfig();
@@ -79,6 +85,10 @@ const server = net.createServer((socket) => {
         return;
       }
       pending.sockets.add(socket);
+      const started = readStartedTrial(request.request_id);
+      if (started) {
+        sendToClient(socket, { type: "event", event: started.response });
+      }
       return;
     }
     if (findPendingRequest(request.request_id)) {
@@ -158,9 +168,37 @@ for await (const line of input) {
       throw new Error(`trial target ${target} is not awaiting completion`);
     }
 
-    const response = parseTrialComplete(command.text, pending.request);
-    writeCompletedTrial(pending.request.request_id, command.id, response);
+    const response = parseTrialResponse(command.text, pending.request);
+    if (response.type === "trial_started") {
+      const started = readStartedTrial(pending.request.request_id);
+      if (
+        started &&
+        started.response.conversation_id !== response.conversation_id
+      ) {
+        throw new Error(
+          `trial target ${target} changed conversations while active`,
+        );
+      }
+      writeStartedTrial(pending.request.request_id, {
+        commandIds: [...(started?.commandIds ?? []), command.id],
+        response,
+      });
+      if (!started) {
+        for (const socket of pending.sockets) {
+          sendToClient(socket, { type: "event", event: response });
+        }
+      }
+      writeWorkerEvent({ type: "command_ack", command_id: command.id });
+      continue;
+    }
+
+    const started = readStartedTrial(pending.request.request_id);
+    writeCompletedTrial(pending.request.request_id, {
+      commandIds: [...(started?.commandIds ?? []), command.id],
+      response,
+    });
     removePendingTrial(pending.request.request_id);
+    removeStartedTrial(pending.request.request_id);
     pendingByTarget.delete(target);
     for (const socket of pending.sockets) {
       sendToClient(socket, { type: "response", event: response });
@@ -205,6 +243,7 @@ function loadPendingTrials(): void {
     const request = parseTrialRun(JSON.parse(fs.readFileSync(file, "utf8")));
     if (readCompletedTrial(request.request_id)) {
       fs.rmSync(file, { force: true });
+      removeStartedTrial(request.request_id);
       continue;
     }
     if (pendingByTarget.has(request.target)) {
@@ -231,6 +270,10 @@ function completedPath(requestId: string): string {
   return statePath("response", requestId);
 }
 
+function startedPath(requestId: string): string {
+  return statePath("started", requestId);
+}
+
 function statePath(kind: string, requestId: string): string {
   const digest = crypto.createHash("sha256").update(requestId).digest("hex");
   return path.join(stateDir, `${kind}-${digest}.json`);
@@ -242,6 +285,24 @@ function writePendingTrial(request: TrialRun): void {
 
 function removePendingTrial(requestId: string): void {
   fs.rmSync(pendingPath(requestId), { force: true });
+}
+
+function readStartedTrial(requestId: string): StartedTrial | null {
+  try {
+    return JSON.parse(
+      fs.readFileSync(startedPath(requestId), "utf8"),
+    ) as StartedTrial;
+  } catch {
+    return null;
+  }
+}
+
+function writeStartedTrial(requestId: string, started: StartedTrial): void {
+  writeJsonAtomically(startedPath(requestId), started);
+}
+
+function removeStartedTrial(requestId: string): void {
+  fs.rmSync(startedPath(requestId), { force: true });
 }
 
 function readCompletedTrial(requestId: string): CompletedTrial | null {
@@ -256,10 +317,9 @@ function readCompletedTrial(requestId: string): CompletedTrial | null {
 
 function writeCompletedTrial(
   requestId: string,
-  commandId: string,
-  response: TrialComplete,
+  completed: CompletedTrial,
 ): void {
-  writeJsonAtomically(completedPath(requestId), { commandId, response });
+  writeJsonAtomically(completedPath(requestId), completed);
 }
 
 function writeJsonAtomically(destination: string, value: object): void {
@@ -277,7 +337,7 @@ function hasCompletedCommand(commandId: string): boolean {
       const completed = JSON.parse(
         fs.readFileSync(path.join(stateDir, name), "utf8"),
       ) as CompletedTrial;
-      return completed.commandId === commandId;
+      return completed.commandIds.includes(commandId);
     } catch {
       return false;
     }

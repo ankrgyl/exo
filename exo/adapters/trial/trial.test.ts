@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { composeTrialPrompt, parseTrialComplete, parseTrialRun } from "./trial";
+import { composeTrialPrompt, parseTrialResponse, parseTrialRun } from "./trial";
 
 const request = parseTrialRun({
   type: "trial_run",
@@ -21,7 +21,7 @@ describe("trial adapter protocol", () => {
 
   it("validates the runtime-completed response", () => {
     expect(
-      parseTrialComplete(
+      parseTrialResponse(
         JSON.stringify({
           type: "trial_complete",
           request_id: "request-1",
@@ -37,6 +37,25 @@ describe("trial adapter protocol", () => {
       target: "trial-1",
       conversation_id: "conversation-1",
       summary: "done",
+    });
+  });
+
+  it("validates the runtime-started response", () => {
+    expect(
+      parseTrialResponse(
+        JSON.stringify({
+          type: "trial_started",
+          request_id: "request-1",
+          target: "trial-1",
+          conversation_id: "conversation-1",
+        }),
+        request,
+      ),
+    ).toEqual({
+      type: "trial_started",
+      request_id: "request-1",
+      target: "trial-1",
+      conversation_id: "conversation-1",
     });
   });
 });

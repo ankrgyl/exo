@@ -27,7 +27,8 @@ attach_job_plugins(job)
   job.run()
     Trial.create()           new ExoAgent
       setup(env)             resolve Harbor's container     [once per trial]
-      run(instruction)       trial_run -> trial_complete    [once per step]
+      run(instruction)       trial_run -> trial_started -> trial_complete
+                                                             [once per step]
       <verifier runs>
       TrialEvent.END         record accumulated agent state
     ... next trial ...
@@ -44,7 +45,8 @@ Harbor constructs the agent and plugin independently:
 - The plugin creates the persistent Exo agent and trial adapter, then starts
   the adapter runner.
 - Each Harbor agent resolves its task container, submits it through the shared
-  socket, and uses the returned conversation id to export its trajectory.
+  socket, and retains the conversation id from `trial_started`. It exports the
+  trajectory after completion or timeout.
 
 The plugin recovers `exo_root` from `job.config.agents[0].kwargs` rather than
 taking its own `--pk` copy, so the path is written down once.

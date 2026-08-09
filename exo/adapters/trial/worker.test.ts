@@ -64,6 +64,7 @@ describe("trial adapter worker", () => {
       subject: socketPath,
     });
     const firstClient = await connect(socketPath);
+    const firstResponses = new LineQueue(firstClient);
     firstClient.write(`${JSON.stringify(request)}\n`);
     expect(JSON.parse(await first.events.next())).toMatchObject({
       type: "message",
@@ -73,6 +74,37 @@ describe("trial adapter worker", () => {
         request_id: "request-1",
         container_id: "container-1",
       },
+    });
+    const firstInput = first.child.stdin;
+    if (firstInput === null) {
+      throw new Error("trial worker stdin is not piped");
+    }
+    firstInput.write(
+      `${JSON.stringify({
+        type: "send_message",
+        id: "started-command-1",
+        target: "trial-1",
+        text: JSON.stringify({
+          type: "trial_started",
+          request_id: "request-1",
+          target: "trial-1",
+          conversation_id: "conversation-1",
+        }),
+        attachments: [],
+      })}\n`,
+    );
+    expect(JSON.parse(await firstResponses.next())).toEqual({
+      type: "event",
+      event: {
+        type: "trial_started",
+        request_id: "request-1",
+        target: "trial-1",
+        conversation_id: "conversation-1",
+      },
+    });
+    expect(JSON.parse(await first.events.next())).toEqual({
+      type: "command_ack",
+      command_id: "started-command-1",
     });
 
     first.child.kill("SIGKILL");
@@ -93,6 +125,15 @@ describe("trial adapter worker", () => {
     const secondClient = await connect(socketPath);
     const responses = new LineQueue(secondClient);
     secondClient.write(`${JSON.stringify(request)}\n`);
+    expect(JSON.parse(await responses.next())).toEqual({
+      type: "event",
+      event: {
+        type: "trial_started",
+        request_id: "request-1",
+        target: "trial-1",
+        conversation_id: "conversation-1",
+      },
+    });
     const workerInput = second.child.stdin;
     if (workerInput === null) {
       throw new Error("trial worker stdin is not piped");
