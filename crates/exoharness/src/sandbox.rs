@@ -683,7 +683,7 @@ impl ManagedSandboxHandle for BorrowedDockerSandboxHandle {
     }
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {
-        bail!("borrowed Docker containers cannot be snapshotted")
+        docker_snapshot_container(&self.container_bin, &self.container_id).await
     }
 }
 
@@ -2325,7 +2325,7 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn borrowed_docker_sandbox_execs_without_taking_container_ownership() {
+    async fn borrowed_docker_sandbox_execs_and_snapshots_without_taking_ownership() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
@@ -2346,6 +2346,9 @@ case "$1" in
     ;;
   exec)
     printf 'borrowed output'
+    ;;
+  save)
+    printf 'snapshot payload'
     ;;
 esac
 "#,
@@ -2410,11 +2413,20 @@ esac
                 container_id: "canonical-id".to_string(),
             }
         );
+        let snapshot = handle
+            .snapshot()
+            .await
+            .expect("snapshot borrowed container");
+        assert_eq!(snapshot.kind, SnapshotKind::DockerImageTar);
+        assert_eq!(snapshot.bytes.as_ref(), b"snapshot payload");
 
         let args = fs::read_to_string(&args_path).expect("read fake docker args");
         assert!(args.contains("inspect\nharbor-task\n---"));
         assert!(args.contains("exec\n--workdir\n/task\ncanonical-id"));
-        assert!(!args.lines().any(|arg| arg == "rm"));
+        assert!(args.contains("commit\n-p\ncanonical-id\nexo-snap-"));
+        assert!(args.contains("save\nexo-snap-"));
+        assert!(args.contains("image\nrm\nexo-snap-"));
+        assert!(!args.contains("rm\ncanonical-id"));
         assert!(!args.lines().any(|arg| arg == "stop"));
         assert!(!args.lines().any(|arg| arg == "kill"));
     }

@@ -8,10 +8,11 @@ use crate::protocol::{
 };
 use crate::{
     AgentHandle, AgentId, AttachSandboxRequest, CancelSandboxProcessRequest,
-    CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, CreateSandboxRequest,
-    ExoHarness, GetSandboxProcessEventsResult, ListConversationsResult, Result, SandboxAttachment,
-    SandboxId, SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, SessionId,
-    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord,
+    CloseSandboxProcessInputRequest, ConversationHandle, ConversationId,
+    CreateSandboxFromSnapshotRequest, CreateSandboxRequest, ExoHarness,
+    GetSandboxProcessEventsResult, ListConversationsResult, Result, SandboxAttachment, SandboxId,
+    SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, SessionId, SnapshotId,
+    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord,
     WaitSandboxProcessRequest, WriteSandboxProcessInputRequest,
 };
 
@@ -139,6 +140,9 @@ impl ExoHarnessServer {
             }
             Request::CreateSandbox { scope, request } => Ok(Response::SandboxId {
                 sandbox_id: self.create_sandbox(scope, request).await?,
+            }),
+            Request::CreateSandboxFromSnapshot { scope, request } => Ok(Response::SandboxId {
+                sandbox_id: self.create_sandbox_from_snapshot(scope, request).await?,
             }),
             Request::AttachSandbox { scope, request } => Ok(Response::SandboxId {
                 sandbox_id: self.attach_sandbox(scope, request).await?,
@@ -518,6 +522,33 @@ impl ExoHarnessServer {
             SandboxScope::Turn { .. } => {
                 Err(anyhow!("attach_sandbox is not supported on a turn scope"))
             }
+        }
+    }
+
+    async fn create_sandbox_from_snapshot(
+        &self,
+        scope: SandboxScope,
+        request: CreateSandboxFromSnapshotRequest,
+    ) -> Result<SandboxId> {
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id)
+                    .await?
+                    .create_sandbox_from_snapshot(request)
+                    .await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .create_sandbox_from_snapshot(request)
+                    .await
+            }
+            SandboxScope::Turn { .. } => Err(anyhow!(
+                "create_sandbox_from_snapshot is not supported on a turn scope"
+            )),
         }
     }
 

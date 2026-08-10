@@ -36,17 +36,17 @@ use crate::{
     ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
     BindingType, BoxAsyncRead, BoxAsyncWrite, CancelSandboxProcessRequest,
     CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, ConversationRecord,
-    CreateSandboxRequest, DurableFileSystem, Event, EventData, EventId, EventKind, EventQuery,
-    EventQueryDirection, EventStream, ExoHarness, FileSystemMount, ForkConversationRequest,
-    GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
-    ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
-    ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId,
-    SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessId,
-    SandboxProcessMode, SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus,
-    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, Secret, SecretId, SecretMetadata,
-    SecretType, SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
-    StartSandboxRequest, TurnHandle, TurnId, TurnRecord, Uuid7, WaitSandboxProcessRequest,
-    WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    CreateSandboxFromSnapshotRequest, CreateSandboxRequest, DurableFileSystem, Event, EventData,
+    EventId, EventKind, EventQuery, EventQueryDirection, EventStream, ExoHarness, FileSystemMount,
+    ForkConversationRequest, GetEventsResult, GetSandboxProcessEventsResult,
+    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
+    PutSecretRequest, ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment,
+    SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery,
+    SandboxProcessId, SandboxProcessMode, SandboxProcessParts, SandboxProcessRecord,
+    SandboxProcessStatus, SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, Secret,
+    SecretId, SecretMetadata, SecretType, SessionId, SnapshotHandle, SnapshotId,
+    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord, Uuid7,
+    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const SANDBOX_PROVIDER_STATE_EVENT: &str = "sandbox_provider_state";
@@ -1091,6 +1091,15 @@ where
         self.sandbox_handle().create_sandbox(request).await
     }
 
+    async fn create_sandbox_from_snapshot(
+        &self,
+        request: CreateSandboxFromSnapshotRequest,
+    ) -> Result<SandboxId> {
+        self.sandbox_handle()
+            .create_sandbox_from_snapshot(request)
+            .await
+    }
+
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {
         self.sandbox_handle().attach_sandbox(request).await
     }
@@ -1613,6 +1622,22 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         self.create_new_sandbox_locked(prepared).await
     }
 
+    async fn create_sandbox_from_snapshot(
+        &self,
+        request: CreateSandboxFromSnapshotRequest,
+    ) -> Result<SandboxId> {
+        self.ensure_full_sandbox_scope("create_sandbox_from_snapshot")?;
+        let (sandbox_id, events) = create_sandbox_from_snapshot_side_effect(
+            self.harness,
+            &self.owner_dir,
+            self.owner,
+            request,
+        )
+        .await?;
+        self.append_events(events).await?;
+        Ok(sandbox_id)
+    }
+
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {
         self.ensure_full_sandbox_scope("attach_sandbox")?;
         let sandbox_id = format!("sandbox-{}", Uuid7::now());
@@ -1693,9 +1718,9 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn snapshot_sandbox(&self, id: SandboxId) -> Result<SnapshotId> {
-        let (snapshot_id, event) =
-            snapshot_sandbox_side_effect(self.harness, &self.owner_dir, id).await?;
-        self.append_events(vec![event]).await?;
+        let (snapshot_id, events) =
+            snapshot_sandbox_side_effect(self.harness, &self.owner_dir, self.owner, id).await?;
+        self.append_events(events).await?;
         Ok(snapshot_id)
     }
 
@@ -2741,22 +2766,17 @@ impl BasicConversationHandle {
 async fn snapshot_sandbox_side_effect(
     harness: &BasicExoHarness,
     owner_dir: &Path,
+    owner: SandboxOwner,
     id: SandboxId,
-) -> Result<(SnapshotId, EventData)> {
-    let sandbox = load_stored_sandbox(harness, owner_dir, &id).await?;
-    if sandbox.attachment.is_some() {
-        bail!("attached sandboxes cannot be snapshotted");
+) -> Result<(SnapshotId, Vec<EventData>)> {
+    let stored = load_stored_sandbox(harness, owner_dir, &id).await?;
+    if !stored.running {
+        bail!("sandbox is not running: {id}");
     }
     // Capture the payload before taking the write lock. Backends may need to
     // talk to docker or pause the container, which can be slow.
-    let handle = harness
-        .inner
-        .running_sandboxes
-        .lock()
-        .await
-        .get(&id)
-        .cloned()
-        .ok_or_else(|| anyhow!("sandbox {id} is not running; start it before snapshotting"))?;
+    let (handle, provider_state_event) =
+        active_sandbox_handle(harness, owner_dir, owner, &id, &stored).await?;
     let payload = handle.snapshot().await?;
 
     let _guard = harness.inner.write_lock.lock().await;
@@ -2786,13 +2806,15 @@ async fn snapshot_sandbox_side_effect(
             &sandbox,
         )
         .await?;
-    Ok((
+    let mut events = Vec::new();
+    if let Some(event) = provider_state_event {
+        events.push(event);
+    }
+    events.push(EventData::SandboxSnapshotted {
+        sandbox_id: id,
         snapshot_id,
-        EventData::SandboxSnapshotted {
-            sandbox_id: id,
-            snapshot_id,
-        },
-    ))
+    });
+    Ok((snapshot_id, events))
 }
 
 async fn start_sandbox_side_effect(
@@ -2807,26 +2829,7 @@ async fn start_sandbox_side_effect(
     }
     // Load the snapshot payload before acquiring the write lock. It can be
     // large, and we don't want to block writers while we read.
-    let snapshot_dir = owner_dir
-        .join("snapshots")
-        .join(request.snapshot_id.to_string());
-    let storage = &harness.inner.storage;
-    let (manifest_result, payload_result) = tokio::join!(
-        storage.get_json::<StoredSnapshotManifest>(snapshot_dir.join("manifest.json")),
-        storage.get_bytes(snapshot_dir.join("payload.bin")),
-    );
-    let manifest = manifest_result.with_context(|| {
-        format!(
-            "loading snapshot manifest for {} (have you taken a snapshot?)",
-            request.snapshot_id
-        )
-    })?;
-    let payload_bytes = payload_result
-        .with_context(|| format!("loading snapshot payload for {}", request.snapshot_id))?;
-    let payload = SnapshotPayload {
-        kind: manifest.kind,
-        bytes: Bytes::from(payload_bytes),
-    };
+    let (_, payload) = load_snapshot(harness, owner_dir, request.snapshot_id).await?;
 
     let mut sandbox = load_stored_sandbox(harness, owner_dir, &request.id).await?;
     sandbox.running = true;
@@ -2934,6 +2937,105 @@ async fn start_sandbox_side_effect(
         sandbox_id: request.id,
         snapshot_id: Some(request.snapshot_id),
     })
+}
+
+async fn create_sandbox_from_snapshot_side_effect(
+    harness: &BasicExoHarness,
+    owner_dir: &Path,
+    owner: SandboxOwner,
+    request: CreateSandboxFromSnapshotRequest,
+) -> Result<(SandboxId, Vec<EventData>)> {
+    let (manifest, payload) = load_snapshot(harness, owner_dir, request.snapshot_id).await?;
+    let source = load_stored_sandbox(harness, owner_dir, &manifest.sandbox_id).await?;
+    let sandbox_id = format!("sandbox-{}", Uuid7::now());
+    let mut sandbox = StoredSandbox {
+        id: sandbox_id.clone(),
+        name: None,
+        provider: request.provider.unwrap_or(source.provider),
+        image: source.image,
+        requested_image: source.requested_image,
+        default_workdir: source.default_workdir,
+        file_system_mounts: source.file_system_mounts,
+        durable_file_systems: source.durable_file_systems,
+        enable_networking: source.enable_networking,
+        idle_seconds: request.idle_seconds.unwrap_or(source.idle_seconds),
+        running: true,
+        latest_snapshot_id: Some(request.snapshot_id),
+        attachment: None,
+    };
+    let handle = harness
+        .inner
+        .sandbox_backend_for_provider(sandbox.provider.clone())
+        .await?
+        .acquire_from_snapshot(sandbox_request(owner, &sandbox_id, &sandbox, None), payload)
+        .await?;
+    if let Some(effective_image) = handle.effective_image()
+        && effective_image != sandbox.image
+    {
+        sandbox
+            .requested_image
+            .get_or_insert_with(|| sandbox.image.clone());
+        sandbox.image = effective_image;
+    }
+
+    let _guard = harness.inner.write_lock.lock().await;
+    harness
+        .inner
+        .storage
+        .put_json(
+            owner_dir
+                .join("sandboxes")
+                .join(format!("{sandbox_id}.json")),
+            &sandbox,
+        )
+        .await?;
+    harness
+        .inner
+        .running_sandboxes
+        .lock()
+        .await
+        .insert(sandbox_id.clone(), handle);
+    let events = vec![
+        EventData::SandboxCreated {
+            sandbox_id: sandbox_id.clone(),
+            name: None,
+            provider: sandbox.provider,
+            image: sandbox.image,
+            default_workdir: sandbox.default_workdir.unwrap_or_default(),
+            file_system_mounts: sandbox.file_system_mounts,
+            durable_file_systems: sandbox.durable_file_systems,
+            enable_networking: sandbox.enable_networking,
+            idle_seconds: sandbox.idle_seconds,
+        },
+        EventData::SandboxStarted {
+            sandbox_id: sandbox_id.clone(),
+            snapshot_id: Some(request.snapshot_id),
+        },
+    ];
+    Ok((sandbox_id, events))
+}
+
+async fn load_snapshot(
+    harness: &BasicExoHarness,
+    owner_dir: &Path,
+    snapshot_id: SnapshotId,
+) -> Result<(StoredSnapshotManifest, SnapshotPayload)> {
+    let snapshot_dir = owner_dir.join("snapshots").join(snapshot_id.to_string());
+    let storage = &harness.inner.storage;
+    let (manifest_result, payload_result) = tokio::join!(
+        storage.get_json::<StoredSnapshotManifest>(snapshot_dir.join("manifest.json")),
+        storage.get_bytes(snapshot_dir.join("payload.bin")),
+    );
+    let manifest = manifest_result.with_context(|| {
+        format!("loading snapshot manifest for {snapshot_id} (have you taken a snapshot?)")
+    })?;
+    let payload_bytes =
+        payload_result.with_context(|| format!("loading snapshot payload for {snapshot_id}"))?;
+    let payload = SnapshotPayload {
+        kind: manifest.kind,
+        bytes: Bytes::from(payload_bytes),
+    };
+    Ok((manifest, payload))
 }
 
 async fn load_stored_sandbox(

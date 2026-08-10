@@ -4,10 +4,10 @@ use crate::{
     AddEventsRequest, AddEventsResult, AgentId, AgentRecord, Artifact, ArtifactVersion,
     AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
     CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, ConversationId,
-    CreateSandboxRequest, Event, EventData, EventId, EventQuery, ForkConversationRequest,
-    GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
-    ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
-    ReadArtifactRequest, SandboxAttachment, SandboxId, SandboxProcessEventQuery,
+    CreateSandboxFromSnapshotRequest, CreateSandboxRequest, Event, EventData, EventId, EventQuery,
+    ForkConversationRequest, GetEventsResult, GetSandboxProcessEventsResult,
+    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
+    PutSecretRequest, ReadArtifactRequest, SandboxAttachment, SandboxId, SandboxProcessEventQuery,
     SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId, SecretMetadata, SessionId,
     SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, ThreadRecord, TurnId, TurnRecord,
     WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
@@ -130,6 +130,10 @@ pub enum Request {
     CreateSandbox {
         scope: SandboxScope,
         request: CreateSandboxRequest,
+    },
+    CreateSandboxFromSnapshot {
+        scope: SandboxScope,
+        request: CreateSandboxFromSnapshotRequest,
     },
     AttachSandbox {
         scope: SandboxScope,
@@ -316,6 +320,7 @@ impl Request {
             Self::AgentReadArtifact { .. } => "agent_read_artifact",
             Self::AgentWriteArtifact { .. } => "agent_write_artifact",
             Self::CreateSandbox { .. } => "create_sandbox",
+            Self::CreateSandboxFromSnapshot { .. } => "create_sandbox_from_snapshot",
             Self::AttachSandbox { .. } => "attach_sandbox",
             Self::DetachSandbox { .. } => "detach_sandbox",
             Self::SnapshotSandbox { .. } => "snapshot_sandbox",

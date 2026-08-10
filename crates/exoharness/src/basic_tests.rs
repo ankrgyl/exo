@@ -19,17 +19,17 @@ use tokio::time::{sleep, timeout};
 
 use crate::test_support::{local_test_config, local_test_config_with_daytona};
 use crate::{
-    Artifact, ArtifactVersion, BasicExoHarness, BeginTurnRequest, Binding, BoxAsyncRead,
-    BoxAsyncWrite, CloseSandboxProcessInputRequest, CreateSandboxRequest, DurableFileSystem,
-    EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness, FileSystemMountMode,
-    ForkConversationRequest, ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest,
-    NewConversationRequest, PutSecretRequest, RunInSandboxRequest, SandboxAttachment,
-    SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput, SandboxKey,
-    SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent, SandboxProcessEventQuery,
-    SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin, SandboxProvider,
-    SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotKind, SnapshotPayload,
-    StartSandboxProcessRequest, StartSandboxRequest, Uuid7, WaitSandboxProcessRequest,
-    WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    Artifact, ArtifactVersion, AttachSandboxRequest, BasicExoHarness, BeginTurnRequest, Binding,
+    BoxAsyncRead, BoxAsyncWrite, CloseSandboxProcessInputRequest, CreateSandboxFromSnapshotRequest,
+    CreateSandboxRequest, DurableFileSystem, EventData, EventKind, EventQuery, EventQueryDirection,
+    ExoHarness, FileSystemMountMode, ForkConversationRequest, ManagedSandboxBackend,
+    ManagedSandboxHandle, NewAgentRequest, NewConversationRequest, PutSecretRequest,
+    RunInSandboxRequest, SandboxAttachment, SandboxBackendRegistration, SandboxCommand,
+    SandboxCommandOutput, SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy,
+    SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
+    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec,
+    Secret, SnapshotKind, SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
+    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const DEFAULT_DURABLE_CONTRACT_MOUNT_PATH: &str = "/home/exo/workspace";
@@ -1631,6 +1631,232 @@ async fn test_conversation(harness: &BasicExoHarness) -> Arc<dyn crate::Conversa
         .new_conversation(NewConversationRequest::default())
         .await
         .expect("conversation")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn attached_sandbox_snapshot_creates_a_separate_owned_sandbox() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let backend = Arc::new(AttachmentTestBackend::default());
+    backend
+        .external_resource_exists
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let harness = BasicExoHarness::new(attachment_test_config(tempdir.path(), backend.clone()))
+        .await
+        .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let agent_id = agent.record().id;
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    let conversation_id = conversation.record().id;
+    let attachment = SandboxAttachment::DockerContainer {
+        container_id: "external-container".to_string(),
+    };
+    let attached_id = conversation
+        .attach_sandbox(AttachSandboxRequest {
+            attachment: attachment.clone(),
+            default_workdir: Some("/workspace".to_string()),
+        })
+        .await
+        .expect("sandbox should attach");
+
+    // Reopen the durable state as a separate process would. Snapshotting must
+    // reacquire the attachment from its descriptor rather than depend on the
+    // process-local handle that performed the original attach.
+    drop(conversation);
+    drop(agent);
+    drop(harness);
+    let reloaded = BasicExoHarness::new(attachment_test_config(tempdir.path(), backend.clone()))
+        .await
+        .expect("reloaded harness should initialize");
+    let reloaded_agent = reloaded
+        .get_agent(&agent_id)
+        .await
+        .expect("agent lookup")
+        .expect("agent should exist");
+    let conversation = reloaded_agent
+        .get_conversation(&conversation_id)
+        .await
+        .expect("conversation lookup")
+        .expect("conversation should exist");
+
+    let snapshot_id = conversation
+        .snapshot_sandbox(attached_id.clone())
+        .await
+        .expect("attached sandbox should snapshot");
+    let restored_id = conversation
+        .create_sandbox_from_snapshot(CreateSandboxFromSnapshotRequest {
+            snapshot_id,
+            idle_seconds: Some(300),
+            provider: None,
+        })
+        .await
+        .expect("snapshot should create an owned sandbox");
+
+    assert_ne!(restored_id, attached_id);
+    assert_eq!(
+        conversation
+            .detach_sandbox(attached_id)
+            .await
+            .expect("the original attachment should remain borrowed"),
+        attachment
+    );
+    conversation
+        .stop_sandbox(restored_id)
+        .await
+        .expect("the restored sandbox should be owned");
+    assert_eq!(
+        backend
+            .restore_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        backend.stop_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+fn attachment_test_config(
+    root: &std::path::Path,
+    backend: Arc<AttachmentTestBackend>,
+) -> crate::BasicExoHarnessConfig {
+    let mut config = local_test_config(root);
+    config.sandbox_default = SandboxProvider::Docker;
+    config.sandbox_backends = vec![SandboxBackendRegistration::from_backend(
+        SandboxProvider::Docker,
+        backend,
+    )];
+    config
+}
+
+#[derive(Default)]
+struct AttachmentTestBackend {
+    attach_calls: std::sync::atomic::AtomicUsize,
+    restore_calls: Arc<std::sync::atomic::AtomicUsize>,
+    stop_calls: Arc<std::sync::atomic::AtomicUsize>,
+    external_resource_exists: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl ManagedSandboxBackend for AttachmentTestBackend {
+    fn is_local(&self) -> bool {
+        false
+    }
+
+    async fn acquire(
+        &self,
+        _request: SandboxRequest,
+    ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        bail!("attachment test backend only supports attach")
+    }
+
+    async fn attach(
+        &self,
+        _request: SandboxRequest,
+        attachment: SandboxAttachment,
+    ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        self.attach_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !self
+            .external_resource_exists
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            bail!("external resource is gone")
+        }
+        Ok(Arc::new(AttachmentTestHandle { attachment }))
+    }
+
+    async fn acquire_from_snapshot(
+        &self,
+        _request: SandboxRequest,
+        payload: SnapshotPayload,
+    ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        assert_eq!(payload.kind, SnapshotKind::DockerImageTar);
+        assert_eq!(payload.bytes.as_ref(), b"submitted state");
+        self.restore_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Arc::new(RestoredAttachmentTestHandle {
+            stop_calls: Arc::clone(&self.stop_calls),
+        }))
+    }
+}
+
+struct AttachmentTestHandle {
+    attachment: SandboxAttachment,
+}
+
+#[async_trait]
+impl ManagedSandboxHandle for AttachmentTestHandle {
+    fn id(&self) -> &str {
+        "attachment-test"
+    }
+
+    async fn exec(&self, _command: &SandboxCommand) -> crate::Result<SandboxCommandOutput> {
+        bail!("attachment test handle does not support exec")
+    }
+
+    async fn start_process(&self, _command: &SandboxCommand) -> crate::Result<SandboxProcessParts> {
+        bail!("attachment test handle does not support start_process")
+    }
+
+    async fn stop(&self) -> crate::Result<()> {
+        bail!("attached sandbox must not be stopped")
+    }
+
+    async fn detach(&self) -> crate::Result<SandboxAttachment> {
+        Ok(self.attachment.clone())
+    }
+
+    async fn snapshot(&self) -> crate::Result<SnapshotPayload> {
+        Ok(SnapshotPayload {
+            kind: SnapshotKind::DockerImageTar,
+            bytes: b"submitted state".to_vec().into(),
+        })
+    }
+}
+
+struct RestoredAttachmentTestHandle {
+    stop_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl ManagedSandboxHandle for RestoredAttachmentTestHandle {
+    fn id(&self) -> &str {
+        "restored-attachment-test"
+    }
+
+    async fn exec(&self, _command: &SandboxCommand) -> crate::Result<SandboxCommandOutput> {
+        bail!("restored attachment test handle does not support exec")
+    }
+
+    async fn start_process(&self, _command: &SandboxCommand) -> crate::Result<SandboxProcessParts> {
+        bail!("restored attachment test handle does not support start_process")
+    }
+
+    async fn stop(&self) -> crate::Result<()> {
+        self.stop_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn detach(&self) -> crate::Result<SandboxAttachment> {
+        bail!("restored attachment test handle does not support detachment")
+    }
+
+    async fn snapshot(&self) -> crate::Result<SnapshotPayload> {
+        Ok(SnapshotPayload {
+            kind: SnapshotKind::DockerImageTar,
+            bytes: b"restored state".to_vec().into(),
+        })
+    }
 }
 
 async fn test_sandbox(conversation: &Arc<dyn crate::ConversationHandle>) -> String {

@@ -42,6 +42,10 @@ pub trait SnapshotHandle: Send + Sync {
 #[async_trait]
 pub trait SandboxHandle: SnapshotHandle {
     async fn create_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId>;
+    async fn create_sandbox_from_snapshot(
+        &self,
+        request: CreateSandboxFromSnapshotRequest,
+    ) -> Result<SandboxId>;
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId>;
     async fn detach_sandbox(&self, id: SandboxId) -> Result<SandboxAttachment>;
     async fn stop_sandbox(&self, id: SandboxId) -> Result<()>;
@@ -693,6 +697,14 @@ pub struct StartSandboxRequest {
     // If unspecified, starts sandbox where it was last run. If specified, will attempt to
     // start the sandbox on the specified provider, if supported. If successful, the
     // sandbox will start there going forward.
+    #[serde(default)]
+    pub provider: Option<SandboxProvider>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateSandboxFromSnapshotRequest {
+    pub snapshot_id: SnapshotId,
+    pub idle_seconds: Option<u64>,
     #[serde(default)]
     pub provider: Option<SandboxProvider>,
 }

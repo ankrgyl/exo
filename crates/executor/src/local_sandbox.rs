@@ -6,8 +6,9 @@ use async_trait::async_trait;
 use exoharness::{
     AddEventsRequest, AddEventsResult, AgentHandle, AgentId, Artifact, ArtifactVersion,
     AttachSandboxRequest, Binding, BindingId, BindingRecord, CancelSandboxProcessRequest,
-    CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, CreateSandboxRequest,
-    Event, EventData, EventId, EventKind, EventStream, ExoHarness, ForkConversationRequest,
+    CloseSandboxProcessInputRequest, ConversationHandle, ConversationId,
+    CreateSandboxFromSnapshotRequest, CreateSandboxRequest, Event, EventData, EventId, EventKind,
+    EventQuery, EventQueryDirection, EventStream, ExoHarness, ForkConversationRequest,
     GetEventsResult, ListConversationsRequest, ListConversationsResult, NewAgentRequest,
     NewConversationRequest, PutSecretRequest, ReadArtifactRequest, Result, RunInSandboxRequest,
     SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery,
@@ -40,6 +41,7 @@ struct LocalSandboxState {
     conversations: Mutex<HashMap<ConversationId, Arc<dyn ConversationHandle>>>,
     conversation_init: Mutex<()>,
     sandboxes: Mutex<HashMap<SandboxId, SandboxId>>,
+    local_snapshots: Mutex<HashSet<SnapshotId>>,
     detached_sandboxes: Mutex<HashMap<SandboxId, SandboxAttachment>>,
     force_local: bool,
     local_providers: HashSet<SandboxProvider>,
@@ -72,6 +74,7 @@ impl LocalSandboxExoHarness {
                 conversations: Mutex::new(HashMap::new()),
                 conversation_init: Mutex::new(()),
                 sandboxes: Mutex::new(HashMap::new()),
+                local_snapshots: Mutex::new(HashSet::new()),
                 detached_sandboxes: Mutex::new(HashMap::new()),
                 force_local,
                 local_providers,
@@ -296,7 +299,9 @@ impl SnapshotHandle for LocalSandboxAgent {
         let Some(local_id) = self.local_sandbox_id(&id).await? else {
             return self.remote.snapshot_sandbox(id).await;
         };
-        self.local_agent().await?.snapshot_sandbox(local_id).await
+        let snapshot_id = self.local_agent().await?.snapshot_sandbox(local_id).await?;
+        self.state.local_snapshots.lock().await.insert(snapshot_id);
+        Ok(snapshot_id)
     }
 
     async fn start_sandbox(&self, request: StartSandboxRequest) -> Result<()> {
@@ -323,6 +328,29 @@ impl SandboxHandle for LocalSandboxAgent {
         }
 
         let local_id = self.local_agent().await?.create_sandbox(request).await?;
+        let remote_id = local_id.clone();
+        self.map_local_sandbox(remote_id.clone(), local_id).await;
+        Ok(remote_id)
+    }
+
+    async fn create_sandbox_from_snapshot(
+        &self,
+        request: CreateSandboxFromSnapshotRequest,
+    ) -> Result<SandboxId> {
+        if !self
+            .state
+            .local_snapshots
+            .lock()
+            .await
+            .contains(&request.snapshot_id)
+        {
+            return self.remote.create_sandbox_from_snapshot(request).await;
+        }
+        let local_id = self
+            .local_agent()
+            .await?
+            .create_sandbox_from_snapshot(request)
+            .await?;
         let remote_id = local_id.clone();
         self.map_local_sandbox(remote_id.clone(), local_id).await;
         Ok(remote_id)
@@ -664,6 +692,33 @@ impl LocalSandboxConversation {
         local_sandbox_id_for(&self.state, self.remote.record().id, sandbox_id).await
     }
 
+    async fn snapshot_is_local(&self, snapshot_id: SnapshotId) -> Result<bool> {
+        let source_id = self
+            .remote
+            .get_events(Some(EventQuery {
+                cursor: None,
+                direction: Some(EventQueryDirection::Desc),
+                limit: None,
+                session_id: None,
+                turn_id: None,
+                types: Some(vec![EventKind::SANDBOX_SNAPSHOTTED]),
+            }))
+            .await?
+            .events
+            .into_iter()
+            .find_map(|event| match event.data {
+                EventData::SandboxSnapshotted {
+                    sandbox_id,
+                    snapshot_id: candidate,
+                } if candidate == snapshot_id => Some(sandbox_id),
+                _ => None,
+            });
+        let Some(source_id) = source_id else {
+            return Ok(false);
+        };
+        Ok(self.local_sandbox_id(&source_id).await?.is_some())
+    }
+
     async fn map_local_sandbox(&self, remote_id: SandboxId, local_id: SandboxId) -> Result<()> {
         self.state
             .sandboxes
@@ -801,6 +856,7 @@ impl SnapshotHandle for LocalSandboxConversation {
             .await?
             .snapshot_sandbox(local_id)
             .await?;
+        self.state.local_snapshots.lock().await.insert(snapshot_id);
         self.append_remote_sandbox_events(vec![EventData::SandboxSnapshotted {
             sandbox_id: id,
             snapshot_id,
@@ -859,6 +915,48 @@ impl SandboxHandle for LocalSandboxConversation {
             EventData::SandboxStarted {
                 sandbox_id: remote_id.clone(),
                 snapshot_id: None,
+            },
+        ])
+        .await?;
+        Ok(remote_id)
+    }
+
+    async fn create_sandbox_from_snapshot(
+        &self,
+        request: CreateSandboxFromSnapshotRequest,
+    ) -> Result<SandboxId> {
+        if !self.snapshot_is_local(request.snapshot_id).await? {
+            return self.remote.create_sandbox_from_snapshot(request).await;
+        }
+
+        let snapshot_id = request.snapshot_id;
+        let local_conversation = self.local_conversation().await?;
+        let local_id = local_conversation
+            .create_sandbox_from_snapshot(request)
+            .await?;
+        let sandbox =
+            crate::conversation_sandbox::conversation_sandboxes(local_conversation.as_ref())
+                .await?
+                .into_iter()
+                .find(|sandbox| sandbox.id == local_id)
+                .ok_or_else(|| anyhow::anyhow!("created local sandbox event was not recorded"))?;
+        let remote_id = format!("sandbox-{}", Uuid7::now());
+        self.map_local_sandbox(remote_id.clone(), local_id).await?;
+        self.append_remote_sandbox_events(vec![
+            EventData::SandboxCreated {
+                sandbox_id: remote_id.clone(),
+                name: None,
+                provider: sandbox.provider,
+                image: sandbox.image,
+                default_workdir: sandbox.default_workdir,
+                file_system_mounts: sandbox.file_system_mounts,
+                durable_file_systems: sandbox.durable_file_systems,
+                enable_networking: sandbox.enable_networking,
+                idle_seconds: sandbox.idle_seconds,
+            },
+            EventData::SandboxStarted {
+                sandbox_id: remote_id.clone(),
+                snapshot_id: Some(snapshot_id),
             },
         ])
         .await?;

@@ -23,6 +23,13 @@ it, and the restore path that actually consumes it.
 - `ConversationHandle::start_sandbox(StartSandboxRequest { id, snapshot_id, .. })`
   starts a fresh container whose filesystem is sourced from the snapshot,
   preserving the original sandbox's mounts, network policy, and lifecycle.
+- `ConversationHandle::create_sandbox_from_snapshot(...)` starts the snapshot
+  under a new sandbox id. The source sandbox remains unchanged, which makes
+  this the appropriate operation for copying submitted evaluation state into
+  an Exo-owned feedback environment.
+- Attached Docker containers can be snapshotted without transferring lifecycle
+  ownership. Snapshotting pauses the container only for `docker commit`; Exo
+  still cannot stop or delete the attached container.
 - A chat-REPL slash-command surface — `/snapshot`, `/snapshots`, `/rewind <id>`,
   `/teleport <provider>` — that drives the round-trip without leaving the
   conversation.
@@ -58,6 +65,7 @@ ConversationHandle             ManagedSandboxHandle           ManagedSandboxBack
   (manifest.json + payload.bin)                                         │
                                                                         │
   start_sandbox(req) ─── load manifest + payload ──► acquire_from_snapshot(req, payload)
+  create_sandbox_from_snapshot(req) ───────────────► acquire_from_snapshot(new id, payload)
 ```
 
 `ConversationHandle` orchestrates: it locates the live handle, asks for a
@@ -65,6 +73,11 @@ payload, persists the bytes, updates sandbox metadata, and emits the
 `SandboxSnapshotted` event. `ManagedSandboxHandle::snapshot` and
 `ManagedSandboxBackend::acquire_from_snapshot` are the backend-specific
 methods that produce and consume the bytes.
+
+`start_sandbox` restores in place and retains the source sandbox id.
+`create_sandbox_from_snapshot` copies the source sandbox configuration into a
+new owned sandbox record and restores the payload there. The latter never
+changes the source record or provider resource.
 
 ### SnapshotPayload and SnapshotKind
 
