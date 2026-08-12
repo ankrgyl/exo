@@ -29,6 +29,7 @@ class EvalScriptTest(unittest.TestCase):
         self.assertEqual(args.model, "gpt-5.5")
         self.assertIsNone(args.n_tasks)
         self.assertEqual(args.n_attempts, 1)
+        self.assertEqual(args.include_task_names, [])
 
     def test_all_tasks_omits_harbor_limit(self) -> None:
         args = self.parse()
@@ -121,6 +122,40 @@ class EvalScriptTest(unittest.TestCase):
                 "--include-task-name",
                 "cobol-modernization",
             ],
+        )
+
+    def test_include_task_names_can_be_repeated(self) -> None:
+        args = self.parse(
+            "--dataset=terminal-bench",
+            "--include-task-name=path-tracing",
+            "--include-task-name=gpt2-codegolf",
+        )
+
+        self.assertEqual(
+            eval_script.dataset_arguments(args),
+            [
+                "--dataset",
+                "terminal-bench@2.0",
+                "--include-task-name",
+                "path-tracing",
+                "--include-task-name",
+                "gpt2-codegolf",
+            ],
+        )
+
+    def test_include_task_names_can_come_from_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "eval.toml"
+            config.write_text(
+                'dataset = "terminal-bench"\n'
+                'include_task_names = ["path-tracing", "gpt2-codegolf"]\n'
+            )
+
+            args = self.parse(f"--config={config}")
+
+        self.assertEqual(
+            args.include_task_names,
+            ["path-tracing", "gpt2-codegolf"],
         )
 
     def test_result_paths_include_harbor_result_and_viewer(self) -> None:
