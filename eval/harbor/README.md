@@ -73,6 +73,17 @@ limit or override those defaults:
 ./eval.sh --dataset=terminal-bench --model=gpt-5.5 --n-tasks=10 --n-attempts=2
 ```
 
+Select particular tasks by repeating `--include-task-name`:
+
+```bash
+./eval.sh --dataset=terminal-bench \
+  --include-task-name=path-tracing \
+  --include-task-name=gpt2-codegolf
+```
+
+The equivalent TOML field is `include_task_names = ["path-tracing",
+"gpt2-codegolf"]`.
+
 For a quick end-to-end check using the bundled tiny task:
 
 ```bash

@@ -38,6 +38,7 @@ CONFIG_FIELDS = {
     "model",
     "n_tasks",
     "n_attempts",
+    "include_task_names",
 }
 
 
@@ -52,6 +53,7 @@ def parse_args() -> argparse.Namespace:
         "model": "gpt-5.5",
         "n_tasks": None,
         "n_attempts": 1,
+        "include_task_names": [],
     }
     if known.config is not None:
         with known.config.open("rb") as file:
@@ -82,6 +84,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model")
     parser.add_argument("--n-tasks", type=int)
     parser.add_argument(
+        "--include-task-name",
+        dest="include_task_names",
+        action="append",
+        help="task name to include; may be passed more than once",
+    )
+    parser.add_argument(
         "--n-attempts", "--number-tries", dest="n_attempts", type=int
     )
     parser.add_argument(
@@ -110,7 +118,7 @@ def dataset_arguments(args: argparse.Namespace) -> list[str]:
             f"unknown dataset {args.dataset!r}; use a built-in name or name@version"
         )
     arguments = ["--dataset", dataset]
-    for task in DATASET_TASKS.get(args.dataset, ()):
+    for task in (*DATASET_TASKS.get(args.dataset, ()), *args.include_task_names):
         arguments.extend(["--include-task-name", task])
     return arguments
 
