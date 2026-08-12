@@ -15,7 +15,7 @@ use lingua::universal::{TextContentPart, UserContent, UserContentPart};
 
 use super::store::{AdapterStore, stable_target_key};
 use super::tools::download_attachment;
-use super::trial::{prepare_trial_run, trial_started};
+use super::trial::{cancellation_response, phase_started, prepare_trial_message};
 use super::types::{
     AdapterAttachment, AdapterAttachmentKind, AdapterConfig, AdapterDeliveryStatus,
     AdapterEventType, AdapterRecord, AdapterTargetConversationRecord, now_ms,
@@ -449,6 +449,11 @@ async fn run_adapter_loop(
     let event_agent = std::sync::Arc::clone(&agent);
     let event_conversation = std::sync::Arc::clone(&conversation);
     let event_config = config.clone();
+    let control_store = store.clone();
+    let control_adapter = adapter.clone();
+    let control_agent = std::sync::Arc::clone(&agent);
+    let control_conversation = std::sync::Arc::clone(&conversation);
+    let control_config = config.clone();
     let outbound_store = store.clone();
     let outbound_adapter_id = adapter.id.clone();
     let stop_store = store.clone();
@@ -464,6 +469,24 @@ async fn run_adapter_loop(
             let agent = std::sync::Arc::clone(&event_agent);
             let conversation = std::sync::Arc::clone(&event_conversation);
             let config = event_config.clone();
+            async move {
+                handle_worker_event(
+                    &store,
+                    agent.as_ref(),
+                    conversation,
+                    &adapter,
+                    &config,
+                    event,
+                )
+                .await
+            }
+        },
+        move |event| {
+            let store = control_store.clone();
+            let adapter = control_adapter.clone();
+            let agent = std::sync::Arc::clone(&control_agent);
+            let conversation = std::sync::Arc::clone(&control_conversation);
+            let config = control_config.clone();
             async move {
                 handle_worker_event(
                     &store,
@@ -597,9 +620,22 @@ async fn handle_worker_event(
             )
             .await?;
             if config.adapter_type == "trial" {
-                let prepared = prepare_trial_run(conversation.as_ref(), metadata.clone()).await?;
+                let prepared = prepare_trial_message(
+                    store,
+                    &adapter.id,
+                    &target,
+                    conversation.as_ref(),
+                    metadata.clone(),
+                )
+                .await?;
                 let conversation_id = conversation.record().id.to_string();
-                let started = trial_started(&prepared, &target, &conversation_id)?;
+                if let Some(response) = cancellation_response(&prepared) {
+                    queue_adapter_message(store, adapter, response, Some(&target), Vec::new())
+                        .await?;
+                    return Ok(());
+                }
+                let started = phase_started(&prepared, &target, &conversation_id)?
+                    .ok_or_else(|| anyhow!("trial request did not produce a started response"))?;
                 // Publish the conversation id before entering the potentially
                 // long-running wakeup turn so evaluators can retain it on timeout.
                 queue_adapter_message(store, adapter, &started, Some(&target), Vec::new()).await?;
@@ -617,6 +653,31 @@ async fn handle_worker_event(
                 attachments,
             )
             .await
+        }
+        WorkerEvent::Control { target, metadata } => {
+            if config.adapter_type != "trial" {
+                bail!(
+                    "{} adapter does not support control events",
+                    config.adapter_type
+                );
+            }
+            let conversation = resolve_message_conversation(
+                store,
+                agent,
+                root_conversation,
+                adapter,
+                config,
+                &target,
+                &metadata,
+            )
+            .await?;
+            let prepared =
+                prepare_trial_message(store, &adapter.id, &target, conversation.as_ref(), metadata)
+                    .await?;
+            let response = cancellation_response(&prepared)
+                .ok_or_else(|| anyhow!("trial control did not produce a cancellation response"))?;
+            queue_adapter_message(store, adapter, response, Some(&target), Vec::new()).await?;
+            Ok(())
         }
         WorkerEvent::Lifecycle { name, metadata } => {
             record_worker_lifecycle(

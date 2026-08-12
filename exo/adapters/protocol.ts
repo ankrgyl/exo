@@ -31,6 +31,11 @@ export type WorkerInboundEvent =
       attachments?: AdapterAttachment[];
     }
   | {
+      type: "control";
+      target: string;
+      metadata: JsonObject;
+    }
+  | {
       type: "lifecycle";
       name: string;
       metadata?: JsonObject;

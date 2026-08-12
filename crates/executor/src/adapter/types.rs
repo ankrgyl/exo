@@ -161,6 +161,20 @@ pub struct AdapterTargetConversationRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdapterTrialRecord {
+    pub adapter_id: String,
+    pub target: String,
+    pub trial_request_id: String,
+    pub conversation_id: String,
+    pub source_sandbox_id: String,
+    pub snapshot_id: String,
+    pub feedback_request_id: Option<String>,
+    pub feedback_sandbox_id: Option<String>,
+    pub feedback_completed: bool,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdapterInboundMessageRecord {
     pub adapter_id: String,
     pub target: String,

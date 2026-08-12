@@ -46,6 +46,10 @@ pub enum WorkerEvent {
         #[serde(default)]
         attachments: Vec<AdapterAttachment>,
     },
+    Control {
+        target: String,
+        metadata: Value,
+    },
     Lifecycle {
         name: String,
         #[serde(default)]
@@ -67,18 +71,21 @@ pub enum WorkerEvent {
     },
 }
 
-pub async fn run_worker_loop<F, Fut, G, OutFut, S, StopFut>(
+pub async fn run_worker_loop<F, Fut, C, ControlFut, G, OutFut, S, StopFut>(
     adapter_id: &str,
     config: &AdapterConfig,
     secret_env: Vec<(String, String)>,
     outbound_notify: Arc<Notify>,
     on_event: F,
+    mut on_control: C,
     take_outbound_messages: G,
     mut should_stop: S,
 ) -> Result<()>
 where
     F: FnMut(WorkerEvent) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    C: FnMut(WorkerEvent) -> ControlFut,
+    ControlFut: std::future::Future<Output = Result<()>>,
     G: FnMut() -> OutFut + Send + 'static,
     OutFut: std::future::Future<Output = Result<Vec<WorkerCommand>>> + Send + 'static,
     S: FnMut() -> StopFut,
@@ -157,6 +164,10 @@ where
                     event = ?event,
                     "adapter worker event"
                 );
+                if matches!(event, WorkerEvent::Control { .. }) {
+                    on_control(event).await?;
+                    continue;
+                }
                 pending_events.fetch_add(1, Ordering::SeqCst);
                 if event_tx.send(event).await.is_err() {
                     break Err(anyhow!("adapter event handler stopped"));
@@ -358,6 +369,7 @@ mod tests {
             Vec::new(),
             outbound_notify,
             |_event| async { Ok(()) },
+            |_event| async { Ok(()) },
             || async { Ok(Vec::new()) },
             || async { Ok(true) },
         )
@@ -397,6 +409,7 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     Ok(())
                 },
+                |_event| async { Ok(()) },
                 || async { Ok(Vec::new()) },
                 move || {
                     let stop_checks = Arc::clone(&stop_checks);
@@ -407,6 +420,52 @@ mod tests {
         .await
         .expect("worker loop did not honor the stop request");
         result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatches_control_while_message_handler_is_busy() {
+        let config = AdapterConfig {
+            adapter_type: "test".to_string(),
+            worker_command: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf '%s\n' '{\"type\":\"message\",\"target\":\"t\",\"text\":\"work\"}' '{\"type\":\"control\",\"target\":\"t\",\"metadata\":{}}'; sleep 60".to_string(),
+            ],
+            initialization: json!({}),
+            state_dir: None,
+            secret_env: Vec::new(),
+        };
+        let (control_tx, control_rx) = oneshot::channel();
+        let mut control_tx = Some(control_tx);
+
+        let worker = tokio::spawn(async move {
+            run_worker_loop(
+                "adapter",
+                &config,
+                Vec::new(),
+                Arc::new(Notify::new()),
+                |_event| async {
+                    std::future::pending::<()>().await;
+                    Ok(())
+                },
+                move |_event| {
+                    let control_tx = control_tx.take();
+                    async move {
+                        control_tx.unwrap().send(()).unwrap();
+                        Ok(())
+                    }
+                },
+                || async { Ok(Vec::new()) },
+                || async { Ok(false) },
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), control_rx)
+            .await
+            .expect("control event waited behind message handler")
+            .unwrap();
+        worker.abort();
     }
 
     #[tokio::test]
@@ -459,6 +518,7 @@ mod tests {
                         Ok(())
                     }
                 },
+                |_event| async { Ok(()) },
                 move || {
                     let outbound = Arc::clone(&outbound_for_worker);
                     async move {

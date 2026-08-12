@@ -30,7 +30,7 @@ attach_job_plugins(job)
       run(instruction)       trial_run -> trial_started -> trial_complete
                                                              [once per step]
       <verifier runs>
-      TrialEvent.END         record accumulated agent state
+      TrialEvent.END         restore submitted snapshot and reflect on grading
     ... next trial ...
 ```
 
@@ -47,6 +47,12 @@ Harbor constructs the agent and plugin independently:
 - Each Harbor agent resolves its task container, submits it through the shared
   socket, and retains the conversation id from `trial_started`. It exports the
   trajectory after completion or timeout.
+
+After Harbor verifies a completed trial, the plugin sends its rewards,
+exception details, and available verifier logs back to the same conversation.
+Exo reflects inside a new sandbox restored from the submitted snapshot. The
+trajectory is exported again afterward so Harbor shows both the task and its
+reflection.
 
 The plugin recovers `exo_root` from `job.config.agents[0].kwargs` rather than
 taking its own `--pk` copy, so the path is written down once.
@@ -131,9 +137,11 @@ its own target-scoped Exo conversation.
 `--n-concurrent 1` is intentionally fixed so each trial deterministically sees
 the persistent agent changes made by all earlier trials.
 
-Feedback and container snapshotting are intentionally deferred. Version one
-ends at `trial_complete`; Harbor then grades and cleans up its original
-container normally.
+At `trial_complete`, Exo snapshots and detaches from Harbor's original
+container without taking ownership of it. Harbor grades and cleans up that
+container normally. Completed trials receive one feedback phase; trials that
+time out before producing a snapshot skip reflection but retain their partial
+trajectory.
 
 The package is pinned to `harbor>=0.20,<0.21` because the `JobPlugin` protocol
 and the `TrialEvent.END` payload may move between Harbor minor releases.

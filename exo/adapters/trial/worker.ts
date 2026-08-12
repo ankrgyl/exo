@@ -16,25 +16,25 @@ import {
   composeTrialPrompt,
   defaultSocketPath,
   parseTrialResponse,
-  parseTrialRun,
-  type TrialComplete,
-  type TrialRun,
-  type TrialStarted,
+  parseTrialSocketRequest,
+  type TrialRequest,
+  type TrialResponse,
+  type TrialSocketRequest,
 } from "./trial";
 
 type PendingTrial = {
-  request: TrialRun;
+  request: TrialRequest;
   sockets: Set<net.Socket>;
 };
 
 type CompletedTrial = {
   commandIds: string[];
-  response: TrialComplete;
+  response: TrialResponse;
 };
 
 type StartedTrial = {
   commandIds: string[];
-  response: TrialStarted;
+  response: TrialResponse;
 };
 
 const config = adapterConfig();
@@ -61,17 +61,53 @@ const server = net.createServer((socket) => {
     if (line.trim().length === 0) {
       return;
     }
-    let request: TrialRun;
+    let request: TrialSocketRequest;
     try {
-      request = parseTrialRun(JSON.parse(line));
+      request = parseTrialSocketRequest(JSON.parse(line));
     } catch (error) {
       sendToClient(socket, { type: "error", message: errorText(error) });
+      return;
+    }
+
+    if (request.type === "trial_cancel") {
+      cancelTrial(request.request_id, request.target, socket);
       return;
     }
 
     const completed = readCompletedTrial(request.request_id);
     if (completed) {
       sendToClient(socket, { type: "response", event: completed.response });
+      return;
+    }
+
+    const targetResponses = completedResponsesForTarget(request.target);
+    const completedTrial = targetResponses.some(
+      ({ response }) =>
+        response.type === "trial_complete" ||
+        response.type === "trial_cancelled",
+    );
+    const completedFeedback = targetResponses.some(
+      ({ response }) => response.type === "feedback_complete",
+    );
+    if (request.type === "trial_run" && completedTrial) {
+      sendToClient(socket, {
+        type: "error",
+        message: `trial target ${request.target} was already used`,
+      });
+      return;
+    }
+    if (request.type === "trial_feedback" && !completedTrial) {
+      sendToClient(socket, {
+        type: "error",
+        message: `trial target ${request.target} has no completed trial`,
+      });
+      return;
+    }
+    if (request.type === "trial_feedback" && completedFeedback) {
+      sendToClient(socket, {
+        type: "error",
+        message: `trial target ${request.target} already completed feedback`,
+      });
       return;
     }
 
@@ -169,7 +205,10 @@ for await (const line of input) {
     }
 
     const response = parseTrialResponse(command.text, pending.request);
-    if (response.type === "trial_started") {
+    if (
+      response.type === "trial_started" ||
+      response.type === "feedback_started"
+    ) {
       const started = readStartedTrial(pending.request.request_id);
       if (
         started &&
@@ -218,7 +257,7 @@ for await (const line of input) {
   }
 }
 
-function emitTrialRun(request: TrialRun, resuming: boolean): void {
+function emitTrialRun(request: TrialRequest, resuming: boolean): void {
   writeWorkerEvent({
     type: "message",
     target: request.target,
@@ -228,8 +267,11 @@ function emitTrialRun(request: TrialRun, resuming: boolean): void {
       ? `${request.request_id}:resume:${startupId}`
       : request.request_id,
     metadata: {
+      type: request.type,
       request_id: request.request_id,
-      container_id: request.container_id,
+      ...(request.type === "trial_run"
+        ? { container_id: request.container_id }
+        : {}),
     },
   });
 }
@@ -240,7 +282,12 @@ function loadPendingTrials(): void {
       continue;
     }
     const file = path.join(stateDir, name);
-    const request = parseTrialRun(JSON.parse(fs.readFileSync(file, "utf8")));
+    const request = parseTrialSocketRequest(
+      JSON.parse(fs.readFileSync(file, "utf8")),
+    );
+    if (request.type === "trial_cancel") {
+      throw new Error("trial cancellation cannot be pending");
+    }
     if (readCompletedTrial(request.request_id)) {
       fs.rmSync(file, { force: true });
       removeStartedTrial(request.request_id);
@@ -251,6 +298,34 @@ function loadPendingTrials(): void {
     }
     pendingByTarget.set(request.target, { request, sockets: new Set() });
   }
+}
+
+function cancelTrial(
+  requestId: string,
+  target: string,
+  socket: net.Socket,
+): void {
+  const pending = pendingByTarget.get(target);
+  if (pending && pending.request.request_id !== requestId) {
+    sendToClient(socket, {
+      type: "error",
+      message: `trial target ${target} is active under another request`,
+    });
+    return;
+  }
+  if (pending) {
+    pending.sockets.add(socket);
+    writeWorkerEvent({
+      type: "control",
+      target,
+      metadata: { type: "trial_cancel", request_id: requestId },
+    });
+    return;
+  }
+  sendToClient(socket, {
+    type: "error",
+    message: `trial target ${target} is not active`,
+  });
 }
 
 function findPendingRequest(requestId: string): PendingTrial | null {
@@ -279,7 +354,7 @@ function statePath(kind: string, requestId: string): string {
   return path.join(stateDir, `${kind}-${digest}.json`);
 }
 
-function writePendingTrial(request: TrialRun): void {
+function writePendingTrial(request: TrialRequest): void {
   writeJsonAtomically(pendingPath(request.request_id), request);
 }
 
@@ -313,6 +388,22 @@ function readCompletedTrial(requestId: string): CompletedTrial | null {
   } catch {
     return null;
   }
+}
+
+function completedResponsesForTarget(target: string): CompletedTrial[] {
+  const completed: CompletedTrial[] = [];
+  for (const name of fs.readdirSync(stateDir)) {
+    if (!name.startsWith("response-") || !name.endsWith(".json")) {
+      continue;
+    }
+    const response = JSON.parse(
+      fs.readFileSync(path.join(stateDir, name), "utf8"),
+    ) as CompletedTrial;
+    if (response.response.target === target) {
+      completed.push(response);
+    }
+  }
+  return completed;
 }
 
 function writeCompletedTrial(

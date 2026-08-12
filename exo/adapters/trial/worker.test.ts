@@ -45,6 +45,74 @@ afterEach(() => {
 });
 
 describe("trial adapter worker", () => {
+  it("forwards cancellation and returns the snapshot response", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "exo-trial-worker-"));
+    tempDirs.push(tempDir);
+    const socketPath = path.join(tempDir, "trial.sock");
+    const stateDir = path.join(tempDir, "state");
+    const worker = startWorker(socketPath, stateDir);
+    await worker.events.next();
+
+    const waiting = await connect(socketPath);
+    waiting.write(
+      `${JSON.stringify({
+        type: "trial_run",
+        request_id: "request-1",
+        target: "trial-1",
+        container_id: "container-1",
+        instructions: "Solve it",
+      })}\n`,
+    );
+    await worker.events.next();
+
+    const cancelling = await connect(socketPath);
+    const responses = new LineQueue(cancelling);
+    cancelling.write(
+      `${JSON.stringify({
+        type: "trial_cancel",
+        request_id: "request-1",
+        target: "trial-1",
+      })}\n`,
+    );
+    expect(JSON.parse(await worker.events.next())).toMatchObject({
+      type: "control",
+      target: "trial-1",
+      metadata: { type: "trial_cancel", request_id: "request-1" },
+    });
+    const workerInput = worker.child.stdin;
+    if (workerInput === null) {
+      throw new Error("trial worker stdin is not piped");
+    }
+    workerInput.write(
+      `${JSON.stringify({
+        type: "send_message",
+        id: "cancel-command-1",
+        target: "trial-1",
+        text: JSON.stringify({
+          type: "trial_cancelled",
+          request_id: "request-1",
+          target: "trial-1",
+          conversation_id: "conversation-1",
+          snapshot_id: "snapshot-1",
+        }),
+      })}\n`,
+    );
+    expect(JSON.parse(await responses.next())).toEqual({
+      type: "response",
+      event: {
+        type: "trial_cancelled",
+        request_id: "request-1",
+        target: "trial-1",
+        conversation_id: "conversation-1",
+        snapshot_id: "snapshot-1",
+      },
+    });
+    expect(fs.readdirSync(stateDir)).toHaveLength(1);
+    expect(fs.readdirSync(stateDir)[0]).toMatch(/^response-/);
+    waiting.destroy();
+    cancelling.end();
+  });
+
   it("recovers a pending trial after restart and replays its response", async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "exo-trial-worker-"));
     tempDirs.push(tempDir);
@@ -148,6 +216,7 @@ describe("trial adapter worker", () => {
           request_id: "request-1",
           target: "trial-1",
           conversation_id: "conversation-1",
+          snapshot_id: "snapshot-1",
           summary: "done",
         }),
         attachments: [],
@@ -160,6 +229,7 @@ describe("trial adapter worker", () => {
         request_id: "request-1",
         target: "trial-1",
         conversation_id: "conversation-1",
+        snapshot_id: "snapshot-1",
         summary: "done",
       },
     });
@@ -179,10 +249,76 @@ describe("trial adapter worker", () => {
         request_id: "request-1",
         target: "trial-1",
         conversation_id: "conversation-1",
+        snapshot_id: "snapshot-1",
         summary: "done",
       },
     });
     retry.end();
+
+    const feedback = {
+      type: "trial_feedback",
+      request_id: "feedback-1",
+      target: "trial-1",
+      instructions: "Extract reusable lessons.",
+      feedback: "The verifier found an edge case.",
+    };
+    const feedbackClient = await connect(socketPath);
+    const feedbackResponses = new LineQueue(feedbackClient);
+    feedbackClient.write(`${JSON.stringify(feedback)}\n`);
+    expect(JSON.parse(await second.events.next())).toMatchObject({
+      type: "message",
+      target: "trial-1",
+      message_id: "feedback-1",
+      metadata: { type: "trial_feedback", request_id: "feedback-1" },
+      text: expect.stringContaining("The verifier found an edge case."),
+    });
+    workerInput.write(
+      `${JSON.stringify({
+        type: "send_message",
+        id: "feedback-started-command",
+        target: "trial-1",
+        text: JSON.stringify({
+          type: "feedback_started",
+          request_id: "feedback-1",
+          target: "trial-1",
+          conversation_id: "conversation-1",
+          sandbox_id: "sandbox-2",
+        }),
+        attachments: [],
+      })}\n`,
+    );
+    expect(JSON.parse(await feedbackResponses.next())).toMatchObject({
+      type: "event",
+      event: { type: "feedback_started", sandbox_id: "sandbox-2" },
+    });
+    expect(JSON.parse(await second.events.next())).toEqual({
+      type: "command_ack",
+      command_id: "feedback-started-command",
+    });
+    workerInput.write(
+      `${JSON.stringify({
+        type: "send_message",
+        id: "feedback-complete-command",
+        target: "trial-1",
+        text: JSON.stringify({
+          type: "feedback_complete",
+          request_id: "feedback-1",
+          target: "trial-1",
+          conversation_id: "conversation-1",
+          summary: "learned",
+        }),
+        attachments: [],
+      })}\n`,
+    );
+    expect(JSON.parse(await feedbackResponses.next())).toMatchObject({
+      type: "response",
+      event: { type: "feedback_complete", summary: "learned" },
+    });
+    expect(JSON.parse(await second.events.next())).toEqual({
+      type: "command_ack",
+      command_id: "feedback-complete-command",
+    });
+    feedbackClient.end();
   }, 10_000);
 });
 

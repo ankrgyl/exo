@@ -2,11 +2,11 @@ import asyncio
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 from exo_harbor.agent import ExoAgent
-from exo_harbor.protocol import TrialStarted
+from exo_harbor.protocol import TrialCancelled, TrialStarted
 
 
 class ExoAgentTest(unittest.IsolatedAsyncioTestCase):
@@ -22,12 +22,20 @@ class ExoAgentTest(unittest.IsolatedAsyncioTestCase):
             agent.context_id = uuid4()
             agent._container_id = "container-1"
 
-            async def time_out(*args, on_started, **kwargs):
+            async def time_out(*args, on_started, on_cancelled, **kwargs):
                 on_started(
                     TrialStarted(
                         request_id="request-1",
                         target=str(agent.context_id),
                         conversation_id="conversation-1",
+                    )
+                )
+                on_cancelled(
+                    TrialCancelled(
+                        request_id="request-1",
+                        target=str(agent.context_id),
+                        conversation_id="conversation-1",
+                        snapshot_id="snapshot-1",
                     )
                 )
                 raise asyncio.TimeoutError
@@ -38,7 +46,9 @@ class ExoAgentTest(unittest.IsolatedAsyncioTestCase):
                 patch("exo_harbor.agent.export_trial_trajectory", export),
                 self.assertRaises(asyncio.TimeoutError),
             ):
-                await agent.run("Fix it", AsyncMock(), AsyncMock())
+                context = MagicMock()
+                context.metadata = {}
+                await agent.run("Fix it", AsyncMock(), context)
 
             export.assert_awaited_once_with(
                 agent._client,
@@ -48,6 +58,8 @@ class ExoAgentTest(unittest.IsolatedAsyncioTestCase):
                 "gpt-5.6-sol",
                 Path(directory) / "trajectory.json",
             )
+            self.assertEqual(context.metadata["exo_snapshot_id"], "snapshot-1")
+            self.assertEqual(context.metadata["exo_instruction"], "Fix it")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -91,6 +92,17 @@ class ExoClient:
             args.extend(("--turn-id", turn_id))
         args.extend(("--limit", str(limit)))
         return await self._run(*args)
+
+    async def delete_snapshots(self) -> int:
+        """Delete snapshot payloads while preserving the rest of the Exo run."""
+        snapshot_directories = list(
+            (self.exo_root / "exoharness" / "agents").glob(
+                "*/conversations/*/snapshots"
+            )
+        )
+        for directory in snapshot_directories:
+            await asyncio.to_thread(shutil.rmtree, directory)
+        return len(snapshot_directories)
 
     async def _ensure_conversation(self, slug: str) -> None:
         if await self._exists("conversation", "show", conventions.AGENT_SLUG, slug):

@@ -7,6 +7,33 @@ from exo_harbor.exo import ExoClient
 
 
 class ExoClientTest(unittest.IsolatedAsyncioTestCase):
+    async def test_delete_snapshots_preserves_other_exo_state(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            exo_root = Path(temporary_directory) / "exo"
+            conversation = (
+                exo_root
+                / "exoharness"
+                / "agents"
+                / "agent-1"
+                / "conversations"
+                / "conversation-1"
+            )
+            snapshot = conversation / "snapshots" / "snapshot-1"
+            snapshot.mkdir(parents=True)
+            (snapshot / "payload.bin").write_bytes(b"snapshot")
+            (conversation / "record.json").write_text("{}", encoding="utf-8")
+            client = ExoClient(
+                exo_bin=Path("/opt/exo/bin/exo"),
+                exo_root=exo_root,
+                repo_root=Path("/src/exo"),
+            )
+
+            count = await client.delete_snapshots()
+
+            self.assertEqual(count, 1)
+            self.assertFalse((conversation / "snapshots").exists())
+            self.assertTrue((conversation / "record.json").exists())
+
     async def test_adapter_runner_uses_eval_root_and_records_pid(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             exo_root = Path(temporary_directory) / "exo"

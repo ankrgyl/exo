@@ -929,7 +929,15 @@ pub async fn execute_send_adapter_message_tool(
         let target = target
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("trial completion requires its inbound target"))?;
-        finalize_trial_completion(&args.text, target, &conversation.record().id.to_string())?
+        finalize_trial_completion(
+            store,
+            &adapter.id,
+            conversation,
+            &args.text,
+            target,
+            &conversation.record().id.to_string(),
+        )
+        .await?
     } else {
         args.text
     };

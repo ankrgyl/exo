@@ -36,7 +36,12 @@ from harbor.models.agent.context import AgentContext
 from exo_harbor import conventions
 from exo_harbor.docker import resolve_main_container
 from exo_harbor.exo import ExoClient
-from exo_harbor.protocol import TrialRun, TrialStarted, send_trial_run
+from exo_harbor.protocol import (
+    TrialCancelled,
+    TrialRun,
+    TrialStarted,
+    send_trial_run,
+)
 from exo_harbor.trajectory import export_trial_trajectory
 
 logger = logging.getLogger(__name__)
@@ -132,10 +137,29 @@ class ExoAgent(BaseAgent):
         def trial_started(started: TrialStarted) -> None:
             nonlocal conversation_id
             conversation_id = started.conversation_id
+            context.metadata = {
+                **(context.metadata or {}),
+                "exo_conversation_id": started.conversation_id,
+            }
             logger.info(
                 "trial %s started in conversation %s",
                 self.context_id,
                 conversation_id,
+            )
+
+        def trial_cancelled(cancelled: TrialCancelled) -> None:
+            nonlocal conversation_id
+            conversation_id = cancelled.conversation_id
+            context.metadata = {
+                **(context.metadata or {}),
+                "exo_conversation_id": cancelled.conversation_id,
+                "exo_snapshot_id": cancelled.snapshot_id,
+                "exo_instruction": instruction,
+            }
+            logger.info(
+                "snapshotted cancelled trial %s as %s",
+                self.context_id,
+                cancelled.snapshot_id,
             )
 
         try:
@@ -149,8 +173,15 @@ class ExoAgent(BaseAgent):
                 ),
                 timeout_sec=self._task_timeout_sec,
                 on_started=trial_started,
+                on_cancelled=trial_cancelled,
             )
             conversation_id = response.conversation_id
+            context.metadata = {
+                **(context.metadata or {}),
+                "exo_conversation_id": response.conversation_id,
+                "exo_snapshot_id": response.snapshot_id,
+                "exo_instruction": instruction,
+            }
         finally:
             if conversation_id is not None:
                 try:
