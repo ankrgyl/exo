@@ -7,14 +7,14 @@ use async_trait::async_trait;
 use exoharness::{
     AddEventsRequest, AddEventsResult, AgentHandle, AgentId, AgentRecord, Artifact,
     ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingRecord, BindingType,
-    ConversationHandle, ConversationId, ConversationRecord, CreateSandboxRequest, Event, EventData,
-    EventQuery, EventQueryDirection, EventStream, ExoHarness, ForkConversationRequest,
-    GetEventsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
-    ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId,
-    SandboxProcess, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessRecord,
-    SandboxProcessStatus, Secret, SecretMetadata, SecretType, SessionId, SnapshotHandle,
-    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, ToolRequest, ToolResult,
-    TurnHandle, TurnId, TurnRecord, Uuid7, WriteArtifactRequest,
+    ConversationHandle, ConversationId, ConversationRecord, CreateSandboxFromSnapshotRequest,
+    CreateSandboxRequest, Event, EventData, EventQuery, EventQueryDirection, EventStream,
+    ExoHarness, ForkConversationRequest, GetEventsResult, NewAgentRequest, NewConversationRequest,
+    PutSecretRequest, ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment,
+    SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery, SandboxProcessParts,
+    SandboxProcessRecord, SandboxProcessStatus, Secret, SecretMetadata, SecretType, SessionId,
+    SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, ToolRequest,
+    ToolResult, TurnHandle, TurnId, TurnRecord, Uuid7, WriteArtifactRequest,
 };
 use futures::FutureExt;
 use futures::io::Cursor;
@@ -810,6 +810,13 @@ impl SandboxHandle for FakeAgentHandle {
         Ok("agent-sandbox".to_string())
     }
 
+    async fn create_sandbox_from_snapshot(
+        &self,
+        _request: CreateSandboxFromSnapshotRequest,
+    ) -> Result<SandboxId> {
+        Err(anyhow!("not implemented"))
+    }
+
     async fn attach_sandbox(&self, _request: AttachSandboxRequest) -> Result<SandboxId> {
         Err(anyhow!("not implemented"))
     }
@@ -1087,6 +1094,13 @@ impl SnapshotHandle for FakeConversationHandle {
 #[async_trait]
 impl SandboxHandle for FakeConversationHandle {
     async fn create_sandbox(&self, _request: CreateSandboxRequest) -> Result<SandboxId> {
+        Err(anyhow!("not implemented"))
+    }
+
+    async fn create_sandbox_from_snapshot(
+        &self,
+        _request: CreateSandboxFromSnapshotRequest,
+    ) -> Result<SandboxId> {
         Err(anyhow!("not implemented"))
     }
 

@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-STATE_DIR="$ROOT_DIR/.exo"
+EXO_ROOT="${EXO_ROOT:-$ROOT_DIR/.exo}"
+STATE_DIR="$EXO_ROOT"
 CONFIG_FILE="${EXO_SERVICE_GUARDIAN_CONFIG:-$STATE_DIR/exo-service-guardian.env}"
 
 # Match exo.sh: services restarted by the guardian spawn node (harness runner,
@@ -208,11 +209,19 @@ pid_running() {
   [[ -f "$pid_file" ]] || return 1
   pid="$(<"$pid_file")"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  kill -0 "$pid" >/dev/null 2>&1
+  process_running "$pid"
+}
+
+process_running() {
+  local pid="$1"
+  local state
+  kill -0 "$pid" >/dev/null 2>&1 || return 1
+  state="$(ps -o stat= -p "$pid" 2>/dev/null)" || return 1
+  [[ -n "$state" && "$state" != Z* ]]
 }
 
 exo_global_args() {
-  printf '%s\0' --env-file-if-exists "$ENV_FILE"
+  printf '%s\0' --root "$EXO_ROOT" --env-file-if-exists "$ENV_FILE"
   if [[ -n "$SANDBOX_BACKEND" ]]; then
     printf '%s\0' --sandbox-backend "$SANDBOX_BACKEND"
   fi
@@ -249,7 +258,7 @@ start_scheduler() {
   fi
   rm -f "$(scheduler_lock_file)" "$(scheduler_restart_file)"
   echo "Starting scheduler..."
-  local scheduler_args=(--env-file-if-exists "$ENV_FILE")
+  local scheduler_args=(--root "$EXO_ROOT" --env-file-if-exists "$ENV_FILE")
   if [[ -n "$SANDBOX_BACKEND" ]]; then
     scheduler_args+=(--sandbox-backend "$SANDBOX_BACKEND")
   fi
@@ -289,7 +298,7 @@ stop_pid_file() {
   local pid
   if [[ -f "$pid_file" ]]; then
     pid="$(<"$pid_file")"
-    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" >/dev/null 2>&1; then
+    if [[ "$pid" =~ ^[0-9]+$ ]] && process_running "$pid"; then
       echo "Stopping $label..."
       terminate_process_tree "$pid"
     fi
@@ -311,7 +320,7 @@ drain_pid_file() {
     return
   fi
   pid="$(<"$pid_file")"
-  if ! [[ "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" >/dev/null 2>&1; then
+  if ! [[ "$pid" =~ ^[0-9]+$ ]] || ! process_running "$pid"; then
     rm -f "$pid_file"
     return
   fi
@@ -328,11 +337,11 @@ drain_pid_file() {
     terminate_process_tree "$pid"
   else
     waited=0
-    while kill -0 "$pid" >/dev/null 2>&1 && [[ "$waited" -lt "$DRAIN_GRACE_SECONDS" ]]; do
+    while process_running "$pid" && [[ "$waited" -lt "$DRAIN_GRACE_SECONDS" ]]; do
       sleep 1
       waited=$((waited + 1))
     done
-    if kill -0 "$pid" >/dev/null 2>&1; then
+    if process_running "$pid"; then
       echo "$label still running after ${DRAIN_GRACE_SECONDS}s drain grace; stopping process tree..."
       terminate_process_tree "$pid"
     else
@@ -344,14 +353,11 @@ drain_pid_file() {
 
 stop_scheduler() {
   drain_pid_file "Exo scheduler" "$(scheduler_pid_file)" "$(scheduler_restart_file)"
-  pkill -f "exo-scheduler-runner .*run --watch" >/dev/null 2>&1 || true
   rm -f "$(scheduler_lock_file)"
 }
 
 stop_adapters() {
   drain_pid_file "Exo adapter runner" "$(adapters_pid_file)" "$(adapters_restart_file)"
-  pkill -f "exo .*adapters run" >/dev/null 2>&1 || true
-  pkill -f "tsx exo/adapters/.*/worker.ts" >/dev/null 2>&1 || true
 }
 
 start_services() {

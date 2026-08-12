@@ -1242,6 +1242,29 @@ async fn updating_sandbox_image_recreates_shell_sandbox_without_shell_program() 
         .expect("previous sandbox should be selected after detachment"),
         second_sandbox_id
     );
+
+    conversation
+        .exoharness_handle()
+        .add_events(AddEventsRequest {
+            session_id: None,
+            turn_id: None,
+            data: vec![EventData::SandboxStarted {
+                sandbox_id: first_sandbox_id.clone(),
+                snapshot_id: Some(Uuid7::now()),
+            }],
+        })
+        .await
+        .expect("explicit sandbox start should be recorded");
+    assert_eq!(
+        ensure_shell_sandbox(
+            conversation.exoharness_handle().as_ref(),
+            &agent_config,
+            &conversation_config,
+        )
+        .await
+        .expect("explicitly started sandbox should be selected"),
+        first_sandbox_id
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

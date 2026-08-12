@@ -252,7 +252,9 @@ where
                 .or(default_conversation_config.shell_program),
             mounts: default_conversation_config.mounts,
             durable_file_systems: default_conversation_config.durable_file_systems,
-            sandbox_scope: default_conversation_config.sandbox_scope,
+            sandbox_scope: request
+                .sandbox_scope
+                .or(default_conversation_config.sandbox_scope),
         };
         self.runtime
             .put_conversation_config(conversation.as_ref(), conversation_config)

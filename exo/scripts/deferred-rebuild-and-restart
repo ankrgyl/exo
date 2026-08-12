@@ -12,6 +12,7 @@
 #   $4 reason_json          JSON-encoded string|null
 #   $5 exo_bin
 #   $6 env_file
+#   $7 exo_root
 #   $@ guardian command...
 set -u
 
@@ -21,7 +22,8 @@ update_id="$3"
 reason_json="$4"
 exo_bin="$5"
 env_file="$6"
-shift 6
+exo_root="$7"
+shift 7
 
 printf '\n[%s] queued rebuild update %s reason=%s:' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -59,7 +61,8 @@ fs.writeFileSync(path, `${JSON.stringify(record)}\n`);
 fi
 
 set +e
-"$exo_bin" --env-file-if-exists "$env_file" conversation complete-rebuild-update \
+"$exo_bin" --root "$exo_root" --env-file-if-exists "$env_file" \
+  conversation complete-rebuild-update \
   --outcome "$record" \
   --status "$status" \
   --exit-code "$code" \

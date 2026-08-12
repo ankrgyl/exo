@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 use super::types::{
     AdapterAttachment, AdapterDeliveryStatus, AdapterEventRecord, AdapterEventType,
     AdapterInboundMessageRecord, AdapterLifecycleState, AdapterOutboundMessageRecord,
-    AdapterRecord, AdapterTargetConversationRecord, NewAdapter, now_ms,
+    AdapterRecord, AdapterTargetConversationRecord, AdapterTrialRecord, NewAdapter, now_ms,
 };
 
 const MAX_QUEUED_MESSAGES_PER_ADAPTER: usize = 1_000;
@@ -143,6 +143,7 @@ impl AdapterStore {
         remove_dir_if_exists(self.failed_dir(adapter_id)).await?;
         remove_dir_if_exists(self.inbound_seen_dir(adapter_id)).await?;
         remove_dir_if_exists(self.target_conversations_dir(adapter_id)).await?;
+        remove_dir_if_exists(self.trials_dir(adapter_id)).await?;
         Ok(Some(adapter))
     }
 
@@ -472,6 +473,29 @@ impl AdapterStore {
         Ok(records)
     }
 
+    pub async fn get_trial(
+        &self,
+        adapter_id: &str,
+        target: &str,
+    ) -> Result<Option<AdapterTrialRecord>> {
+        let path = self.trial_path(adapter_id, target);
+        match fs::read(&path).await {
+            Ok(bytes) => Ok(Some(serde_json::from_slice::<AdapterTrialRecord>(&bytes)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to read trial record {}", path.display())),
+        }
+    }
+
+    pub async fn put_trial(&self, record: &AdapterTrialRecord) -> Result<()> {
+        let dir = self.trials_dir(&record.adapter_id);
+        fs::create_dir_all(&dir).await?;
+        let path = self.trial_path(&record.adapter_id, &record.target);
+        write_json_file(&path, record)
+            .await
+            .with_context(|| format!("failed to write trial record {}", path.display()))
+    }
+
     pub async fn record_inbound_message_once(
         &self,
         adapter_id: &str,
@@ -590,6 +614,15 @@ impl AdapterStore {
 
     fn target_conversation_path(&self, adapter_id: &str, target: &str) -> PathBuf {
         self.target_conversations_dir(adapter_id)
+            .join(format!("{}.json", stable_target_key(target)))
+    }
+
+    fn trials_dir(&self, adapter_id: &str) -> PathBuf {
+        self.root.join("trials").join(adapter_id)
+    }
+
+    fn trial_path(&self, adapter_id: &str, target: &str) -> PathBuf {
+        self.trials_dir(adapter_id)
             .join(format!("{}.json", stable_target_key(target)))
     }
 

@@ -20,13 +20,13 @@ use crate::{
     AddEventsRequest, AddEventsResult, AgentHandle, AgentId, AgentRecord, Artifact,
     ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
     CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, ConversationHandle,
-    ConversationId, ConversationRecord, CreateSandboxRequest, Event, EventData, EventId,
-    EventQuery, EventStream, ExoHarness, ForkConversationRequest, GetEventsResult,
-    GetSandboxProcessEventsResult, ListConversationsRequest, ListConversationsResult,
-    NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest, Result,
-    RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess,
-    SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus,
-    Secret, SecretId, SecretMetadata, SessionId, SnapshotHandle, SnapshotId,
+    ConversationId, ConversationRecord, CreateSandboxFromSnapshotRequest, CreateSandboxRequest,
+    Event, EventData, EventId, EventQuery, EventStream, ExoHarness, ForkConversationRequest,
+    GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
+    ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
+    ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId,
+    SandboxProcess, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessRecord,
+    SandboxProcessStatus, Secret, SecretId, SecretMetadata, SessionId, SnapshotHandle, SnapshotId,
     StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnRecord,
     WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
@@ -209,6 +209,20 @@ async fn http_create_sandbox(
 ) -> Result<SandboxId> {
     match harness
         .request(Request::CreateSandbox { scope, request })
+        .await?
+    {
+        Response::SandboxId { sandbox_id } => Ok(sandbox_id),
+        response => unexpected_response(response, "sandbox_id"),
+    }
+}
+
+async fn http_create_sandbox_from_snapshot(
+    harness: &HttpExoHarness,
+    scope: SandboxScope,
+    request: CreateSandboxFromSnapshotRequest,
+) -> Result<SandboxId> {
+    match harness
+        .request(Request::CreateSandboxFromSnapshot { scope, request })
         .await?
     {
         Response::SandboxId { sandbox_id } => Ok(sandbox_id),
@@ -669,6 +683,13 @@ impl SandboxHandle for HttpAgentHandle {
         http_create_sandbox(&self.harness, self.sandbox_scope(), request).await
     }
 
+    async fn create_sandbox_from_snapshot(
+        &self,
+        request: CreateSandboxFromSnapshotRequest,
+    ) -> Result<SandboxId> {
+        http_create_sandbox_from_snapshot(&self.harness, self.sandbox_scope(), request).await
+    }
+
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {
         http_attach_sandbox(&self.harness, self.sandbox_scope(), request).await
     }
@@ -1043,6 +1064,13 @@ impl SnapshotHandle for HttpConversationHandle {
 impl SandboxHandle for HttpConversationHandle {
     async fn create_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId> {
         http_create_sandbox(&self.harness, self.sandbox_scope(), request).await
+    }
+
+    async fn create_sandbox_from_snapshot(
+        &self,
+        request: CreateSandboxFromSnapshotRequest,
+    ) -> Result<SandboxId> {
+        http_create_sandbox_from_snapshot(&self.harness, self.sandbox_scope(), request).await
     }
 
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {
