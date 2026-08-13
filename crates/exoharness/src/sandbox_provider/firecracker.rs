@@ -439,6 +439,18 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
     }
 
     async fn stop(&self) -> Result<()> {
+        if self.machine.record.workspace_id.is_some()
+            && process_running(&self.shared.pid_path(&self.machine.record.machine_id))
+        {
+            // Firecracker's clean-shutdown API is x86-only. On every architecture,
+            // sync the durable filesystem through the guest before terminating the
+            // VMM so completed writes are not stranded in the guest page cache.
+            // https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/actions.md#intel-and-amd-only-sendctrlaltdel
+            GuestClient::new(Arc::clone(&self.shared), self.machine.vsock_path.clone())
+                .sync_filesystem(&self.request.spec.default_workdir)
+                .await
+                .context("syncing Firecracker durable filesystem before stop")?;
+        }
         self.shared
             .warm_machines
             .lock()
@@ -1899,6 +1911,10 @@ fn prepare_and_launch_blocking(
         }),
     )?;
     if record.workspace_id.is_some() {
+        // Writeback advertises virtio-blk FLUSH to the guest and turns a guest
+        // flush into fsync(2) on the backing file. Combined with the explicit
+        // guest sync during stop, this makes the workspace a durability boundary.
+        // https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/block-caching.md#writeback-mode
         firecracker_put(
             &api_socket,
             "/drives/workspace",
@@ -1907,6 +1923,7 @@ fn prepare_and_launch_blocking(
                 "path_on_host": "/workspace.ext4",
                 "is_root_device": false,
                 "is_read_only": false,
+                "cache_type": "Writeback",
             }),
         )?;
     }
@@ -2286,6 +2303,35 @@ impl GuestClient {
             response
                 .error
                 .unwrap_or_else(|| "unknown error".to_string())
+        )
+    }
+
+    async fn sync_filesystem(&self, path: &str) -> Result<()> {
+        let argv = vec![
+            "/usr/bin/sync".to_string(),
+            "--file-system".to_string(),
+            path.to_string(),
+        ];
+        let env = HashMap::new();
+        let response: ExecResponse = self
+            .invoke_with_timeout(
+                &ExecRequest {
+                    request_type: "exec",
+                    argv: &argv,
+                    env: &env,
+                    cwd: "/",
+                    timeout_ms: Some(duration_to_millis(GUEST_REQUEST_TIMEOUT)),
+                },
+                GUEST_REQUEST_TIMEOUT,
+            )
+            .await?;
+        if response.ok == Some(true) || response.exit_code == Some(0) {
+            return Ok(());
+        }
+        bail!(
+            "Firecracker guest filesystem sync failed: {}{}",
+            response.stderr.unwrap_or_default(),
+            response.error.unwrap_or_default()
         )
     }
 }

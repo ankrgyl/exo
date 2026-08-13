@@ -152,7 +152,7 @@ resolve_inside_rootfs() {
   esac
 }
 
-for required in bin/sh usr/bin/cat usr/bin/chown usr/bin/mkdir usr/bin/mount usr/bin/mountpoint usr/bin/python3 usr/bin/rm usr/bin/setpriv usr/sbin/ip; do
+for required in bin/sh usr/bin/cat usr/bin/chown usr/bin/mkdir usr/bin/mount usr/bin/mountpoint usr/bin/python3 usr/bin/rm usr/bin/setpriv usr/bin/sync usr/sbin/ip; do
   resolved="$(resolve_inside_rootfs "$WORK_DIR/rootfs/$required")"
   if [[ ! -x "$resolved" ]]; then
     echo "OCI image must contain /$required" >&2

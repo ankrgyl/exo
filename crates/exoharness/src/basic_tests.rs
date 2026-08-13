@@ -162,6 +162,60 @@ async fn local_process_sandbox_contract_start_process_long_running_protocol() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "uses a real Firecracker sandbox; run inside a Linux KVM host as root"]
+async fn firecracker_sandbox_contract_start_process_stdio_and_env() {
+    let handle = firecracker_contract_handle("stdio-and-env").await;
+    crate::contract_tests::sandbox_handle_start_process_supports_interactive_stdio_and_env(handle)
+        .await
+        .expect("Firecracker sandbox start_process contract");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "uses a real Firecracker sandbox; run inside a Linux KVM host as root"]
+async fn firecracker_sandbox_contract_start_process_long_running_protocol() {
+    let handle = firecracker_contract_handle("long-running-protocol").await;
+    crate::contract_tests::sandbox_handle_start_process_supports_long_running_request_response_protocol(
+        handle,
+    )
+    .await
+    .expect("Firecracker sandbox long-running protocol contract");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "uses a real Firecracker sandbox; run inside a Linux KVM host as root"]
+async fn firecracker_sandbox_contract_durable_file_system_survives_stop_and_reacquire() {
+    crate::contract_tests::sandbox_backend_durable_file_system_survives_stop_and_reacquire(
+        firecracker_contract_backend(),
+        firecracker_durable_contract_request("durable-file-system"),
+    )
+    .await
+    .expect("Firecracker sandbox durable filesystem contract");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "uses a real Firecracker sandbox; run inside a Linux KVM host as root"]
+async fn firecracker_sandbox_contract_workdir_survives_stop_and_reacquire() {
+    crate::contract_tests::sandbox_backend_workdir_survives_stop_and_reacquire(
+        firecracker_contract_backend(),
+        firecracker_durable_contract_request("workdir"),
+    )
+    .await
+    .expect("Firecracker sandbox workdir contract");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "uses a real Firecracker sandbox; run inside a Linux KVM host as root"]
+async fn firecracker_sandbox_contract_long_running_process_and_workdir_survive_stop_and_reacquire()
+{
+    crate::contract_tests::sandbox_backend_long_running_process_and_workdir_survive_stop_and_reacquire(
+        firecracker_contract_backend(),
+        firecracker_durable_contract_request("long-running-process-and-workdir"),
+    )
+    .await
+    .expect("Firecracker sandbox long-running process and workdir contract");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn local_process_sandbox_rejects_durable_file_systems() {
     let tempdir = TempDir::new().expect("tempdir");
     let backend: Arc<dyn ManagedSandboxBackend> =
@@ -324,6 +378,37 @@ async fn local_process_contract_handle(
         })
         .await
         .expect("acquire sandbox")
+}
+
+fn firecracker_contract_backend() -> Arc<dyn ManagedSandboxBackend> {
+    Arc::new(
+        crate::FirecrackerSandboxBackend::new(
+            crate::FirecrackerConfig::from_env().expect("Firecracker config from environment"),
+        )
+        .expect("FirecrackerSandboxBackend::new"),
+    )
+}
+
+async fn firecracker_contract_handle(contract: &str) -> Arc<dyn ManagedSandboxHandle> {
+    firecracker_contract_backend()
+        .acquire(provider_contract_request(
+            "firecracker",
+            contract,
+            env_or("FIRECRACKER_IMAGE", &crate::default_firecracker_image()),
+            "/",
+        ))
+        .await
+        .expect("acquire Firecracker sandbox")
+}
+
+fn firecracker_durable_contract_request(contract: &str) -> SandboxRequest {
+    let mount_path = durable_contract_mount_path();
+    durable_provider_contract_request(
+        "firecracker",
+        contract,
+        env_or("FIRECRACKER_IMAGE", &crate::default_firecracker_image()),
+        &mount_path,
+    )
 }
 
 async fn daytona_contract_handle(contract: &str) -> Option<Arc<dyn ManagedSandboxHandle>> {
