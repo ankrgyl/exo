@@ -100,6 +100,7 @@ impl SandboxBackendRegistration {
             "docker" => Ok(Self::docker()),
             "e2b" => Ok(Self::e2b(E2bBackendSpec::default())),
             "local_process" => Ok(Self::local_process()),
+            "smolvm" => Ok(Self::smolvm()),
             "sprites" => Ok(Self::sprites(SpritesBackendSpec::default())),
             "vercel" => Ok(Self::vercel(VercelBackendSpec::with_conventional_secrets())),
             _ => bail!("sandbox provider {provider} is not built into exoharness"),
@@ -135,6 +136,16 @@ impl SandboxBackendRegistration {
         Self::from_backend(
             SandboxProvider::LocalProcess,
             Arc::new(LocalProcessSandboxBackend::new()),
+        )
+    }
+
+    /// Local microVM sandboxes via the `smolvm` CLI. Unlike `docker` this puts a
+    /// hypervisor boundary around the workload, and unlike `apple_container` it
+    /// is not macOS-only.
+    pub fn smolvm() -> Self {
+        Self::from_backend(
+            SandboxProvider::Smolvm,
+            Arc::new(crate::SmolvmSandboxBackend::new()),
         )
     }
 

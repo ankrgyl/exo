@@ -121,8 +121,10 @@ Options:
   --profile <name>             Checked-in tool profile: practical (default) or bootstrap
   --sandbox-image <image>      Sandbox image (default: ubuntu:24.04)
   --sandbox-provider <provider>
-                                Sandbox provider: daytona, apple-container, docker, or local-process
-  --sandbox-backend <backend>   Local sandbox backend: apple-container, docker, or local-process.
+                                Sandbox provider: daytona, apple-container, docker, smolvm, or
+                                local-process
+  --sandbox-backend <backend>   Local sandbox backend: apple-container, docker, smolvm, or
+                                local-process.
                                 Defaults to --sandbox-provider when that provider is local.
   --self-repo-mount <path>      Sandbox path for this repo (default: /workspace/exo)
   --agent-cli-mount <host-dir>  Bind-mount this host directory read-write into the
@@ -373,7 +375,7 @@ effective_sandbox_backend() {
     return
   fi
   case "$SANDBOX_PROVIDER" in
-    apple-container|docker|local-process)
+    apple-container|docker|smolvm|local-process)
       printf '%s\n' "$SANDBOX_PROVIDER"
       ;;
   esac
@@ -558,6 +560,11 @@ container_pull_image() {
 }
 
 ensure_sandbox_image() {
+  # smolvm pulls its own images inside the VM, so there is nothing for docker or
+  # podman to pre-pull — and requiring either would put a daemon back in the path.
+  if [[ "$(effective_sandbox_backend)" == "smolvm" ]]; then
+    return
+  fi
   local status=0
   container_image_exists || status=$?
   case "$status" in
@@ -865,6 +872,40 @@ cleanup_stale_sandbox_containers() {
   fi
 }
 
+# The smolvm equivalent. Machines carry the same exo.sandbox.* labels, but only
+# `machine ls --json` reports them, so this needs a JSON reader and skips when
+# either tool is absent — the same stance as the docker sweep above. There is no
+# mounts-this-checkout check: `machine ls` reports a mount count, not paths, so a
+# machine whose owner is still alive is always left alone.
+cleanup_stale_sandbox_machines() {
+  command -v smolvm >/dev/null 2>&1 || return
+  command -v python3 >/dev/null 2>&1 || return
+  local name owner removed=0
+  while IFS=$'\t' read -r name owner; do
+    [[ -n "$name" ]] || continue
+    if [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null; then
+      continue
+    fi
+    echo "Removing stale sandbox machine $name..."
+    smolvm machine delete --name "$name" --force >/dev/null 2>&1 || true
+    removed=$((removed + 1))
+  done < <(smolvm machine ls --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    machines = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for machine in machines if isinstance(machines, list) else []:
+    labels = machine.get("labels") or {}
+    if "exo.sandbox.key" not in labels:
+        continue
+    print("%s\t%s" % (machine.get("name", ""), labels.get("exo.sandbox.owner-pid", "")))
+')
+  if [[ "$removed" -gt 0 ]]; then
+    echo "Removed $removed stale sandbox machine(s)."
+  fi
+}
+
 container_mounts_current_checkout() {
   local container="$1"
   local source
@@ -884,6 +925,7 @@ fresh_start() {
   fi
   delete_all_agents_and_conversations
   cleanup_stale_sandbox_containers
+  cleanup_stale_sandbox_machines
   if [[ "$USE_SANDBOX" == true ]]; then
     PULL_SANDBOX=true
   fi
@@ -1372,8 +1414,8 @@ while [[ $# -gt 0 ]]; do
     --sandbox-provider)
       SANDBOX_PROVIDER="${2:-}"
       case "$SANDBOX_PROVIDER" in
-        daytona|apple-container|docker|local-process) ;;
-        *) die "--sandbox-provider must be daytona, apple-container, docker, or local-process" ;;
+        daytona|apple-container|docker|smolvm|local-process) ;;
+        *) die "--sandbox-provider must be daytona, apple-container, docker, smolvm, or local-process" ;;
       esac
       SANDBOX_PROVIDER_EXPLICIT=true
       shift 2
@@ -1381,8 +1423,8 @@ while [[ $# -gt 0 ]]; do
     --sandbox-backend)
       SANDBOX_BACKEND="${2:-}"
       case "$SANDBOX_BACKEND" in
-        apple-container|docker|local-process) ;;
-        *) die "--sandbox-backend must be apple-container, docker, or local-process" ;;
+        apple-container|docker|smolvm|local-process) ;;
+        *) die "--sandbox-backend must be apple-container, docker, smolvm, or local-process" ;;
       esac
       SANDBOX_BACKEND_EXPLICIT=true
       shift 2

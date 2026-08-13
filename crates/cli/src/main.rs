@@ -226,6 +226,7 @@ enum SandboxProviderArg {
     #[value(name = "apple-container")]
     AppleContainer,
     Docker,
+    Smolvm,
     #[value(name = "local-process")]
     LocalProcess,
 }
@@ -240,6 +241,7 @@ impl From<SandboxProviderArg> for SandboxProvider {
             SandboxProviderArg::AwsAgentCore => Self::AwsAgentCore,
             SandboxProviderArg::AppleContainer => Self::AppleContainer,
             SandboxProviderArg::Docker => Self::Docker,
+            SandboxProviderArg::Smolvm => Self::Smolvm,
             SandboxProviderArg::LocalProcess => Self::LocalProcess,
         }
     }
@@ -250,6 +252,7 @@ enum SandboxBackendArg {
     #[value(name = "apple-container")]
     AppleContainer,
     Docker,
+    Smolvm,
     #[value(name = "local-process")]
     LocalProcess,
 }
@@ -259,6 +262,7 @@ impl From<SandboxBackendArg> for SandboxBackendRegistration {
         match value {
             SandboxBackendArg::AppleContainer => Self::apple_container(),
             SandboxBackendArg::Docker => Self::docker(),
+            SandboxBackendArg::Smolvm => Self::smolvm(),
             SandboxBackendArg::LocalProcess => Self::local_process(),
         }
     }
@@ -297,6 +301,7 @@ fn default_sandbox_backends() -> Vec<SandboxBackendRegistration> {
     vec![
         default_sandbox_backend(),
         SandboxBackendRegistration::local_process(),
+        SandboxBackendRegistration::smolvm(),
         SandboxBackendRegistration::daytona(DaytonaBackendSpec::default()),
         SandboxBackendRegistration::e2b(E2bBackendSpec::default()),
         SandboxBackendRegistration::sprites(SpritesBackendSpec::default()),

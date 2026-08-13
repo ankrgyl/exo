@@ -661,6 +661,7 @@ impl SandboxProvider {
     pub const AppleContainer: Self = Self::from_static("apple_container");
     pub const Docker: Self = Self::from_static("docker");
     pub const LocalProcess: Self = Self::from_static("local_process");
+    pub const Smolvm: Self = Self::from_static("smolvm");
 
     pub const fn from_static(provider: &'static str) -> Self {
         Self(Cow::Borrowed(provider))
