@@ -1835,6 +1835,64 @@ async fn sandbox_provider_state_persists_through_events_after_harness_reload() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn deleting_conversation_stops_persisted_sandbox_after_harness_reload() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let state = serde_json::json!({
+        "microvm_id": "microvm-test"
+    });
+    let first_backend = Arc::new(TestProviderStateBackend::new(state.clone()));
+    let harness =
+        BasicExoHarness::new_with_sandbox_backend(local_test_config(tempdir.path()), first_backend)
+            .await
+            .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let agent_id = agent.record().id;
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    let conversation_id = conversation.record().id;
+    conversation
+        .create_sandbox(provider_state_test_create_request())
+        .await
+        .expect("sandbox should be created");
+    drop(conversation);
+    drop(agent);
+    drop(harness);
+
+    let second_backend = Arc::new(TestProviderStateBackend::new(state.clone()));
+    let reloaded = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        second_backend.clone(),
+    )
+    .await
+    .expect("reloaded harness should initialize");
+    let reloaded_agent = reloaded
+        .get_agent(&agent_id)
+        .await
+        .expect("agent lookup should succeed")
+        .expect("agent should exist");
+
+    assert!(
+        reloaded_agent
+            .delete_conversation(&conversation_id)
+            .await
+            .expect("conversation deletion should succeed")
+    );
+    assert_eq!(
+        second_backend.requests.lock().await.as_slice(),
+        &[Some(state)]
+    );
+    assert_eq!(*second_backend.stop_count.lock().await, 1);
+}
+
 fn provider_state_test_create_request() -> CreateSandboxRequest {
     CreateSandboxRequest {
         name: Some("stateful".to_string()),
@@ -1851,6 +1909,7 @@ fn provider_state_test_create_request() -> CreateSandboxRequest {
 struct TestProviderStateBackend {
     state: Value,
     requests: Arc<AsyncMutex<Vec<Option<Value>>>>,
+    stop_count: Arc<AsyncMutex<usize>>,
 }
 
 impl TestProviderStateBackend {
@@ -1858,6 +1917,7 @@ impl TestProviderStateBackend {
         Self {
             state,
             requests: Arc::new(AsyncMutex::new(Vec::new())),
+            stop_count: Arc::new(AsyncMutex::new(0)),
         }
     }
 }
@@ -1875,6 +1935,7 @@ impl ManagedSandboxBackend for TestProviderStateBackend {
         self.requests.lock().await.push(request.provider_state);
         Ok(Arc::new(TestProviderStateHandle {
             state: self.state.clone(),
+            stop_count: Arc::clone(&self.stop_count),
         }))
     }
 
@@ -1897,6 +1958,7 @@ impl ManagedSandboxBackend for TestProviderStateBackend {
 
 struct TestProviderStateHandle {
     state: Value,
+    stop_count: Arc<AsyncMutex<usize>>,
 }
 
 #[async_trait]
@@ -1918,6 +1980,7 @@ impl ManagedSandboxHandle for TestProviderStateHandle {
     }
 
     async fn stop(&self) -> crate::Result<()> {
+        *self.stop_count.lock().await += 1;
         Ok(())
     }
 

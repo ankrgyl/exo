@@ -3,11 +3,12 @@
 //! Security-sensitive choices follow Firecracker's upstream production guidance:
 //! https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::future::Future;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::Ipv4Addr;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
@@ -16,7 +17,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context as TaskContext, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -39,6 +40,10 @@ const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
 const MAX_GUEST_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_GUEST_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MACHINE_ID: &str = "fc-0000000000000000-00000000";
+// sockaddr_un.sun_path is 108 bytes including the trailing NUL on Linux.
+// https://github.com/torvalds/linux/blob/master/include/uapi/linux/un.h
+const UNIX_SOCKET_PATH_CAPACITY: usize = 108;
 // The guest agent drops to UID 10001 before binding, so keep its AF_VSOCK port
 // above Linux's privileged range. The kernel enforces that in vsock_bind().
 // https://github.com/torvalds/linux/blob/master/net/vmw_vsock/af_vsock.c
@@ -69,6 +74,7 @@ const BLOCKED_EGRESS_CIDRS: &[&str] = &[
 ];
 static ONE_SHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static MANIFEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn default_firecracker_image() -> String {
     "/var/lib/exo/firecracker/rootfs.ext4".to_string()
@@ -129,6 +135,9 @@ struct MachineRecord {
     slot: u32,
     network_enabled: bool,
     workspace_id: Option<String>,
+    // The lease mtime is refreshed on use; keeping the TTL in the immutable
+    // manifest lets a later CLI process reap a VM without process-local state.
+    idle_ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -179,7 +188,7 @@ impl FirecrackerSandboxBackend {
             )
         })?;
         fs::set_permissions(&config.state_root, Permissions::from_mode(0o700))?;
-        for directory in ["jailer", "manifests", "slots", "workspaces"] {
+        for directory in ["jailer", "leases", "manifests", "slots", "workspaces"] {
             let path = config.state_root.join(directory);
             fs::create_dir_all(&path)?;
             fs::set_permissions(path, Permissions::from_mode(0o700))?;
@@ -189,6 +198,7 @@ impl FirecrackerSandboxBackend {
         config.kernel = fs::canonicalize(&config.kernel)?;
         config.state_root = fs::canonicalize(&config.state_root)?;
         validate_private_root(&config.state_root)?;
+        validate_api_socket_path(&config)?;
 
         Ok(Self {
             shared: Arc::new(Shared {
@@ -201,7 +211,7 @@ impl FirecrackerSandboxBackend {
 
     async fn reap_expired_machines(&self) -> Result<()> {
         let now = Instant::now();
-        let expired = {
+        let mut expired = {
             let mut machines = self.shared.warm_machines.lock().await;
             let keys = machines
                 .iter()
@@ -214,10 +224,27 @@ impl FirecrackerSandboxBackend {
                 .collect::<Vec<_>>();
             keys.into_iter()
                 .filter_map(|key| machines.remove(&key))
+                .map(|entry| entry.machine_id)
                 .collect::<Vec<_>>()
         };
-        for entry in expired {
-            self.shared.cleanup_machine(&entry.machine_id, true).await?;
+        let state_root = self.shared.config.state_root.clone();
+        let persisted = tokio::task::spawn_blocking(move || {
+            expired_machine_ids(&state_root, SystemTime::now())
+        })
+        .await
+        .context("joining Firecracker lease scan")??;
+        expired.extend(persisted);
+
+        let expired = expired.into_iter().collect::<HashSet<_>>();
+        if !expired.is_empty() {
+            self.shared
+                .warm_machines
+                .lock()
+                .await
+                .retain(|_, entry| !expired.contains(&entry.machine_id));
+        }
+        for machine_id in expired {
+            self.shared.cleanup_machine(&machine_id, true).await?;
         }
         Ok(())
     }
@@ -254,7 +281,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
 
         if request.lifecycle.idle_ttl.is_none() {
             let sequence = ONE_SHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let machine_id = format!("{stable_machine_id}-{}-{sequence}", std::process::id());
+            let machine_id = one_shot_machine_id(&request.key, &spec_hash, sequence);
             let machine = self
                 .shared
                 .ensure_machine(&request, &machine_id, &spec_hash)
@@ -284,6 +311,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
             .shared
             .ensure_machine(&request, &stable_machine_id, &spec_hash)
             .await?;
+        self.shared.touch_machine_lease(&stable_machine_id).await?;
         self.shared.warm_machines.lock().await.insert(
             request.key.clone(),
             WarmMachineEntry {
@@ -359,11 +387,12 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
             )
             .await?;
         touch_machine(
+            &self.shared,
             &self.shared.warm_machines,
             &self.request.key,
             &machine.record.machine_id,
         )
-        .await;
+        .await?;
         let output = GuestClient::new(Arc::clone(&self.shared), machine.vsock_path)
             .exec(&self.request.spec, command)
             .await;
@@ -378,11 +407,12 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
             };
         }
         touch_machine(
+            &self.shared,
             &self.shared.warm_machines,
             &self.request.key,
             &machine.record.machine_id,
         )
-        .await;
+        .await?;
         output
     }
 
@@ -396,11 +426,12 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
             )
             .await?;
         touch_machine(
+            &self.shared,
             &self.shared.warm_machines,
             &self.request.key,
             &machine.record.machine_id,
         )
-        .await;
+        .await?;
         let cleanup_machine_id = self.one_shot.then(|| machine.record.machine_id.clone());
         GuestClient::new(Arc::clone(&self.shared), machine.vsock_path)
             .start_process(&self.request.spec, command, cleanup_machine_id)
@@ -490,6 +521,14 @@ impl Shared {
         .context("joining Firecracker manifest read")?
     }
 
+    async fn touch_machine_lease(&self, machine_id: &str) -> Result<()> {
+        let state_root = self.config.state_root.clone();
+        let machine_id = machine_id.to_string();
+        tokio::task::spawn_blocking(move || touch_machine_lease(&state_root, &machine_id))
+            .await
+            .context("joining Firecracker lease update")?
+    }
+
     async fn new_machine_record(
         &self,
         request: &SandboxRequest,
@@ -505,6 +544,7 @@ impl Shared {
             .durable_file_systems
             .first()
             .map(|file_system| stable_fnv1a_hex(&format!("{}\n{}", request.key, file_system.name)));
+        let idle_ttl_seconds = request.lifecycle.idle_ttl.map(|ttl| ttl.as_secs());
         tokio::task::spawn_blocking(move || {
             let slot = allocate_resource_slot(&state_root, &machine_id)?;
             let record = MachineRecord {
@@ -513,6 +553,7 @@ impl Shared {
                 slot,
                 network_enabled,
                 workspace_id,
+                idle_ttl_seconds,
             };
             if let Err(error) = write_manifest(&state_root, &record) {
                 if let Err(release_error) =
@@ -584,6 +625,7 @@ impl Shared {
         if delete_rootfs {
             let jail_dir = self.jail_dir(machine_id);
             let manifest = self.manifest_path(machine_id);
+            let lease = lease_path(&self.config.state_root, machine_id);
             let cgroup_dir = firecracker_cgroup_dir(&self.config, machine_id);
             let slot_claim = record
                 .as_ref()
@@ -598,6 +640,11 @@ impl Shared {
                 if manifest.try_exists()? {
                     fs::remove_file(&manifest).with_context(|| {
                         format!("removing Firecracker manifest {}", manifest.display())
+                    })?;
+                }
+                if lease.try_exists()? {
+                    fs::remove_file(&lease).with_context(|| {
+                        format!("removing Firecracker lease {}", lease.display())
                     })?;
                 }
                 if cgroup_dir.try_exists()? {
@@ -879,6 +926,17 @@ fn validate_private_root(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_api_socket_path(config: &FirecrackerConfig) -> Result<()> {
+    let path = jail_root(config, MAX_MACHINE_ID).join("run/firecracker.socket");
+    if path.as_os_str().as_bytes().len() >= UNIX_SOCKET_PATH_CAPACITY {
+        bail!(
+            "Firecracker state root is too long for the API Unix socket path: {}",
+            config.state_root.display()
+        );
+    }
+    Ok(())
+}
+
 fn find_executable(program: &str) -> Result<PathBuf> {
     let path = std::env::var_os("PATH").context("PATH is not set")?;
     std::env::split_paths(&path)
@@ -946,6 +1004,14 @@ fn machine_id(key: &SandboxKey, spec_hash: &str) -> String {
     )
 }
 
+fn one_shot_machine_id(key: &SandboxKey, spec_hash: &str, sequence: u64) -> String {
+    format!(
+        "fc-{}-{}",
+        stable_fnv1a_hex(&format!("{key}\n{}\n{sequence}", std::process::id())),
+        &spec_hash[..8]
+    )
+}
+
 fn valid_machine_id(machine_id: &str) -> bool {
     machine_id.starts_with("fc-")
         && machine_id.len() <= 64
@@ -982,6 +1048,97 @@ fn manifest_path(state_root: &Path, machine_id: &str) -> PathBuf {
     state_root
         .join("manifests")
         .join(format!("{machine_id}.json"))
+}
+
+fn lease_path(state_root: &Path, machine_id: &str) -> PathBuf {
+    state_root.join("leases").join(machine_id)
+}
+
+fn touch_machine_lease(state_root: &Path, machine_id: &str) -> Result<()> {
+    if !valid_machine_id(machine_id) {
+        bail!("invalid Firecracker machine id: {machine_id}");
+    }
+    let path = lease_path(state_root, machine_id);
+    let sequence = LEASE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = path.with_extension(format!("{}.{sequence}.tmp", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .with_context(|| format!("creating Firecracker lease {}", temporary.display()))?;
+    fs::set_permissions(&temporary, Permissions::from_mode(0o600))?;
+    file.write_all(machine_id.as_bytes())
+        .with_context(|| format!("writing Firecracker lease {}", temporary.display()))?;
+    file.sync_all()?;
+    // A rename gives readers either the old or new mtime and also replaces a
+    // stale lease without opening a path supplied outside the private state root.
+    if let Err(error) = fs::rename(&temporary, &path) {
+        if let Err(cleanup_error) = fs::remove_file(&temporary) {
+            return Err(error).with_context(|| {
+                format!(
+                    "publishing Firecracker lease {}; also failed to remove temporary lease: {cleanup_error}",
+                    path.display()
+                )
+            });
+        }
+        return Err(error)
+            .with_context(|| format!("publishing Firecracker lease {}", path.display()));
+    }
+    Ok(())
+}
+
+fn expired_machine_ids(state_root: &Path, now: SystemTime) -> Result<Vec<String>> {
+    let mut expired = Vec::new();
+    for entry in fs::read_dir(state_root.join("manifests"))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("json")
+        {
+            continue;
+        }
+        let path = entry.path();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "failed reading Firecracker manifest during lease scan");
+                continue;
+            }
+        };
+        let record = match serde_json::from_slice::<MachineRecord>(&bytes) {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "failed decoding Firecracker manifest during lease scan");
+                continue;
+            }
+        };
+        if !valid_machine_id(&record.machine_id)
+            || manifest_path(state_root, &record.machine_id) != path
+        {
+            tracing::warn!(path = %path.display(), "ignored mismatched Firecracker manifest during lease scan");
+            continue;
+        }
+        let Some(idle_ttl_seconds) = record.idle_ttl_seconds else {
+            continue;
+        };
+        let last_used = match fs::metadata(lease_path(state_root, &record.machine_id)) {
+            Ok(metadata) => metadata.modified()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                entry.metadata()?.modified()?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if last_used
+            .checked_add(Duration::from_secs(idle_ttl_seconds))
+            .is_some_and(|deadline| deadline <= now)
+        {
+            expired.push(record.machine_id);
+        }
+    }
+    Ok(expired)
 }
 
 fn write_manifest(state_root: &Path, record: &MachineRecord) -> Result<()> {
@@ -2332,15 +2489,26 @@ async fn wait_for_guest(shared: &Shared, client: &GuestClient, machine_id: &str)
 }
 
 async fn touch_machine(
+    shared: &Shared,
     machines: &Mutex<HashMap<SandboxKey, WarmMachineEntry>>,
     key: &SandboxKey,
     machine_id: &str,
-) {
-    if let Some(entry) = machines.lock().await.get_mut(key)
-        && entry.machine_id == machine_id
-    {
-        entry.last_used_at = Instant::now();
+) -> Result<()> {
+    let touched = {
+        let mut machines = machines.lock().await;
+        if let Some(entry) = machines.get_mut(key)
+            && entry.machine_id == machine_id
+        {
+            entry.last_used_at = Instant::now();
+            true
+        } else {
+            false
+        }
+    };
+    if touched {
+        shared.touch_machine_lease(machine_id).await?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2363,6 +2531,16 @@ mod tests {
     fn validates_machine_ids_and_cidrs() {
         assert!(valid_machine_id("fc-0123456789abcdef-01234567"));
         assert!(!valid_machine_id("../firecracker"));
+        let one_shot = one_shot_machine_id(
+            &SandboxKey::AgentSandbox {
+                agent_id: "agent".to_string(),
+                sandbox_id: "sandbox".to_string(),
+            },
+            "0123456789abcdef",
+            u64::MAX,
+        );
+        assert!(valid_machine_id(&one_shot));
+        assert_eq!(one_shot.len(), MAX_MACHINE_ID.len());
         assert!(validate_ipv4_cidr("203.0.113.0/24").is_ok());
         assert!(validate_ipv4_cidr("203.0.113.0/33").is_err());
         assert!(validate_ipv4_cidr("example.com/24").is_err());
@@ -2407,6 +2585,7 @@ mod tests {
             slot: 1,
             network_enabled: false,
             workspace_id: None,
+            idle_ttl_seconds: Some(60),
         };
         let second = MachineRecord {
             spec_hash: "second".to_string(),
@@ -2419,6 +2598,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stored.spec_hash, "first");
+    }
+
+    #[test]
+    fn persisted_lease_expires_machine_after_idle_ttl() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("leases")).unwrap();
+        fs::create_dir(directory.path().join("manifests")).unwrap();
+        let record = MachineRecord {
+            machine_id: "fc-machine".to_string(),
+            spec_hash: "spec".to_string(),
+            slot: 1,
+            network_enabled: false,
+            workspace_id: None,
+            idle_ttl_seconds: Some(60),
+        };
+        write_manifest(directory.path(), &record).unwrap();
+        touch_machine_lease(directory.path(), &record.machine_id).unwrap();
+        let last_used = fs::metadata(lease_path(directory.path(), &record.machine_id))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        assert!(
+            expired_machine_ids(directory.path(), last_used + Duration::from_secs(59))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            expired_machine_ids(directory.path(), last_used + Duration::from_secs(60)).unwrap(),
+            vec![record.machine_id]
+        );
     }
 
     #[tokio::test]

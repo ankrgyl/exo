@@ -1287,8 +1287,33 @@ impl AgentHandle for BasicAgentHandle {
     }
 
     async fn delete_conversation(&self, id: &ConversationId) -> Result<bool> {
-        let _guard = self.harness.inner.write_lock.lock().await;
         let conversation_dir = self.conversations_dir().join(id.to_string());
+        if self
+            .harness
+            .inner
+            .storage
+            .list_keys(&conversation_dir)
+            .await?
+            .is_empty()
+        {
+            return Ok(false);
+        }
+
+        let sandboxes = self
+            .harness
+            .inner
+            .storage
+            .list_json_matching_suffix::<StoredSandbox>(conversation_dir.join("sandboxes"), ".json")
+            .await?;
+        let sandbox_handle =
+            BasicScopedSandboxHandle::conversation(&self.harness, *id, conversation_dir.clone());
+        for sandbox in sandboxes {
+            if sandbox.running && sandbox.attachment.is_none() {
+                sandbox_handle.stop_sandbox(sandbox.id).await?;
+            }
+        }
+
+        let _guard = self.harness.inner.write_lock.lock().await;
         if self
             .harness
             .inner
@@ -1794,6 +1819,9 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         if stored.attachment.is_some() {
             bail!("attached sandboxes must be detached, not stopped");
         }
+        if !stored.running {
+            return Ok(());
+        }
         let sandbox_handle = self
             .harness
             .inner
@@ -1801,9 +1829,15 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .lock()
             .await
             .remove(&id);
-        if let Some(sandbox_handle) = sandbox_handle {
-            sandbox_handle.stop().await?;
-        }
+        let sandbox_handle = match sandbox_handle {
+            Some(sandbox_handle) => sandbox_handle,
+            None => {
+                create_sandbox_handle(self.harness, &self.owner_dir, self.owner, &id, &stored)
+                    .await?
+                    .0
+            }
+        };
+        sandbox_handle.stop().await?;
 
         let _guard = self.harness.inner.write_lock.lock().await;
         let mut sandbox = self.load_sandbox(&id).await?;
