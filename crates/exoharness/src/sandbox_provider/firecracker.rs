@@ -767,7 +767,16 @@ fn validate_host(config: &FirecrackerConfig) -> Result<()> {
             bail!("Firecracker sandbox execution requires the cgroup v2 {required} controller");
         }
     }
-    for program in ["chown", "cp", "ip", "kill", "mkfs.ext4", "nft", "sysctl"] {
+    for program in [
+        "chown",
+        "cp",
+        "ip",
+        "iptables",
+        "kill",
+        "mkfs.ext4",
+        "nft",
+        "sysctl",
+    ] {
         trusted_host_command(program)
             .with_context(|| format!("required trusted host command {program}"))?;
     }
@@ -883,8 +892,29 @@ fn find_executable(program: &str) -> Result<PathBuf> {
 
 fn trusted_host_command(program: &str) -> Result<PathBuf> {
     let executable = find_executable(program)?;
+    let file_name = executable
+        .file_name()
+        .context("trusted host command has no file name")?;
+    let parent = fs::canonicalize(
+        executable
+            .parent()
+            .context("trusted host command has no parent")?,
+    )?;
+    let executable = parent.join(file_name);
     validate_trusted_file(&format!("host command {program}"), &executable)?;
-    fs::canonicalize(executable).with_context(|| format!("resolving host command {program}"))
+    for component in executable.ancestors().skip(1) {
+        let metadata = fs::metadata(component)?;
+        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            bail!(
+                "host command {program} parent must be root-owned and not group/world-writable: {}",
+                component.display()
+            );
+        }
+    }
+    // Preserve the invoked name for trusted multicall binaries such as
+    // iptables -> xtables-nft-multi. Canonicalizing the final symlink changes
+    // argv[0], so xtables cannot select its iptables frontend.
+    Ok(executable)
 }
 
 fn binary_version(path: &Path) -> Result<String> {
@@ -1378,10 +1408,74 @@ fn prepare_network(
             "masquerade",
         ],
     )?;
+    // Docker and similar host services commonly leave the compatibility
+    // FORWARD chain at DROP. An accept verdict in our nftables base chain does
+    // not override a later base-chain drop, so admit only this VM's veth there.
+    // The nftables rules above still enforce source validation, destination
+    // filtering, return-traffic state, and cross-VM isolation.
+    // https://github.com/firecracker-microvm/firecracker/blob/main/docs/network-setup.md#host-network-setup
+    run_checked(
+        "iptables",
+        &[
+            "-w",
+            "-I",
+            "FORWARD",
+            "1",
+            "-i",
+            &network.host_veth,
+            "-j",
+            "ACCEPT",
+        ],
+    )?;
+    run_checked(
+        "iptables",
+        &[
+            "-w",
+            "-I",
+            "FORWARD",
+            "1",
+            "-o",
+            &network.host_veth,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "ESTABLISHED,RELATED",
+            "-j",
+            "ACCEPT",
+        ],
+    )?;
     Ok(())
 }
 
 fn cleanup_network_blocking(network: &NetworkConfig) {
+    remove_all_matching_rules(
+        "iptables",
+        &[
+            "-w",
+            "-D",
+            "FORWARD",
+            "-i",
+            &network.host_veth,
+            "-j",
+            "ACCEPT",
+        ],
+    );
+    remove_all_matching_rules(
+        "iptables",
+        &[
+            "-w",
+            "-D",
+            "FORWARD",
+            "-o",
+            &network.host_veth,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "ESTABLISHED,RELATED",
+            "-j",
+            "ACCEPT",
+        ],
+    );
     run_ignoring_status("nft", &["delete", "table", "inet", &network.nft_table]);
     run_ignoring_status("ip", &["route", "del", &network.guest_cidr]);
     run_ignoring_status("ip", &["link", "del", &network.host_veth]);
@@ -1416,6 +1510,26 @@ fn run_ignoring_status(program: &str, arguments: &[&str]) {
     if let Err(error) = Command::new(executable).args(arguments).output() {
         tracing::debug!(program, %error, "Firecracker cleanup command could not start");
     }
+}
+
+fn remove_all_matching_rules(program: &str, arguments: &[&str]) {
+    let executable = match trusted_host_command(program) {
+        Ok(executable) => executable,
+        Err(error) => {
+            tracing::debug!(program, %error, "Firecracker cleanup command is not trusted");
+            return;
+        }
+    };
+    for _ in 0..64 {
+        match Command::new(&executable).args(arguments).output() {
+            Ok(output) if output.status.success() => {}
+            _ => return,
+        }
+    }
+    tracing::warn!(
+        program,
+        "stopped after removing 64 duplicate Firecracker firewall rules"
+    );
 }
 
 fn jail_dir(config: &FirecrackerConfig, machine_id: &str) -> PathBuf {

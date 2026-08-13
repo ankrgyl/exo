@@ -45,7 +45,7 @@ if [[ "$EUID" -ne 0 ]]; then
   exit 1
 fi
 
-for command in basename chmod chown dirname docker install ln mkdir mkfs.ext4 mktemp realpath rm tar truncate; do
+for command in basename chmod chown dirname docker install ln mkdir mkfs.ext4 mktemp readlink rm tar truncate; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "Required command not found: $command" >&2
     exit 1
@@ -82,33 +82,90 @@ docker export "$CONTAINER_ID" | tar -C "$WORK_DIR/rootfs" -xf -
 docker rm "$CONTAINER_ID" >/dev/null
 CONTAINER_ID=""
 
-assert_inside_rootfs() {
+resolve_inside_rootfs() {
+  local root="$WORK_DIR/rootfs"
   local candidate="$1"
-  local resolved
-  resolved="$(realpath -m "$candidate")"
+  case "$candidate" in
+    "$root" | "$root"/*) ;;
+    *)
+      echo "OCI image path is outside its root filesystem: $candidate" >&2
+      return 1
+      ;;
+  esac
+
+  # Absolute symlink targets in an OCI rootfs are relative to the guest root.
+  # Resolve components ourselves so merged-/usr links such as /usr/sbin/ip ->
+  # /usr/bin/ip cannot escape into the build host, without executing image code.
+  # https://github.com/opencontainers/image-spec/blob/main/layer.md
+  local remainder="${candidate#"$root"}"
+  remainder="${remainder#/}"
+  local resolved="$root"
+  local symlinks=0
+
+  while [[ -n "$remainder" ]]; do
+    local component="${remainder%%/*}"
+    if [[ "$remainder" == */* ]]; then
+      remainder="${remainder#*/}"
+    else
+      remainder=""
+    fi
+
+    case "$component" in
+      "" | ".") ;;
+      "..")
+        if [[ "$resolved" != "$root" ]]; then
+          resolved="${resolved%/*}"
+        fi
+        ;;
+      *)
+        local next="$resolved/$component"
+        if [[ -L "$next" ]]; then
+          symlinks=$((symlinks + 1))
+          if ((symlinks > 40)); then
+            echo "Too many OCI image symlinks while resolving: $candidate" >&2
+            return 1
+          fi
+          local target
+          target="$(readlink "$next")"
+          if [[ "$target" == /* ]]; then
+            resolved="$root"
+            target="${target#/}"
+          fi
+          if [[ -n "$remainder" ]]; then
+            remainder="$target/$remainder"
+          else
+            remainder="$target"
+          fi
+        else
+          resolved="$next"
+        fi
+        ;;
+    esac
+  done
+
   case "$resolved" in
-    "$WORK_DIR/rootfs" | "$WORK_DIR/rootfs"/*) ;;
+    "$root" | "$root"/*) printf '%s\n' "$resolved" ;;
     *)
       echo "OCI image path escapes its root filesystem: $candidate -> $resolved" >&2
-      exit 1
+      return 1
       ;;
   esac
 }
 
 for required in bin/sh usr/bin/cat usr/bin/chown usr/bin/mkdir usr/bin/mount usr/bin/mountpoint usr/bin/python3 usr/bin/rm usr/bin/setpriv usr/sbin/ip; do
-  assert_inside_rootfs "$WORK_DIR/rootfs/$required"
-  if [[ ! -x "$WORK_DIR/rootfs/$required" ]]; then
+  resolved="$(resolve_inside_rootfs "$WORK_DIR/rootfs/$required")"
+  if [[ ! -x "$resolved" ]]; then
     echo "OCI image must contain /$required" >&2
     exit 1
   fi
 done
 
-assert_inside_rootfs "$WORK_DIR/rootfs/runtime"
-assert_inside_rootfs "$WORK_DIR/rootfs/home/exo/workspace"
-mkdir -p "$WORK_DIR/rootfs/runtime" "$WORK_DIR/rootfs/home/exo/workspace"
-install -m 0755 "$SCRIPT_DIR/exo-firecracker-init" "$WORK_DIR/rootfs/runtime/exo-firecracker-init"
-install -m 0755 "$SCRIPT_DIR/exo-firecracker-agent.py" "$WORK_DIR/rootfs/runtime/exo-firecracker-agent.py"
-chown -R 10001:10001 "$WORK_DIR/rootfs/home/exo"
+runtime_dir="$(resolve_inside_rootfs "$WORK_DIR/rootfs/runtime")"
+workspace_dir="$(resolve_inside_rootfs "$WORK_DIR/rootfs/home/exo/workspace")"
+mkdir -p "$runtime_dir" "$workspace_dir"
+install -m 0755 "$SCRIPT_DIR/exo-firecracker-init" "$runtime_dir/exo-firecracker-init"
+install -m 0755 "$SCRIPT_DIR/exo-firecracker-agent.py" "$runtime_dir/exo-firecracker-agent.py"
+chown -R 10001:10001 "$(resolve_inside_rootfs "$WORK_DIR/rootfs/home/exo")"
 
 OUTPUT_TEMP="$(mktemp "${OUTPUT}.tmp.XXXXXX")"
 truncate -s "${SIZE_GIB}G" "$OUTPUT_TEMP"

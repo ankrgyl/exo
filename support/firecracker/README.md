@@ -17,7 +17,8 @@ support/firecracker/build-rootfs.sh \
 The OCI image must contain `/bin/sh`, Python 3, `setpriv`, `ip`, `mount`,
 `mountpoint`, and the standard `cat`, `chown`, `mkdir`, and `rm` utilities. The
 guest kernel must contain `CONFIG_VIRTIO_VSOCKETS=y`; the host requires KVM,
-cgroup v2, iproute2, nftables, e2fsprogs, and `CONFIG_VHOST_VSOCK`.
+cgroup v2, iproute2, iptables, nftables, e2fsprogs, and
+`CONFIG_VHOST_VSOCK`.
 
 Install matching official Firecracker and jailer release binaries under
 `/usr/local/bin`, and install the guest kernel at
@@ -46,6 +47,36 @@ macOS by running it in a Linux VM with nested virtualization enabled; on an
 Intel Mac, VMware Fusion's **Enable hypervisor applications in this virtual
 machine** setting is the documented example.
 
+On Apple M3 and newer, Lima can expose Apple's nested virtualization support to
+an ARM64 Linux guest. From the Exo checkout, create a dedicated VM whose only
+writable host mount is that checkout:
+
+```bash
+brew install lima
+limactl start \
+  --name=exo-firecracker \
+  --vm-type=vz \
+  --arch=aarch64 \
+  --nested-virt \
+  --cpus=6 \
+  --memory=4 \
+  --disk=50 \
+  --containerd=none \
+  --mount-only="$PWD:w" \
+  template:default
+limactl shell exo-firecracker
+sudo test -r /dev/kvm && sudo test -w /dev/kvm
+```
+
+Lima documents nested virtualization as supported with its `vz` driver on M3
+and newer:
+https://github.com/lima-vm/lima/blob/master/templates/default.yaml
+
+A 4 GiB outer VM is sufficient for development, but set
+`EXO_FIRECRACKER_MEMORY_MIB=1024` so an individual inner microVM does not try to
+consume the outer VM's full default allocation. Compiling Exo in 4 GiB may also
+need disk-backed swap.
+
 Run Exo inside that Linux VM:
 
 ```bash
@@ -53,8 +84,15 @@ sudo EXO_FIRECRACKER_KERNEL=/var/lib/exo/firecracker/vmlinux \
   target/debug/exo --sandbox-backend firecracker serve
 ```
 
-The server intentionally binds only to loopback, so expose it through an SSH
-tunnel rather than an unauthenticated LAN listener:
+With the default Lima guest agent, the guest's detected TCP listener is
+forwarded to the same macOS loopback port. Verify it from macOS:
+
+```bash
+curl http://127.0.0.1:4766/health
+```
+
+For another Linux VM, expose the loopback listener through an SSH tunnel rather
+than an unauthenticated LAN listener:
 
 ```bash
 ssh -L 4766:127.0.0.1:4766 your-linux-vm
