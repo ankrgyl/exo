@@ -40,6 +40,10 @@ const DEFAULT_AGENTCORE_DURABLE_CONTRACT_MOUNT_PATH: &str = "/mnt/workspace";
 fn sandbox_backend_registration_uses_backend_locality() {
     assert!(SandboxBackendRegistration::apple_container().is_local());
     assert!(SandboxBackendRegistration::docker().is_local());
+    assert_eq!(
+        SandboxBackendRegistration::firecracker().is_local(),
+        cfg!(target_os = "linux")
+    );
     assert!(SandboxBackendRegistration::local_process().is_local());
     assert!(!SandboxBackendRegistration::daytona(crate::DaytonaBackendSpec::default()).is_local());
 }
@@ -52,6 +56,7 @@ fn sandbox_backend_registration_resolves_builtin_providers() {
         SandboxProvider::Daytona,
         SandboxProvider::Docker,
         SandboxProvider::E2b,
+        SandboxProvider::Firecracker,
         SandboxProvider::LocalProcess,
         SandboxProvider::Sprites,
         SandboxProvider::Vercel,

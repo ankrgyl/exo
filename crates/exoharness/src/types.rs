@@ -671,6 +671,7 @@ impl SandboxProvider {
     pub const AwsAgentCore: Self = Self::from_static("aws_agentcore");
     pub const AppleContainer: Self = Self::from_static("apple_container");
     pub const Docker: Self = Self::from_static("docker");
+    pub const Firecracker: Self = Self::from_static("firecracker");
     pub const LocalProcess: Self = Self::from_static("local_process");
 
     pub const fn from_static(provider: &'static str) -> Self {
@@ -940,6 +941,10 @@ pub enum SandboxProviderConfig {
         #[serde(default = "crate::sandbox_provider::default_docker_image")]
         default_image: String,
     },
+    Firecracker {
+        #[serde(default = "crate::sandbox_provider::default_firecracker_image")]
+        default_image: String,
+    },
     Daytona {
         /// Secret-store id of the API key.
         api_key_secret_id: SecretId,
@@ -1011,6 +1016,7 @@ impl SandboxProviderConfig {
             Self::Sprites { .. } => SandboxProvider::Sprites,
             Self::Vercel { .. } => SandboxProvider::Vercel,
             Self::Docker { .. } => SandboxProvider::Docker,
+            Self::Firecracker { .. } => SandboxProvider::Firecracker,
             Self::AwsAgentCore { .. } => SandboxProvider::AwsAgentCore,
         }
     }
@@ -1021,6 +1027,7 @@ impl SandboxProviderConfig {
             Self::Daytona { default_image, .. }
             | Self::Vercel { default_image, .. }
             | Self::Docker { default_image, .. }
+            | Self::Firecracker { default_image, .. }
             | Self::E2b { default_image, .. }
             | Self::AwsAgentCore { default_image, .. } => Some(default_image),
             Self::Sprites { .. } => None,
@@ -1247,6 +1254,7 @@ mod tests {
         );
         assert_eq!(SandboxProvider::Vercel.to_string(), "vercel");
         assert_eq!(SandboxProvider::AwsAgentCore.to_string(), "aws_agentcore");
+        assert_eq!(SandboxProvider::Firecracker.to_string(), "firecracker");
         assert_eq!(SandboxProvider::LocalProcess.to_string(), "local_process");
         assert_eq!(
             serde_json::to_value(SandboxProvider::AppleContainer).unwrap(),

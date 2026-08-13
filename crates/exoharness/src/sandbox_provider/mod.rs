@@ -29,6 +29,14 @@ mod aws_agentcore {
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 mod e2b;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+mod firecracker;
+#[cfg(not(all(not(target_arch = "wasm32"), feature = "basic-backend")))]
+mod firecracker {
+    pub fn default_firecracker_image() -> String {
+        "/var/lib/exo/firecracker/rootfs.ext4".to_string()
+    }
+}
+#[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub mod process_bridge;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 mod sprites;
@@ -58,6 +66,9 @@ pub(crate) use docker::DEFAULT_DOCKER_IMAGE;
 pub use docker::default_docker_image;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use e2b::{DEFAULT_E2B_API_URL, DEFAULT_E2B_ENVD_PORT, E2bConfig, E2bSandboxBackend};
+pub use firecracker::default_firecracker_image;
+#[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+pub use firecracker::{FirecrackerConfig, FirecrackerSandboxBackend};
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use sprites::{DEFAULT_SPRITES_API_URL, SpritesConfig, SpritesSandboxBackend};
 pub use vercel::default_vercel_image;

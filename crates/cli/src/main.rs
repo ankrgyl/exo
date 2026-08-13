@@ -33,11 +33,11 @@ use executor::{
     ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount, FileSystemMountMode,
     ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART, HTTP_EXOHARNESS_TRACING_TARGET,
     Harness, HarnessAgent, HarnessConversation, HttpExoHarness, LocalSandboxExoHarness,
-    NewAgentRequest, PutSecretRequest, RlmHarness, RunInSandboxRequest, SANDBOX_MAIN_MOUNT_DIR,
-    SandboxAttachment, SandboxBackendRegistration, SandboxProcess, SandboxProvider,
-    SandboxProviderConfig, SandboxScope, Secret, SecretBackendChoice, SpritesBackendSpec,
-    ToolRequest, ToolRuntime, TypeScriptHarness, TypeScriptHarnessConfig, Uuid7, VercelBackendSpec,
-    default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
+    PutSecretRequest, RlmHarness, SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment,
+    SandboxBackendRegistration, SandboxProvider, SandboxProviderConfig, SandboxScope, Secret,
+    SecretBackendChoice, SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness,
+    TypeScriptHarnessConfig, Uuid7, VercelBackendSpec, default_aws_agentcore_image,
+    default_daytona_image, default_docker_image, default_e2b_template, default_firecracker_image,
     default_vercel_image, effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config,
     record_host_event, send_conversation_wakeup, serve_exoharness_http_listener_with_options,
 };
@@ -228,6 +228,7 @@ enum SandboxProviderArg {
     #[value(name = "apple-container")]
     AppleContainer,
     Docker,
+    Firecracker,
     #[value(name = "local-process")]
     LocalProcess,
 }
@@ -242,7 +243,29 @@ impl From<SandboxProviderArg> for SandboxProvider {
             SandboxProviderArg::AwsAgentCore => Self::AwsAgentCore,
             SandboxProviderArg::AppleContainer => Self::AppleContainer,
             SandboxProviderArg::Docker => Self::Docker,
+            SandboxProviderArg::Firecracker => Self::Firecracker,
             SandboxProviderArg::LocalProcess => Self::LocalProcess,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SandboxBackendArg {
+    #[value(name = "apple-container")]
+    AppleContainer,
+    Docker,
+    Firecracker,
+    #[value(name = "local-process")]
+    LocalProcess,
+}
+
+impl From<SandboxBackendArg> for SandboxBackendRegistration {
+    fn from(value: SandboxBackendArg) -> Self {
+        match value {
+            SandboxBackendArg::AppleContainer => Self::apple_container(),
+            SandboxBackendArg::Docker => Self::docker(),
+            SandboxBackendArg::Firecracker => Self::firecracker(),
+            SandboxBackendArg::LocalProcess => Self::local_process(),
         }
     }
 }
@@ -266,8 +289,8 @@ fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
 /// Daytona (offered even with no key set — credentials resolve lazily).
 fn default_sandbox_backends() -> Vec<SandboxBackendRegistration> {
     vec![
-        SandboxBackendRegistration::apple_container(),
-        SandboxBackendRegistration::docker(),
+        default_sandbox_backend(),
+        SandboxBackendRegistration::firecracker(),
         SandboxBackendRegistration::local_process(),
         SandboxBackendRegistration::daytona(DaytonaBackendSpec::default()),
         SandboxBackendRegistration::e2b(E2bBackendSpec::default()),
@@ -2252,6 +2275,9 @@ async fn main() -> Result<()> {
                     SandboxProviderArg::Docker => SandboxProviderConfig::Docker {
                         default_image: default_image.unwrap_or_else(default_docker_image),
                     },
+                    SandboxProviderArg::Firecracker => SandboxProviderConfig::Firecracker {
+                        default_image: default_image.unwrap_or_else(default_firecracker_image),
+                    },
                     SandboxProviderArg::E2b => {
                         let secret =
                             secret.ok_or_else(|| anyhow!("--secret is required for e2b"))?;
@@ -3750,6 +3776,37 @@ mod create_tests {
             super::Commands::Agent {
                 command: super::AgentCommands::Create {
                     sandbox_provider: Some(super::SandboxProviderArg::LocalProcess),
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn firecracker_backend_and_provider_parse() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from([
+            "exo",
+            "--sandbox-backend",
+            "firecracker",
+            "agent",
+            "create",
+            "test",
+            "--sandbox-provider",
+            "firecracker",
+            "--model",
+            "test-model",
+        ])
+        .expect("Firecracker sandbox backend and provider parse");
+        assert!(matches!(
+            cli.sandbox_backend,
+            Some(super::SandboxBackendArg::Firecracker)
+        ));
+        assert!(matches!(
+            cli.command,
+            super::Commands::Agent {
+                command: super::AgentCommands::Create {
+                    sandbox_provider: Some(super::SandboxProviderArg::Firecracker),
                     ..
                 }
             }

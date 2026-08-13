@@ -99,6 +99,7 @@ impl SandboxBackendRegistration {
             )),
             "docker" => Ok(Self::docker()),
             "e2b" => Ok(Self::e2b(E2bBackendSpec::default())),
+            "firecracker" => Ok(Self::firecracker()),
             "local_process" => Ok(Self::local_process()),
             "sprites" => Ok(Self::sprites(SpritesBackendSpec::default())),
             "vercel" => Ok(Self::vercel(VercelBackendSpec::with_conventional_secrets())),
@@ -128,6 +129,20 @@ impl SandboxBackendRegistration {
         Self::from_backend(
             SandboxProvider::Docker,
             Arc::new(CliContainerSandboxBackend::docker()),
+        )
+    }
+
+    pub fn firecracker() -> Self {
+        Self::from_factory(
+            SandboxProvider::Firecracker,
+            cfg!(target_os = "linux"),
+            |_| {
+                Box::pin(async move {
+                    Ok(Arc::new(crate::FirecrackerSandboxBackend::new(
+                        crate::FirecrackerConfig::from_env()?,
+                    )?) as Arc<dyn ManagedSandboxBackend>)
+                })
+            },
         )
     }
 
