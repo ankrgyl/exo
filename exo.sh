@@ -43,6 +43,7 @@ START_ADAPTERS="${EXO_START_ADAPTERS:-true}"
 ADAPTER_LIMIT="${EXO_ADAPTER_LIMIT:-50}"
 CONTROL=false
 SETUP_PROFILE=false
+FORCE=false
 SKIP_BUILD="${EXO_SKIP_BUILD:-false}"
 TEMPLATE="${EXO_TEMPLATE:-canonical}"
 PROFILE="${EXO_PROFILE:-practical}"
@@ -67,7 +68,6 @@ usage() {
 Usage:
   ./exo.sh [options]
   ./exo.sh list
-  ./exo.sh delall all
   ./exo.sh fresh
   ./exo.sh stop-all
   ./exo.sh build
@@ -84,8 +84,7 @@ Choose a different template with --template.
 
 Subcommands:
   list             List agents and conversations
-  delall all       Delete all agents and conversations
-  fresh            Rebuild, delete all state, and start a clean REPL
+  fresh            Rebuild, wipe local agent/conversation/adapter state, and start a clean REPL
   stop-all         Stop the scheduler and adapter runners, preserving .exo state
   build            Install JS dependencies and build the exo CLI and scheduler
   register-model   Store an API-key secret and register a model binding; uses
@@ -154,6 +153,7 @@ Options:
   --env-file <path>            Env file to read if present (default: .env)
   --exo-bin <path>             exo binary path (default: ./target/debug/exo)
   --scheduler-bin <path>       Scheduler runner path (default: ./target/debug/exo-scheduler-runner)
+  --force                      Skip the confirmation prompt for fresh
   --help                       Show this help
 
 Environment overrides:
@@ -770,6 +770,24 @@ delete_adapter_state() {
     "$ROOT_DIR/.exo/exo-adapters.lock"
 }
 
+confirm_fresh_wipe() {
+  if [[ "$FORCE" == true ]]; then
+    return
+  fi
+  if [[ ! -t 0 ]]; then
+    die "fresh needs confirmation. Re-run with --force."
+  fi
+  echo "This will delete local Exo state in this checkout:"
+  echo "  agents, conversations, and their event history"
+  echo "  adapter records and adapter logs"
+  echo "  leftover local sandbox containers from this checkout"
+  echo "It keeps API keys, model bindings, .env, and .exo/exo-profile.md,"
+  echo "then starts a new agent."
+  echo
+  read -r -p "Type 'fresh' to continue: " reply
+  [[ "$reply" == "fresh" ]] || die "aborted"
+}
+
 delete_all_agents_and_conversations() {
   ensure_exo_bin
   stop_scheduler
@@ -877,6 +895,7 @@ container_mounts_current_checkout() {
 }
 
 fresh_start() {
+  confirm_fresh_wipe
   if [[ "$SKIP_BUILD" == true ]]; then
     ensure_exo_bin
   else
@@ -1269,15 +1288,14 @@ while [[ $# -gt 0 ]]; do
       [[ $# -eq 0 ]] || die "list does not accept additional arguments"
       COMMAND="list"
       ;;
-    delall|delete-all)
+    fresh|reset|delall|delete-all)
+      wipe_cmd="$1"
       shift
-      [[ "${1:-}" == "all" ]] || die "delall requires literal argument: all"
-      shift
-      [[ $# -eq 0 ]] || die "delall all does not accept additional arguments"
-      COMMAND="delall"
-      ;;
-    fresh|reset)
-      shift
+      if [[ "$wipe_cmd" == "delall" || "$wipe_cmd" == "delete-all" ]]; then
+        [[ "${1:-}" == "all" ]] || die "use ./exo.sh fresh"
+        shift
+      fi
+      [[ $# -eq 0 || "$1" == -* ]] || die "$wipe_cmd does not accept additional arguments"
       COMMAND="fresh"
       ;;
     stop-all|stop)
@@ -1502,6 +1520,10 @@ while [[ $# -gt 0 ]]; do
       PULL_SANDBOX=true
       shift
       ;;
+    --force)
+      FORCE=true
+      shift
+      ;;
     --skip-build)
       SKIP_BUILD=true
       shift
@@ -1548,9 +1570,6 @@ case "$COMMAND" in
     ;;
   list)
     list_agents_and_conversations
-    ;;
-  delall)
-    delete_all_agents_and_conversations
     ;;
   fresh)
     fresh_start

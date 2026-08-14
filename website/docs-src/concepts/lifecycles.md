@@ -92,7 +92,7 @@ installed in the sandbox persist across conversations.
 
 ```bash
 exo agent delete <agent>
-# bulk local wipe (destructive):
+# bulk local wipe (destructive; prompts unless --force):
 ./exo.sh fresh
 ```
 
