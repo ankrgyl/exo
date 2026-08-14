@@ -938,20 +938,17 @@ fn compose_inbound_wakeup_prompt(
         "{} message received at target `{}` from {} via adapter `{}`:\n\n{}",
         config.adapter_type, target, sender, adapter.name, text,
     );
-    if config.adapter_type == "slack" {
-        if let Some(dm_target) = metadata.get("dmTarget").and_then(|value| value.as_str()) {
-            prompt.push_str(&format!(
-                "\n\nSlack sender DM target: `{dm_target}`. Use this only for appropriate private follow-up; do not use DM to bypass safety policy.",
-            ));
-        }
-        if metadata
-            .get("isActiveThread")
-            .and_then(|value| value.as_bool())
-            == Some(true)
-        {
-            prompt.push_str(
-                "\n\nThis Slack message is from an active thread, but it may be ambient conversation. Only call send_adapter_message if the message appears directed at Exo, asks Exo to do something, or clearly needs an Exo response. If no response is needed, do nothing.",
-            );
+    if let Some(notes) = metadata
+        .get("promptNotes")
+        .and_then(|value| value.as_array())
+    {
+        for note in notes.iter().filter_map(|value| value.as_str()) {
+            let note = note.trim();
+            if note.is_empty() {
+                continue;
+            }
+            prompt.push_str("\n\n");
+            prompt.push_str(note);
         }
     }
     if !attachments.is_empty() {
@@ -1254,7 +1251,33 @@ mod tests {
     }
 
     #[test]
-    fn wakeup_prompt_includes_slack_dm_target() {
+    fn wakeup_prompt_appends_worker_prompt_notes() {
+        let prompt = compose_inbound_wakeup_prompt(
+            &test_adapter_config(),
+            &test_adapter_record(),
+            "C123:1700000000.000000",
+            Some("U123"),
+            "hello",
+            &serde_json::json!({
+                "promptNotes": [
+                    "Slack sender DM target: `dm:U123`. Use this only for appropriate private follow-up; do not use DM to bypass safety policy.",
+                    "This Slack message is from an active thread, but it may be ambient conversation. Only call send_adapter_message if the message appears directed at Exo, asks Exo to do something, or clearly needs an Exo response. If no response is needed, do nothing.",
+                    "",
+                    12
+                ]
+            }),
+            &[],
+            0,
+        );
+        assert!(prompt.contains("Slack sender DM target: `dm:U123`"));
+        assert!(prompt.contains("do not use DM to bypass safety policy"));
+        assert!(prompt.contains("Only call send_adapter_message"));
+        assert!(prompt.contains("If no response is needed, do nothing"));
+        assert!(!prompt.contains("\n\n12"));
+    }
+
+    #[test]
+    fn wakeup_prompt_ignores_legacy_slack_metadata_without_prompt_notes() {
         let mut adapter = test_adapter_record();
         adapter.config.adapter_type = "slack".to_string();
         adapter.name = "slack-dev".to_string();
@@ -1268,9 +1291,7 @@ mod tests {
             &[],
             0,
         );
-        assert!(prompt.contains("Slack sender DM target: `dm:U123`"));
-        assert!(prompt.contains("do not use DM to bypass safety policy"));
-        assert!(prompt.contains("Only call send_adapter_message"));
-        assert!(prompt.contains("If no response is needed, do nothing"));
+        assert!(!prompt.contains("Slack sender DM target"));
+        assert!(!prompt.contains("active thread"));
     }
 }
