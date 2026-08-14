@@ -53,6 +53,8 @@ pub use executor_types::{
     ModelResponseStream, PendingToolCall, SandboxScope, SendRequest, SendResult, ToolDefinition,
     ToolRuntime, TypeScriptHarnessConfig, effective_sandbox_scope,
 };
+#[cfg(feature = "firecracker")]
+pub use exoharness::run_firecracker_bridge;
 pub use exoharness::{
     AgentHandle, AttachSandboxRequest, BasicExoHarness, BasicExoHarnessConfig, Binding,
     BindingRecord, ConversationHandle, CreateSandboxRequest, DEFAULT_SANDBOX_IMAGE,

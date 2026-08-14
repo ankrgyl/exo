@@ -47,6 +47,14 @@ pub trait SandboxHandle: SnapshotHandle {
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId>;
     async fn detach_sandbox(&self, id: SandboxId) -> Result<SandboxAttachment>;
     async fn stop_sandbox(&self, id: SandboxId) -> Result<()>;
+    #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+    async fn connect_sandbox_tcp(
+        &self,
+        _id: SandboxId,
+        _port: u16,
+    ) -> Result<Option<crate::BoxSandboxTcpStream>> {
+        Ok(None)
+    }
     async fn start_sandbox_process(
         &self,
         request: StartSandboxProcessRequest,

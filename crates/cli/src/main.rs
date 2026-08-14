@@ -380,6 +380,8 @@ impl From<SandboxScopeArg> for SandboxScope {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    #[command(hide = true)]
+    FirecrackerBridge,
     /// Manage agents and their executor configuration.
     Agent {
         #[command(subcommand)]
@@ -972,6 +974,17 @@ enum ConversationMountCommands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Commands::FirecrackerBridge) {
+        #[cfg(feature = "firecracker")]
+        {
+            if let Some(exit_code) = executor::run_firecracker_bridge().await? {
+                std::process::exit(exit_code);
+            }
+            return Ok(());
+        }
+        #[cfg(not(feature = "firecracker"))]
+        bail!("Firecracker bridge support requires building Exo with --features firecracker");
+    }
     let exo_config = build_exo_config(&cli)?;
     let env = CliEnvironment::load(cli.env_file_if_exists.as_deref(), cli.env_file.as_deref())?;
     let runtime_config = env.braintrust_runtime_config(
@@ -1022,6 +1035,9 @@ async fn main() -> Result<()> {
     )
     .await?;
     match cli.command {
+        Commands::FirecrackerBridge => {
+            unreachable!("Firecracker bridge returns before harness startup")
+        }
         Commands::Tools { .. } => unreachable!("tools commands return before harness startup"),
         Commands::Adapters { command } => {
             adapters::handle_adapter_command(&cli.root, Arc::clone(&harness), command).await?;
@@ -2720,8 +2736,8 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
             ConversationCommands::CompleteRebuildUpdate { .. } => None,
         },
         Commands::Repl { agent, .. } => Some(agent.as_deref().unwrap_or(DEFAULT_REPL_SLUG)),
-        Commands::Sandbox { .. }
-        | Commands::Secret { .. }
+        Commands::Secret { .. }
+        | Commands::FirecrackerBridge
         | Commands::Model { .. }
         | Commands::Provider { .. }
         | Commands::Adapters { .. }

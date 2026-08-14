@@ -19,10 +19,10 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::sandbox::{
-    CliContainerSandboxBackend, LocalProcessSandboxBackend, ManagedSandboxBackend,
-    ManagedSandboxHandle, SANDBOX_MAIN_MOUNT_DIR, SandboxCommand, SandboxKey,
-    SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxNetworkPolicy, SandboxRequest,
-    SandboxSpec, SnapshotKind, SnapshotPayload, sandbox_spec_hash,
+    BoxSandboxTcpStream, CliContainerSandboxBackend, LocalProcessSandboxBackend,
+    ManagedSandboxBackend, ManagedSandboxHandle, SANDBOX_MAIN_MOUNT_DIR, SandboxCommand,
+    SandboxKey, SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxNetworkPolicy,
+    SandboxRequest, SandboxSpec, SnapshotKind, SnapshotPayload, sandbox_spec_hash,
 };
 #[cfg(feature = "apple-keychain")]
 use crate::secrets::AppleKeychainSecretKeyProvider;
@@ -141,14 +141,9 @@ impl SandboxBackendRegistration {
     pub fn firecracker_with_snapshots(snapshot_enabled: bool) -> Self {
         Self::from_factory(
             SandboxProvider::Firecracker,
-            cfg!(target_os = "linux"),
+            cfg!(any(target_os = "linux", target_os = "macos")),
             move |_| {
-                Box::pin(async move {
-                    let mut config = crate::FirecrackerConfig::from_env()?;
-                    config.snapshot_enabled = snapshot_enabled;
-                    Ok(Arc::new(crate::FirecrackerSandboxBackend::new(config)?)
-                        as Arc<dyn ManagedSandboxBackend>)
-                })
+                Box::pin(async move { crate::firecracker_backend_from_env(snapshot_enabled).await })
             },
         )
     }
@@ -1147,6 +1142,14 @@ where
         self.sandbox_handle().stop_sandbox(id).await
     }
 
+    async fn connect_sandbox_tcp(
+        &self,
+        id: SandboxId,
+        port: u16,
+    ) -> Result<Option<BoxSandboxTcpStream>> {
+        self.sandbox_handle().connect_sandbox_tcp(id, port).await
+    }
+
     async fn start_sandbox_process(
         &self,
         request: StartSandboxProcessRequest,
@@ -1874,6 +1877,24 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         self.append_events_locked(vec![EventData::SandboxStopped { sandbox_id: id }])
             .await?;
         Ok(())
+    }
+
+    async fn connect_sandbox_tcp(
+        &self,
+        id: SandboxId,
+        port: u16,
+    ) -> Result<Option<BoxSandboxTcpStream>> {
+        self.ensure_full_sandbox_scope("connect_sandbox_tcp")?;
+        let sandbox = self.load_sandbox(&id).await?;
+        if !sandbox.running {
+            bail!("sandbox is not running: {id}");
+        }
+        let (sandbox_handle, provider_state_event) =
+            active_sandbox_handle(self.harness, &self.owner_dir, self.owner, &id, &sandbox).await?;
+        if let Some(event) = provider_state_event {
+            self.append_events(vec![event]).await?;
+        }
+        sandbox_handle.connect_tcp(port).await
     }
 
     async fn start_sandbox_process(

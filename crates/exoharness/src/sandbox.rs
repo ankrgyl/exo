@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,7 +23,7 @@ use uuid::Uuid;
 
 use crate::{DurableFileSystem, SandboxAttachment};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SandboxKey {
     AgentSandbox {
         agent_id: String,
@@ -49,18 +50,18 @@ impl fmt::Display for SandboxKey {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxLifecycleConfig {
     pub idle_ttl: Option<Duration>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SandboxMountAccess {
     ReadOnly,
     ReadWrite,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SandboxMount {
     pub host_path: PathBuf,
     pub guest_path: String,
@@ -68,13 +69,13 @@ pub struct SandboxMount {
     pub internal: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SandboxNetworkPolicy {
     Enabled,
     Disabled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SandboxSpec {
     pub image: String,
     pub mounts: Vec<SandboxMount>,
@@ -83,7 +84,7 @@ pub struct SandboxSpec {
     pub default_workdir: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxRequest {
     pub key: SandboxKey,
     pub spec: SandboxSpec,
@@ -91,7 +92,7 @@ pub struct SandboxRequest {
     pub provider_state: Option<Value>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxCommand {
     pub argv: Vec<String>,
     pub env: HashMap<String, String>,
@@ -100,7 +101,7 @@ pub struct SandboxCommand {
     pub timeout: Option<Duration>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxCommandOutput {
     pub ok: bool,
     pub exit_code: Option<i32>,
@@ -160,6 +161,10 @@ pub trait ManagedSandboxHandle: Send + Sync {
 
     async fn start_process(&self, command: &SandboxCommand) -> Result<crate::SandboxProcessParts>;
 
+    async fn connect_tcp(&self, _port: u16) -> Result<Option<BoxSandboxTcpStream>> {
+        Ok(None)
+    }
+
     async fn stop(&self) -> Result<()>;
 
     /// Relinquish lifecycle ownership without stopping the sandbox and return
@@ -170,6 +175,12 @@ pub trait ManagedSandboxHandle: Send + Sync {
     /// error if this backend doesn't (yet) support snapshotting.
     async fn snapshot(&self) -> Result<SnapshotPayload>;
 }
+
+pub trait SandboxTcpStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+
+impl<T> SandboxTcpStream for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+
+pub type BoxSandboxTcpStream = Pin<Box<dyn SandboxTcpStream>>;
 
 #[async_trait]
 pub trait ManagedSandboxBackend: Send + Sync {

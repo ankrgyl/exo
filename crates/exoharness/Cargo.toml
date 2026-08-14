@@ -67,10 +67,11 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }
-tempfile = { workspace = true, optional = true }
+tempfile = { version = "3.13.0", optional = true }
 thiserror.workspace = true
 tokio = { version = "1.52.1", default-features = false, features = [
   "fs",
+  "io-std",
   "io-util",
   "net",
   "process",

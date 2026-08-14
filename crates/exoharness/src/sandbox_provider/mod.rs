@@ -31,7 +31,15 @@ mod e2b;
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
 mod firecracker;
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+mod firecracker_bridge;
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
 mod firecracker_image;
+#[cfg(all(
+    target_os = "macos",
+    not(target_arch = "wasm32"),
+    feature = "firecracker"
+))]
+mod firecracker_lima;
 #[cfg(not(all(not(target_arch = "wasm32"), feature = "firecracker")))]
 mod firecracker {
     pub fn default_firecracker_image() -> String {
@@ -71,6 +79,31 @@ pub use e2b::{DEFAULT_E2B_API_URL, DEFAULT_E2B_ENVD_PORT, E2bConfig, E2bSandboxB
 pub use firecracker::default_firecracker_image;
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
 pub use firecracker::{FirecrackerConfig, FirecrackerSandboxBackend};
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+pub use firecracker_bridge::run_firecracker_bridge;
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+pub async fn firecracker_backend_from_env(
+    snapshot_enabled: bool,
+) -> anyhow::Result<std::sync::Arc<dyn crate::ManagedSandboxBackend>> {
+    let mut config = FirecrackerConfig::from_env()?;
+    config.snapshot_enabled = snapshot_enabled;
+    #[cfg(target_os = "linux")]
+    {
+        Ok(std::sync::Arc::new(FirecrackerSandboxBackend::new(config)?))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Ok(std::sync::Arc::new(
+            firecracker_lima::LimaFirecrackerSandboxBackend::from_env(config).await?,
+        ))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        drop(config);
+        anyhow::bail!("Firecracker sandbox execution is only supported on Linux or macOS with Lima")
+    }
+}
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use sprites::{DEFAULT_SPRITES_API_URL, SpritesConfig, SpritesSandboxBackend};
 pub use vercel::default_vercel_image;
