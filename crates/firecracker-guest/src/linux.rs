@@ -19,6 +19,7 @@ use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 
 const AGENT_PORT: u32 = 10_052;
+const READY_HOST_PORT: u32 = 10_053;
 const GUEST_UID: u32 = 10_001;
 const GUEST_GID: u32 = 10_001;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -637,6 +638,7 @@ fn sync_filesystem(path: &str) -> Response {
 pub fn run() -> Result<(), String> {
     initialize_guest()?;
     let listener = vsock_listener()?;
+    signal_ready_to_host()?;
     let state = Arc::new(AgentState::default());
     let active_connections = Arc::new(AtomicUsize::new(0));
     loop {
@@ -684,23 +686,127 @@ pub fn run() -> Result<(), String> {
     }
 }
 
+fn signal_ready_to_host() -> Result<(), String> {
+    // Firecracker forwards a guest connection to the host listener at
+    // `<uds_path>_<port>`, giving the host an event-driven readiness edge.
+    // https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md#guest-initiated-connections
+    let descriptor =
+        unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let socket = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    let address = libc::sockaddr_vm {
+        svm_family: libc::AF_VSOCK as libc::sa_family_t,
+        svm_reserved1: 0,
+        svm_port: READY_HOST_PORT,
+        svm_cid: libc::VMADDR_CID_HOST,
+        svm_zero: [0; 4],
+    };
+    let result = unsafe {
+        libc::connect(
+            socket.as_raw_fd(),
+            (&raw const address).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        return Err(format!(
+            "connecting guest-ready vsock: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut socket = File::from(socket);
+    socket
+        .write_all(&[1])
+        .and_then(|()| socket.flush())
+        .map_err(|error| error.to_string())
+}
+
 fn initialize_guest() -> Result<(), String> {
     mount_pseudo_filesystems()?;
     let command_line = fs::read_to_string("/proc/cmdline").map_err(|error| error.to_string())?;
+    setup_root_overlay()?;
     configure_network(&command_line)?;
     let workspace = command_line_value(&command_line, "exo_workspace")
         .unwrap_or_else(|| "/home/exo/workspace".to_string());
     if let Some(path) = command_line_value(&command_line, "exo_workspace")
-        && Path::new("/dev/vdb").exists()
+        && Path::new("/dev/vdc").exists()
     {
         fs::create_dir_all(&path).map_err(|error| error.to_string())?;
-        mount_filesystem(Some("/dev/vdb"), &path, Some("ext4"), 0, None)?;
+        mount_filesystem(Some("/dev/vdc"), &path, Some("ext4"), 0, None)?;
         chown(&path, Some(GUEST_UID), Some(GUEST_GID)).map_err(|error| error.to_string())?;
     }
     fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
     chown(&workspace, Some(GUEST_UID), Some(GUEST_GID)).map_err(|error| error.to_string())?;
     std::env::set_current_dir(&workspace).map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn setup_root_overlay() -> Result<(), String> {
+    // The immutable OCI filesystem is shared by every VM. A separate sparse
+    // ext4 disk holds only this VM's changes, matching the lower/upper layout
+    // used by Hypeman instead of copying the full base image per launch.
+    // https://github.com/kernel/hypeman/blob/main/lib/system/init/mount.go
+    wait_for_device("/dev/vda")?;
+    wait_for_device("/dev/vdb")?;
+    for path in ["/mnt/lower", "/mnt/upper", "/mnt/newroot"] {
+        fs::create_dir_all(path).map_err(|error| error.to_string())?;
+    }
+    mount_filesystem(
+        Some("/dev/vda"),
+        "/mnt/lower",
+        Some("ext4"),
+        libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
+        None,
+    )?;
+    mount_filesystem(
+        Some("/dev/vdb"),
+        "/mnt/upper",
+        Some("ext4"),
+        libc::MS_NOSUID | libc::MS_NODEV,
+        None,
+    )?;
+    for path in ["/mnt/upper/upper", "/mnt/upper/work"] {
+        fs::create_dir_all(path).map_err(|error| error.to_string())?;
+    }
+    mount_filesystem(
+        Some("overlay"),
+        "/mnt/newroot",
+        Some("overlay"),
+        libc::MS_NOSUID | libc::MS_NODEV,
+        Some("lowerdir=/mnt/lower,upperdir=/mnt/upper/upper,workdir=/mnt/upper/work"),
+    )?;
+    for path in ["proc", "sys", "dev"] {
+        let target = format!("/mnt/newroot/{path}");
+        fs::create_dir_all(&target).map_err(|error| error.to_string())?;
+        mount_filesystem(
+            Some(&format!("/{path}")),
+            &target,
+            None,
+            libc::MS_BIND | libc::MS_REC,
+            None,
+        )?;
+    }
+    let newroot = c_string("/mnt/newroot")?;
+    if unsafe { libc::chroot(newroot.as_ptr()) } != 0 {
+        return Err(format!(
+            "switching to merged root filesystem: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    std::env::set_current_dir("/").map_err(|error| error.to_string())
+}
+
+fn wait_for_device(path: &str) -> Result<(), String> {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(2) {
+        if Path::new(path).exists() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    Err(format!("timed out waiting for block device {path}"))
 }
 
 fn mount_pseudo_filesystems() -> Result<(), String> {

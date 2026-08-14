@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use tempfile::{Builder as TempBuilder, NamedTempFile};
 use tokio::io::AsyncWriteExt;
 
-const MATERIALIZER_VERSION: u32 = 2;
+const MATERIALIZER_VERSION: u32 = 4;
 const EXT4_MAGIC_OFFSET: u64 = 1024 + 0x38;
 const EXT4_MAGIC: [u8; 2] = [0x53, 0xef];
 const GUEST_UID: u32 = 10_001;
@@ -54,7 +54,6 @@ struct CachedImageMetadata {
     source_digest: String,
     manifest_digest: String,
     platform: String,
-    guest_runtime_digest: String,
 }
 
 #[derive(Debug, Clone)]
@@ -80,37 +79,61 @@ pub(super) async fn resolve_image(
     state_root: &Path,
     source: &str,
     image_size_gib: u64,
-    guest_runtime: &Path,
 ) -> Result<PathBuf> {
     let total_started = Instant::now();
     if looks_like_local_image(source) {
         let lookup_started = Instant::now();
-        let image = fs::canonicalize(source)
-            .with_context(|| format!("resolving Firecracker root filesystem image {source}"))?;
-        if !image.is_file() {
-            bail!(
-                "Firecracker image must be an ext4 root filesystem file: {}",
-                image.display()
-            );
-        }
-        validate_ext4_image(&image)?;
-        record_step(source, None, "cache_lookup", lookup_started.elapsed(), true);
-        record_step(source, None, "total", total_started.elapsed(), true);
+        let state_root = state_root.to_path_buf();
+        let source_path = source.to_string();
+        let (image, cache_hit) =
+            tokio::task::spawn_blocking(move || cache_local_image(&state_root, &source_path))
+                .await
+                .context("joining local Firecracker image cache")??;
+        record_step(
+            source,
+            None,
+            "cache_lookup",
+            lookup_started.elapsed(),
+            cache_hit,
+        );
+        record_step(source, None, "total", total_started.elapsed(), cache_hit);
         return Ok(image);
     }
 
     let reference = source
         .parse::<Reference>()
         .with_context(|| format!("parsing Firecracker OCI image reference {source}"))?;
-    let guest_runtime_digest = sha256_file(guest_runtime).with_context(|| {
-        format!(
-            "hashing Firecracker guest runtime {}",
-            guest_runtime.display()
-        )
-    })?;
     let cache_root = state_root.join("images");
     prepare_private_dir(&cache_root)?;
     prepare_private_dir(&cache_root.join("blobs/sha256"))?;
+    let platform = current_platform()?;
+
+    // An OCI digest is immutable, so a completed platform cache entry can be
+    // used without contacting the registry again. This keeps ECR authentication
+    // and manifest lookup out of every warm VM launch.
+    // https://github.com/opencontainers/distribution-spec/blob/main/spec.md#pulling-manifests
+    if let Some(source_digest) = immutable_reference_digest(source)? {
+        let cache_dir = cache_image_dir(&cache_root, &platform, source_digest)?;
+        if cache_dir.try_exists()? {
+            let lookup_started = Instant::now();
+            let image = validate_cache_entry(&cache_dir, source_digest, None, &platform)?;
+            record_step(
+                source,
+                Some(source_digest),
+                "cache_lookup",
+                lookup_started.elapsed(),
+                true,
+            );
+            record_step(
+                source,
+                Some(source_digest),
+                "total",
+                total_started.elapsed(),
+                true,
+            );
+            return Ok(image);
+        }
+    }
 
     let auth_started = Instant::now();
     let auth = registry_auth(&reference)?;
@@ -138,21 +161,14 @@ pub(super) async fn resolve_image(
     let image_config: OciImageConfiguration = serde_json::from_str(&config_json)
         .with_context(|| format!("decoding OCI image configuration for {source}"))?;
     validate_platform(&image_config)?;
-    let platform = current_platform()?;
-    let cache_dir = cache_image_dir(
-        &cache_root,
-        &platform,
-        &source_digest,
-        &guest_runtime_digest,
-    )?;
+    let cache_dir = cache_image_dir(&cache_root, &platform, &source_digest)?;
     let cache_lookup_started = Instant::now();
     if cache_dir.try_exists()? {
         let image = validate_cache_entry(
             &cache_dir,
             &source_digest,
-            &manifest_digest,
+            Some(&manifest_digest),
             &platform,
-            &guest_runtime_digest,
         )?;
         record_step(
             source,
@@ -220,13 +236,11 @@ pub(super) async fn resolve_image(
         source_digest: source_digest.clone(),
         manifest_digest: manifest_digest.clone(),
         platform: platform.clone(),
-        guest_runtime_digest: guest_runtime_digest.clone(),
     };
     let build_cache_root = cache_root.clone();
     let build_cache_dir = cache_dir.clone();
     let build_source = source.to_string();
     let build_digest = manifest_digest.clone();
-    let build_guest_runtime = guest_runtime.to_path_buf();
     let image = tokio::task::spawn_blocking(move || {
         build_and_publish_image(
             &build_cache_root,
@@ -236,7 +250,6 @@ pub(super) async fn resolve_image(
             layers,
             metadata,
             image_size_gib,
-            &build_guest_runtime,
         )
     })
     .await
@@ -256,6 +269,75 @@ fn looks_like_local_image(source: &str) -> bool {
         || source.starts_with("./")
         || source.starts_with("../")
         || source.ends_with(".ext4")
+}
+
+fn immutable_reference_digest(source: &str) -> Result<Option<&str>> {
+    let Some((_, digest)) = source.rsplit_once('@') else {
+        return Ok(None);
+    };
+    sha256_hex(digest)?;
+    Ok(Some(digest))
+}
+
+fn cache_local_image(state_root: &Path, source: &str) -> Result<(PathBuf, bool)> {
+    let source = fs::canonicalize(source)
+        .with_context(|| format!("resolving Firecracker root filesystem image {source}"))?;
+    validate_ext4_image(&source)?;
+    let metadata = fs::metadata(&source)?;
+    let identity = format!(
+        "{}:{}:{}:{}:{}:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec()
+    );
+    let digest = hex::encode(Sha256::digest(identity.as_bytes()));
+    let local_root = state_root
+        .join("images")
+        .join(format!("v{MATERIALIZER_VERSION}"))
+        .join("local");
+    prepare_private_dir(&local_root)?;
+    let cache_dir = local_root.join(digest);
+    let cached = cache_dir.join("rootfs.ext4");
+    if cached.try_exists()? {
+        validate_ext4_image(&cached)?;
+        return Ok((cached, true));
+    }
+
+    let temporary = TempBuilder::new()
+        .prefix("local-image-")
+        .tempdir_in(&local_root)?;
+    let staged = temporary.path().join("rootfs.ext4");
+    fs::copy(&source, &staged).with_context(|| {
+        format!(
+            "staging local Firecracker image {} into its immutable cache",
+            source.display()
+        )
+    })?;
+    fs::set_permissions(&staged, Permissions::from_mode(0o444))?;
+    validate_ext4_image(&staged)?;
+    let temporary_path = temporary.keep();
+    match fs::rename(&temporary_path, &cache_dir) {
+        Ok(()) => {}
+        Err(error) if cache_dir.try_exists()? => {
+            fs::remove_dir_all(&temporary_path)?;
+            tracing::debug!(%error, path = %cache_dir.display(), "another process cached the local Firecracker image first");
+        }
+        Err(error) => {
+            fs::remove_dir_all(&temporary_path)?;
+            return Err(error).with_context(|| {
+                format!(
+                    "publishing local Firecracker image cache {}",
+                    cache_dir.display()
+                )
+            });
+        }
+    }
+    validate_ext4_image(&cached)?;
+    Ok((cached, false))
 }
 
 fn registry_auth(reference: &Reference) -> Result<RegistryAuth> {
@@ -435,7 +517,6 @@ fn build_and_publish_image(
     layers: Vec<CachedLayer>,
     metadata: CachedImageMetadata,
     image_size_gib: u64,
-    guest_runtime: &Path,
 ) -> Result<PathBuf> {
     let temporary = TempBuilder::new()
         .prefix("image-build-")
@@ -461,13 +542,13 @@ fn build_and_publish_image(
         false,
     );
 
-    let inject_started = Instant::now();
-    inject_guest_runtime(&rootfs, guest_runtime)?;
+    let guest_root_started = Instant::now();
+    prepare_guest_rootfs(&rootfs)?;
     record_step(
         source,
         Some(manifest_digest),
-        "runtime_inject",
-        inject_started.elapsed(),
+        "guest_root_prepare",
+        guest_root_started.elapsed(),
         false,
     );
 
@@ -493,7 +574,10 @@ fn build_and_publish_image(
     if !status.success() {
         bail!("mkfs.ext4 failed while materializing {source}: {status}");
     }
-    fs::set_permissions(&image, Permissions::from_mode(0o600))?;
+    // The cache directories remain root-only. Making the image itself read-only
+    // lets each jail hard-link the same immutable inode without changing its
+    // ownership or copying its data.
+    fs::set_permissions(&image, Permissions::from_mode(0o444))?;
     validate_ext4_image(&image)?;
     record_step(
         source,
@@ -538,9 +622,8 @@ fn build_and_publish_image(
     validate_cache_entry(
         cache_dir,
         &metadata.source_digest,
-        &metadata.manifest_digest,
+        Some(&metadata.manifest_digest),
         &metadata.platform,
-        &metadata.guest_runtime_digest,
     )
 }
 
@@ -739,19 +822,9 @@ fn jailed_path(root: &Path, relative: &Path, allow_final_symlink: bool) -> Resul
     Ok(path)
 }
 
-fn inject_guest_runtime(rootfs: &Path, guest_runtime: &Path) -> Result<()> {
-    let runtime = create_jailed_dir(rootfs, Path::new("runtime"))?;
+fn prepare_guest_rootfs(rootfs: &Path) -> Result<()> {
     let home = create_jailed_dir(rootfs, Path::new("home/exo"))?;
     let workspace = create_jailed_dir(rootfs, Path::new("home/exo/workspace"))?;
-    let destination = runtime.join("exo-firecracker-guest");
-    fs::copy(guest_runtime, &destination).with_context(|| {
-        format!(
-            "injecting Firecracker guest runtime {} into OCI rootfs",
-            guest_runtime.display()
-        )
-    })?;
-    fs::set_permissions(&destination, Permissions::from_mode(0o755))?;
-    File::open(&destination)?.sync_all()?;
     std::os::unix::fs::chown(&home, Some(GUEST_UID), Some(GUEST_GID))?;
     std::os::unix::fs::chown(&workspace, Some(GUEST_UID), Some(GUEST_GID))?;
     Ok(())
@@ -814,18 +887,12 @@ fn current_architecture() -> Result<&'static str> {
     }
 }
 
-fn cache_image_dir(
-    cache_root: &Path,
-    platform: &str,
-    digest: &str,
-    guest_runtime_digest: &str,
-) -> Result<PathBuf> {
+fn cache_image_dir(cache_root: &Path, platform: &str, digest: &str) -> Result<PathBuf> {
     let digest = sha256_hex(digest)?;
     Ok(cache_root
         .join(format!("v{MATERIALIZER_VERSION}"))
         .join(platform)
-        .join(digest)
-        .join(guest_runtime_digest))
+        .join(digest))
 }
 
 fn sha256_hex(digest: &str) -> Result<&str> {
@@ -841,9 +908,8 @@ fn sha256_hex(digest: &str) -> Result<&str> {
 fn validate_cache_entry(
     cache_dir: &Path,
     source_digest: &str,
-    manifest_digest: &str,
+    manifest_digest: Option<&str>,
     platform: &str,
-    guest_runtime_digest: &str,
 ) -> Result<PathBuf> {
     let metadata_path = cache_dir.join("metadata.json");
     let metadata: CachedImageMetadata =
@@ -853,9 +919,8 @@ fn validate_cache_entry(
         .with_context(|| format!("decoding image cache metadata {}", metadata_path.display()))?;
     if metadata.materializer_version != MATERIALIZER_VERSION
         || metadata.source_digest != source_digest
-        || metadata.manifest_digest != manifest_digest
         || metadata.platform != platform
-        || metadata.guest_runtime_digest != guest_runtime_digest
+        || manifest_digest.is_some_and(|digest| metadata.manifest_digest != digest)
     {
         bail!(
             "Firecracker image cache metadata mismatch: {}",
@@ -865,20 +930,6 @@ fn validate_cache_entry(
     let image = cache_dir.join("rootfs.ext4");
     validate_ext4_image(&image)?;
     Ok(image)
-}
-
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut input = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = input.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    Ok(hex::encode(hasher.finalize()))
 }
 
 pub(super) fn validate_ext4_image(path: &Path) -> Result<()> {
@@ -1027,21 +1078,24 @@ mod tests {
     #[test]
     fn cache_path_is_versioned_platform_and_digest_addressed() {
         let digest = format!("sha256:{}", "a".repeat(64));
-        let runtime_digest = "b".repeat(64);
         assert_eq!(
-            cache_image_dir(Path::new("/cache"), "linux-arm64", &digest, &runtime_digest,).unwrap(),
-            Path::new("/cache/v2/linux-arm64")
-                .join("a".repeat(64))
-                .join(runtime_digest)
+            cache_image_dir(Path::new("/cache"), "linux-arm64", &digest).unwrap(),
+            Path::new("/cache/v4/linux-arm64").join("a".repeat(64))
         );
-        assert!(
-            cache_image_dir(
-                Path::new("/cache"),
-                "linux-arm64",
-                "latest",
-                &"b".repeat(64)
-            )
-            .is_err()
+        assert!(cache_image_dir(Path::new("/cache"), "linux-arm64", "latest").is_err());
+    }
+
+    #[test]
+    fn immutable_reference_digest_requires_sha256() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(
+            immutable_reference_digest(&format!("registry.example/repo@{digest}")).unwrap(),
+            Some(digest.as_str())
         );
+        assert_eq!(
+            immutable_reference_digest("registry.example/repo:latest").unwrap(),
+            None
+        );
+        assert!(immutable_reference_digest("registry.example/repo@latest").is_err());
     }
 }

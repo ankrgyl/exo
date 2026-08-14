@@ -1,10 +1,10 @@
 # Firecracker sandbox artifacts
 
 Exo's optional Firecracker backend accepts either an OCI image reference or an
-existing ext4 root filesystem, plus an uncompressed guest kernel. It launches
-Firecracker only through the matching `jailer` binary, communicates with a
-static Rust PID 1 over virtio-vsock, and adds a TAP device only when the
-sandbox requests networking.
+existing ext4 root filesystem, plus an uncompressed guest kernel and a minimal
+initramfs. It launches Firecracker only through the matching `jailer` binary,
+communicates with a static Rust PID 1 over virtio-vsock, and adds a TAP device
+only when the sandbox requests networking.
 
 Build the CLI with the backend and its OCI/filesystem dependencies enabled:
 
@@ -13,11 +13,18 @@ cargo build -p exo --features firecracker
 ```
 
 For an OCI reference, Exo resolves the platform manifest, pulls its layers
-directly from the registry, applies OCI whiteouts, injects the Firecracker guest
-runtime, and creates ext4 with `mkfs.ext4 -d`. This path does not use Docker or
-containerd. Images are cached by immutable manifest-list digest, platform, and
-guest-runtime digest under `EXO_FIRECRACKER_STATE_ROOT/images/v2`; each VM gets
-a sparse/reflinked writable copy of the cached filesystem.
+directly from the registry, applies OCI whiteouts, creates the guest-owned
+workspace directories, and creates ext4 with `mkfs.ext4 -d`. This path does not
+use Docker or containerd. Images are cached by immutable manifest-list digest
+and platform under `EXO_FIRECRACKER_STATE_ROOT/images/v4`. After the first
+materialization, a digest-pinned OCI reference reaches this cache without a
+registry request.
+
+The cached ext4 image is an immutable lower layer shared by hard link across
+VMs. Every VM gets a new sparse ext4 upper layer, and the initramfs mounts the
+pair with OverlayFS. VM startup therefore never copies the base filesystem.
+The kernel and initramfs are likewise copied into an immutable host cache once
+and hard-linked into each jail.
 
 Build the guest runtime on the Linux KVM host and install it as a trusted host
 artifact:
@@ -26,9 +33,13 @@ artifact:
 guest_runtime="$(support/firecracker/build-guest.sh)"
 sudo install -o root -g root -m 0755 "$guest_runtime" \
   /var/lib/exo/firecracker/exo-firecracker-guest
+sudo support/firecracker/build-initramfs.sh \
+  --guest-runtime /var/lib/exo/firecracker/exo-firecracker-guest \
+  --output /var/lib/exo/firecracker/exo-firecracker-initramfs.cpio
 ```
 
-The guest runtime is statically linked and runs directly as PID 1. It mounts
+The guest runtime is statically linked and runs directly as PID 1 from the
+initramfs. It mounts the immutable base and sparse upper with OverlayFS, mounts
 the pseudo filesystems, configures the guest network, mounts an optional
 workspace, and serves the bounded process protocol only to the host vsock CID.
 Every workload child clears supplementary groups and irreversibly drops to
@@ -47,8 +58,8 @@ users.
 The generated filesystem is 8 GiB by default; set
 `EXO_FIRECRACKER_IMAGE_SIZE_GIB` to change it. Structured logs report
 `duration_ms` for registry authentication, manifest resolution, cache lookup,
-blob pulls, layer extraction, runtime injection, ext4 creation, and the total
-materialization path. Blob-pull logs also report bytes and cache hit/miss
+blob pulls, layer extraction, guest-root preparation, ext4 creation, and the
+total materialization path. Blob-pull logs also report bytes and cache hit/miss
 counts.
 
 The standalone Docker-based builder remains available when an ext4 artifact is
@@ -64,9 +75,10 @@ support/firecracker/build-rootfs.sh \
   --output /var/lib/exo/firecracker/rootfs.ext4
 ```
 
-The guest kernel must contain `CONFIG_VIRTIO_VSOCKETS=y`; the host requires
-KVM, cgroup v2, iproute2, iptables, nftables, e2fsprogs, static glibc development
-files for the guest-runtime build, and `CONFIG_VHOST_VSOCK`.
+The guest kernel must contain `CONFIG_BLK_DEV_INITRD=y`, `CONFIG_EXT4_FS=y`,
+`CONFIG_OVERLAY_FS=y`, and `CONFIG_VIRTIO_VSOCKETS=y`; the host requires KVM,
+cgroup v2, iproute2, iptables, nftables, e2fsprogs, cpio, static glibc
+development files for the guest-runtime build, and `CONFIG_VHOST_VSOCK`.
 
 Install matching official Firecracker and jailer release binaries under
 `/usr/local/bin`, and install the guest kernel at
@@ -80,7 +92,7 @@ Run Exo as root, select the backend, and configure the provider binding:
 
 ```bash
 sudo EXO_FIRECRACKER_KERNEL=/var/lib/exo/firecracker/vmlinux \
-  EXO_FIRECRACKER_GUEST_RUNTIME=/var/lib/exo/firecracker/exo-firecracker-guest \
+  EXO_FIRECRACKER_INITRAMFS=/var/lib/exo/firecracker/exo-firecracker-initramfs.cpio \
   target/debug/exo --sandbox-backend firecracker provider configure \
   --provider firecracker \
   --default-image 123456789012.dkr.ecr.us-east-1.amazonaws.com/exo-sandbox@sha256:...
@@ -130,7 +142,7 @@ Run Exo inside that Linux VM:
 
 ```bash
 sudo EXO_FIRECRACKER_KERNEL=/var/lib/exo/firecracker/vmlinux \
-  EXO_FIRECRACKER_GUEST_RUNTIME=/var/lib/exo/firecracker/exo-firecracker-guest \
+  EXO_FIRECRACKER_INITRAMFS=/var/lib/exo/firecracker/exo-firecracker-initramfs.cpio \
   target/debug/exo --sandbox-backend firecracker serve
 ```
 
@@ -166,5 +178,10 @@ The implementation follows Firecracker's upstream guidance for
 [jailer operation](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md),
 [network setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/network-setup.md),
 and [virtio-vsock](https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md).
+The initramfs follows Firecracker's
+[custom initrd guidance](https://github.com/firecracker-microvm/firecracker/blob/main/docs/initrd.md#custom),
+and the VMM uses a
+[configuration file without the API server](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md#configuring-the-microvm-without-sending-api-requests)
+to keep API polling and serial configuration requests out of the startup path.
 The nested-virtualization macOS setup comes from Firecracker's
 [development environment guide](https://github.com/firecracker-microvm/firecracker/blob/main/docs/dev-machine-setup.md#macos-with-vmware-fusion).

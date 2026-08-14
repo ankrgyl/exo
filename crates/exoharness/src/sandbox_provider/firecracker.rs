@@ -6,11 +6,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::future::Future;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixStream as StdUnixStream;
+use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
@@ -22,7 +22,8 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
@@ -38,10 +39,7 @@ use super::firecracker_image::resolve_image;
 #[cfg(test)]
 use super::firecracker_image::validate_ext4_image;
 
-const API_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(30);
-const GUEST_READY_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
-const GUEST_READY_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
 const MAX_GUEST_REQUEST_BYTES: usize = 1024 * 1024;
@@ -54,6 +52,10 @@ const UNIX_SOCKET_PATH_CAPACITY: usize = 108;
 // above Linux's privileged range. The kernel enforces that in vsock_bind().
 // https://github.com/torvalds/linux/blob/master/net/vmw_vsock/af_vsock.c
 const GUEST_AGENT_PORT: u32 = 10_052;
+// A guest-initiated vsock connection becomes an event-driven ready signal on
+// the host, avoiding repeated CONNECT probes that contend with early boot.
+// https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md#guest-initiated-connections
+const GUEST_READY_HOST_PORT: u32 = 10_053;
 const MAX_RESOURCE_SLOTS: u32 = 32_768;
 const NETWORK_BASE: Ipv4Addr = Ipv4Addr::new(10, 240, 0, 0);
 const EXO_NETWORK_CIDR: &str = "10.240.0.0/14";
@@ -82,6 +84,7 @@ const BLOCKED_EGRESS_CIDRS: &[&str] = &[
 static ONE_SHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static MANIFEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn default_firecracker_image() -> String {
     "/var/lib/exo/firecracker/rootfs.ext4".to_string()
@@ -92,7 +95,7 @@ pub struct FirecrackerConfig {
     pub firecracker_bin: PathBuf,
     pub jailer_bin: PathBuf,
     pub kernel: PathBuf,
-    pub guest_runtime: PathBuf,
+    pub initramfs: PathBuf,
     pub state_root: PathBuf,
     pub vcpu_count: u8,
     pub memory_mib: u32,
@@ -110,9 +113,9 @@ impl FirecrackerConfig {
             firecracker_bin: env_path("EXO_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
             jailer_bin: env_path("EXO_FIRECRACKER_JAILER", "/usr/local/bin/jailer"),
             kernel: env_path("EXO_FIRECRACKER_KERNEL", "/var/lib/exo/firecracker/vmlinux"),
-            guest_runtime: env_path(
-                "EXO_FIRECRACKER_GUEST_RUNTIME",
-                "/var/lib/exo/firecracker/exo-firecracker-guest",
+            initramfs: env_path(
+                "EXO_FIRECRACKER_INITRAMFS",
+                "/var/lib/exo/firecracker/exo-firecracker-initramfs.cpio",
             ),
             state_root: env_path(
                 "EXO_FIRECRACKER_STATE_ROOT",
@@ -174,6 +177,67 @@ struct NetworkConfig {
     guest_mac: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct FirecrackerVmConfiguration {
+    boot_source: FirecrackerBootSource,
+    drives: Vec<FirecrackerDrive>,
+    machine_config: FirecrackerMachineConfiguration,
+    network_interfaces: Vec<FirecrackerNetworkInterface>,
+    vsock: FirecrackerVsock,
+}
+
+#[derive(Serialize)]
+struct FirecrackerBootSource {
+    kernel_image_path: &'static str,
+    initrd_path: &'static str,
+    boot_args: String,
+}
+
+#[derive(Serialize)]
+struct FirecrackerDrive {
+    drive_id: &'static str,
+    path_on_host: &'static str,
+    is_root_device: bool,
+    is_read_only: bool,
+    cache_type: &'static str,
+    io_engine: &'static str,
+}
+
+#[derive(Serialize)]
+struct FirecrackerMachineConfiguration {
+    vcpu_count: u8,
+    mem_size_mib: u32,
+    smt: bool,
+    track_dirty_pages: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct FirecrackerRateLimiter {
+    bandwidth: FirecrackerTokenBucket,
+}
+
+#[derive(Clone, Serialize)]
+struct FirecrackerTokenBucket {
+    size: u64,
+    refill_time: u64,
+}
+
+#[derive(Serialize)]
+struct FirecrackerNetworkInterface {
+    iface_id: &'static str,
+    guest_mac: String,
+    host_dev_name: &'static str,
+    rx_rate_limiter: FirecrackerRateLimiter,
+    tx_rate_limiter: FirecrackerRateLimiter,
+}
+
+#[derive(Serialize)]
+struct FirecrackerVsock {
+    guest_cid: u32,
+    uds_path: &'static str,
+}
+
 #[derive(Debug, Clone)]
 struct Machine {
     record: MachineRecord,
@@ -208,7 +272,14 @@ impl FirecrackerSandboxBackend {
             )
         })?;
         fs::set_permissions(&config.state_root, Permissions::from_mode(0o700))?;
-        for directory in ["jailer", "leases", "manifests", "slots", "workspaces"] {
+        for directory in [
+            "artifacts",
+            "jailer",
+            "leases",
+            "manifests",
+            "slots",
+            "workspaces",
+        ] {
             let path = config.state_root.join(directory);
             fs::create_dir_all(&path)?;
             fs::set_permissions(path, Permissions::from_mode(0o700))?;
@@ -216,9 +287,12 @@ impl FirecrackerSandboxBackend {
         config.firecracker_bin = fs::canonicalize(&config.firecracker_bin)?;
         config.jailer_bin = fs::canonicalize(&config.jailer_bin)?;
         config.kernel = fs::canonicalize(&config.kernel)?;
-        config.guest_runtime = fs::canonicalize(&config.guest_runtime)?;
+        config.initramfs = fs::canonicalize(&config.initramfs)?;
         config.state_root = fs::canonicalize(&config.state_root)?;
         validate_private_root(&config.state_root)?;
+        config.kernel = cache_immutable_artifact(&config.state_root, "kernel", &config.kernel)?;
+        config.initramfs =
+            cache_immutable_artifact(&config.state_root, "initramfs", &config.initramfs)?;
         validate_api_socket_path(&config)?;
 
         Ok(Self {
@@ -283,7 +357,6 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
             &self.shared.config.state_root,
             &request.spec.image,
             self.shared.config.image_size_gib,
-            &self.shared.config.guest_runtime,
         )
         .await?;
         request.spec.image = image.to_string_lossy().into_owned();
@@ -547,17 +620,19 @@ impl Shared {
             machine_record_started.elapsed(),
         );
         let host_started = Instant::now();
-        if let Err(error) = self.prepare_and_launch(request, &record).await {
-            if let Err(cleanup_error) = self.cleanup_machine(machine_id, true).await {
-                tracing::warn!(%cleanup_error, machine_id, "failed cleaning up unsuccessful Firecracker launch");
+        let ready_listener = match self.prepare_and_launch(request, &record).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                if let Err(cleanup_error) = self.cleanup_machine(machine_id, true).await {
+                    tracing::warn!(%cleanup_error, machine_id, "failed cleaning up unsuccessful Firecracker launch");
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
         record_launch_timing(machine_id, "host_prepare_and_start", host_started.elapsed());
         let machine = machine_from_record(&self.config, record);
-        let client = GuestClient::new(Arc::clone(self), machine.vsock_path.clone());
         let guest_ready_started = Instant::now();
-        wait_for_guest(self, &client, machine_id).await?;
+        wait_for_guest(self, machine_id, ready_listener).await?;
         record_launch_timing(machine_id, "guest_ready", guest_ready_started.elapsed());
         record_launch_timing(machine_id, "total", launch_started.elapsed());
         Ok(machine)
@@ -633,7 +708,7 @@ impl Shared {
         &self,
         request: &SandboxRequest,
         record: &MachineRecord,
-    ) -> Result<()> {
+    ) -> Result<StdUnixListener> {
         let config = self.config.clone();
         let request = request.clone();
         let record = record.clone();
@@ -833,7 +908,7 @@ fn validate_host(config: &FirecrackerConfig) -> Result<()> {
     validate_trusted_file("Firecracker binary", &config.firecracker_bin)?;
     validate_trusted_file("Firecracker jailer", &config.jailer_bin)?;
     validate_trusted_file("Firecracker guest kernel", &config.kernel)?;
-    validate_trusted_file("Firecracker guest runtime", &config.guest_runtime)?;
+    validate_trusted_file("Firecracker guest initramfs", &config.initramfs)?;
     OpenOptions::new()
         .read(true)
         .write(true)
@@ -925,6 +1000,55 @@ pub(super) fn validate_trusted_file(label: &str, path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn cache_immutable_artifact(state_root: &Path, label: &str, source: &Path) -> Result<PathBuf> {
+    let mut input = File::open(source)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let digest = hex::encode(hasher.finalize());
+    let artifacts = state_root.join("artifacts");
+    let cached = artifacts.join(format!("{label}-{digest}"));
+    if !cached.try_exists()? {
+        let sequence = ARTIFACT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = artifacts.join(format!(".{label}.{}.{}", std::process::id(), sequence));
+        fs::copy(source, &temporary).with_context(|| {
+            format!("staging immutable Firecracker {label} {}", source.display())
+        })?;
+        fs::set_permissions(&temporary, Permissions::from_mode(0o444))?;
+        File::open(&temporary)?.sync_all()?;
+        match fs::hard_link(&temporary, &cached) {
+            Ok(()) => {}
+            Err(error) if cached.try_exists()? => {
+                tracing::debug!(%error, path = %cached.display(), "another process cached the Firecracker artifact first");
+            }
+            Err(error) => {
+                fs::remove_file(&temporary)?;
+                return Err(error).with_context(|| {
+                    format!(
+                        "publishing immutable Firecracker {label} {}",
+                        cached.display()
+                    )
+                });
+            }
+        }
+        fs::remove_file(&temporary)?;
+    }
+    let metadata = fs::metadata(&cached)?;
+    if metadata.uid() != 0 || metadata.mode() & 0o222 != 0 || metadata.mode() & 0o004 == 0 {
+        bail!(
+            "cached Firecracker {label} must be root-owned, immutable, and readable in its jail: {}",
+            cached.display()
+        );
+    }
+    Ok(cached)
 }
 
 fn validate_private_root(path: &Path) -> Result<()> {
@@ -1761,57 +1885,88 @@ fn prepare_and_launch_blocking(
     config: &FirecrackerConfig,
     request: &SandboxRequest,
     record: &MachineRecord,
-) -> Result<()> {
-    let rootfs_copy_started = Instant::now();
+) -> Result<StdUnixListener> {
+    let rootfs_link_started = Instant::now();
     let root = jail_root(config, &record.machine_id);
     fs::create_dir_all(&root)?;
     fs::set_permissions(&root, Permissions::from_mode(0o700))?;
+    let ready_listener = prepare_ready_listener(&root)?;
     let rootfs = root.join("rootfs.ext4");
-    let copied_rootfs = !rootfs.try_exists()?;
-    if copied_rootfs {
-        run_checked(
-            "cp",
-            &[
-                "--reflink=auto",
-                "--sparse=always",
-                &request.spec.image,
-                &rootfs.to_string_lossy(),
-            ],
-        )?;
+    let linked_rootfs = !rootfs.try_exists()?;
+    if linked_rootfs {
+        fs::hard_link(&request.spec.image, &rootfs).with_context(|| {
+            format!(
+                "linking immutable Firecracker base image {} into jail {}",
+                request.spec.image,
+                rootfs.display()
+            )
+        })?;
     }
     let rootfs_metadata = fs::metadata(&rootfs)
         .with_context(|| format!("reading Firecracker rootfs metadata {}", rootfs.display()))?;
+    if rootfs_metadata.mode() & 0o222 != 0 || rootfs_metadata.mode() & 0o004 == 0 {
+        bail!(
+            "Firecracker cached base image must be immutable and readable in its jail: {}",
+            rootfs.display()
+        );
+    }
     tracing::info!(
         machine_id = record.machine_id,
-        step = "rootfs_copy",
-        duration_ms = rootfs_copy_started.elapsed().as_secs_f64() * 1000.0,
-        copied_rootfs,
+        step = "rootfs_link",
+        duration_ms = rootfs_link_started.elapsed().as_secs_f64() * 1000.0,
+        linked_rootfs,
         rootfs_logical_bytes = rootfs_metadata.len(),
         rootfs_allocated_bytes = rootfs_metadata.blocks().saturating_mul(512),
         "Firecracker VM launch timing"
     );
 
+    let overlay_started = Instant::now();
+    let overlay = root.join("overlay.ext4");
+    let created_overlay = !overlay.try_exists()?;
+    if created_overlay {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&overlay)?;
+        file.set_len(config.image_size_gib * 1024 * 1024 * 1024)?;
+        run_checked(
+            "mkfs.ext4",
+            &[
+                "-q",
+                "-F",
+                "-E",
+                "lazy_itable_init=1,lazy_journal_init=1",
+                &overlay.to_string_lossy(),
+            ],
+        )?;
+    }
+    record_launch_timing(
+        &record.machine_id,
+        "overlay_create",
+        overlay_started.elapsed(),
+    );
+
     let jail_setup_started = Instant::now();
     let kernel = root.join("vmlinux");
-    fs::copy(&config.kernel, &kernel).with_context(|| {
+    fs::hard_link(&config.kernel, &kernel).with_context(|| {
         format!(
-            "copying Firecracker kernel {} to {}",
+            "linking cached Firecracker kernel {} into {}",
             config.kernel.display(),
             kernel.display()
         )
     })?;
+    let initramfs = root.join("initramfs.cpio");
+    fs::hard_link(&config.initramfs, &initramfs).with_context(|| {
+        format!(
+            "linking cached Firecracker initramfs {} into {}",
+            config.initramfs.display(),
+            initramfs.display()
+        )
+    })?;
     let host_uid = jailer_uid(config, record)?;
     let ownership = format!("{host_uid}:{host_uid}");
-    run_checked(
-        "chown",
-        &[
-            &ownership,
-            &rootfs.to_string_lossy(),
-            &kernel.to_string_lossy(),
-        ],
-    )?;
-    fs::set_permissions(&kernel, Permissions::from_mode(0o400))?;
-    fs::set_permissions(&rootfs, Permissions::from_mode(0o600))?;
+    run_checked("chown", &[&ownership, &overlay.to_string_lossy()])?;
+    fs::set_permissions(&overlay, Permissions::from_mode(0o600))?;
 
     if let Some(workspace_id) = record.workspace_id.as_ref() {
         let workspace = config
@@ -1847,6 +2002,98 @@ fn prepare_and_launch_blocking(
         run_checked("chown", &[&ownership, &jailed_workspace.to_string_lossy()])?;
     }
 
+    let network = record.network();
+    // Disable the guest serial driver and discard VMM stdout so malicious guest
+    // writes cannot grow an unbounded host log.
+    // https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md#8250-serial-device
+    let mut boot_args =
+        String::from("reboot=k panic=1 pci=off rdinit=/init 8250.nr_uarts=0 quiet loglevel=1");
+    if record.network_enabled {
+        boot_args.push_str(&format!(
+            " exo_guest_ip={} exo_gateway={} exo_prefix=30 exo_dns={}",
+            network.guest_ip, network.guest_gateway, config.dns_server
+        ));
+    }
+    if record.workspace_id.is_some() {
+        boot_args.push_str(" exo_workspace=");
+        boot_args.push_str(&request.spec.default_workdir);
+    }
+    let mut drives = vec![
+        FirecrackerDrive {
+            drive_id: "rootfs",
+            path_on_host: "/rootfs.ext4",
+            is_root_device: false,
+            is_read_only: true,
+            cache_type: "Unsafe",
+            io_engine: "Sync",
+        },
+        FirecrackerDrive {
+            drive_id: "overlay",
+            path_on_host: "/overlay.ext4",
+            is_root_device: false,
+            is_read_only: false,
+            cache_type: "Writeback",
+            io_engine: "Sync",
+        },
+    ];
+    if record.workspace_id.is_some() {
+        // Writeback advertises virtio-blk FLUSH to the guest and turns a guest
+        // flush into fsync(2) on the backing file. Combined with the explicit
+        // guest sync during stop, this makes the workspace a durability boundary.
+        // https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/block-caching.md#writeback-mode
+        drives.push(FirecrackerDrive {
+            drive_id: "workspace",
+            path_on_host: "/workspace.ext4",
+            is_root_device: false,
+            is_read_only: false,
+            cache_type: "Writeback",
+            io_engine: "Sync",
+        });
+    }
+    // The control channel is vsock rather than TCP: networking-disabled sandboxes
+    // still support exec, and the guest agent is never reachable through egress.
+    // https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md#setting-up-the-virtio-vsock-device
+    let network_interfaces = if record.network_enabled {
+        let bucket = FirecrackerRateLimiter {
+            bandwidth: FirecrackerTokenBucket {
+                size: config.network_bytes_per_second,
+                refill_time: 1000,
+            },
+        };
+        vec![FirecrackerNetworkInterface {
+            iface_id: "eth0",
+            guest_mac: network.guest_mac,
+            host_dev_name: "tap0",
+            rx_rate_limiter: bucket.clone(),
+            tx_rate_limiter: bucket,
+        }]
+    } else {
+        Vec::new()
+    };
+    let vm_config = FirecrackerVmConfiguration {
+        boot_source: FirecrackerBootSource {
+            kernel_image_path: "/vmlinux",
+            initrd_path: "/initramfs.cpio",
+            boot_args,
+        },
+        drives,
+        machine_config: FirecrackerMachineConfiguration {
+            vcpu_count: config.vcpu_count,
+            mem_size_mib: config.memory_mib,
+            smt: false,
+            track_dirty_pages: false,
+        },
+        network_interfaces,
+        vsock: FirecrackerVsock {
+            guest_cid: record.slot + 3,
+            uds_path: "/run/exo.vsock",
+        },
+    };
+    let vm_config_path = root.join("vm-config.json");
+    fs::write(&vm_config_path, serde_json::to_vec(&vm_config)?)?;
+    run_checked("chown", &[&ownership, &vm_config_path.to_string_lossy()])?;
+    fs::set_permissions(&vm_config_path, Permissions::from_mode(0o400))?;
+
     let stderr_path = root.join("firecracker.stderr");
     let stderr = File::create(&stderr_path)?;
     fs::set_permissions(&stderr_path, Permissions::from_mode(0o600))?;
@@ -1863,11 +2110,13 @@ fn prepare_and_launch_blocking(
         "jail_setup",
         jail_setup_started.elapsed(),
     );
-    let vmm_api_ready_started = Instant::now();
+
     // Always use the matching jailer: it creates the mount/PID namespaces and
     // cgroup, then drops to a unique unprivileged UID before execing Firecracker.
+    // A config file starts the VM without serial API setup, and --no-api removes
+    // the otherwise-unused API server from the startup path.
     // https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md#jailer-operation
-    // https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md#jailer-configuration
+    // https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md#configuring-the-microvm-without-sending-api-requests
     let mut command = Command::new(&config.jailer_bin);
     command
         .arg("--id")
@@ -1895,15 +2144,21 @@ fn prepare_and_launch_blocking(
         .arg(format!("cpu.max={cpu_max}"))
         .arg("--resource-limit")
         .arg("no-file=4096")
+        .arg("--")
+        .arg("--no-api")
+        .arg("--config-file")
+        .arg("/vm-config.json")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr));
     // Deliberately do not pass --no-seccomp or a custom filter. Release builds'
     // embedded default filters are Firecracker's recommended production setting.
     // https://github.com/firecracker-microvm/firecracker/blob/main/docs/seccomp.md#default-filters-recommended
+    let vmm_spawn_started = Instant::now();
     let mut child = command
         .spawn()
         .context("launching Firecracker through jailer")?;
+    record_launch_timing(&record.machine_id, "vmm_spawn", vmm_spawn_started.elapsed());
     let machine_id = record.machine_id.clone();
     std::thread::spawn(move || match child.wait() {
         Ok(status) if !status.success() => {
@@ -1914,123 +2169,21 @@ fn prepare_and_launch_blocking(
         }
         _ => {}
     });
+    Ok(ready_listener)
+}
 
-    let api_socket = root.join("run/firecracker.socket");
-    wait_for_api_socket(&api_socket, &root.join("firecracker.pid"), &stderr_path)?;
-    record_launch_timing(
-        &record.machine_id,
-        "vmm_api_ready",
-        vmm_api_ready_started.elapsed(),
-    );
-    let vmm_configure_started = Instant::now();
-    firecracker_put(
-        &api_socket,
-        "/machine-config",
-        &json!({
-            "vcpu_count": config.vcpu_count,
-            "mem_size_mib": config.memory_mib,
-            "smt": false,
-        }),
-    )?;
-    let network = record.network();
-    // Disable the guest serial driver and discard VMM stdout so malicious guest
-    // writes cannot grow an unbounded host log.
-    // https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md#8250-serial-device
-    let mut boot_args = String::from(
-        "reboot=k panic=1 pci=off root=/dev/vda rw init=/runtime/exo-firecracker-guest 8250.nr_uarts=0 quiet loglevel=1",
-    );
-    if record.network_enabled {
-        boot_args.push_str(&format!(
-            " exo_guest_ip={} exo_gateway={} exo_prefix=30 exo_dns={}",
-            network.guest_ip, network.guest_gateway, config.dns_server
-        ));
+fn prepare_ready_listener(root: &Path) -> Result<StdUnixListener> {
+    let run = root.join("run");
+    fs::create_dir_all(&run)?;
+    fs::set_permissions(&run, Permissions::from_mode(0o755))?;
+    let path = run.join(format!("exo.vsock_{GUEST_READY_HOST_PORT}"));
+    if path.try_exists()? {
+        fs::remove_file(&path)?;
     }
-    if record.workspace_id.is_some() {
-        boot_args.push_str(" exo_workspace=");
-        boot_args.push_str(&request.spec.default_workdir);
-    }
-    firecracker_put(
-        &api_socket,
-        "/boot-source",
-        &json!({
-            "kernel_image_path": "/vmlinux",
-            "boot_args": boot_args,
-        }),
-    )?;
-    firecracker_put(
-        &api_socket,
-        "/drives/rootfs",
-        &json!({
-            "drive_id": "rootfs",
-            "path_on_host": "/rootfs.ext4",
-            "is_root_device": true,
-            "is_read_only": false,
-        }),
-    )?;
-    if record.workspace_id.is_some() {
-        // Writeback advertises virtio-blk FLUSH to the guest and turns a guest
-        // flush into fsync(2) on the backing file. Combined with the explicit
-        // guest sync during stop, this makes the workspace a durability boundary.
-        // https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/block-caching.md#writeback-mode
-        firecracker_put(
-            &api_socket,
-            "/drives/workspace",
-            &json!({
-                "drive_id": "workspace",
-                "path_on_host": "/workspace.ext4",
-                "is_root_device": false,
-                "is_read_only": false,
-                "cache_type": "Writeback",
-            }),
-        )?;
-    }
-    // The control channel is vsock rather than TCP: networking-disabled sandboxes
-    // still support exec, and the guest agent is never reachable through egress.
-    // https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md#setting-up-the-virtio-vsock-device
-    firecracker_put(
-        &api_socket,
-        "/vsock",
-        &json!({
-            "guest_cid": record.slot + 3,
-            "uds_path": "/run/exo.vsock",
-        }),
-    )?;
-    if record.network_enabled {
-        let bucket = json!({
-            "bandwidth": {
-                "size": config.network_bytes_per_second,
-                "refill_time": 1000,
-            }
-        });
-        firecracker_put(
-            &api_socket,
-            "/network-interfaces/eth0",
-            &json!({
-                "iface_id": "eth0",
-                "guest_mac": network.guest_mac,
-                "host_dev_name": "tap0",
-                "rx_rate_limiter": bucket,
-                "tx_rate_limiter": bucket,
-            }),
-        )?;
-    }
-    record_launch_timing(
-        &record.machine_id,
-        "vmm_configure",
-        vmm_configure_started.elapsed(),
-    );
-    let instance_start_started = Instant::now();
-    firecracker_put(
-        &api_socket,
-        "/actions",
-        &json!({"action_type": "InstanceStart"}),
-    )?;
-    record_launch_timing(
-        &record.machine_id,
-        "instance_start_api",
-        instance_start_started.elapsed(),
-    );
-    Ok(())
+    let listener = StdUnixListener::bind(&path)
+        .with_context(|| format!("binding Firecracker guest-ready socket {}", path.display()))?;
+    fs::set_permissions(&path, Permissions::from_mode(0o666))?;
+    Ok(listener)
 }
 
 fn jailer_uid(config: &FirecrackerConfig, record: &MachineRecord) -> Result<u32> {
@@ -2038,81 +2191,6 @@ fn jailer_uid(config: &FirecrackerConfig, record: &MachineRecord) -> Result<u32>
         .jailer_uid_base
         .checked_add(record.slot)
         .context("Firecracker jailer UID overflow")
-}
-
-fn wait_for_api_socket(socket: &Path, pid_path: &Path, stderr_path: &Path) -> Result<()> {
-    let started = Instant::now();
-    let mut delay = Duration::from_millis(25);
-    while started.elapsed() < API_READY_TIMEOUT {
-        if socket.exists() {
-            return Ok(());
-        }
-        if pid_path.exists() && !process_running(pid_path) {
-            bail!(
-                "Firecracker exited before its API became ready: {}",
-                tail_file(stderr_path)?
-            );
-        }
-        std::thread::sleep(delay);
-        delay = (delay * 2).min(Duration::from_millis(250));
-    }
-    bail!(
-        "Firecracker API socket did not become ready: {}",
-        tail_file(stderr_path)?
-    )
-}
-
-fn firecracker_put(socket: &Path, path: &str, body: &Value) -> Result<()> {
-    let payload = serde_json::to_vec(body)?;
-    let mut stream = StdUnixStream::connect(socket)
-        .with_context(|| format!("connecting to Firecracker API socket {}", socket.display()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    write!(
-        stream,
-        "PUT {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        payload.len()
-    )?;
-    stream.write_all(&payload)?;
-    stream.flush()?;
-
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    reader.read_line(&mut status_line)?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u16>().ok())
-        .with_context(|| format!("invalid Firecracker API status line: {status_line:?}"))?;
-    let mut content_length = 0usize;
-    loop {
-        let mut header = String::new();
-        reader.read_line(&mut header)?;
-        if header == "\r\n" || header.is_empty() {
-            break;
-        }
-        if let Some(value) = header
-            .split_once(':')
-            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-            .map(|(_, value)| value.trim())
-        {
-            content_length = value
-                .parse()
-                .context("invalid Firecracker content-length")?;
-        }
-    }
-    if content_length > MAX_GUEST_RESPONSE_BYTES {
-        bail!("Firecracker API response is too large: {content_length} bytes");
-    }
-    let mut response = vec![0; content_length];
-    reader.read_exact(&mut response)?;
-    if (200..300).contains(&status) {
-        return Ok(());
-    }
-    bail!(
-        "Firecracker API {path} returned {status}: {}",
-        String::from_utf8_lossy(&response)
-    )
 }
 
 fn process_running(pid_path: &Path) -> bool {
@@ -2590,47 +2668,58 @@ fn record_launch_timing(machine_id: &str, step: &str, duration: Duration) {
     );
 }
 
-async fn wait_for_guest(shared: &Shared, client: &GuestClient, machine_id: &str) -> Result<()> {
+async fn wait_for_guest(
+    shared: &Shared,
+    machine_id: &str,
+    listener: StdUnixListener,
+) -> Result<()> {
+    let pid_path = shared.pid_path(machine_id);
+    let stderr_path = jail_root(&shared.config, machine_id).join("firecracker.stderr");
+    let machine_id = machine_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        wait_for_guest_blocking(&machine_id, &pid_path, &stderr_path, listener)
+    })
+    .await
+    .context("joining Firecracker guest-ready wait")?
+}
+
+fn wait_for_guest_blocking(
+    machine_id: &str,
+    pid_path: &Path,
+    stderr_path: &Path,
+    listener: StdUnixListener,
+) -> Result<()> {
     let started = Instant::now();
-    let mut last_error = None;
-    let mut attempts = 0u32;
-    let mut failed_ping_duration = Duration::ZERO;
-    let mut sleep_duration = Duration::ZERO;
+    listener.set_nonblocking(true)?;
     while started.elapsed() < GUEST_READY_TIMEOUT {
-        if !process_running(&shared.pid_path(machine_id)) {
+        if !process_running(pid_path) {
             bail!("Firecracker process exited while waiting for the guest agent");
         }
-        attempts += 1;
-        let ping_started = Instant::now();
-        match client.ping_with_timeout(GUEST_READY_PROBE_TIMEOUT).await {
-            Ok(()) => {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+                let mut marker = [0_u8; 1];
+                stream.read_exact(&mut marker)?;
+                if marker != [1] {
+                    bail!("invalid Firecracker guest-ready marker");
+                }
                 tracing::info!(
                     machine_id,
                     step = "guest_ready_detail",
                     duration_ms = started.elapsed().as_secs_f64() * 1000.0,
-                    attempts,
-                    failed_ping_duration_ms = failed_ping_duration.as_secs_f64() * 1000.0,
-                    successful_ping_duration_ms = ping_started.elapsed().as_secs_f64() * 1000.0,
-                    sleep_duration_ms = sleep_duration.as_secs_f64() * 1000.0,
+                    mechanism = "guest_initiated_vsock",
                     "Firecracker VM launch timing"
                 );
                 return Ok(());
             }
-            Err(error) => {
-                failed_ping_duration += ping_started.elapsed();
-                last_error = Some(error);
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error).context("accepting Firecracker guest-ready signal"),
         }
-        let sleep_started = Instant::now();
-        tokio::time::sleep(GUEST_READY_POLL_INTERVAL).await;
-        sleep_duration += sleep_started.elapsed();
+        std::thread::sleep(Duration::from_millis(1));
     }
-    let detail = last_error
-        .map(|error| format!("{error:#}"))
-        .unwrap_or_else(|| "no response".to_string());
     bail!(
-        "Firecracker guest agent did not become ready: {detail}; {}",
-        tail_file(&jail_root(&shared.config, machine_id).join("firecracker.stderr"))?
+        "Firecracker guest agent did not become ready; {}",
+        tail_file(stderr_path)?
     )
 }
 
