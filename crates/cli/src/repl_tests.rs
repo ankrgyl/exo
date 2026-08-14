@@ -1,4 +1,4 @@
-use crate::{pick_repl_model, repl_agent_model_needs_update};
+use crate::{format_repl_failure, pick_repl_model, repl_agent_model_needs_update};
 
 #[test]
 fn pick_repl_model_prefers_an_explicit_request() {
@@ -22,12 +22,29 @@ fn pick_repl_model_falls_back_to_the_first_registered() {
 #[test]
 fn pick_repl_model_rejects_an_unregistered_request() {
     let registered = vec!["gpt-5.4".to_string()];
-    assert!(pick_repl_model(&registered, Some("missing".to_string())).is_err());
+    let error = pick_repl_model(&registered, Some("missing".to_string())).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("`missing` is not registered"));
+    assert!(message.contains("exo model register missing --secret openai"));
+    assert!(!message.contains("typescript harness failed"));
 }
 
 #[test]
 fn pick_repl_model_requires_a_registered_model() {
-    assert!(pick_repl_model(&[], None).is_err());
+    let error = pick_repl_model(&[], None).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("`gpt-5.6-terra` is not registered"));
+    assert!(message.contains("exo secret set openai --env OPENAI_API_KEY"));
+}
+
+#[test]
+fn missing_model_repl_errors_skip_the_turn_failed_prefix() {
+    let error =
+        anyhow::anyhow!("typescript harness failed: model is not registered: gpt-5.6-terra");
+    let rendered = format_repl_failure(&error, "turn failed");
+    assert!(rendered.starts_with("model `gpt-5.6-terra` is not registered."));
+    assert!(!rendered.contains("turn failed"));
+    assert!(!rendered.contains("typescript harness failed"));
 }
 
 #[test]

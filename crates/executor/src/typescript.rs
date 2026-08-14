@@ -442,6 +442,9 @@ impl TypeScriptRunnerProcess {
                         }
                         GuestToHostMessage::Done => return Ok(()),
                         GuestToHostMessage::Error { message, stack } => {
+                            if message.contains("model is not registered") {
+                                bail!("{message}");
+                            }
                             let stack_suffix = stack
                                 .as_deref()
                                 .map(|stack| format!("\n{stack}"))

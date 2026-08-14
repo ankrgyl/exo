@@ -20,6 +20,7 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
+use crate::format_repl_failure;
 use crate::render::{
     ASSISTANT_LABEL, Verbosity, compact_result_status, compact_timestamp, print_transcript,
     render_assistant_content, render_tool_call, render_tool_result,
@@ -506,7 +507,7 @@ impl ChatRepl {
                             self.editor.add_history_entry(line.as_str())?;
                             if let Err(error) = self.send(trimmed).await {
                                 println!();
-                                println!("turn failed: {error:#}");
+                                println!("{}", format_repl_failure(&error, "turn failed"));
                             }
                         }
                     }

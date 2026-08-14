@@ -21,6 +21,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
+use crate::format_repl_failure;
 use crate::render::{
     ASSISTANT_LABEL, Verbosity, compact_result_status, compact_timestamp, render_tool_call,
     render_tool_result, render_transcript_lines,
@@ -611,7 +612,9 @@ impl TuiApp {
                     while let Some(event) = stream.next().await {
                         let app_event = match event {
                             Ok(event) => AppEvent::Stream(event),
-                            Err(error) => AppEvent::StreamError(format!("{error:#}")),
+                            Err(error) => {
+                                AppEvent::StreamError(format_repl_failure(&error, "stream error"))
+                            }
                         };
                         if tx.send(app_event).is_err() {
                             return;
@@ -619,7 +622,10 @@ impl TuiApp {
                     }
                 }
                 Err(error) => {
-                    let _ = tx.send(AppEvent::StreamError(format!("{error:#}")));
+                    let _ = tx.send(AppEvent::StreamError(format_repl_failure(
+                        &error,
+                        "stream error",
+                    )));
                 }
             }
             let _ = tx.send(AppEvent::StreamDone);
