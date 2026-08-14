@@ -25,6 +25,7 @@ firecracker = [
   "dep:docker_credential",
   "dep:flate2",
   "dep:hex",
+  "dep:libc",
   "dep:oci-client",
   "dep:sha2",
   "dep:tar",
@@ -57,6 +58,7 @@ futures.workspace = true
 hex = { workspace = true, optional = true }
 keyring = { version = "4.0.0-rc.3", optional = true }
 keyring-core = { version = "0.7.2", optional = true }
+libc = { workspace = true, optional = true }
 lingua.workspace = true
 object_store = { workspace = true, optional = true }
 oci-client = { workspace = true, optional = true }
