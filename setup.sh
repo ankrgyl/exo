@@ -812,7 +812,7 @@ main() {
   prompt_env_secret "$MODEL_API_KEY_ENV" "$env_file" \
     "$MODEL_PROVIDER_LABEL API key" true
   set_env_default "EXO_CHAT_BASE_URL" "${EXO_CHAT_BASE_URL:-$DEFAULT_EXO_CHAT_BASE_URL}" "$env_file"
-  echo "Canonical setup uses ExoChat as the default external adapter and will show a browser URL to open."
+  echo "Canonical setup starts a terminal chat and ExoChat (browser URL). Either works; ExoChat stays up if you close the terminal."
 
   info "Configure Exo"
   USER_NAME="$(prompt_text "Your name, or blank to skip" "$USER_NAME")"
@@ -852,9 +852,13 @@ print_success_banner() {
 EOF
   echo "Exo is installed and your agent is ready."
   echo
-  echo "Your agent is long-running: once started, it stays up after you /exit the"
-  echo "chat, and it serves an ExoChat URL you can open from any browser, anywhere."
-  echo "If you ever lose that URL, ask your agent for it from the CLI chat."
+  echo "Two ways to talk to your agent (use either — both are the same conversation):"
+  echo "  1. Terminal UI — the chat that opens when you run ./exo.sh"
+  echo "  2. ExoChat — browser/phone URL printed on first start"
+  echo
+  echo "Your agent is long-running: ExoChat keeps working after you /exit or close"
+  echo "the terminal chat. Reconnect the terminal anytime with ./exo.sh."
+  echo "If you lose the ExoChat URL, ask your agent for it from the CLI chat."
   echo
   echo "Start chatting:"
   if [[ "$launch_dir" != "$dir" ]]; then

@@ -13,8 +13,11 @@ Use the default canonical setup:
 ```
 
 The control script starts the adapter runner, watches `.exo/exo-adapters.log`,
-and prints an ExoChat URL. Open that URL in a browser or on your phone to chat
-with the agent.
+and prints an ExoChat URL. You can talk to the agent either in the terminal UI
+(`./exo.sh` REPL) or via that URL in a browser/phone — same conversation.
+ExoChat keeps working after you `/exit` or close the terminal chat, as long as
+the agent/adapter runner is still up. If you lose the URL, ask the agent for
+it from the CLI.
 
 For local relay testing, start the worker in one terminal:
 
