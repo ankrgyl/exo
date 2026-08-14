@@ -40,6 +40,7 @@ use super::firecracker_image::resolve_image;
 use super::firecracker_image::validate_ext4_image;
 
 const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const PID_FILE_STARTUP_TIMEOUT: Duration = Duration::from_secs(1);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
 const MAX_GUEST_REQUEST_BYTES: usize = 1024 * 1024;
@@ -632,7 +633,12 @@ impl Shared {
         record_launch_timing(machine_id, "host_prepare_and_start", host_started.elapsed());
         let machine = machine_from_record(&self.config, record);
         let guest_ready_started = Instant::now();
-        wait_for_guest(self, machine_id, ready_listener).await?;
+        if let Err(error) = wait_for_guest(self, machine_id, ready_listener).await {
+            if let Err(cleanup_error) = self.cleanup_machine(machine_id, true).await {
+                tracing::warn!(%cleanup_error, machine_id, "failed cleaning up unsuccessful Firecracker guest boot");
+            }
+            return Err(error);
+        }
         record_launch_timing(machine_id, "guest_ready", guest_ready_started.elapsed());
         record_launch_timing(machine_id, "total", launch_started.elapsed());
         Ok(machine)
@@ -2690,10 +2696,21 @@ fn wait_for_guest_blocking(
     listener: StdUnixListener,
 ) -> Result<()> {
     let started = Instant::now();
+    // With --new-pid-ns the jailer clones Firecracker and only then writes the
+    // child's host PID, so Command::spawn returning can precede firecracker.pid.
+    // https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md#jailer-usage
+    let mut observed_process = false;
     listener.set_nonblocking(true)?;
     while started.elapsed() < GUEST_READY_TIMEOUT {
-        if !process_running(pid_path) {
+        if process_running(pid_path) {
+            observed_process = true;
+        } else if observed_process {
             bail!("Firecracker process exited while waiting for the guest agent");
+        } else if started.elapsed() >= PID_FILE_STARTUP_TIMEOUT {
+            bail!(
+                "Firecracker process did not become observable after launch; {}",
+                tail_file(stderr_path)?
+            );
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
