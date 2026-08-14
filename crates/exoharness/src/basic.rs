@@ -134,14 +134,20 @@ impl SandboxBackendRegistration {
 
     #[cfg(feature = "firecracker")]
     pub fn firecracker() -> Self {
+        Self::firecracker_with_snapshots(false)
+    }
+
+    #[cfg(feature = "firecracker")]
+    pub fn firecracker_with_snapshots(snapshot_enabled: bool) -> Self {
         Self::from_factory(
             SandboxProvider::Firecracker,
             cfg!(target_os = "linux"),
-            |_| {
+            move |_| {
                 Box::pin(async move {
-                    Ok(Arc::new(crate::FirecrackerSandboxBackend::new(
-                        crate::FirecrackerConfig::from_env()?,
-                    )?) as Arc<dyn ManagedSandboxBackend>)
+                    let mut config = crate::FirecrackerConfig::from_env()?;
+                    config.snapshot_enabled = snapshot_enabled;
+                    Ok(Arc::new(crate::FirecrackerSandboxBackend::new(config)?)
+                        as Arc<dyn ManagedSandboxBackend>)
                 })
             },
         )
@@ -154,6 +160,11 @@ impl SandboxBackendRegistration {
                 bail!("Firecracker support requires building Exo with --features firecracker")
             })
         })
+    }
+
+    #[cfg(not(feature = "firecracker"))]
+    pub fn firecracker_with_snapshots(_snapshot_enabled: bool) -> Self {
+        Self::firecracker()
     }
 
     pub fn local_process() -> Self {

@@ -66,7 +66,6 @@ const DEFAULT_NETWORK_BYTES_PER_SECOND: u64 = 100 * 1024 * 1024;
 const DEFAULT_JAILER_UID_BASE: u32 = 100_000;
 const DEFAULT_VCPU_COUNT: u8 = 2;
 const DEFAULT_MEMORY_MIB: u32 = 4096;
-const DEFAULT_SNAPSHOT_ENABLED: bool = true;
 const SNAPSHOT_CACHE_VERSION: u32 = 1;
 const FIRECRACKER_API_SOCKET: &str = "firecracker.socket";
 const FIRECRACKER_API_TIMEOUT: Duration = Duration::from_secs(5);
@@ -143,10 +142,7 @@ impl FirecrackerConfig {
                 "EXO_FIRECRACKER_NETWORK_BYTES_PER_SECOND",
                 DEFAULT_NETWORK_BYTES_PER_SECOND,
             )?,
-            snapshot_enabled: env_parse(
-                "EXO_FIRECRACKER_SNAPSHOT_ENABLED",
-                DEFAULT_SNAPSHOT_ENABLED,
-            )?,
+            snapshot_enabled: false,
         })
     }
 }
