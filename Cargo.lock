@@ -2617,6 +2617,7 @@ dependencies = [
  "hex",
  "keyring",
  "keyring-core",
+ "libc",
  "lingua",
  "object_store",
  "oci-client",
