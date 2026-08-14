@@ -2485,6 +2485,19 @@ fn wait_for_firecracker_api(root: &Path, machine_id: &str) -> Result<PathBuf> {
 }
 
 fn firecracker_api_put<T: Serialize>(socket: &Path, path: &str, body: &T) -> Result<()> {
+    firecracker_api_request(socket, "PUT", path, body)
+}
+
+fn firecracker_api_patch<T: Serialize>(socket: &Path, path: &str, body: &T) -> Result<()> {
+    firecracker_api_request(socket, "PATCH", path, body)
+}
+
+fn firecracker_api_request<T: Serialize>(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    body: &T,
+) -> Result<()> {
     let body = serde_json::to_vec(body)?;
     let mut stream = StdUnixStream::connect(socket)
         .with_context(|| format!("connecting to Firecracker API {}", socket.display()))?;
@@ -2492,7 +2505,7 @@ fn firecracker_api_put<T: Serialize>(socket: &Path, path: &str, body: &T) -> Res
     stream.set_write_timeout(Some(FIRECRACKER_API_TIMEOUT))?;
     write!(
         stream,
-        "PUT {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )?;
     stream.write_all(&body)?;
@@ -2532,7 +2545,7 @@ fn firecracker_api_put<T: Serialize>(socket: &Path, path: &str, body: &T) -> Res
         return Ok(());
     }
     bail!(
-        "Firecracker API PUT {path} failed with status {status}: {}",
+        "Firecracker API {method} {path} failed with status {status}: {}",
         String::from_utf8_lossy(&response_body)
     )
 }
@@ -2699,7 +2712,7 @@ fn ensure_snapshot_template(
             ready_listener,
         )?;
 
-        firecracker_api_put(&api, "/vm", &FirecrackerVmState { state: "Paused" })?;
+        firecracker_api_patch(&api, "/vm", &FirecrackerVmState { state: "Paused" })?;
         let snapshot_started = Instant::now();
         // A full snapshot is generated once per immutable image/config/slot. Its
         // memory file is later mapped MAP_PRIVATE and faulted lazily by each clone.
