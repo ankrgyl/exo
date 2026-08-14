@@ -70,6 +70,7 @@ const DEFAULT_SNAPSHOT_ENABLED: bool = true;
 const SNAPSHOT_CACHE_VERSION: u32 = 1;
 const FIRECRACKER_API_SOCKET: &str = "firecracker.socket";
 const FIRECRACKER_API_TIMEOUT: Duration = Duration::from_secs(5);
+const FIRECRACKER_SNAPSHOT_CREATE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DEVICE_MAPPER_CHUNK_SECTORS: u64 = 8;
 // Firecracker forwards guest packets without filtering them. Keep special-use,
 // link-local, host-private, and cross-VM ranges closed unless explicitly admitted.
@@ -2485,11 +2486,20 @@ fn wait_for_firecracker_api(root: &Path, machine_id: &str) -> Result<PathBuf> {
 }
 
 fn firecracker_api_put<T: Serialize>(socket: &Path, path: &str, body: &T) -> Result<()> {
-    firecracker_api_request(socket, "PUT", path, body)
+    firecracker_api_request(socket, "PUT", path, body, FIRECRACKER_API_TIMEOUT)
 }
 
 fn firecracker_api_patch<T: Serialize>(socket: &Path, path: &str, body: &T) -> Result<()> {
-    firecracker_api_request(socket, "PATCH", path, body)
+    firecracker_api_request(socket, "PATCH", path, body, FIRECRACKER_API_TIMEOUT)
+}
+
+fn firecracker_api_put_with_timeout<T: Serialize>(
+    socket: &Path,
+    path: &str,
+    body: &T,
+    timeout: Duration,
+) -> Result<()> {
+    firecracker_api_request(socket, "PUT", path, body, timeout)
 }
 
 fn firecracker_api_request<T: Serialize>(
@@ -2497,12 +2507,13 @@ fn firecracker_api_request<T: Serialize>(
     method: &str,
     path: &str,
     body: &T,
+    timeout: Duration,
 ) -> Result<()> {
     let body = serde_json::to_vec(body)?;
     let mut stream = StdUnixStream::connect(socket)
         .with_context(|| format!("connecting to Firecracker API {}", socket.display()))?;
-    stream.set_read_timeout(Some(FIRECRACKER_API_TIMEOUT))?;
-    stream.set_write_timeout(Some(FIRECRACKER_API_TIMEOUT))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     write!(
         stream,
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2718,7 +2729,7 @@ fn ensure_snapshot_template(
         // memory file is later mapped MAP_PRIVATE and faulted lazily by each clone.
         // https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md#full-and-diff-snapshots
         // https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md#memory-backend
-        firecracker_api_put(
+        firecracker_api_put_with_timeout(
             &api,
             "/snapshot/create",
             &FirecrackerSnapshotCreate {
@@ -2726,6 +2737,7 @@ fn ensure_snapshot_template(
                 snapshot_path: "/snapshot/state",
                 mem_file_path: "/snapshot/memory",
             },
+            FIRECRACKER_SNAPSHOT_CREATE_TIMEOUT,
         )?;
         record_launch_timing(
             &record.machine_id,
