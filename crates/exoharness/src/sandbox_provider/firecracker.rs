@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::future::Future;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader as StdBufReader, Read, Seek, SeekFrom, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -2497,25 +2497,43 @@ fn firecracker_api_put<T: Serialize>(socket: &Path, path: &str, body: &T) -> Res
     )?;
     stream.write_all(&body)?;
     stream.flush()?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
-    let status_line = response
-        .split(|byte| *byte == b'\n')
-        .next()
-        .context("Firecracker API returned an empty response")?;
-    let status_line = String::from_utf8_lossy(status_line);
+    let mut reader = StdBufReader::new(stream);
+    let mut status_line = String::new();
+    if reader.read_line(&mut status_line)? == 0 {
+        bail!("Firecracker API returned an empty response");
+    }
     let status = status_line
         .split_whitespace()
         .nth(1)
         .context("Firecracker API response did not include a status")?
         .parse::<u16>()
         .context("Firecracker API returned an invalid status")?;
+    let mut content_length = 0_usize;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header)? == 0 {
+            bail!("Firecracker API response ended before its headers");
+        }
+        if header == "\r\n" {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value
+                .trim()
+                .parse()
+                .context("Firecracker API returned an invalid Content-Length")?;
+        }
+    }
+    let mut response_body = vec![0_u8; content_length];
+    reader.read_exact(&mut response_body)?;
     if (200..300).contains(&status) {
         return Ok(());
     }
     bail!(
         "Firecracker API PUT {path} failed with status {status}: {}",
-        String::from_utf8_lossy(&response)
+        String::from_utf8_lossy(&response_body)
     )
 }
 
