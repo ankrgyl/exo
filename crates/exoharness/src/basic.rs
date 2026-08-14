@@ -1150,6 +1150,10 @@ where
         self.sandbox_handle().connect_sandbox_tcp(id, port).await
     }
 
+    async fn sandbox_supports_tcp(&self, id: SandboxId) -> Result<bool> {
+        self.sandbox_handle().sandbox_supports_tcp(id).await
+    }
+
     async fn start_sandbox_process(
         &self,
         request: StartSandboxProcessRequest,
@@ -1895,6 +1899,20 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             self.append_events(vec![event]).await?;
         }
         sandbox_handle.connect_tcp(port).await
+    }
+
+    async fn sandbox_supports_tcp(&self, id: SandboxId) -> Result<bool> {
+        self.ensure_full_sandbox_scope("sandbox_supports_tcp")?;
+        let sandbox = self.load_sandbox(&id).await?;
+        if !sandbox.running {
+            bail!("sandbox is not running: {id}");
+        }
+        let (sandbox_handle, provider_state_event) =
+            active_sandbox_handle(self.harness, &self.owner_dir, self.owner, &id, &sandbox).await?;
+        if let Some(event) = provider_state_event {
+            self.append_events(vec![event]).await?;
+        }
+        Ok(sandbox_handle.supports_tcp())
     }
 
     async fn start_sandbox_process(

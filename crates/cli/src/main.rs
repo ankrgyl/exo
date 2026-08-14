@@ -977,6 +977,7 @@ async fn main() -> Result<()> {
     if matches!(cli.command, Commands::FirecrackerBridge) {
         #[cfg(feature = "firecracker")]
         {
+            init_firecracker_bridge_tracing();
             if let Some(exit_code) = executor::run_firecracker_bridge().await? {
                 std::process::exit(exit_code);
             }
@@ -2743,6 +2744,18 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
         | Commands::Adapters { .. }
         | Commands::Tools { .. }
         | Commands::Serve { .. } => None,
+    }
+}
+
+#[cfg(feature = "firecracker")]
+fn init_firecracker_bridge_tracing() {
+    let layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .with_filter(tracing_subscriber::filter::LevelFilter::INFO);
+    match tracing_subscriber::registry().with(layer).try_init() {
+        Ok(()) | Err(_) => {}
     }
 }
 

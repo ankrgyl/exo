@@ -161,6 +161,10 @@ pub trait ManagedSandboxHandle: Send + Sync {
 
     async fn start_process(&self, command: &SandboxCommand) -> Result<crate::SandboxProcessParts>;
 
+    fn supports_tcp(&self) -> bool {
+        false
+    }
+
     async fn connect_tcp(&self, _port: u16) -> Result<Option<BoxSandboxTcpStream>> {
         Ok(None)
     }

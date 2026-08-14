@@ -600,6 +600,10 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
             .await
     }
 
+    fn supports_tcp(&self) -> bool {
+        true
+    }
+
     async fn connect_tcp(&self, port: u16) -> Result<Option<BoxSandboxTcpStream>> {
         if !self.machine.record.network_enabled {
             bail!("Firecracker sandbox does not have networking enabled");

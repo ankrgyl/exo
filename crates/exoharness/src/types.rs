@@ -48,6 +48,10 @@ pub trait SandboxHandle: SnapshotHandle {
     async fn detach_sandbox(&self, id: SandboxId) -> Result<SandboxAttachment>;
     async fn stop_sandbox(&self, id: SandboxId) -> Result<()>;
     #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+    async fn sandbox_supports_tcp(&self, _id: SandboxId) -> Result<bool> {
+        Ok(false)
+    }
+    #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
     async fn connect_sandbox_tcp(
         &self,
         _id: SandboxId,
