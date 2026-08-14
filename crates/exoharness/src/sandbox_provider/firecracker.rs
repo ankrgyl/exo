@@ -2747,7 +2747,10 @@ fn ensure_snapshot_template(
         // Never resume the template after snapshotting it. Reusing both sides of
         // the same captured state duplicates identifiers and random state.
         // https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md#snapshot-security-and-uniqueness
-        stop_machine_process_blocking(&template_id, &root.join("firecracker.pid"))?;
+        // The template is paused and its disk/snapshot files are already synced;
+        // it must never resume, so terminate it immediately instead of spending
+        // the normal graceful-shutdown window on a paused VMM.
+        kill_machine_process_blocking(&template_id, &root.join("firecracker.pid"))?;
 
         replace_hard_link(&snapshot_output.join("state"), &temporary.join("state"))?;
         replace_hard_link(&snapshot_output.join("memory"), &temporary.join("memory"))?;
@@ -2849,7 +2852,11 @@ fn loop_attached_to(loop_device: &Path, backing_file: &Path) -> Result<bool> {
 
 fn command_succeeds(program: &str, arguments: &[&str]) -> Result<bool> {
     let executable = trusted_host_command(program)?;
-    Ok(Command::new(executable).args(arguments).status()?.success())
+    Ok(Command::new(executable)
+        .args(arguments)
+        .output()?
+        .status
+        .success())
 }
 
 fn prepare_snapshot_cow(
@@ -3073,6 +3080,18 @@ fn process_running(pid_path: &Path) -> bool {
 }
 
 fn stop_machine_process_blocking(machine_id: &str, pid_path: &Path) -> Result<()> {
+    terminate_machine_process_blocking(machine_id, pid_path, true)
+}
+
+fn kill_machine_process_blocking(machine_id: &str, pid_path: &Path) -> Result<()> {
+    terminate_machine_process_blocking(machine_id, pid_path, false)
+}
+
+fn terminate_machine_process_blocking(
+    machine_id: &str,
+    pid_path: &Path,
+    graceful: bool,
+) -> Result<()> {
     let Ok(pid) = fs::read_to_string(pid_path) else {
         return Ok(());
     };
@@ -3107,13 +3126,15 @@ fn stop_machine_process_blocking(machine_id: &str, pid_path: &Path) -> Result<()
     if !is_firecracker || !has_machine_id || !in_machine_cgroup {
         bail!("refusing to stop pid {pid}: it does not match Firecracker machine {machine_id}");
     }
-    run_checked("kill", &["-TERM", &pid.to_string()])?;
-    let started = Instant::now();
-    while started.elapsed() < PROCESS_STOP_TIMEOUT {
-        if !proc_dir.exists() {
-            return Ok(());
+    if graceful {
+        run_checked("kill", &["-TERM", &pid.to_string()])?;
+        let started = Instant::now();
+        while started.elapsed() < PROCESS_STOP_TIMEOUT {
+            if !proc_dir.exists() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
     run_checked("kill", &["-KILL", &pid.to_string()])?;
     let killed = Instant::now();
