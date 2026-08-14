@@ -132,6 +132,7 @@ impl SandboxBackendRegistration {
         )
     }
 
+    #[cfg(feature = "firecracker")]
     pub fn firecracker() -> Self {
         Self::from_factory(
             SandboxProvider::Firecracker,
@@ -144,6 +145,15 @@ impl SandboxBackendRegistration {
                 })
             },
         )
+    }
+
+    #[cfg(not(feature = "firecracker"))]
+    pub fn firecracker() -> Self {
+        Self::from_factory(SandboxProvider::Firecracker, false, |_| {
+            Box::pin(async move {
+                bail!("Firecracker support requires building Exo with --features firecracker")
+            })
+        })
     }
 
     pub fn local_process() -> Self {

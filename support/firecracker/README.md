@@ -1,9 +1,58 @@
 # Firecracker sandbox artifacts
 
-Exo's Firecracker backend consumes an ext4 root filesystem and an uncompressed
-guest kernel. It launches Firecracker only through the matching `jailer`
-binary, communicates with the guest agent over virtio-vsock, and adds a TAP
-device only when the sandbox requests networking.
+Exo's optional Firecracker backend accepts either an OCI image reference or an
+existing ext4 root filesystem, plus an uncompressed guest kernel. It launches
+Firecracker only through the matching `jailer` binary, communicates with a
+static Rust PID 1 over virtio-vsock, and adds a TAP device only when the
+sandbox requests networking.
+
+Build the CLI with the backend and its OCI/filesystem dependencies enabled:
+
+```bash
+cargo build -p exo --features firecracker
+```
+
+For an OCI reference, Exo resolves the platform manifest, pulls its layers
+directly from the registry, applies OCI whiteouts, injects the Firecracker guest
+runtime, and creates ext4 with `mkfs.ext4 -d`. This path does not use Docker or
+containerd. Images are cached by immutable manifest-list digest, platform, and
+guest-runtime digest under `EXO_FIRECRACKER_STATE_ROOT/images/v2`; each VM gets
+a sparse/reflinked writable copy of the cached filesystem.
+
+Build the guest runtime on the Linux KVM host and install it as a trusted host
+artifact:
+
+```bash
+guest_runtime="$(support/firecracker/build-guest.sh)"
+sudo install -o root -g root -m 0755 "$guest_runtime" \
+  /var/lib/exo/firecracker/exo-firecracker-guest
+```
+
+The guest runtime is statically linked and runs directly as PID 1. It mounts
+the pseudo filesystems, configures the guest network, mounts an optional
+workspace, and serves the bounded process protocol only to the host vsock CID.
+Every workload child clears supplementary groups and irreversibly drops to
+UID/GID 10001 with `no_new_privs`. OCI images do not need Python, a shell, `ip`,
+`mount`, `setpriv`, or other boot-time utilities.
+
+Registry credentials come from
+`EXO_FIRECRACKER_REGISTRY_USERNAME`/`EXO_FIRECRACKER_REGISTRY_PASSWORD`, or the
+Docker credential configuration and helper for the user running Exo. For ECR,
+this supports `docker-credential-ecr-login` without requiring a Docker daemon.
+Because Exo and the Firecracker jailer run as root, set `DOCKER_CONFIG` to the
+intended root-owned credential configuration when necessary. Exo rejects a
+credential config, credential helper, or parent path writable by non-root
+users.
+
+The generated filesystem is 8 GiB by default; set
+`EXO_FIRECRACKER_IMAGE_SIZE_GIB` to change it. Structured logs report
+`duration_ms` for registry authentication, manifest resolution, cache lookup,
+blob pulls, layer extraction, runtime injection, ext4 creation, and the total
+materialization path. Blob-pull logs also report bytes and cache hit/miss
+counts.
+
+The standalone Docker-based builder remains available when an ext4 artifact is
+preferred ahead of time:
 
 Build a root filesystem as root from the same OCI image used by another Exo
 backend:
@@ -11,14 +60,13 @@ backend:
 ```bash
 support/firecracker/build-rootfs.sh \
   --image your-sandbox-image@sha256:... \
+  --guest-runtime /var/lib/exo/firecracker/exo-firecracker-guest \
   --output /var/lib/exo/firecracker/rootfs.ext4
 ```
 
-The OCI image must contain `/bin/sh`, Python 3, `setpriv`, `ip`, `mount`,
-`mountpoint`, and the standard `cat`, `chown`, `mkdir`, and `rm` utilities. The
-guest kernel must contain `CONFIG_VIRTIO_VSOCKETS=y`; the host requires KVM,
-cgroup v2, iproute2, iptables, nftables, e2fsprogs, and
-`CONFIG_VHOST_VSOCK`.
+The guest kernel must contain `CONFIG_VIRTIO_VSOCKETS=y`; the host requires
+KVM, cgroup v2, iproute2, iptables, nftables, e2fsprogs, static glibc development
+files for the guest-runtime build, and `CONFIG_VHOST_VSOCK`.
 
 Install matching official Firecracker and jailer release binaries under
 `/usr/local/bin`, and install the guest kernel at
@@ -32,9 +80,10 @@ Run Exo as root, select the backend, and configure the provider binding:
 
 ```bash
 sudo EXO_FIRECRACKER_KERNEL=/var/lib/exo/firecracker/vmlinux \
+  EXO_FIRECRACKER_GUEST_RUNTIME=/var/lib/exo/firecracker/exo-firecracker-guest \
   target/debug/exo --sandbox-backend firecracker provider configure \
   --provider firecracker \
-  --default-image /var/lib/exo/firecracker/rootfs.ext4
+  --default-image 123456789012.dkr.ecr.us-east-1.amazonaws.com/exo-sandbox@sha256:...
 ```
 
 Agents can then select `--sandbox-provider firecracker`; the Exo CLI and data
@@ -81,6 +130,7 @@ Run Exo inside that Linux VM:
 
 ```bash
 sudo EXO_FIRECRACKER_KERNEL=/var/lib/exo/firecracker/vmlinux \
+  EXO_FIRECRACKER_GUEST_RUNTIME=/var/lib/exo/firecracker/exo-firecracker-guest \
   target/debug/exo --sandbox-backend firecracker serve
 ```
 

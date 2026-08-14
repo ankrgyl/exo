@@ -34,8 +34,14 @@ use crate::sandbox::{
 use crate::sandbox_provider::process_bridge;
 use crate::{FileSystemMountMode, SandboxAttachment, SandboxProcessParts};
 
+use super::firecracker_image::resolve_image;
+#[cfg(test)]
+use super::firecracker_image::validate_ext4_image;
+
 const API_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const GUEST_READY_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
+const GUEST_READY_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
 const MAX_GUEST_REQUEST_BYTES: usize = 1024 * 1024;
@@ -52,6 +58,7 @@ const MAX_RESOURCE_SLOTS: u32 = 32_768;
 const NETWORK_BASE: Ipv4Addr = Ipv4Addr::new(10, 240, 0, 0);
 const EXO_NETWORK_CIDR: &str = "10.240.0.0/14";
 const DEFAULT_WORKSPACE_SIZE_GIB: u64 = 20;
+const DEFAULT_IMAGE_SIZE_GIB: u64 = 8;
 const DEFAULT_NETWORK_BYTES_PER_SECOND: u64 = 100 * 1024 * 1024;
 const DEFAULT_JAILER_UID_BASE: u32 = 100_000;
 const DEFAULT_VCPU_COUNT: u8 = 2;
@@ -85,9 +92,11 @@ pub struct FirecrackerConfig {
     pub firecracker_bin: PathBuf,
     pub jailer_bin: PathBuf,
     pub kernel: PathBuf,
+    pub guest_runtime: PathBuf,
     pub state_root: PathBuf,
     pub vcpu_count: u8,
     pub memory_mib: u32,
+    pub image_size_gib: u64,
     pub workspace_size_gib: u64,
     pub jailer_uid_base: u32,
     pub dns_server: Ipv4Addr,
@@ -101,12 +110,17 @@ impl FirecrackerConfig {
             firecracker_bin: env_path("EXO_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
             jailer_bin: env_path("EXO_FIRECRACKER_JAILER", "/usr/local/bin/jailer"),
             kernel: env_path("EXO_FIRECRACKER_KERNEL", "/var/lib/exo/firecracker/vmlinux"),
+            guest_runtime: env_path(
+                "EXO_FIRECRACKER_GUEST_RUNTIME",
+                "/var/lib/exo/firecracker/exo-firecracker-guest",
+            ),
             state_root: env_path(
                 "EXO_FIRECRACKER_STATE_ROOT",
                 "/var/lib/exo/firecracker/state",
             ),
             vcpu_count: env_parse("EXO_FIRECRACKER_VCPU_COUNT", DEFAULT_VCPU_COUNT)?,
             memory_mib: env_parse("EXO_FIRECRACKER_MEMORY_MIB", DEFAULT_MEMORY_MIB)?,
+            image_size_gib: env_parse("EXO_FIRECRACKER_IMAGE_SIZE_GIB", DEFAULT_IMAGE_SIZE_GIB)?,
             workspace_size_gib: env_parse(
                 "EXO_FIRECRACKER_WORKSPACE_SIZE_GIB",
                 DEFAULT_WORKSPACE_SIZE_GIB,
@@ -126,6 +140,12 @@ impl FirecrackerConfig {
 struct FirecrackerProviderState {
     machine_id: String,
     spec_hash: String,
+    // `prepare_network` installs a host route to this per-VM address. Returning
+    // the address lets the host controller reach an explicitly selected guest
+    // service without publishing it outside the host or weakening guest-to-host
+    // and guest-to-guest firewall rules.
+    // https://github.com/firecracker-microvm/firecracker/blob/main/docs/network-setup.md#host-network-setup
+    guest_ip: Option<Ipv4Addr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +216,7 @@ impl FirecrackerSandboxBackend {
         config.firecracker_bin = fs::canonicalize(&config.firecracker_bin)?;
         config.jailer_bin = fs::canonicalize(&config.jailer_bin)?;
         config.kernel = fs::canonicalize(&config.kernel)?;
+        config.guest_runtime = fs::canonicalize(&config.guest_runtime)?;
         config.state_root = fs::canonicalize(&config.state_root)?;
         validate_private_root(&config.state_root)?;
         validate_api_socket_path(&config)?;
@@ -257,7 +278,15 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        let request = prepare_request(request)?;
+        let mut request = prepare_request(request)?;
+        let image = resolve_image(
+            &self.shared.config.state_root,
+            &request.spec.image,
+            self.shared.config.image_size_gib,
+            &self.shared.config.guest_runtime,
+        )
+        .await?;
+        request.spec.image = image.to_string_lossy().into_owned();
         let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
         self.reap_expired_machines().await?;
         let spec_hash = sandbox_spec_hash(&request.spec);
@@ -368,6 +397,11 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
             serde_json::to_value(FirecrackerProviderState {
                 machine_id: self.machine.record.machine_id.clone(),
                 spec_hash: self.spec_hash.clone(),
+                guest_ip: self
+                    .machine
+                    .record
+                    .network_enabled
+                    .then(|| self.machine.record.network().guest_ip),
             })
             .expect("Firecracker provider state should serialize")
         })
@@ -498,6 +532,8 @@ impl Shared {
             }
         }
 
+        let launch_started = Instant::now();
+        let machine_record_started = Instant::now();
         let record = match existing {
             Some(record) if record.spec_hash == spec_hash => record,
             _ => {
@@ -505,15 +541,25 @@ impl Shared {
                     .await?
             }
         };
+        record_launch_timing(
+            machine_id,
+            "machine_record",
+            machine_record_started.elapsed(),
+        );
+        let host_started = Instant::now();
         if let Err(error) = self.prepare_and_launch(request, &record).await {
             if let Err(cleanup_error) = self.cleanup_machine(machine_id, true).await {
                 tracing::warn!(%cleanup_error, machine_id, "failed cleaning up unsuccessful Firecracker launch");
             }
             return Err(error);
         }
+        record_launch_timing(machine_id, "host_prepare_and_start", host_started.elapsed());
         let machine = machine_from_record(&self.config, record);
         let client = GuestClient::new(Arc::clone(self), machine.vsock_path.clone());
+        let guest_ready_started = Instant::now();
         wait_for_guest(self, &client, machine_id).await?;
+        record_launch_timing(machine_id, "guest_ready", guest_ready_started.elapsed());
+        record_launch_timing(machine_id, "total", launch_started.elapsed());
         Ok(machine)
     }
 
@@ -595,7 +641,9 @@ impl Shared {
             let network = record.network();
             let result = (|| {
                 if record.network_enabled {
+                    let started = Instant::now();
                     prepare_network(&config, &network, jailer_uid(&config, &record)?)?;
+                    record_launch_timing(&record.machine_id, "network_setup", started.elapsed());
                 }
                 prepare_and_launch_blocking(&config, &request, &record)
             })();
@@ -715,31 +763,7 @@ fn prepare_request(request: SandboxRequest) -> Result<SandboxRequest> {
     {
         bail!("Firecracker workdir must be an absolute path without whitespace");
     }
-    let image = fs::canonicalize(&request.spec.image).with_context(|| {
-        format!(
-            "resolving Firecracker root filesystem image {}",
-            request.spec.image
-        )
-    })?;
-    if !image.is_file() {
-        bail!(
-            "Firecracker image must be an ext4 root filesystem file: {}",
-            image.display()
-        );
-    }
-    validate_ext4_image(&image)?;
-    Ok(SandboxRequest {
-        key: request.key,
-        spec: SandboxSpec {
-            image: image.to_string_lossy().into_owned(),
-            mounts: request.spec.mounts,
-            durable_file_systems: request.spec.durable_file_systems,
-            network: request.spec.network,
-            default_workdir: request.spec.default_workdir,
-        },
-        lifecycle: request.lifecycle,
-        provider_state: request.provider_state,
-    })
+    Ok(request)
 }
 
 fn parse_provider_state(value: &Value) -> Result<FirecrackerProviderState> {
@@ -809,6 +833,7 @@ fn validate_host(config: &FirecrackerConfig) -> Result<()> {
     validate_trusted_file("Firecracker binary", &config.firecracker_bin)?;
     validate_trusted_file("Firecracker jailer", &config.jailer_bin)?;
     validate_trusted_file("Firecracker guest kernel", &config.kernel)?;
+    validate_trusted_file("Firecracker guest runtime", &config.guest_runtime)?;
     OpenOptions::new()
         .read(true)
         .write(true)
@@ -844,6 +869,9 @@ fn validate_host(config: &FirecrackerConfig) -> Result<()> {
     }
     if config.memory_mib < 128 {
         bail!("Firecracker memory must be at least 128 MiB");
+    }
+    if config.image_size_gib == 0 {
+        bail!("Firecracker OCI image size must be positive");
     }
     if config.workspace_size_gib == 0 {
         bail!("Firecracker workspace size must be positive");
@@ -881,26 +909,7 @@ fn validate_file(label: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_ext4_image(path: &Path) -> Result<()> {
-    let mut image = File::open(path)
-        .with_context(|| format!("opening Firecracker root filesystem {}", path.display()))?;
-    image
-        .seek(SeekFrom::Start(1024 + 0x38))
-        .with_context(|| format!("reading ext4 superblock from {}", path.display()))?;
-    let mut magic = [0_u8; 2];
-    image
-        .read_exact(&mut magic)
-        .with_context(|| format!("reading ext4 magic from {}", path.display()))?;
-    if magic != [0x53, 0xef] {
-        bail!(
-            "Firecracker image is not an ext4 filesystem: {}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn validate_trusted_file(label: &str, path: &Path) -> Result<()> {
+pub(super) fn validate_trusted_file(label: &str, path: &Path) -> Result<()> {
     validate_file(label, path)?;
     let path = fs::canonicalize(path)?;
     // Jailer treats its executable and path arguments as trusted input. A writable
@@ -960,7 +969,7 @@ fn find_executable(program: &str) -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("{program} is not executable on PATH"))
 }
 
-fn trusted_host_command(program: &str) -> Result<PathBuf> {
+pub(super) fn trusted_host_command(program: &str) -> Result<PathBuf> {
     let executable = find_executable(program)?;
     let file_name = executable
         .file_name()
@@ -1428,6 +1437,27 @@ fn prepare_network(
             "{ type nat hook postrouting priority srcnat; policy accept; }",
         ],
     )?;
+    // Permit only replies to host-initiated connections before rejecting all
+    // unsolicited guest-to-host traffic. This lets host controllers reach a
+    // selected guest service without exposing host listeners to the guest.
+    // https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md#filtering-guest-egress-network-traffic
+    run_checked(
+        "nft",
+        &[
+            "add",
+            "rule",
+            "inet",
+            &network.nft_table,
+            "input",
+            "iifname",
+            &network.host_veth,
+            "ct",
+            "state",
+            "established,related",
+            "counter",
+            "accept",
+        ],
+    )?;
     run_checked(
         "nft",
         &[
@@ -1732,11 +1762,13 @@ fn prepare_and_launch_blocking(
     request: &SandboxRequest,
     record: &MachineRecord,
 ) -> Result<()> {
+    let rootfs_copy_started = Instant::now();
     let root = jail_root(config, &record.machine_id);
     fs::create_dir_all(&root)?;
     fs::set_permissions(&root, Permissions::from_mode(0o700))?;
     let rootfs = root.join("rootfs.ext4");
-    if !rootfs.try_exists()? {
+    let copied_rootfs = !rootfs.try_exists()?;
+    if copied_rootfs {
         run_checked(
             "cp",
             &[
@@ -1747,6 +1779,19 @@ fn prepare_and_launch_blocking(
             ],
         )?;
     }
+    let rootfs_metadata = fs::metadata(&rootfs)
+        .with_context(|| format!("reading Firecracker rootfs metadata {}", rootfs.display()))?;
+    tracing::info!(
+        machine_id = record.machine_id,
+        step = "rootfs_copy",
+        duration_ms = rootfs_copy_started.elapsed().as_secs_f64() * 1000.0,
+        copied_rootfs,
+        rootfs_logical_bytes = rootfs_metadata.len(),
+        rootfs_allocated_bytes = rootfs_metadata.blocks().saturating_mul(512),
+        "Firecracker VM launch timing"
+    );
+
+    let jail_setup_started = Instant::now();
     let kernel = root.join("vmlinux");
     fs::copy(&config.kernel, &kernel).with_context(|| {
         format!(
@@ -1813,6 +1858,12 @@ fn prepare_and_launch_blocking(
     ) * 1024
         * 1024;
     let cpu_max = format!("{} 100000", u32::from(config.vcpu_count) * 100_000);
+    record_launch_timing(
+        &record.machine_id,
+        "jail_setup",
+        jail_setup_started.elapsed(),
+    );
+    let vmm_api_ready_started = Instant::now();
     // Always use the matching jailer: it creates the mount/PID namespaces and
     // cgroup, then drops to a unique unprivileged UID before execing Firecracker.
     // https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md#jailer-operation
@@ -1866,6 +1917,12 @@ fn prepare_and_launch_blocking(
 
     let api_socket = root.join("run/firecracker.socket");
     wait_for_api_socket(&api_socket, &root.join("firecracker.pid"), &stderr_path)?;
+    record_launch_timing(
+        &record.machine_id,
+        "vmm_api_ready",
+        vmm_api_ready_started.elapsed(),
+    );
+    let vmm_configure_started = Instant::now();
     firecracker_put(
         &api_socket,
         "/machine-config",
@@ -1880,7 +1937,7 @@ fn prepare_and_launch_blocking(
     // writes cannot grow an unbounded host log.
     // https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md#8250-serial-device
     let mut boot_args = String::from(
-        "reboot=k panic=1 pci=off root=/dev/vda rw init=/runtime/exo-firecracker-init 8250.nr_uarts=0 quiet loglevel=1",
+        "reboot=k panic=1 pci=off root=/dev/vda rw init=/runtime/exo-firecracker-guest 8250.nr_uarts=0 quiet loglevel=1",
     );
     if record.network_enabled {
         boot_args.push_str(&format!(
@@ -1957,11 +2014,22 @@ fn prepare_and_launch_blocking(
             }),
         )?;
     }
+    record_launch_timing(
+        &record.machine_id,
+        "vmm_configure",
+        vmm_configure_started.elapsed(),
+    );
+    let instance_start_started = Instant::now();
     firecracker_put(
         &api_socket,
         "/actions",
         &json!({"action_type": "InstanceStart"}),
     )?;
+    record_launch_timing(
+        &record.machine_id,
+        "instance_start_api",
+        instance_start_started.elapsed(),
+    );
     Ok(())
 }
 
@@ -2129,12 +2197,16 @@ impl GuestClient {
     }
 
     async fn ping(&self) -> Result<()> {
+        self.ping_with_timeout(Duration::from_secs(2)).await
+    }
+
+    async fn ping_with_timeout(&self, timeout: Duration) -> Result<()> {
         let response: OperationResponse = self
             .invoke_with_timeout(
                 &PingRequest {
                     request_type: "ping",
                 },
-                Duration::from_secs(2),
+                timeout,
             )
             .await?;
         if response.ok {
@@ -2307,31 +2379,23 @@ impl GuestClient {
     }
 
     async fn sync_filesystem(&self, path: &str) -> Result<()> {
-        let argv = vec![
-            "/usr/bin/sync".to_string(),
-            "--file-system".to_string(),
-            path.to_string(),
-        ];
-        let env = HashMap::new();
-        let response: ExecResponse = self
+        let response: OperationResponse = self
             .invoke_with_timeout(
-                &ExecRequest {
-                    request_type: "exec",
-                    argv: &argv,
-                    env: &env,
-                    cwd: "/",
-                    timeout_ms: Some(duration_to_millis(GUEST_REQUEST_TIMEOUT)),
+                &SyncFilesystemRequest {
+                    request_type: "sync_filesystem",
+                    path,
                 },
                 GUEST_REQUEST_TIMEOUT,
             )
             .await?;
-        if response.ok == Some(true) || response.exit_code == Some(0) {
+        if response.ok {
             return Ok(());
         }
         bail!(
-            "Firecracker guest filesystem sync failed: {}{}",
-            response.stderr.unwrap_or_default(),
-            response.error.unwrap_or_default()
+            "Firecracker guest filesystem sync failed: {}",
+            response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
         )
     }
 }
@@ -2430,6 +2494,13 @@ struct KillProcessRequest<'a> {
     process_id: &'a str,
 }
 
+#[derive(Serialize)]
+struct SyncFilesystemRequest<'a> {
+    #[serde(rename = "type")]
+    request_type: &'static str,
+    path: &'a str,
+}
+
 #[derive(Deserialize)]
 struct OperationResponse {
     ok: bool,
@@ -2510,20 +2581,49 @@ fn duration_to_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn record_launch_timing(machine_id: &str, step: &str, duration: Duration) {
+    tracing::info!(
+        machine_id,
+        step,
+        duration_ms = duration.as_secs_f64() * 1000.0,
+        "Firecracker VM launch timing"
+    );
+}
+
 async fn wait_for_guest(shared: &Shared, client: &GuestClient, machine_id: &str) -> Result<()> {
     let started = Instant::now();
-    let mut delay = Duration::from_millis(25);
     let mut last_error = None;
+    let mut attempts = 0u32;
+    let mut failed_ping_duration = Duration::ZERO;
+    let mut sleep_duration = Duration::ZERO;
     while started.elapsed() < GUEST_READY_TIMEOUT {
         if !process_running(&shared.pid_path(machine_id)) {
             bail!("Firecracker process exited while waiting for the guest agent");
         }
-        match client.ping().await {
-            Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error),
+        attempts += 1;
+        let ping_started = Instant::now();
+        match client.ping_with_timeout(GUEST_READY_PROBE_TIMEOUT).await {
+            Ok(()) => {
+                tracing::info!(
+                    machine_id,
+                    step = "guest_ready_detail",
+                    duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+                    attempts,
+                    failed_ping_duration_ms = failed_ping_duration.as_secs_f64() * 1000.0,
+                    successful_ping_duration_ms = ping_started.elapsed().as_secs_f64() * 1000.0,
+                    sleep_duration_ms = sleep_duration.as_secs_f64() * 1000.0,
+                    "Firecracker VM launch timing"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                failed_ping_duration += ping_started.elapsed();
+                last_error = Some(error);
+            }
         }
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(Duration::from_millis(500));
+        let sleep_started = Instant::now();
+        tokio::time::sleep(GUEST_READY_POLL_INTERVAL).await;
+        sleep_duration += sleep_started.elapsed();
     }
     let detail = last_error
         .map(|error| format!("{error:#}"))

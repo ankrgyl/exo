@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::future::Future;
 use std::pin::Pin;
@@ -42,7 +43,7 @@ fn sandbox_backend_registration_uses_backend_locality() {
     assert!(SandboxBackendRegistration::docker().is_local());
     assert_eq!(
         SandboxBackendRegistration::firecracker().is_local(),
-        cfg!(target_os = "linux")
+        cfg!(all(target_os = "linux", feature = "firecracker"))
     );
     assert!(SandboxBackendRegistration::local_process().is_local());
     assert!(!SandboxBackendRegistration::daytona(crate::DaytonaBackendSpec::default()).is_local());
@@ -162,15 +163,33 @@ async fn local_process_sandbox_contract_start_process_long_running_protocol() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "firecracker")]
 #[ignore = "uses a real Firecracker sandbox; run inside a Linux KVM host as root"]
 async fn firecracker_sandbox_contract_start_process_stdio_and_env() {
     let handle = firecracker_contract_handle("stdio-and-env").await;
-    crate::contract_tests::sandbox_handle_start_process_supports_interactive_stdio_and_env(handle)
+    crate::contract_tests::sandbox_handle_start_process_supports_interactive_stdio_and_env(
+        Arc::clone(&handle),
+    )
+    .await
+    .expect("Firecracker sandbox start_process contract");
+    let status = handle
+        .exec(&SandboxCommand {
+            argv: vec!["/bin/cat".to_string(), "/proc/self/status".to_string()],
+            env: HashMap::new(),
+            display_argv: None,
+            cwd: Some("/".to_string()),
+            timeout: Some(Duration::from_secs(10)),
+        })
         .await
-        .expect("Firecracker sandbox start_process contract");
+        .expect("read Firecracker workload process status");
+    assert!(status.ok, "{}{}", status.stdout, status.stderr);
+    assert!(status.stdout.contains("Uid:\t10001\t10001\t10001\t10001"));
+    assert!(status.stdout.contains("Gid:\t10001\t10001\t10001\t10001"));
+    assert!(status.stdout.contains("NoNewPrivs:\t1"));
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "firecracker")]
 #[ignore = "uses a real Firecracker sandbox; run inside a Linux KVM host as root"]
 async fn firecracker_sandbox_contract_start_process_long_running_protocol() {
     let handle = firecracker_contract_handle("long-running-protocol").await;
@@ -182,6 +201,7 @@ async fn firecracker_sandbox_contract_start_process_long_running_protocol() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "firecracker")]
 #[ignore = "uses a real Firecracker sandbox; run inside a Linux KVM host as root"]
 async fn firecracker_sandbox_contract_durable_file_system_survives_stop_and_reacquire() {
     crate::contract_tests::sandbox_backend_durable_file_system_survives_stop_and_reacquire(
@@ -193,6 +213,7 @@ async fn firecracker_sandbox_contract_durable_file_system_survives_stop_and_reac
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "firecracker")]
 #[ignore = "uses a real Firecracker sandbox; run inside a Linux KVM host as root"]
 async fn firecracker_sandbox_contract_workdir_survives_stop_and_reacquire() {
     crate::contract_tests::sandbox_backend_workdir_survives_stop_and_reacquire(
@@ -204,6 +225,7 @@ async fn firecracker_sandbox_contract_workdir_survives_stop_and_reacquire() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "firecracker")]
 #[ignore = "uses a real Firecracker sandbox; run inside a Linux KVM host as root"]
 async fn firecracker_sandbox_contract_long_running_process_and_workdir_survive_stop_and_reacquire()
 {
@@ -380,7 +402,14 @@ async fn local_process_contract_handle(
         .expect("acquire sandbox")
 }
 
+#[cfg(feature = "firecracker")]
 fn firecracker_contract_backend() -> Arc<dyn ManagedSandboxBackend> {
+    drop(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .try_init(),
+    );
     Arc::new(
         crate::FirecrackerSandboxBackend::new(
             crate::FirecrackerConfig::from_env().expect("Firecracker config from environment"),
@@ -389,6 +418,7 @@ fn firecracker_contract_backend() -> Arc<dyn ManagedSandboxBackend> {
     )
 }
 
+#[cfg(feature = "firecracker")]
 async fn firecracker_contract_handle(contract: &str) -> Arc<dyn ManagedSandboxHandle> {
     firecracker_contract_backend()
         .acquire(provider_contract_request(
@@ -401,6 +431,7 @@ async fn firecracker_contract_handle(contract: &str) -> Arc<dyn ManagedSandboxHa
         .expect("acquire Firecracker sandbox")
 }
 
+#[cfg(feature = "firecracker")]
 fn firecracker_durable_contract_request(contract: &str) -> SandboxRequest {
     let mount_path = durable_contract_mount_path();
     durable_provider_contract_request(

@@ -8,6 +8,7 @@ rust-version.workspace = true
 [features]
 default = []
 aws-agentcore = ["exoharness/aws-agentcore"]
+firecracker = ["exoharness/firecracker"]
 
 [dependencies]
 anyhow.workspace = true

@@ -2,12 +2,13 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 --image <oci-image> --output <rootfs.ext4> [--size-gib <size>]" >&2
+  echo "Usage: $0 --image <oci-image> --output <rootfs.ext4> [--guest-runtime <path>] [--size-gib <size>]" >&2
 }
 
 IMAGE=""
 OUTPUT=""
 SIZE_GIB=8
+GUEST_RUNTIME="/var/lib/exo/firecracker/exo-firecracker-guest"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -21,6 +22,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --size-gib)
       SIZE_GIB="$2"
+      shift 2
+      ;;
+    --guest-runtime)
+      GUEST_RUNTIME="$2"
       shift 2
       ;;
     -h | --help)
@@ -40,6 +45,11 @@ if [[ -z "$IMAGE" || -z "$OUTPUT" ]]; then
   exit 2
 fi
 
+if [[ ! -x "$GUEST_RUNTIME" ]]; then
+  echo "Static Firecracker guest runtime is not executable: $GUEST_RUNTIME" >&2
+  exit 1
+fi
+
 if [[ "$EUID" -ne 0 ]]; then
   echo "Root is required so the image records guest UID 10001 ownership" >&2
   exit 1
@@ -52,7 +62,6 @@ for command in basename chmod chown dirname docker install ln mkdir mkfs.ext4 mk
   fi
 done
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 mkdir -p "$(dirname "$OUTPUT")"
 OUTPUT="$(cd "$(dirname "$OUTPUT")" && pwd -P)/$(basename "$OUTPUT")"
 if [[ -e "$OUTPUT" || -L "$OUTPUT" ]]; then
@@ -152,19 +161,10 @@ resolve_inside_rootfs() {
   esac
 }
 
-for required in bin/sh usr/bin/cat usr/bin/chown usr/bin/mkdir usr/bin/mount usr/bin/mountpoint usr/bin/python3 usr/bin/rm usr/bin/setpriv usr/bin/sync usr/sbin/ip; do
-  resolved="$(resolve_inside_rootfs "$WORK_DIR/rootfs/$required")"
-  if [[ ! -x "$resolved" ]]; then
-    echo "OCI image must contain /$required" >&2
-    exit 1
-  fi
-done
-
 runtime_dir="$(resolve_inside_rootfs "$WORK_DIR/rootfs/runtime")"
 workspace_dir="$(resolve_inside_rootfs "$WORK_DIR/rootfs/home/exo/workspace")"
 mkdir -p "$runtime_dir" "$workspace_dir"
-install -m 0755 "$SCRIPT_DIR/exo-firecracker-init" "$runtime_dir/exo-firecracker-init"
-install -m 0755 "$SCRIPT_DIR/exo-firecracker-agent.py" "$runtime_dir/exo-firecracker-agent.py"
+install -m 0755 "$GUEST_RUNTIME" "$runtime_dir/exo-firecracker-guest"
 chown -R 10001:10001 "$(resolve_inside_rootfs "$WORK_DIR/rootfs/home/exo")"
 
 OUTPUT_TEMP="$(mktemp "${OUTPUT}.tmp.XXXXXX")"
