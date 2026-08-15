@@ -146,4 +146,16 @@ describe("Feishu send idempotency key", () => {
   it("stays inside Feishu's 50-character limit", () => {
     expect(feishuSendUuid("x".repeat(80))).toHaveLength(50);
   });
+
+  it("maps ids past the limit to a deterministic key", () => {
+    const longId = `019f6453-6208-7a41-9c2e-4f1d3b8a5c07-${"x".repeat(30)}`;
+    const key = feishuSendUuid(longId);
+    expect(key).toHaveLength(50);
+    expect(feishuSendUuid(longId)).toBe(key);
+  });
+
+  it("does not collapse long ids that share a 50-character prefix", () => {
+    const prefix = "d".repeat(60);
+    expect(feishuSendUuid(`${prefix}a`)).not.toBe(feishuSendUuid(`${prefix}b`));
+  });
 });

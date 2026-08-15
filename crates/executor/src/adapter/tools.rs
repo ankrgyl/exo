@@ -191,8 +191,10 @@ struct FeishuAdapterCreationConfig {
     _adapter_type: FeishuAdapterType,
     app_id: String,
     app_secret_secret_id: String,
-    #[serde(default)]
-    domain: Option<FeishuDomain>,
+    // Required, matching the model-facing schema: defaulting an international
+    // Lark tenant to the feishu domain would silently target the wrong API
+    // endpoint.
+    domain: FeishuDomain,
     trigger: FeishuTrigger,
     #[serde(default)]
     default_target: Option<String>,
@@ -520,7 +522,7 @@ impl AdapterCreationConfig {
                     initialization: serde_json::json!({
                         "appId": config.app_id,
                         "appSecretEnv": "EXO_FEISHU_APP_SECRET",
-                        "domain": config.domain.map(|domain| domain.as_str()).unwrap_or("feishu"),
+                        "domain": config.domain.as_str(),
                         "trigger": config.trigger.as_str(),
                         "defaultTarget": config.default_target,
                     }),

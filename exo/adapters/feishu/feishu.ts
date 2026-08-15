@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { isRecord } from "../protocol";
 
 export type FeishuTriggerPolicy = "mentions_only" | "all_messages";
@@ -68,11 +70,25 @@ export function receiveIdTypeForTarget(target: string): "open_id" | "chat_id" {
 // Feishu's idempotency key for message sends. Requests sharing a uuid deliver
 // at most one message per hour, which is what makes a redelivery safe. The
 // runtime's outbound message id is stable across delivery attempts, so it is
-// the right value; Feishu caps the field at 50 characters.
+// the right value; Feishu caps the field at 50 characters. Today's delivery
+// ids are 36-char UUIDs and pass through unchanged. An id that ever exceeds
+// the cap maps deterministically to prefix + SHA-256: two long ids sharing a
+// prefix never collide into one dropped send, and a redelivery of the same
+// id keeps reusing the same key.
 const FEISHU_SEND_UUID_MAX_CHARS = 50;
+const FEISHU_SEND_UUID_DIGEST_CHARS = 32;
 
 export function feishuSendUuid(deliveryId: string): string {
-  return deliveryId.slice(0, FEISHU_SEND_UUID_MAX_CHARS);
+  if (deliveryId.length <= FEISHU_SEND_UUID_MAX_CHARS) {
+    return deliveryId;
+  }
+  const digest = createHash("sha256")
+    .update(deliveryId)
+    .digest("hex")
+    .slice(0, FEISHU_SEND_UUID_DIGEST_CHARS);
+  const prefixChars =
+    FEISHU_SEND_UUID_MAX_CHARS - FEISHU_SEND_UUID_DIGEST_CHARS - 1;
+  return `${deliveryId.slice(0, prefixChars)}-${digest}`;
 }
 
 function extractText(message: Record<string, unknown>): string | null {
