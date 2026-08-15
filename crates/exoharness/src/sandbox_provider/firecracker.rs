@@ -1020,11 +1020,15 @@ impl Shared {
         }
         let record = self.load_machine_record(machine_id).await?;
         self.stop_machine_process(machine_id).await?;
-        if let Some(record) = record.as_ref() {
-            let config = self.config.clone();
-            let record = record.clone();
+        if delete_rootfs && let Some(record) = record.as_ref() {
+            let cow = snapshot_cow_path(&self.config, &record.machine_id);
             tokio::task::spawn_blocking(move || {
-                cleanup_snapshot_overlay(&config, &record, delete_rootfs)
+                if cow.try_exists()? {
+                    fs::remove_file(&cow).with_context(|| {
+                        format!("removing Firecracker snapshot overlay {}", cow.display())
+                    })?;
+                }
+                Ok::<(), anyhow::Error>(())
             })
             .await
             .context("joining Firecracker snapshot overlay cleanup")??;
@@ -2486,12 +2490,8 @@ fn prepare_api_run_dir(root: &Path, uid: u32) -> Result<()> {
         .context("setting Firecracker API run directory permissions")
 }
 
-fn firecracker_api_socket(root: &Path) -> PathBuf {
-    root.join("run").join(FIRECRACKER_API_SOCKET)
-}
-
 fn wait_for_firecracker_api(root: &Path, machine_id: &str) -> Result<PathBuf> {
-    let socket = firecracker_api_socket(root);
+    let socket = root.join("run").join(FIRECRACKER_API_SOCKET);
     let pid_path = root.join("firecracker.pid");
     let started = Instant::now();
     let mut observed_process = false;
@@ -2510,21 +2510,8 @@ fn wait_for_firecracker_api(root: &Path, machine_id: &str) -> Result<PathBuf> {
     bail!("Firecracker {machine_id} API did not become ready: {stderr}")
 }
 
-fn firecracker_api_put<T: Serialize>(socket: &Path, path: &str, body: &T) -> Result<()> {
-    firecracker_api_request(socket, "PUT", path, body, FIRECRACKER_API_TIMEOUT)
-}
-
 fn firecracker_api_patch<T: Serialize>(socket: &Path, path: &str, body: &T) -> Result<()> {
     firecracker_api_request(socket, "PATCH", path, body, FIRECRACKER_API_TIMEOUT)
-}
-
-fn firecracker_api_put_with_timeout<T: Serialize>(
-    socket: &Path,
-    path: &str,
-    body: &T,
-    timeout: Duration,
-) -> Result<()> {
-    firecracker_api_request(socket, "PUT", path, body, timeout)
 }
 
 fn firecracker_api_request<T: Serialize>(
@@ -2687,8 +2674,9 @@ fn create_fork_snapshot(
         // map the immutable memory file privately and get independent COW disks.
         // https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md#full-and-diff-snapshots
         // https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md#memory-backend
-        firecracker_api_put_with_timeout(
+        firecracker_api_request(
             &api,
+            "PUT",
             "/snapshot/create",
             &FirecrackerSnapshotCreate {
                 snapshot_type: "Full",
@@ -2793,22 +2781,6 @@ fn prepare_snapshot_overlay(
     Ok(created)
 }
 
-fn cleanup_snapshot_overlay(
-    config: &FirecrackerConfig,
-    record: &MachineRecord,
-    delete: bool,
-) -> Result<()> {
-    if delete {
-        let cow = snapshot_cow_path(config, &record.machine_id);
-        if cow.try_exists()? {
-            fs::remove_file(&cow).with_context(|| {
-                format!("removing Firecracker snapshot overlay {}", cow.display())
-            })?;
-        }
-    }
-    Ok(())
-}
-
 fn launch_snapshot_clone(
     config: &FirecrackerConfig,
     request: &SandboxRequest,
@@ -2842,8 +2814,9 @@ fn launch_snapshot_clone(
     // kernels reseed their CSPRNG before cloned workloads consume randomness.
     // No user process or secret is admitted before this restore completes.
     // https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/random-for-clones.md#linux-kernels-with-vmgenid-support
-    firecracker_api_put(
+    firecracker_api_request(
         &api,
+        "PUT",
         "/snapshot/load",
         &FirecrackerSnapshotLoad {
             snapshot_path: "/snapshot/state",
@@ -2854,6 +2827,7 @@ fn launch_snapshot_clone(
             track_dirty_pages: false,
             resume_vm: true,
         },
+        FIRECRACKER_API_TIMEOUT,
     )?;
     record_launch_timing(&record.machine_id, "snapshot_load", load_started.elapsed());
     Ok(GuestReadiness::Probe)
@@ -3051,7 +3025,9 @@ impl GuestClient {
                     argv: &command.argv,
                     env: &command.env,
                     cwd: &cwd,
-                    timeout_ms: command.timeout.map(duration_to_millis),
+                    timeout_ms: command
+                        .timeout
+                        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
                 },
                 request_timeout,
             )
@@ -3381,10 +3357,6 @@ impl Drop for ProcessWait {
     fn drop(&mut self) {
         self.cleanup.take();
     }
-}
-
-fn duration_to_millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn record_launch_timing(machine_id: &str, step: &str, duration: Duration) {

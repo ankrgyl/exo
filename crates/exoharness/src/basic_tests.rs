@@ -190,6 +190,43 @@ async fn firecracker_sandbox_contract_start_process_stdio_and_env() {
     )
     .await
     .expect("Firecracker sandbox start_process contract");
+    assert!(handle.supports_tcp());
+    let mut server = handle
+        .start_process(&SandboxCommand {
+            argv: vec![
+                "/usr/bin/python3".to_string(),
+                "-u".to_string(),
+                "-c".to_string(),
+                "import socket; server = socket.create_server(('0.0.0.0', 18080)); print('ready', flush=True); client, _ = server.accept(); client.sendall(client.recv(4))".to_string(),
+            ],
+            env: HashMap::new(),
+            display_argv: None,
+            cwd: Some("/".to_string()),
+            timeout: Some(Duration::from_secs(10)),
+        })
+        .await
+        .expect("start Firecracker TCP echo server");
+    let mut ready = [0; 6];
+    server
+        .stdout
+        .read_exact(&mut ready)
+        .await
+        .expect("wait for Firecracker TCP echo server");
+    assert_eq!(&ready, b"ready\n");
+    let mut stream = handle
+        .connect_tcp(18080)
+        .await
+        .expect("connect to Firecracker TCP echo server")
+        .expect("Firecracker TCP support disappeared");
+    tokio::io::AsyncWriteExt::write_all(&mut stream, b"ping")
+        .await
+        .expect("write Firecracker TCP payload");
+    let mut echoed = [0; 4];
+    tokio::io::AsyncReadExt::read_exact(&mut stream, &mut echoed)
+        .await
+        .expect("read Firecracker TCP payload");
+    assert_eq!(&echoed, b"ping");
+    assert_eq!(server.wait.await.expect("wait for TCP echo server"), 0);
     let status = handle
         .exec(&SandboxCommand {
             argv: vec!["/bin/cat".to_string(), "/proc/self/status".to_string()],

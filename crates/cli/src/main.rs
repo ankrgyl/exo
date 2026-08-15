@@ -261,13 +261,13 @@ enum SandboxBackendArg {
     LocalProcess,
 }
 
-impl SandboxBackendArg {
-    fn registration(self) -> SandboxBackendRegistration {
-        match self {
-            SandboxBackendArg::AppleContainer => SandboxBackendRegistration::apple_container(),
-            SandboxBackendArg::Docker => SandboxBackendRegistration::docker(),
-            SandboxBackendArg::Firecracker => SandboxBackendRegistration::firecracker(),
-            SandboxBackendArg::LocalProcess => SandboxBackendRegistration::local_process(),
+impl From<SandboxBackendArg> for SandboxBackendRegistration {
+    fn from(value: SandboxBackendArg) -> Self {
+        match value {
+            SandboxBackendArg::AppleContainer => Self::apple_container(),
+            SandboxBackendArg::Docker => Self::docker(),
+            SandboxBackendArg::Firecracker => Self::firecracker(),
+            SandboxBackendArg::LocalProcess => Self::local_process(),
         }
     }
 }
@@ -281,7 +281,7 @@ fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
     };
     let sandbox_backend = cli
         .sandbox_backend
-        .map(SandboxBackendArg::registration)
+        .map(SandboxBackendRegistration::from)
         .unwrap_or_else(default_sandbox_backend);
     let sandbox_default = sandbox_backend.provider();
     let mut sandbox_backends = default_sandbox_backends();
