@@ -76,6 +76,11 @@ const SNAPSHOT_CACHE_VERSION: u32 = 1;
 // https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md#8250-serial-device
 const VMM_LOG_MAX_BYTES: u64 = 1024 * 1024;
 const FIRECRACKER_API_SOCKET: &str = "firecracker.socket";
+// The API socket peer is the jailed VMM, which counts as untrusted once a
+// guest compromises it. Bounding what root reads back keeps a hostile VMM
+// from ballooning this process's memory with endless status lines, headers,
+// or an absurd Content-Length.
+const FIRECRACKER_API_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 const FIRECRACKER_API_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRECRACKER_SNAPSHOT_CREATE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 // Firecracker forwards guest packets without filtering them. Keep special-use,
@@ -2657,7 +2662,9 @@ fn firecracker_api_request<T: Serialize>(
     )?;
     stream.write_all(&body)?;
     stream.flush()?;
-    let mut reader = StdBufReader::new(stream);
+    // Read::take bounds every byte read from the VMM, status line and headers
+    // included; see FIRECRACKER_API_MAX_RESPONSE_BYTES.
+    let mut reader = StdBufReader::new(stream.take(FIRECRACKER_API_MAX_RESPONSE_BYTES));
     let mut status_line = String::new();
     if reader.read_line(&mut status_line)? == 0 {
         bail!("Firecracker API returned an empty response");
@@ -2685,6 +2692,11 @@ fn firecracker_api_request<T: Serialize>(
                 .parse()
                 .context("Firecracker API returned an invalid Content-Length")?;
         }
+    }
+    // Cap before allocating: the length is a VMM-supplied number and must not
+    // size an allocation on its own.
+    if content_length > FIRECRACKER_API_MAX_RESPONSE_BYTES as usize {
+        bail!("Firecracker API response is too large: {content_length} bytes");
     }
     let mut response_body = vec![0_u8; content_length];
     reader.read_exact(&mut response_body)?;
@@ -3346,7 +3358,12 @@ async fn vsock_request(path: &Path, payload: &[u8]) -> Result<Vec<u8>> {
         .await?;
     stream.get_mut().flush().await?;
     let mut acknowledgement = Vec::new();
-    stream.read_until(b'\n', &mut acknowledgement).await?;
+    // Bound the read itself, not just the post-read length check: the peer is
+    // the VMM, and an endless ack line without a newline would otherwise grow
+    // this buffer without limit. A truncated 129-byte read fails the checks.
+    let mut limited = stream.take(129);
+    limited.read_until(b'\n', &mut acknowledgement).await?;
+    let stream = limited.into_inner();
     if acknowledgement.len() > 128
         || !acknowledgement.starts_with(b"OK ")
         || !acknowledgement.ends_with(b"\n")

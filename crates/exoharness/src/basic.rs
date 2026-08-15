@@ -2156,6 +2156,21 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .await
     }
 
+    // The sandbox is acquired before the write lock is taken, while agent and
+    // conversation deletion remove the owner's whole storage prefix under
+    // that lock. Persisting without rechecking would resurrect the deleted
+    // prefix and leave a live VM whose record no listing or reaper would ever
+    // see again.
+    async fn owner_exists_locked(&self) -> Result<bool> {
+        Ok(!self
+            .harness
+            .inner
+            .storage
+            .list_keys(&self.owner_dir)
+            .await?
+            .is_empty())
+    }
+
     async fn persist_created_sandbox_locked(
         &self,
         sandbox: StoredSandbox,
@@ -2163,6 +2178,14 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         provider_state_event: Option<EventData>,
     ) -> Result<SandboxId> {
         let sandbox_id = sandbox.id.clone();
+        if !self.owner_exists_locked().await? {
+            // This VM was created for the deleted owner, so it must not
+            // outlive the failed persist.
+            if let Err(error) = sandbox_handle.stop().await {
+                tracing::warn!(%error, sandbox_id, "failed stopping sandbox whose owner was deleted");
+            }
+            bail!("sandbox owner was deleted while the sandbox was starting");
+        }
         self.harness
             .inner
             .storage
@@ -2208,6 +2231,11 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         provider_state_event: Option<EventData>,
     ) -> Result<SandboxId> {
         let sandbox_id = sandbox.id.clone();
+        if !self.owner_exists_locked().await? {
+            // An attached sandbox belongs to its external owner and keeps
+            // running; only this attachment record is abandoned.
+            bail!("sandbox owner was deleted while the sandbox was attaching");
+        }
         let attachment = sandbox
             .attachment
             .clone()

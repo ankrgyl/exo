@@ -159,6 +159,15 @@ pub(super) async fn resolve_image(
     // digest; tags remain only a user-facing input and never identify cache
     // entries.
     // https://github.com/opencontainers/distribution-spec/blob/main/spec.md#pulling-manifests
+    //
+    // KNOWN LIMITATION: oci-client buffers the manifest and config responses
+    // in memory with no size cap (`res.bytes().await` internally), so the
+    // registry HOST is trusted for this process's availability. Image
+    // references come from operator configuration, never from agents, which
+    // is why this is documented rather than worked around; a proper fix is a
+    // response size limit in oci-client or a hand-rolled bounded fetch. Layer
+    // blobs are NOT affected: pull_blob streams them to disk through
+    // LimitedAsyncWriter under declared-size and cumulative budgets.
     let (manifest, manifest_digest, config_json, list_digest) = client
         .pull_manifest_and_config_and_list_digest(&reference, &auth)
         .await
@@ -229,13 +238,8 @@ pub(super) async fn resolve_image(
                 descriptor.digest
             );
         }
-        let (path, cache_hit) = pull_blob(
-            &client,
-            &reference,
-            descriptor,
-            &cache_root.join("blobs/sha256"),
-        )
-        .await?;
+        // Enforce the cumulative budget before downloading, so an over-budget
+        // manifest is rejected without its blobs ever landing in the cache.
         pull_stats.bytes = pull_stats
             .bytes
             .checked_add(declared)
@@ -248,6 +252,13 @@ pub(super) async fn resolve_image(
                 image_bytes.saturating_mul(4)
             );
         }
+        let (path, cache_hit) = pull_blob(
+            &client,
+            &reference,
+            descriptor,
+            &cache_root.join("blobs/sha256"),
+        )
+        .await?;
         if cache_hit {
             pull_stats.cache_hits += 1;
         } else {
@@ -834,8 +845,20 @@ fn apply_layer(rootfs: &Path, layer: &CachedLayer, decompressed_budget: u64) -> 
     // only the guest's nosuid mounts keep inert.
     archive.set_unpack_xattrs(false);
     archive.set_overwrite(true);
+    // The byte budget alone does not bound inodes: tar headers are 512 bytes,
+    // so a budget-sized stream of empty files could still exhaust the host
+    // filesystem's inode table. Real images stay far below this cap.
+    let entry_budget = (decompressed_budget / 8192).max(65_536);
+    let mut entries_extracted = 0_u64;
     for entry in archive.entries()? {
         let mut entry = entry?;
+        entries_extracted += 1;
+        if entries_extracted > entry_budget {
+            bail!(
+                "OCI layer {} contains more than {entry_budget} entries",
+                layer.path.display()
+            );
+        }
         let path = entry.path()?.into_owned();
         validate_archive_path(&path)?;
         if whiteout_path(&path)?.is_some() {
@@ -988,6 +1011,14 @@ fn directory_tree_bytes(path: &Path) -> Result<u64> {
     while let Some(directory) = pending.pop() {
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
+            // DirEntry::metadata has lstat semantics — unlike fs::metadata it
+            // never follows symlinks — so an image that plants a link to /
+            // cannot pull this walk outside the staging tree, loop it, or
+            // inflate the reported size. This is easy to misread (and has
+            // been flagged in review as if it followed links); the property
+            // is pinned by the directory_tree_bytes_never_follows_symlinks
+            // test, so don't "fix" this to fs::symlink_metadata or fs::metadata.
+            // https://doc.rust-lang.org/std/fs/struct.DirEntry.html#method.metadata
             let metadata = entry.metadata()?;
             if metadata.is_dir() {
                 pending.push(entry.path());
@@ -1494,6 +1525,23 @@ mod tests {
         fs::hard_link(directory.path().join("a"), nested.join("a-link")).unwrap();
 
         assert_eq!(directory_tree_bytes(directory.path()).unwrap(), 150);
+    }
+
+    #[test]
+    fn directory_tree_bytes_never_follows_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = directory.path().join("outside");
+        let rootfs = directory.path().join("rootfs");
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(&rootfs).unwrap();
+        fs::write(outside.join("huge"), vec![0_u8; 4096]).unwrap();
+        fs::write(rootfs.join("counted"), vec![0_u8; 100]).unwrap();
+        std::os::unix::fs::symlink(&outside, rootfs.join("dir-escape")).unwrap();
+        std::os::unix::fs::symlink(outside.join("huge"), rootfs.join("file-escape")).unwrap();
+        // A self-referential link must not loop the walk either.
+        std::os::unix::fs::symlink(&rootfs, rootfs.join("self")).unwrap();
+
+        assert_eq!(directory_tree_bytes(&rootfs).unwrap(), 100);
     }
 
     #[test]

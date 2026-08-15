@@ -162,6 +162,12 @@ Be aware of what this backend does _not_ do, and what stays on the operator:
   between sandboxes comes from KVM, not from anything inside the guest.
 - **Tag references are trust-on-first-use.** Only digest-pinned references
   anchor the full download chain to something you chose.
+- **The registry host is trusted for availability.** Manifest and config
+  responses are buffered in memory without a size cap (a limitation of the
+  underlying OCI client library), so a hostile registry _server_ could exhaust
+  the host process's memory. Layer blobs are not affected — they stream to
+  disk under strict size budgets. Image references come from operator
+  configuration, not from agents, so point Exo only at registries you trust.
 
 The implementation follows Firecracker's upstream guidance for
 [jailer operation](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md),
