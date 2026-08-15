@@ -38,7 +38,7 @@ use crate::{
     CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, ConversationRecord,
     CreateSandboxRequest, DurableFileSystem, Event, EventData, EventId, EventKind, EventQuery,
     EventQueryDirection, EventStream, ExoHarness, FileSystemMount, ForkConversationRequest,
-    GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
+    ForkSandboxRequest, GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
     ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
     ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId,
     SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessId,
@@ -1126,6 +1126,10 @@ where
         self.sandbox_handle().create_sandbox(request).await
     }
 
+    async fn fork_sandbox(&self, request: ForkSandboxRequest) -> Result<SandboxId> {
+        self.sandbox_handle().fork_sandbox(request).await
+    }
+
     async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {
         self.sandbox_handle().terminate_sandbox(id).await
     }
@@ -1703,49 +1707,83 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         self.create_new_sandbox_locked(prepared).await
     }
 
+    async fn fork_sandbox(&self, request: ForkSandboxRequest) -> Result<SandboxId> {
+        self.ensure_full_sandbox_scope("fork_sandbox")?;
+        let source = self.load_sandbox(&request.source_id).await?;
+        if source.attachment.is_some() {
+            bail!("attached sandboxes cannot be forked");
+        }
+        if !source.running {
+            bail!("source sandbox is not running: {}", request.source_id);
+        }
+        let prepared = prepare_sandbox_request(self.harness, request.sandbox).await?;
+        if prepared.provider != source.provider {
+            bail!(
+                "source provider {} does not match target provider {}",
+                source.provider,
+                prepared.provider
+            );
+        }
+        let sandbox_id = format!("sandbox-{}", Uuid7::now());
+        let sandbox = prepared.stored_sandbox(sandbox_id.clone());
+        let backend = self
+            .harness
+            .inner
+            .sandbox_backend_for_provider(sandbox.provider.clone())
+            .await?;
+        let source_request = sandbox_request(self.owner, &request.source_id, &source, None);
+        let target_request = sandbox_request(self.owner, &sandbox_id, &sandbox, None);
+        let sandbox_handle = match backend
+            .fork_sandbox(source_request, target_request.clone())
+            .await?
+        {
+            Some(handle) => handle,
+            None => backend.acquire(target_request).await?,
+        };
+        let provider_state_event = sandbox_provider_state_event(
+            &sandbox_id,
+            sandbox.provider.clone(),
+            sandbox_provider_state_key(self.owner, &sandbox_id, &sandbox),
+            None,
+            &sandbox_handle,
+        )?;
+        let _guard = self.harness.inner.write_lock.lock().await;
+        self.persist_created_sandbox_locked(sandbox, sandbox_handle, provider_state_event)
+            .await
+    }
+
     async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {
         self.ensure_full_sandbox_scope("terminate_sandbox")?;
-        let _guard = self.harness.inner.write_lock.lock().await;
-        let sandbox = self.load_sandbox(&id).await?;
+        let mut sandbox = self.load_sandbox(&id).await?;
         if sandbox.attachment.is_some() {
             bail!("attached sandboxes cannot be terminated");
         }
-        if sandbox.running {
-            let backend = self
-                .harness
-                .inner
-                .sandbox_backend_for_provider(sandbox.provider.clone())
-                .await?;
-            let state_key = sandbox_provider_state_key(self.owner, &id, &sandbox);
-            let provider_state = load_sandbox_provider_state(
-                self.harness,
-                &self.owner_dir,
-                self.owner,
-                &id,
-                sandbox.provider.clone(),
-                &state_key,
-            )
+        let backend = self
+            .harness
+            .inner
+            .sandbox_backend_for_provider(sandbox.provider.clone())
             .await?;
-            backend
-                .terminate(sandbox_request(self.owner, &id, &sandbox, provider_state))
-                .await?;
-            self.harness
-                .inner
-                .running_sandboxes
-                .lock()
-                .await
-                .remove(&id);
+        backend
+            .terminate(sandbox_request(self.owner, &id, &sandbox, None))
+            .await?;
+        self.harness
+            .inner
+            .running_sandboxes
+            .lock()
+            .await
+            .remove(&id);
+        if !sandbox.running {
+            return Ok(());
         }
+        let _guard = self.harness.inner.write_lock.lock().await;
+        sandbox.running = false;
         self.harness
             .inner
             .storage
-            .delete_key_if_exists(self.sandboxes_dir().join(format!("{id}.json")))
+            .put_json(self.sandboxes_dir().join(format!("{id}.json")), &sandbox)
             .await?;
-        if sandbox.running {
-            self.append_events_locked(vec![EventData::SandboxStopped { sandbox_id: id }])
-                .await?;
-        }
-        Ok(())
+        self.append_events_locked(vec![EventData::SandboxStopped { sandbox_id: id }])
+            .await
     }
 
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {

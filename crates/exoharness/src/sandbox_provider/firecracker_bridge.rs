@@ -47,6 +47,15 @@ pub enum FirecrackerBridgeRequest {
         config: FirecrackerConfig,
         request: SandboxRequest,
     },
+    Fork {
+        config: FirecrackerConfig,
+        source: SandboxRequest,
+        target: SandboxRequest,
+    },
+    Terminate {
+        config: FirecrackerConfig,
+        request: SandboxRequest,
+    },
 }
 
 impl FirecrackerBridgeRequest {
@@ -67,6 +76,12 @@ pub enum FirecrackerBridgeResponse {
         output: SandboxCommandOutput,
     },
     Stopped,
+    Forked {
+        id: String,
+        provider_state: Option<Value>,
+        effective_image: Option<String>,
+    },
+    Terminated,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -283,6 +298,27 @@ async fn handle_request(
         FirecrackerBridgeRequest::Stop { config, request } => {
             backends.acquire(config, request).await?.stop().await?;
             Ok(FirecrackerBridgeResponse::Stopped)
+        }
+        FirecrackerBridgeRequest::Fork {
+            config,
+            source,
+            target,
+        } => {
+            let handle = backends
+                .backend(config)
+                .await?
+                .fork_sandbox(source, target)
+                .await?
+                .context("Firecracker backend did not fork the sandbox")?;
+            Ok(FirecrackerBridgeResponse::Forked {
+                id: handle.id().to_string(),
+                provider_state: handle.provider_state(),
+                effective_image: handle.effective_image(),
+            })
+        }
+        FirecrackerBridgeRequest::Terminate { config, request } => {
+            backends.backend(config).await?.terminate(request).await?;
+            Ok(FirecrackerBridgeResponse::Terminated)
         }
         FirecrackerBridgeRequest::StartProcess { .. }
         | FirecrackerBridgeRequest::ConnectTcp { .. } => {

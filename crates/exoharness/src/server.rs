@@ -9,10 +9,10 @@ use crate::protocol::{
 use crate::{
     AgentHandle, AgentId, AttachSandboxRequest, CancelSandboxProcessRequest,
     CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, CreateSandboxRequest,
-    ExoHarness, GetSandboxProcessEventsResult, ListConversationsResult, Result, SandboxAttachment,
-    SandboxId, SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, SandboxRecord,
-    SessionId, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId,
-    TurnRecord, WaitSandboxProcessRequest, WriteSandboxProcessInputRequest,
+    ExoHarness, ForkSandboxRequest, GetSandboxProcessEventsResult, ListConversationsResult, Result,
+    SandboxAttachment, SandboxId, SandboxProcessEventQuery, SandboxProcessRecord,
+    SandboxProcessStatus, SessionId, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest,
+    TurnHandle, TurnId, TurnRecord, WaitSandboxProcessRequest, WriteSandboxProcessInputRequest,
 };
 
 pub struct ExoHarnessServer {
@@ -142,6 +142,9 @@ impl ExoHarnessServer {
             }),
             Request::CreateSandbox { scope, request } => Ok(Response::SandboxId {
                 sandbox_id: self.create_sandbox(scope, request).await?,
+            }),
+            Request::ForkSandbox { scope, request } => Ok(Response::SandboxId {
+                sandbox_id: self.fork_sandbox(scope, request).await?,
             }),
             Request::TerminateSandbox { scope, sandbox_id } => {
                 self.terminate_sandbox(scope, sandbox_id).await?;
@@ -501,10 +504,17 @@ impl ExoHarnessServer {
         }
     }
 
-    async fn list_sandboxes(&self, scope: SandboxScope) -> Result<Vec<SandboxRecord>> {
+    async fn fork_sandbox(
+        &self,
+        scope: SandboxScope,
+        request: ForkSandboxRequest,
+    ) -> Result<SandboxId> {
         match scope {
             SandboxScope::Agent { agent_id } => {
-                self.require_agent(&agent_id).await?.list_sandboxes().await
+                self.require_agent(&agent_id)
+                    .await?
+                    .fork_sandbox(request)
+                    .await
             }
             SandboxScope::Conversation {
                 agent_id,
@@ -512,11 +522,11 @@ impl ExoHarnessServer {
             } => {
                 self.require_conversation(agent_id, conversation_id)
                     .await?
-                    .list_sandboxes()
+                    .fork_sandbox(request)
                     .await
             }
             SandboxScope::Turn { .. } => {
-                Err(anyhow!("list_sandboxes is not supported on a turn scope"))
+                Err(anyhow!("fork_sandbox is not supported on a turn scope"))
             }
         }
     }

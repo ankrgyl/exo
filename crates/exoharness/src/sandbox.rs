@@ -213,6 +213,17 @@ pub trait ManagedSandboxBackend: Send + Sync {
     async fn terminate(&self, _request: SandboxRequest) -> Result<()> {
         bail!("sandbox backend does not support explicit termination")
     }
+
+    /// Copy `source` to `target`, leaving the source available as the fork base.
+    /// `None` means this backend does not support forking and the caller may
+    /// cold-start the target instead.
+    async fn fork_sandbox(
+        &self,
+        _source: SandboxRequest,
+        _target: SandboxRequest,
+    ) -> Result<Option<Arc<dyn ManagedSandboxHandle>>> {
+        Ok(None)
+    }
 }
 
 pub const DEFAULT_SANDBOX_IMAGE: &str = crate::sandbox_provider::DEFAULT_DOCKER_IMAGE;

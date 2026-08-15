@@ -61,6 +61,11 @@ enum Request {
     SyncFilesystem {
         path: String,
     },
+    ConfigureNetwork {
+        address: Ipv4Addr,
+        gateway: Ipv4Addr,
+        prefix: u8,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,6 +332,11 @@ impl AgentState {
             } => self.process_bridge(&process_id, request),
             Request::KillProcess { process_id } => self.kill_process(&process_id),
             Request::SyncFilesystem { path } => sync_filesystem(&path),
+            Request::ConfigureNetwork {
+                address,
+                gateway,
+                prefix,
+            } => configure_restored_network(address, gateway, prefix),
         }
     }
 
@@ -632,6 +642,19 @@ fn sync_filesystem(path: &str) -> Response {
         Response::ok()
     } else {
         Response::error(std::io::Error::last_os_error().to_string())
+    }
+}
+
+fn configure_restored_network(address: Ipv4Addr, gateway: Ipv4Addr, prefix: u8) -> Response {
+    if prefix > 32 {
+        return Response::error("guest prefix must be at most 32");
+    }
+    let result = set_interface_address("eth0", address, prefix)
+        .and_then(|()| set_interface_up("eth0"))
+        .and_then(|()| replace_default_route("eth0", gateway));
+    match result {
+        Ok(()) => Response::ok(),
+        Err(error) => Response::error(error),
     }
 }
 
@@ -955,6 +978,29 @@ fn add_default_route(name: &str, gateway: Ipv4Addr) -> Result<(), String> {
     } else {
         Err(std::io::Error::last_os_error().to_string())
     }
+}
+
+fn replace_default_route(name: &str, gateway: Ipv4Addr) -> Result<(), String> {
+    // A restored guest still has the source route in kernel memory. Delete it
+    // before adding the clone gateway so the old default cannot win route lookup.
+    // These ioctl values and rtentry fields are the Linux UAPI used at boot too.
+    // https://github.com/torvalds/linux/blob/master/include/uapi/linux/sockios.h
+    // https://github.com/torvalds/linux/blob/master/include/uapi/linux/route.h
+    let socket = ipv4_control_socket()?;
+    let device = c_string(name)?;
+    let mut route = unsafe { std::mem::zeroed::<libc::rtentry>() };
+    route.rt_dst = ipv4_sockaddr(Ipv4Addr::UNSPECIFIED);
+    route.rt_genmask = ipv4_sockaddr(Ipv4Addr::UNSPECIFIED);
+    route.rt_flags = libc::RTF_UP as libc::c_ushort;
+    route.rt_dev = device.as_ptr().cast_mut();
+    let result = unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCDELRT, &route) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) && error.raw_os_error() != Some(libc::ENOENT) {
+            return Err(error.to_string());
+        }
+    }
+    add_default_route(name, gateway)
 }
 
 fn ipv4_control_socket() -> Result<OwnedFd, String> {

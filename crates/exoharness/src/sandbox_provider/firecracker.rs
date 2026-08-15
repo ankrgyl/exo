@@ -171,6 +171,8 @@ struct MachineRecord {
     // manifest lets a later CLI process reap a VM without process-local state.
     idle_ttl_seconds: Option<u64>,
     snapshot_template: Option<String>,
+    #[serde(default)]
+    snapshot_network_slot: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -398,23 +400,11 @@ impl FirecrackerSandboxBackend {
         }
         Ok(())
     }
-}
 
-#[async_trait]
-impl ManagedSandboxBackend for FirecrackerSandboxBackend {
-    fn is_local(&self) -> bool {
-        true
-    }
-
-    async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        let mut request = prepare_request(request)?;
-        let image = resolve_image(
-            &self.shared.config.state_root,
-            &request.spec.image,
-            self.shared.config.image_size_gib,
-        )
-        .await?;
-        request.spec.image = image.to_string_lossy().into_owned();
+    async fn acquire_resolved(
+        &self,
+        request: SandboxRequest,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
         self.reap_expired_machines().await?;
         let spec_hash = sandbox_spec_hash(&request.spec);
@@ -487,6 +477,29 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
             one_shot: false,
         }))
     }
+}
+
+#[async_trait]
+impl ManagedSandboxBackend for FirecrackerSandboxBackend {
+    fn is_local(&self) -> bool {
+        true
+    }
+
+    async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        let mut request = prepare_request(request)?;
+        {
+            let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
+            self.reap_expired_machines().await?;
+        }
+        let image = resolve_image(
+            &self.shared.config.state_root,
+            &request.spec.image,
+            self.shared.config.image_size_gib,
+        )
+        .await?;
+        request.spec.image = image.to_string_lossy().into_owned();
+        self.acquire_resolved(request).await
+    }
 
     async fn attach(
         &self,
@@ -494,6 +507,125 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         _attachment: SandboxAttachment,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         bail!("Firecracker sandboxes do not support external attachments")
+    }
+
+    async fn terminate(&self, request: SandboxRequest) -> Result<()> {
+        let persisted_machine_id = request
+            .provider_state
+            .as_ref()
+            .map(parse_provider_state)
+            .transpose()?
+            .map(|state| state.machine_id);
+        if let Some(machine_id) = persisted_machine_id.as_deref() {
+            let machine_key_prefix = format!("fc-{}-", stable_fnv1a_hex(&request.key.to_string()));
+            if !valid_machine_id(machine_id) || !machine_id.starts_with(&machine_key_prefix) {
+                bail!("Firecracker provider state does not match the terminated sandbox key");
+            }
+        }
+        let machine_id = self
+            .shared
+            .warm_machines
+            .lock()
+            .await
+            .remove(&request.key)
+            .map(|entry| entry.machine_id)
+            .or(persisted_machine_id)
+            .unwrap_or_else(|| {
+                let spec_hash = sandbox_spec_hash(&request.spec);
+                machine_id(&request.key, &spec_hash)
+            });
+        self.shared.cleanup_machine(&machine_id, true).await
+    }
+
+    async fn fork_sandbox(
+        &self,
+        source: SandboxRequest,
+        mut target: SandboxRequest,
+    ) -> Result<Option<Arc<dyn ManagedSandboxHandle>>> {
+        if !self.shared.config.snapshot_enabled {
+            bail!("Firecracker forking requires snapshots to be enabled")
+        }
+        if source.spec != target.spec {
+            bail!("Firecracker fork source and target specifications must match")
+        }
+        if !source.spec.durable_file_systems.is_empty() {
+            bail!("Firecracker forking does not support durable filesystems")
+        }
+
+        let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
+        let source_entry = self
+            .shared
+            .warm_machines
+            .lock()
+            .await
+            .get(&source.key)
+            .cloned()
+            .context("Firecracker fork source is not active")?;
+        let source_record = self
+            .shared
+            .load_machine_record(&source_entry.machine_id)
+            .await?
+            .context("Firecracker fork source manifest is missing")?;
+        if !process_running(&self.shared.pid_path(&source_record.machine_id)) {
+            bail!("Firecracker fork source is not running")
+        }
+        if source_record.snapshot_template.is_none() {
+            bail!("Firecracker fork source was not launched in snapshot-capable mode")
+        }
+
+        GuestClient::new(
+            Arc::clone(&self.shared),
+            machine_from_record(&self.shared.config, source_record.clone()).vsock_path,
+        )
+        .sync_filesystem(&source.spec.default_workdir)
+        .await
+        .context("syncing Firecracker fork source filesystem")?;
+        let config = self.shared.config.clone();
+        let source_record_for_snapshot = source_record.clone();
+        let template_key = tokio::task::spawn_blocking(move || {
+            let template_key = fork_snapshot_template_key(&config, &source_record_for_snapshot)?;
+            ensure_fork_snapshot_template(&config, &source_record_for_snapshot, &template_key)?;
+            Ok::<String, anyhow::Error>(template_key)
+        })
+        .await
+        .context("joining Firecracker fork snapshot creation")??;
+
+        target = prepare_request(target)?;
+        let image = resolve_image(
+            &self.shared.config.state_root,
+            &target.spec.image,
+            self.shared.config.image_size_gib,
+        )
+        .await?;
+        target.spec.image = image.to_string_lossy().into_owned();
+        let target_spec_hash = sandbox_spec_hash(&target.spec);
+        let target_machine_id = machine_id(&target.key, &target_spec_hash);
+        self.shared
+            .new_fork_machine_record(
+                &target,
+                &target_machine_id,
+                &target_spec_hash,
+                template_key,
+                source_record.slot,
+            )
+            .await?;
+        drop(_lifecycle_guard);
+
+        match self.acquire_resolved(target).await {
+            Ok(handle) => Ok(Some(handle)),
+            Err(error) => {
+                if let Err(cleanup_error) =
+                    self.shared.cleanup_machine(&target_machine_id, true).await
+                {
+                    tracing::warn!(
+                        machine_id = target_machine_id,
+                        error = format!("{cleanup_error:#}"),
+                        "failed cleaning up unsuccessful Firecracker fork"
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     async fn acquire_from_snapshot(
@@ -706,9 +838,29 @@ impl Shared {
             }
             return Err(error);
         }
+        if machine.record.network_enabled
+            && machine
+                .record
+                .snapshot_network_slot
+                .is_some_and(|slot| slot != machine.record.slot)
+        {
+            self.reconfigure_restored_network(&machine).await?;
+        }
         record_launch_timing(machine_id, "guest_ready", guest_ready_started.elapsed());
         record_launch_timing(machine_id, "total", launch_started.elapsed());
         Ok(machine)
+    }
+
+    async fn reconfigure_restored_network(self: &Arc<Self>, machine: &Machine) -> Result<()> {
+        // Snapshot memory contains the source guest's configured IP, while each
+        // clone gets a distinct host TAP/resource slot. Reset the address before
+        // exposing the clone's TCP endpoint.
+        // https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md
+        // https://github.com/firecracker-microvm/firecracker/blob/main/docs/network-setup.md
+        let network = machine.record.network();
+        GuestClient::new(Arc::clone(self), machine.vsock_path.clone())
+            .configure_network(network.guest_ip, network.guest_gateway, 30)
+            .await
     }
 
     async fn load_machine_record(&self, machine_id: &str) -> Result<Option<MachineRecord>> {
@@ -781,6 +933,7 @@ impl Shared {
                 workspace_id,
                 idle_ttl_seconds,
                 snapshot_template,
+                snapshot_network_slot: None,
             };
             if let Err(error) = write_manifest(&state_root, &record) {
                 if let Err(release_error) =
@@ -796,6 +949,48 @@ impl Shared {
         })
         .await
         .context("joining Firecracker machine allocation")?
+    }
+
+    async fn new_fork_machine_record(
+        &self,
+        request: &SandboxRequest,
+        machine_id: &str,
+        spec_hash: &str,
+        snapshot_template: String,
+        snapshot_network_slot: u32,
+    ) -> Result<MachineRecord> {
+        let state_root = self.config.state_root.clone();
+        let machine_id = machine_id.to_string();
+        let spec_hash = spec_hash.to_string();
+        let network_enabled = request.spec.network == SandboxNetworkPolicy::Enabled;
+        let idle_ttl_seconds = request.lifecycle.idle_ttl.map(|ttl| ttl.as_secs());
+        tokio::task::spawn_blocking(move || {
+            validate_snapshot_key(&snapshot_template)?;
+            let slot = allocate_resource_slot_from(&state_root, &machine_id, 0)?;
+            let record = MachineRecord {
+                machine_id,
+                spec_hash,
+                slot,
+                network_enabled,
+                workspace_id: None,
+                idle_ttl_seconds,
+                snapshot_template: Some(snapshot_template),
+                snapshot_network_slot: Some(snapshot_network_slot),
+            };
+            if let Err(error) = write_manifest(&state_root, &record) {
+                if let Err(release_error) =
+                    release_resource_slot(&state_root, record.slot, &record.machine_id)
+                {
+                    return Err(error.context(format!(
+                        "also failed to release fork resource slot: {release_error:#}"
+                    )));
+                }
+                return Err(error);
+            }
+            Ok(record)
+        })
+        .await
+        .context("joining Firecracker fork machine allocation")?
     }
 
     async fn prepare_and_launch(
@@ -1351,6 +1546,11 @@ fn snapshot_template_key(
         hasher.update(modified.subsec_nanos().to_le_bytes());
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn hash_snapshot_string(hasher: &mut Sha256, value: &str) {
+    hasher.update(value.len().to_le_bytes());
+    hasher.update(value.as_bytes());
 }
 
 fn machine_from_record(config: &FirecrackerConfig, record: MachineRecord) -> Machine {
@@ -2673,7 +2873,10 @@ fn ensure_snapshot_template(
     fs::create_dir(&temporary)?;
     fs::set_permissions(&temporary, Permissions::from_mode(0o700))?;
 
-    let template_id = format!("fc-template-{}-{:08x}", &template_key[..16], record.slot);
+    // Keep the transient jail id short enough that its guest-ready AF_UNIX
+    // socket remains below sockaddr_un.sun_path's 108-byte limit. The durable
+    // snapshot directory still uses the full SHA-256 template key.
+    let template_id = format!("fc-t-{}-{:04x}", &template_key[..12], record.slot);
     let mut template_record = record.clone();
     template_record.machine_id = template_id.clone();
     template_record.workspace_id = None;
@@ -2731,7 +2934,6 @@ fn ensure_snapshot_template(
             &stderr_path,
             ready_listener,
         )?;
-
         firecracker_api_patch(&api, "/vm", &FirecrackerVmState { state: "Paused" })?;
         let snapshot_started = Instant::now();
         // A full snapshot is generated once per immutable image/config/slot. Its
@@ -2807,6 +3009,145 @@ fn ensure_snapshot_template(
             });
         }
     }
+    validate_snapshot_template(config, &destination)?;
+    Ok(())
+}
+
+fn fork_snapshot_template_key(
+    config: &FirecrackerConfig,
+    source: &MachineRecord,
+) -> Result<String> {
+    let pid = fs::read_to_string(jail_root(config, &source.machine_id).join("firecracker.pid"))?;
+    let stat = fs::read_to_string(format!("/proc/{}/stat", pid.trim()))?;
+    let fields = stat
+        .rsplit_once(')')
+        .context("invalid Firecracker process stat")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let start_time = fields
+        .get(19)
+        .context("Firecracker process stat is missing its start time")?;
+    let mut hasher = Sha256::new();
+    hasher.update(SNAPSHOT_CACHE_VERSION.to_le_bytes());
+    hash_snapshot_string(&mut hasher, "live-fork");
+    hash_snapshot_string(&mut hasher, &source.machine_id);
+    hash_snapshot_string(&mut hasher, &source.spec_hash);
+    hash_snapshot_string(&mut hasher, pid.trim());
+    hash_snapshot_string(&mut hasher, start_time);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn ensure_fork_snapshot_template(
+    config: &FirecrackerConfig,
+    source: &MachineRecord,
+    template_key: &str,
+) -> Result<()> {
+    let destination = snapshot_template_dir(config, template_key)?;
+    if validate_snapshot_template(config, &destination)? {
+        return Ok(());
+    }
+    if destination.try_exists()? {
+        fs::remove_dir_all(&destination).with_context(|| {
+            format!(
+                "removing incomplete Firecracker fork snapshot {}",
+                destination.display()
+            )
+        })?;
+    }
+
+    let sequence = ARTIFACT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = config.state_root.join("snapshots").join(format!(
+        ".{template_key}.fork.{}.{}",
+        std::process::id(),
+        sequence
+    ));
+    fs::create_dir(&temporary)?;
+    fs::set_permissions(&temporary, Permissions::from_mode(0o700))?;
+
+    let root = jail_root(config, &source.machine_id);
+    let output_name = format!("fork-{}", &template_key[..12]);
+    let output = root.join(&output_name);
+    if output.try_exists()? {
+        fs::remove_dir_all(&output)?;
+    }
+    fs::create_dir(&output)?;
+    let ownership = format!(
+        "{}:{}",
+        jailer_uid(config, source)?,
+        jailer_uid(config, source)?
+    );
+    run_checked("chown", &[&ownership, &output.to_string_lossy()])?;
+    fs::set_permissions(&output, Permissions::from_mode(0o700))?;
+
+    let api = wait_for_firecracker_api(&root, &source.machine_id)?;
+    firecracker_api_patch(&api, "/vm", &FirecrackerVmState { state: "Paused" })?;
+    let snapshot_path = format!("/{output_name}/state");
+    let memory_path = format!("/{output_name}/memory");
+    let result = (|| {
+        let snapshot_started = Instant::now();
+        // A fork captures a full point-in-time device/RAM image once. Clones
+        // map the immutable memory file privately and get independent COW disks.
+        // https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md#full-and-diff-snapshots
+        // https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md#memory-backend
+        firecracker_api_put_with_timeout(
+            &api,
+            "/snapshot/create",
+            &FirecrackerSnapshotCreate {
+                snapshot_type: "Full",
+                snapshot_path: &snapshot_path,
+                mem_file_path: &memory_path,
+            },
+            FIRECRACKER_SNAPSHOT_CREATE_TIMEOUT,
+        )?;
+        record_launch_timing(
+            &source.machine_id,
+            "fork_snapshot_create",
+            snapshot_started.elapsed(),
+        );
+
+        let overlay = temporary.join("overlay.ext4");
+        run_checked(
+            "cp",
+            &[
+                "--sparse=always",
+                "--reflink=auto",
+                &root.join("overlay.ext4").to_string_lossy(),
+                &overlay.to_string_lossy(),
+            ],
+        )?;
+        replace_hard_link(&output.join("state"), &temporary.join("state"))?;
+        replace_hard_link(&output.join("memory"), &temporary.join("memory"))?;
+        for path in [temporary.join("state"), temporary.join("memory"), overlay] {
+            run_checked("chown", &["0:0", &path.to_string_lossy()])?;
+            fs::set_permissions(&path, Permissions::from_mode(0o444))?;
+            File::open(path)?.sync_all()?;
+        }
+        let complete = temporary.join("complete");
+        File::create(&complete)?.sync_all()?;
+        fs::set_permissions(&complete, Permissions::from_mode(0o444))?;
+        Ok::<(), anyhow::Error>(())
+    })();
+    let resume = firecracker_api_patch(&api, "/vm", &FirecrackerVmState { state: "Resumed" });
+    if let Err(error) = result {
+        if temporary.try_exists()? {
+            fs::remove_dir_all(&temporary)?;
+        }
+        if let Err(resume_error) = resume {
+            return Err(error).context(format!(
+                "creating Firecracker fork snapshot; source resume also failed: {resume_error:#}"
+            ));
+        }
+        return Err(error).context("creating Firecracker fork snapshot");
+    }
+    resume.context("resuming Firecracker fork source")?;
+    fs::remove_dir_all(&output)?;
+    fs::rename(&temporary, &destination).with_context(|| {
+        format!(
+            "publishing Firecracker fork snapshot {}",
+            destination.display()
+        )
+    })?;
     validate_snapshot_template(config, &destination)?;
     Ok(())
 }
@@ -3382,6 +3723,31 @@ impl GuestClient {
                 .unwrap_or_else(|| "unknown error".to_string())
         )
     }
+
+    async fn configure_network(
+        &self,
+        address: Ipv4Addr,
+        gateway: Ipv4Addr,
+        prefix: u8,
+    ) -> Result<()> {
+        let response: OperationResponse = self
+            .invoke(&ConfigureNetworkRequest {
+                request_type: "configure_network",
+                address,
+                gateway,
+                prefix,
+            })
+            .await?;
+        if response.ok {
+            return Ok(());
+        }
+        bail!(
+            "Firecracker fork clone network reconfiguration failed: {}",
+            response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
+        )
+    }
 }
 
 async fn vsock_request(path: &Path, payload: &[u8]) -> Result<Vec<u8>> {
@@ -3483,6 +3849,15 @@ struct SyncFilesystemRequest<'a> {
     #[serde(rename = "type")]
     request_type: &'static str,
     path: &'a str,
+}
+
+#[derive(Serialize)]
+struct ConfigureNetworkRequest<'a> {
+    #[serde(rename = "type")]
+    request_type: &'a str,
+    address: Ipv4Addr,
+    gateway: Ipv4Addr,
+    prefix: u8,
 }
 
 #[derive(Deserialize)]
@@ -3806,6 +4181,7 @@ mod tests {
             workspace_id: None,
             idle_ttl_seconds: Some(60),
             snapshot_template: None,
+            snapshot_network_slot: None,
         };
         let second = MachineRecord {
             spec_hash: "second".to_string(),
@@ -3833,6 +4209,7 @@ mod tests {
             workspace_id: None,
             idle_ttl_seconds: Some(60),
             snapshot_template: None,
+            snapshot_network_slot: None,
         };
         write_manifest(directory.path(), &record).unwrap();
         touch_machine_lease(directory.path(), &record.machine_id).unwrap();

@@ -88,6 +88,13 @@ pub async fn firecracker_backend_from_env(
 ) -> anyhow::Result<std::sync::Arc<dyn crate::ManagedSandboxBackend>> {
     let mut config = FirecrackerConfig::from_env()?;
     config.snapshot_enabled = snapshot_enabled;
+    firecracker_backend_from_config(config).await
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+async fn firecracker_backend_from_config(
+    config: FirecrackerConfig,
+) -> anyhow::Result<std::sync::Arc<dyn crate::ManagedSandboxBackend>> {
     #[cfg(target_os = "linux")]
     {
         Ok(std::sync::Arc::new(FirecrackerSandboxBackend::new(config)?))
@@ -103,6 +110,13 @@ pub async fn firecracker_backend_from_env(
         drop(config);
         anyhow::bail!("Firecracker sandbox execution is only supported on Linux or macOS with Lima")
     }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32"), feature = "firecracker"))]
+pub(crate) async fn firecracker_backend_for_test(
+    config: FirecrackerConfig,
+) -> anyhow::Result<std::sync::Arc<dyn crate::ManagedSandboxBackend>> {
+    firecracker_backend_from_config(config).await
 }
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use sprites::{DEFAULT_SPRITES_API_URL, SpritesConfig, SpritesSandboxBackend};

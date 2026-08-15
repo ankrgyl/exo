@@ -311,12 +311,24 @@ fn cache_local_image(state_root: &Path, source: &str) -> Result<(PathBuf, bool)>
         .prefix("local-image-")
         .tempdir_in(&local_root)?;
     let staged = temporary.path().join("rootfs.ext4");
-    fs::copy(&source, &staged).with_context(|| {
-        format!(
-            "staging local Firecracker image {} into its immutable cache",
+    let copy = super::firecracker::trusted_host_command("cp")?;
+    let status = Command::new(copy)
+        .args(["--sparse=always", "--reflink=auto", "--"])
+        .arg(&source)
+        .arg(&staged)
+        .status()
+        .with_context(|| {
+            format!(
+                "staging local Firecracker image {} into its immutable cache",
+                source.display()
+            )
+        })?;
+    if !status.success() {
+        bail!(
+            "staging local Firecracker image {} into its immutable cache failed with {status}",
             source.display()
-        )
-    })?;
+        );
+    }
     fs::set_permissions(&staged, Permissions::from_mode(0o444))?;
     validate_ext4_image(&staged)?;
     let temporary_path = temporary.keep();

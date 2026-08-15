@@ -6,11 +6,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+#[cfg(feature = "firecracker")]
+use std::time::Instant;
 
 use anyhow::bail;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, Cursor};
+#[cfg(feature = "firecracker")]
+use futures::{SinkExt, StreamExt};
 use lingua::Message;
 use lingua::universal::{AssistantContent, UserContent};
 use serde_json::Value;
@@ -18,6 +22,8 @@ use tempfile::TempDir;
 use tokio::fs;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::time::{sleep, timeout};
+#[cfg(feature = "firecracker")]
+use tokio_tungstenite::tungstenite::{Message as WebSocketMessage, client::IntoClientRequest};
 
 use crate::test_support::{local_test_config, local_test_config_with_daytona};
 use crate::{
@@ -206,6 +212,206 @@ async fn firecracker_sandbox_contract_start_process_long_running_protocol() {
     )
     .await
     .expect("Firecracker sandbox long-running protocol contract");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "firecracker")]
+#[ignore = "benchmarks live Firecracker fork restore with a running Codex exec server"]
+async fn firecracker_codex_live_fork_benchmark() {
+    const PORT: u16 = 41_255;
+
+    drop(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .try_init(),
+    );
+    let mut config = crate::FirecrackerConfig::from_env().expect("Firecracker config");
+    config.snapshot_enabled = true;
+    let backend = crate::sandbox_provider::firecracker_backend_for_test(config)
+        .await
+        .expect("Firecracker backend");
+    let source_request = provider_contract_request(
+        "firecracker",
+        "codex-fork-source",
+        env_or("FIRECRACKER_IMAGE", &crate::default_firecracker_image()),
+        "/tmp/exo-home/workspace",
+    );
+    let source = backend
+        .acquire(source_request.clone())
+        .await
+        .expect("acquire fork source");
+    let source_process = source
+        .start_process(&SandboxCommand {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-lc".to_string(),
+                format!(
+                    "set -eu; mkdir -p /tmp/exo-home/workspace /tmp/exo-codex-home /tmp/exo-codex-sqlite; rm -f /tmp/exo-codex-home/auth.json; cd /tmp/exo-home/workspace; exec /usr/local/bin/codex exec-server --listen ws://0.0.0.0:{PORT}"
+                ),
+            ],
+            env: HashMap::from([
+                ("HOME".to_string(), "/tmp/exo-home".to_string()),
+                ("CODEX_HOME".to_string(), "/tmp/exo-codex-home".to_string()),
+                (
+                    "CODEX_SQLITE_HOME".to_string(),
+                    "/tmp/exo-codex-sqlite".to_string(),
+                ),
+                (
+                    "PATH".to_string(),
+                    "/usr/local/bin:/usr/bin:/bin".to_string(),
+                ),
+                ("SHELL".to_string(), "/bin/bash".to_string()),
+            ]),
+            display_argv: None,
+            cwd: Some("/".to_string()),
+            timeout: None,
+        })
+        .await
+        .expect("start Codex fork source");
+    wait_for_firecracker_listener(&source, PORT)
+        .await
+        .expect("Codex fork source listener");
+
+    for sample in 1..=2 {
+        let target_request = provider_contract_request(
+            "firecracker",
+            &format!("codex-fork-target-{sample}"),
+            env_or("FIRECRACKER_IMAGE", &crate::default_firecracker_image()),
+            "/tmp/exo-home/workspace",
+        );
+        let fork_started = Instant::now();
+        let target = backend
+            .fork_sandbox(source_request.clone(), target_request)
+            .await
+            .expect("fork Codex sandbox")
+            .expect("Firecracker supports fork");
+        let fork_duration = fork_started.elapsed();
+        let connect_duration = connect_and_initialize_snapshotted_codex(&target, PORT)
+            .await
+            .expect("initialize forked Codex server");
+        println!(
+            "Codex live fork sample {sample}: fork={:.3}s connect_initialize={:.3}s total={:.3}s",
+            fork_duration.as_secs_f64(),
+            connect_duration.as_secs_f64(),
+            (fork_duration + connect_duration).as_secs_f64()
+        );
+        target.stop().await.expect("stop fork target");
+    }
+
+    drop(source_process);
+    source.stop().await.expect("stop fork source");
+}
+
+#[cfg(feature = "firecracker")]
+async fn wait_for_firecracker_listener(
+    handle: &Arc<dyn ManagedSandboxHandle>,
+    port: u16,
+) -> anyhow::Result<()> {
+    let port = format!("{port:04X}");
+    let probe = format!(
+        "awk -v port=:{port} '$2 ~ port \"$\" && $4 == \"0A\" {{ found=1 }} END {{ exit found ? 0 : 1 }}' /proc/net/tcp /proc/net/tcp6"
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = handle
+            .exec(&SandboxCommand {
+                argv: vec!["/bin/sh".to_string(), "-c".to_string(), probe.clone()],
+                env: HashMap::new(),
+                display_argv: None,
+                cwd: Some("/".to_string()),
+                timeout: Some(Duration::from_secs(2)),
+            })
+            .await?;
+        if output.ok {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("Firecracker listener did not become ready on port {port}");
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(feature = "firecracker")]
+#[derive(serde::Serialize)]
+struct CodexInitializeRequest<'a> {
+    id: u64,
+    method: &'a str,
+    params: CodexInitializeParams<'a>,
+}
+
+#[cfg(feature = "firecracker")]
+#[derive(serde::Serialize)]
+struct CodexInitializeParams<'a> {
+    #[serde(rename = "clientName")]
+    client_name: &'a str,
+}
+
+#[cfg(feature = "firecracker")]
+#[derive(serde::Deserialize)]
+struct CodexInitializeResponse {
+    id: Option<u64>,
+    error: Option<CodexInitializeError>,
+}
+
+#[cfg(feature = "firecracker")]
+#[derive(serde::Deserialize)]
+struct CodexInitializeError {
+    message: String,
+}
+
+#[cfg(feature = "firecracker")]
+async fn connect_and_initialize_snapshotted_codex(
+    handle: &Arc<dyn ManagedSandboxHandle>,
+    port: u16,
+) -> anyhow::Result<Duration> {
+    let started = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stream = loop {
+        match handle.connect_tcp(port).await {
+            Ok(Some(stream)) => break stream,
+            Ok(None) => bail!("Firecracker sandbox does not support TCP"),
+            Err(error) if Instant::now() < deadline => {
+                tracing::debug!(%error, port, "waiting for snapshotted Codex listener");
+                sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let request = format!("ws://127.0.0.1:{port}").into_client_request()?;
+    let (mut websocket, _) = tokio_tungstenite::client_async(request, stream).await?;
+    websocket
+        .send(WebSocketMessage::Text(
+            serde_json::to_string(&CodexInitializeRequest {
+                id: 1,
+                method: "initialize",
+                params: CodexInitializeParams {
+                    client_name: "exo-snapshot-benchmark",
+                },
+            })?
+            .into(),
+        ))
+        .await?;
+    while let Some(message) = websocket.next().await {
+        let WebSocketMessage::Text(text) = message? else {
+            continue;
+        };
+        let response: CodexInitializeResponse = serde_json::from_str(text.as_ref())?;
+        if response.id != Some(1) {
+            continue;
+        }
+        if let Some(error) = response.error {
+            bail!("snapshotted Codex initialize failed: {}", error.message);
+        }
+        websocket
+            .send(WebSocketMessage::Text(
+                r#"{"method":"initialized"}"#.to_string().into(),
+            ))
+            .await?;
+        return Ok(started.elapsed());
+    }
+    bail!("snapshotted Codex WebSocket closed before initialize completed")
 }
 
 #[tokio::test(flavor = "current_thread")]

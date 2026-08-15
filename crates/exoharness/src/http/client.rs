@@ -21,12 +21,12 @@ use crate::{
     ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
     CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, ConversationHandle,
     ConversationId, ConversationRecord, CreateSandboxRequest, Event, EventData, EventId,
-    EventQuery, EventStream, ExoHarness, ForkConversationRequest, GetEventsResult,
-    GetSandboxProcessEventsResult, ListConversationsRequest, ListConversationsResult,
-    NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest, Result,
-    RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess,
-    SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus,
-    SandboxRecord, Secret, SecretId, SecretMetadata, SessionId, SnapshotHandle, SnapshotId,
+    EventQuery, EventStream, ExoHarness, ForkConversationRequest, ForkSandboxRequest,
+    GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
+    ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
+    ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId,
+    SandboxProcess, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessRecord,
+    SandboxProcessStatus, Secret, SecretId, SecretMetadata, SessionId, SnapshotHandle, SnapshotId,
     StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnRecord,
     WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
@@ -216,13 +216,17 @@ async fn http_create_sandbox(
     }
 }
 
-async fn http_list_sandboxes(
+async fn http_fork_sandbox(
     harness: &HttpExoHarness,
     scope: SandboxScope,
-) -> Result<Vec<SandboxRecord>> {
-    match harness.request(Request::ListSandboxes { scope }).await? {
-        Response::Sandboxes { sandboxes } => Ok(sandboxes),
-        response => unexpected_response(response, "sandboxes"),
+    request: ForkSandboxRequest,
+) -> Result<SandboxId> {
+    match harness
+        .request(Request::ForkSandbox { scope, request })
+        .await?
+    {
+        Response::SandboxId { sandbox_id } => Ok(sandbox_id),
+        response => unexpected_response(response, "sandbox_id"),
     }
 }
 
@@ -697,6 +701,10 @@ impl SandboxHandle for HttpAgentHandle {
         http_create_sandbox(&self.harness, self.sandbox_scope(), request).await
     }
 
+    async fn fork_sandbox(&self, request: ForkSandboxRequest) -> Result<SandboxId> {
+        http_fork_sandbox(&self.harness, self.sandbox_scope(), request).await
+    }
+
     async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {
         http_terminate_sandbox(&self.harness, self.sandbox_scope(), id).await
     }
@@ -1079,6 +1087,10 @@ impl SandboxHandle for HttpConversationHandle {
 
     async fn create_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId> {
         http_create_sandbox(&self.harness, self.sandbox_scope(), request).await
+    }
+
+    async fn fork_sandbox(&self, request: ForkSandboxRequest) -> Result<SandboxId> {
+        http_fork_sandbox(&self.harness, self.sandbox_scope(), request).await
     }
 
     async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {

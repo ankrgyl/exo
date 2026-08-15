@@ -188,6 +188,48 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         bail!("Firecracker sandboxes do not support external attachments")
     }
 
+    async fn terminate(&self, request: SandboxRequest) -> Result<()> {
+        match self
+            .request(FirecrackerBridgeRequest::Terminate {
+                config: self.config.clone(),
+                request,
+            })
+            .await?
+        {
+            FirecrackerBridgeResponse::Terminated => Ok(()),
+            _ => bail!("Firecracker Lima bridge returned the wrong response to terminate"),
+        }
+    }
+
+    async fn fork_sandbox(
+        &self,
+        source: SandboxRequest,
+        target: SandboxRequest,
+    ) -> Result<Option<Arc<dyn ManagedSandboxHandle>>> {
+        let response = self
+            .request(FirecrackerBridgeRequest::Fork {
+                config: self.config.clone(),
+                source,
+                target: target.clone(),
+            })
+            .await?;
+        let FirecrackerBridgeResponse::Forked {
+            id,
+            provider_state,
+            effective_image,
+        } = response
+        else {
+            bail!("Firecracker Lima bridge returned the wrong response to fork");
+        };
+        Ok(Some(Arc::new(LimaFirecrackerSandboxHandle {
+            id,
+            provider_state,
+            effective_image,
+            request: target,
+            backend: self.client(),
+        })))
+    }
+
     async fn acquire_from_snapshot(
         &self,
         _request: SandboxRequest,

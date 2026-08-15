@@ -9,7 +9,7 @@ use exoharness::{
     ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingRecord, BindingType,
     ConversationHandle, ConversationId, ConversationRecord, CreateSandboxRequest, Event, EventData,
     EventQuery, EventQueryDirection, EventStream, ExoHarness, ForkConversationRequest,
-    GetEventsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
+    ForkSandboxRequest, GetEventsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
     ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId,
     SandboxProcess, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessRecord,
     SandboxProcessStatus, SandboxRecord, Secret, SecretMetadata, SecretType, SessionId,
@@ -814,6 +814,10 @@ impl SandboxHandle for FakeAgentHandle {
         Ok("agent-sandbox".to_string())
     }
 
+    async fn fork_sandbox(&self, _request: ForkSandboxRequest) -> Result<SandboxId> {
+        Err(anyhow!("not implemented"))
+    }
+
     async fn terminate_sandbox(&self, _id: SandboxId) -> Result<()> {
         Err(anyhow!("not implemented"))
     }
@@ -1099,6 +1103,10 @@ impl SandboxHandle for FakeConversationHandle {
     }
 
     async fn create_sandbox(&self, _request: CreateSandboxRequest) -> Result<SandboxId> {
+        Err(anyhow!("not implemented"))
+    }
+
+    async fn fork_sandbox(&self, _request: ForkSandboxRequest) -> Result<SandboxId> {
         Err(anyhow!("not implemented"))
     }
 
