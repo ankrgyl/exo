@@ -3,7 +3,6 @@ use std::ffi::OsString;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -161,14 +160,6 @@ pub trait ManagedSandboxHandle: Send + Sync {
 
     async fn start_process(&self, command: &SandboxCommand) -> Result<crate::SandboxProcessParts>;
 
-    fn supports_tcp(&self) -> bool {
-        false
-    }
-
-    async fn connect_tcp(&self, _port: u16) -> Result<Option<BoxSandboxTcpStream>> {
-        Ok(None)
-    }
-
     async fn stop(&self) -> Result<()>;
 
     /// Relinquish lifecycle ownership without stopping the sandbox and return
@@ -179,12 +170,6 @@ pub trait ManagedSandboxHandle: Send + Sync {
     /// error if this backend doesn't (yet) support snapshotting.
     async fn snapshot(&self) -> Result<SnapshotPayload>;
 }
-
-pub trait SandboxTcpStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
-
-impl<T> SandboxTcpStream for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
-
-pub type BoxSandboxTcpStream = Pin<Box<dyn SandboxTcpStream>>;
 
 #[async_trait]
 pub trait ManagedSandboxBackend: Send + Sync {
@@ -214,15 +199,13 @@ pub trait ManagedSandboxBackend: Send + Sync {
         bail!("sandbox backend does not support explicit termination")
     }
 
-    /// Copy `source` to `target`, leaving the source available as the fork base.
-    /// `None` means this backend does not support forking and the caller may
-    /// cold-start the target instead.
+    /// Copy the current state of `source` to `target`.
     async fn fork_sandbox(
         &self,
         _source: SandboxRequest,
         _target: SandboxRequest,
-    ) -> Result<Option<Arc<dyn ManagedSandboxHandle>>> {
-        Ok(None)
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        bail!("sandbox backend does not support forking")
     }
 }
 

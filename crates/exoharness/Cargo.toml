@@ -24,7 +24,6 @@ firecracker = [
   "basic-backend",
   "dep:docker_credential",
   "dep:flate2",
-  "dep:hex",
   "dep:libc",
   "dep:oci-client",
   "dep:sha2",
@@ -55,7 +54,6 @@ chrono.workspace = true
 docker_credential = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 futures.workspace = true
-hex = { workspace = true, optional = true }
 keyring = { version = "4.0.0-rc.3", optional = true }
 keyring-core = { version = "0.7.2", optional = true }
 libc = { workspace = true, optional = true }
@@ -67,7 +65,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }
-tempfile = { version = "3.13.0", optional = true }
+tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { version = "1.52.1", default-features = false, features = [
   "fs",

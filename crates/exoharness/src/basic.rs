@@ -19,10 +19,10 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::sandbox::{
-    BoxSandboxTcpStream, CliContainerSandboxBackend, LocalProcessSandboxBackend,
-    ManagedSandboxBackend, ManagedSandboxHandle, SANDBOX_MAIN_MOUNT_DIR, SandboxCommand,
-    SandboxKey, SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxNetworkPolicy,
-    SandboxRequest, SandboxSpec, SnapshotKind, SnapshotPayload, sandbox_spec_hash,
+    CliContainerSandboxBackend, LocalProcessSandboxBackend, ManagedSandboxBackend,
+    ManagedSandboxHandle, SANDBOX_MAIN_MOUNT_DIR, SandboxCommand, SandboxKey,
+    SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxNetworkPolicy, SandboxRequest,
+    SandboxSpec, SnapshotKind, SnapshotPayload, sandbox_spec_hash,
 };
 #[cfg(feature = "apple-keychain")]
 use crate::secrets::AppleKeychainSecretKeyProvider;
@@ -134,17 +134,10 @@ impl SandboxBackendRegistration {
 
     #[cfg(feature = "firecracker")]
     pub fn firecracker() -> Self {
-        Self::firecracker_with_snapshots(false)
-    }
-
-    #[cfg(feature = "firecracker")]
-    pub fn firecracker_with_snapshots(snapshot_enabled: bool) -> Self {
         Self::from_factory(
             SandboxProvider::Firecracker,
             cfg!(any(target_os = "linux", target_os = "macos")),
-            move |_| {
-                Box::pin(async move { crate::firecracker_backend_from_env(snapshot_enabled).await })
-            },
+            |_| Box::pin(crate::firecracker_backend_from_env()),
         )
     }
 
@@ -155,11 +148,6 @@ impl SandboxBackendRegistration {
                 bail!("Firecracker support requires building Exo with --features firecracker")
             })
         })
-    }
-
-    #[cfg(not(feature = "firecracker"))]
-    pub fn firecracker_with_snapshots(_snapshot_enabled: bool) -> Self {
-        Self::firecracker()
     }
 
     pub fn local_process() -> Self {
@@ -1130,10 +1118,6 @@ where
         self.sandbox_handle().fork_sandbox(request).await
     }
 
-    async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {
-        self.sandbox_handle().terminate_sandbox(id).await
-    }
-
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {
         self.sandbox_handle().attach_sandbox(request).await
     }
@@ -1144,18 +1128,6 @@ where
 
     async fn stop_sandbox(&self, id: SandboxId) -> Result<()> {
         self.sandbox_handle().stop_sandbox(id).await
-    }
-
-    async fn connect_sandbox_tcp(
-        &self,
-        id: SandboxId,
-        port: u16,
-    ) -> Result<Option<BoxSandboxTcpStream>> {
-        self.sandbox_handle().connect_sandbox_tcp(id, port).await
-    }
-
-    async fn sandbox_supports_tcp(&self, id: SandboxId) -> Result<bool> {
-        self.sandbox_handle().sandbox_supports_tcp(id).await
     }
 
     async fn start_sandbox_process(
@@ -1341,7 +1313,7 @@ impl AgentHandle for BasicAgentHandle {
             BasicScopedSandboxHandle::conversation(&self.harness, *id, conversation_dir.clone());
         for sandbox in sandboxes {
             if sandbox.running && sandbox.attachment.is_none() {
-                sandbox_handle.stop_sandbox(sandbox.id).await?;
+                sandbox_handle.terminate_sandbox(sandbox.id).await?;
             }
         }
 
@@ -1733,13 +1705,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .await?;
         let source_request = sandbox_request(self.owner, &request.source_id, &source, None);
         let target_request = sandbox_request(self.owner, &sandbox_id, &sandbox, None);
-        let sandbox_handle = match backend
-            .fork_sandbox(source_request, target_request.clone())
-            .await?
-        {
-            Some(handle) => handle,
-            None => backend.acquire(target_request).await?,
-        };
+        let sandbox_handle = backend.fork_sandbox(source_request, target_request).await?;
         let provider_state_event = sandbox_provider_state_event(
             &sandbox_id,
             sandbox.provider.clone(),
@@ -1763,8 +1729,18 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .inner
             .sandbox_backend_for_provider(sandbox.provider.clone())
             .await?;
+        let state_key = sandbox_provider_state_key(self.owner, &id, &sandbox);
+        let provider_state = load_sandbox_provider_state(
+            self.harness,
+            &self.owner_dir,
+            self.owner,
+            &id,
+            sandbox.provider.clone(),
+            &state_key,
+        )
+        .await?;
         backend
-            .terminate(sandbox_request(self.owner, &id, &sandbox, None))
+            .terminate(sandbox_request(self.owner, &id, &sandbox, provider_state))
             .await?;
         self.harness
             .inner
@@ -1919,38 +1895,6 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         self.append_events_locked(vec![EventData::SandboxStopped { sandbox_id: id }])
             .await?;
         Ok(())
-    }
-
-    async fn connect_sandbox_tcp(
-        &self,
-        id: SandboxId,
-        port: u16,
-    ) -> Result<Option<BoxSandboxTcpStream>> {
-        self.ensure_full_sandbox_scope("connect_sandbox_tcp")?;
-        let sandbox = self.load_sandbox(&id).await?;
-        if !sandbox.running {
-            bail!("sandbox is not running: {id}");
-        }
-        let (sandbox_handle, provider_state_event) =
-            active_sandbox_handle(self.harness, &self.owner_dir, self.owner, &id, &sandbox).await?;
-        if let Some(event) = provider_state_event {
-            self.append_events(vec![event]).await?;
-        }
-        sandbox_handle.connect_tcp(port).await
-    }
-
-    async fn sandbox_supports_tcp(&self, id: SandboxId) -> Result<bool> {
-        self.ensure_full_sandbox_scope("sandbox_supports_tcp")?;
-        let sandbox = self.load_sandbox(&id).await?;
-        if !sandbox.running {
-            bail!("sandbox is not running: {id}");
-        }
-        let (sandbox_handle, provider_state_event) =
-            active_sandbox_handle(self.harness, &self.owner_dir, self.owner, &id, &sandbox).await?;
-        if let Some(event) = provider_state_event {
-            self.append_events(vec![event]).await?;
-        }
-        Ok(sandbox_handle.supports_tcp())
     }
 
     async fn start_sandbox_process(

@@ -19,6 +19,7 @@ use crate::{
 
 const MAX_BRIDGE_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+const STREAM_INPUT_QUEUE_DEPTH: usize = 16;
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -38,11 +39,6 @@ pub enum FirecrackerBridgeRequest {
         request: SandboxRequest,
         command: SandboxCommand,
     },
-    ConnectTcp {
-        config: FirecrackerConfig,
-        request: SandboxRequest,
-        port: u16,
-    },
     Stop {
         config: FirecrackerConfig,
         request: SandboxRequest,
@@ -60,7 +56,7 @@ pub enum FirecrackerBridgeRequest {
 
 impl FirecrackerBridgeRequest {
     fn is_stream(&self) -> bool {
-        matches!(self, Self::StartProcess { .. } | Self::ConnectTcp { .. })
+        matches!(self, Self::StartProcess { .. })
     }
 }
 
@@ -109,7 +105,6 @@ pub enum FirecrackerBridgeClientFrame {
 pub enum FirecrackerBridgeStreamChannel {
     Stdout,
     Stderr,
-    Tcp,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -180,7 +175,7 @@ impl BridgeBackendCache {
 }
 
 type BridgeWriter = Arc<Mutex<tokio::io::Stdout>>;
-type BridgeStreams = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<BridgeStreamInput>>>>;
+type BridgeStreams = Arc<Mutex<HashMap<u64, mpsc::Sender<BridgeStreamInput>>>>;
 
 pub async fn run_firecracker_bridge() -> Result<Option<i32>> {
     let writer = Arc::new(Mutex::new(tokio::io::stdout()));
@@ -255,7 +250,7 @@ pub async fn run_firecracker_bridge() -> Result<Option<i32>> {
 
     let streams = std::mem::take(&mut *streams.lock().await);
     for (_, sender) in streams {
-        if sender.send(BridgeStreamInput::Cancel).is_err() {
+        if sender.send(BridgeStreamInput::Cancel).await.is_err() {
             tracing::debug!("Firecracker bridge stream already closed during shutdown");
         }
     }
@@ -265,7 +260,7 @@ pub async fn run_firecracker_bridge() -> Result<Option<i32>> {
 async fn send_stream_input(streams: &BridgeStreams, id: u64, input: BridgeStreamInput) {
     let sender = streams.lock().await.get(&id).cloned();
     if let Some(sender) = sender
-        && sender.send(input).is_err()
+        && sender.send(input).await.is_err()
     {
         streams.lock().await.remove(&id);
     }
@@ -308,8 +303,7 @@ async fn handle_request(
                 .backend(config)
                 .await?
                 .fork_sandbox(source, target)
-                .await?
-                .context("Firecracker backend did not fork the sandbox")?;
+                .await?;
             Ok(FirecrackerBridgeResponse::Forked {
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),
@@ -320,8 +314,7 @@ async fn handle_request(
             backends.backend(config).await?.terminate(request).await?;
             Ok(FirecrackerBridgeResponse::Terminated)
         }
-        FirecrackerBridgeRequest::StartProcess { .. }
-        | FirecrackerBridgeRequest::ConnectTcp { .. } => {
+        FirecrackerBridgeRequest::StartProcess { .. } => {
             bail!("streaming Firecracker request reached the RPC handler")
         }
     }
@@ -334,7 +327,7 @@ async fn open_stream(
     streams: &BridgeStreams,
     writer: &BridgeWriter,
 ) -> Result<()> {
-    let (input_sender, input_receiver) = mpsc::unbounded_channel();
+    let (input_sender, input_receiver) = mpsc::channel(STREAM_INPUT_QUEUE_DEPTH);
     if streams.lock().await.insert(id, input_sender).is_some() {
         bail!("duplicate Firecracker bridge stream id {id}");
     }
@@ -352,20 +345,6 @@ async fn open_stream(
             send_server_frame(writer, &FirecrackerBridgeServerFrame::StreamOpened { id }).await?;
             proxy_process(id, parts, input_receiver, writer).await?;
         }
-        FirecrackerBridgeRequest::ConnectTcp {
-            config,
-            request,
-            port,
-        } => {
-            let stream = backends
-                .acquire(config, request)
-                .await?
-                .connect_tcp(port)
-                .await?
-                .context("Firecracker sandbox does not support TCP connections")?;
-            send_server_frame(writer, &FirecrackerBridgeServerFrame::StreamOpened { id }).await?;
-            proxy_tcp(id, stream, input_receiver, writer).await?;
-        }
         _ => bail!("non-streaming Firecracker request reached the stream handler"),
     }
     streams.lock().await.remove(&id);
@@ -375,7 +354,7 @@ async fn open_stream(
 async fn proxy_process(
     id: u64,
     parts: SandboxProcessParts,
-    mut input_receiver: mpsc::UnboundedReceiver<BridgeStreamInput>,
+    mut input_receiver: mpsc::Receiver<BridgeStreamInput>,
     writer: &BridgeWriter,
 ) -> Result<()> {
     let SandboxProcessParts {
@@ -465,51 +444,6 @@ async fn copy_output(
         &FirecrackerBridgeServerFrame::StreamClosed { id, channel },
     )
     .await
-}
-
-async fn proxy_tcp(
-    id: u64,
-    stream: crate::BoxSandboxTcpStream,
-    mut input_receiver: mpsc::UnboundedReceiver<BridgeStreamInput>,
-    writer: &BridgeWriter,
-) -> Result<()> {
-    let (mut reader, mut writer_half) = tokio::io::split(stream);
-    let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
-    loop {
-        tokio::select! {
-            read = reader.read(&mut buffer) => {
-                let read = read?;
-                if read == 0 {
-                    send_server_frame(
-                        writer,
-                        &FirecrackerBridgeServerFrame::StreamClosed {
-                            id,
-                            channel: FirecrackerBridgeStreamChannel::Tcp,
-                        },
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                send_server_frame(
-                    writer,
-                    &FirecrackerBridgeServerFrame::StreamData {
-                        id,
-                        channel: FirecrackerBridgeStreamChannel::Tcp,
-                        data: BASE64.encode(&buffer[..read]),
-                    },
-                )
-                .await?;
-            }
-            input = input_receiver.recv() => match input {
-                Some(BridgeStreamInput::Data(data)) => {
-                    writer_half.write_all(&data).await?;
-                    writer_half.flush().await?;
-                }
-                Some(BridgeStreamInput::Closed) => writer_half.shutdown().await?,
-                Some(BridgeStreamInput::Cancel) | None => return Ok(()),
-            }
-        }
-    }
 }
 
 async fn send_server_frame(

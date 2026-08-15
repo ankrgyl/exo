@@ -2614,7 +2614,6 @@ dependencies = [
  "docker_credential",
  "flate2",
  "futures",
- "hex",
  "keyring",
  "keyring-core",
  "libc",

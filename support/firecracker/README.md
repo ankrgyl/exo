@@ -62,19 +62,6 @@ blob pulls, layer extraction, guest-root preparation, ext4 creation, and the
 total materialization path. Blob-pull logs also report bytes and cache hit/miss
 counts.
 
-The standalone Docker-based builder remains available when an ext4 artifact is
-preferred ahead of time:
-
-Build a root filesystem as root from the same OCI image used by another Exo
-backend:
-
-```bash
-support/firecracker/build-rootfs.sh \
-  --image your-sandbox-image@sha256:... \
-  --guest-runtime /var/lib/exo/firecracker/exo-firecracker-guest \
-  --output /var/lib/exo/firecracker/rootfs.ext4
-```
-
 The guest kernel must contain `CONFIG_BLK_DEV_INITRD=y`, `CONFIG_EXT4_FS=y`,
 `CONFIG_OVERLAY_FS=y`, and `CONFIG_VIRTIO_VSOCKETS=y`; the host requires KVM,
 cgroup v2, iproute2, iptables, nftables, e2fsprogs, cpio, static glibc
@@ -103,14 +90,10 @@ model remain the same as for hosted sandbox providers.
 
 ## macOS development
 
-Firecracker itself requires Linux KVM. Its upstream development guide supports
-macOS by running it in a Linux VM with nested virtualization enabled; on an
-Intel Mac, VMware Fusion's **Enable hypervisor applications in this virtual
-machine** setting is the documented example.
-
-On Apple M3 and newer, Lima can expose Apple's nested virtualization support to
-an ARM64 Linux guest. From the Exo checkout, create a dedicated VM whose only
-writable host mount is that checkout:
+Firecracker itself requires Linux KVM. On Apple M3 and newer, Exo uses Lima to
+run its Firecracker backend in an ARM64 Linux guest while the CLI stays native
+on macOS. Create a dedicated VM whose only writable host mount is the Exo
+checkout:
 
 ```bash
 brew install lima
@@ -133,39 +116,12 @@ Lima documents nested virtualization as supported with its `vz` driver on M3
 and newer:
 https://github.com/lima-vm/lima/blob/master/templates/default.yaml
 
-A 4 GiB outer VM is sufficient for development, but set
-`EXO_FIRECRACKER_MEMORY_MIB=1024` so an individual inner microVM does not try to
-consume the outer VM's full default allocation. Compiling Exo in 4 GiB may also
-need disk-backed swap.
-
-Run Exo inside that Linux VM:
-
-```bash
-sudo EXO_FIRECRACKER_KERNEL=/var/lib/exo/firecracker/vmlinux \
-  EXO_FIRECRACKER_INITRAMFS=/var/lib/exo/firecracker/exo-firecracker-initramfs.cpio \
-  target/debug/exo --sandbox-backend firecracker serve
-```
-
-With the default Lima guest agent, the guest's detected TCP listener is
-forwarded to the same macOS loopback port. Verify it from macOS:
-
-```bash
-curl http://127.0.0.1:4766/health
-```
-
-For another Linux VM, expose the loopback listener through an SSH tunnel rather
-than an unauthenticated LAN listener:
-
-```bash
-ssh -L 4766:127.0.0.1:4766 your-linux-vm
-```
-
-Then point the macOS Exo CLI at `http://127.0.0.1:4766` with
-`--exoharness-url`, including when configuring the provider or creating an
-agent. Firecracker is considered local only on Linux, so macOS clients leave
-its sandbox operations on the remote Linux Exo server while keeping the same
-Exo CLI and provider model. This uses Exo's existing HTTP mode; it does not
-introduce a separate Firecracker wrapper or sandbox daemon.
+A 4 GiB outer VM is sufficient for development. The macOS backend defaults
+inner microVMs to 1 GiB, builds a Linux bridge binary in the shared checkout,
+and runs it through passwordless `sudo` in the `exo-firecracker` Lima instance.
+The Firecracker binaries, kernel, initramfs, and state directory remain inside
+that VM. Run the macOS Exo CLI normally with `--sandbox-backend firecracker`.
+Set `EXO_FIRECRACKER_LIMA_INSTANCE` to use a differently named instance.
 
 Enabled networking permits public IPv4 egress, blocks host access, unsolicited
 ingress, link-local addresses, and private/special-use ranges, and applies a
@@ -181,7 +137,8 @@ and [virtio-vsock](https://github.com/firecracker-microvm/firecracker/blob/main/
 The initramfs follows Firecracker's
 [custom initrd guidance](https://github.com/firecracker-microvm/firecracker/blob/main/docs/initrd.md#custom),
 and the VMM uses a
-[configuration file without the API server](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md#configuring-the-microvm-without-sending-api-requests)
-to keep API polling and serial configuration requests out of the startup path.
+[configuration file](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md#configuring-the-microvm-without-sending-api-requests)
+for atomic startup while retaining its jailed API socket for point-in-time
+forks.
 The nested-virtualization macOS setup comes from Firecracker's
 [development environment guide](https://github.com/firecracker-microvm/firecracker/blob/main/docs/dev-machine-setup.md#macos-with-vmware-fusion).

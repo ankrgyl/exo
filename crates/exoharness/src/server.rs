@@ -146,10 +146,6 @@ impl ExoHarnessServer {
             Request::ForkSandbox { scope, request } => Ok(Response::SandboxId {
                 sandbox_id: self.fork_sandbox(scope, request).await?,
             }),
-            Request::TerminateSandbox { scope, sandbox_id } => {
-                self.terminate_sandbox(scope, sandbox_id).await?;
-                Ok(Response::Unit)
-            }
             Request::AttachSandbox { scope, request } => Ok(Response::SandboxId {
                 sandbox_id: self.attach_sandbox(scope, request).await?,
             }),
@@ -528,29 +524,6 @@ impl ExoHarnessServer {
             SandboxScope::Turn { .. } => {
                 Err(anyhow!("fork_sandbox is not supported on a turn scope"))
             }
-        }
-    }
-
-    async fn terminate_sandbox(&self, scope: SandboxScope, sandbox_id: SandboxId) -> Result<()> {
-        match scope {
-            SandboxScope::Agent { agent_id } => {
-                self.require_agent(&agent_id)
-                    .await?
-                    .terminate_sandbox(sandbox_id)
-                    .await
-            }
-            SandboxScope::Conversation {
-                agent_id,
-                conversation_id,
-            } => {
-                self.require_conversation(agent_id, conversation_id)
-                    .await?
-                    .terminate_sandbox(sandbox_id)
-                    .await
-            }
-            SandboxScope::Turn { .. } => Err(anyhow!(
-                "terminate_sandbox is not supported on a turn scope"
-            )),
         }
     }
 

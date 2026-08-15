@@ -24,10 +24,11 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader, ReadBuf};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio_util::sync::PollSender;
 
 use crate::sandbox::{
-    BoxSandboxTcpStream, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
-    SandboxCommandOutput, SandboxRequest, SnapshotPayload,
+    ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput,
+    SandboxRequest, SnapshotPayload,
 };
 use crate::{SandboxAttachment, SandboxProcessParts};
 
@@ -39,6 +40,9 @@ use super::firecracker_bridge::{
 
 const DEFAULT_LIMA_INSTANCE: &str = "exo-firecracker";
 const DEFAULT_LIMA_TARGET_DIR: &str = "/var/tmp/exo-firecracker-bridge-target";
+const BRIDGE_FRAME_QUEUE_DEPTH: usize = 16;
+const BRIDGE_STREAM_QUEUE_DEPTH: usize = 16;
+const BRIDGE_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 pub struct LimaFirecrackerSandboxBackend {
     config: FirecrackerConfig,
@@ -102,7 +106,7 @@ impl LimaFirecrackerSandboxBackend {
             .arg("--")
             .arg("env")
             .arg(format!("CARGO_TARGET_DIR={}", target_dir.display()))
-            .arg("CARGO_BUILD_JOBS=2")
+            .arg("CARGO_BUILD_JOBS=1")
             .arg("CARGO_INCREMENTAL=0")
             .arg("CARGO_PROFILE_DEV_DEBUG=0")
             .arg("RUSTFLAGS=-C linker=clang -C link-arg=-fuse-ld=lld")
@@ -205,7 +209,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         &self,
         source: SandboxRequest,
         target: SandboxRequest,
-    ) -> Result<Option<Arc<dyn ManagedSandboxHandle>>> {
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let response = self
             .request(FirecrackerBridgeRequest::Fork {
                 config: self.config.clone(),
@@ -221,13 +225,13 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         else {
             bail!("Firecracker Lima bridge returned the wrong response to fork");
         };
-        Ok(Some(Arc::new(LimaFirecrackerSandboxHandle {
+        Ok(Arc::new(LimaFirecrackerSandboxHandle {
             id,
             provider_state,
             effective_image,
             request: target,
             backend: self.client(),
-        })))
+        }))
     }
 
     async fn acquire_from_snapshot(
@@ -285,23 +289,6 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
                 command: command.clone(),
             })
             .await
-    }
-
-    fn supports_tcp(&self) -> bool {
-        true
-    }
-
-    async fn connect_tcp(&self, port: u16) -> Result<Option<BoxSandboxTcpStream>> {
-        let stream = self
-            .backend
-            .bridge
-            .connect_tcp(FirecrackerBridgeRequest::ConnectTcp {
-                config: self.backend.config.clone(),
-                request: self.request.clone(),
-                port,
-            })
-            .await?;
-        Ok(Some(Box::pin(stream)))
     }
 
     async fn stop(&self) -> Result<()> {
@@ -421,21 +408,6 @@ impl LimaBridgeManager {
         }
         unreachable!("Firecracker bridge process retry loop must return")
     }
-
-    async fn connect_tcp(&self, request: FirecrackerBridgeRequest) -> Result<LimaTcpStream> {
-        for attempt in 0..2 {
-            let connection = self.connection().await?;
-            match connection.connect_tcp(request.clone()).await {
-                Ok(stream) => return Ok(stream),
-                Err(error) if connection.is_closed() && attempt == 0 => {
-                    self.invalidate(&connection).await;
-                    tracing::debug!(%error, "restarting closed Firecracker Lima bridge");
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        unreachable!("Firecracker bridge TCP retry loop must return")
-    }
 }
 
 impl Drop for LimaBridgeManager {
@@ -453,7 +425,7 @@ type OpenResult = std::result::Result<(), String>;
 type ExitResult = std::result::Result<i32, String>;
 
 struct LimaBridgeConnection {
-    outgoing: mpsc::UnboundedSender<FirecrackerBridgeClientFrame>,
+    outgoing: mpsc::Sender<FirecrackerBridgeClientFrame>,
     state: Arc<LimaBridgeClientState>,
     next_id: AtomicU64,
 }
@@ -467,9 +439,8 @@ struct LimaBridgeClientState {
 
 struct ClientStreamRoutes {
     opened: Option<oneshot::Sender<OpenResult>>,
-    stdout: Option<mpsc::UnboundedSender<BridgeReadEvent>>,
-    stderr: Option<mpsc::UnboundedSender<BridgeReadEvent>>,
-    tcp: Option<mpsc::UnboundedSender<BridgeReadEvent>>,
+    stdout: Option<mpsc::Sender<BridgeReadEvent>>,
+    stderr: Option<mpsc::Sender<BridgeReadEvent>>,
     exited: Option<oneshot::Sender<ExitResult>>,
 }
 
@@ -495,7 +466,7 @@ impl LimaBridgeConnection {
             .take()
             .context("opening Firecracker bridge stderr")?;
         let state = Arc::new(LimaBridgeClientState::new());
-        let (outgoing, mut outgoing_receiver) = mpsc::unbounded_channel();
+        let (outgoing, mut outgoing_receiver) = mpsc::channel(BRIDGE_FRAME_QUEUE_DEPTH);
 
         let writer_state = Arc::clone(&state);
         tokio::spawn(async move {
@@ -512,7 +483,7 @@ impl LimaBridgeConnection {
             loop {
                 match read_frame::<FirecrackerBridgeServerFrame>(&mut stdout).await {
                     Ok(frame) => {
-                        if let Err(error) = reader_state.handle_frame(frame) {
+                        if let Err(error) = reader_state.handle_frame(frame).await {
                             reader_state
                                 .fail(format!("decoding Firecracker Lima bridge: {error:#}"));
                             return;
@@ -568,8 +539,8 @@ impl LimaBridgeConnection {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn send(&self, frame: FirecrackerBridgeClientFrame) -> Result<()> {
-        self.outgoing.send(frame).map_err(|_| {
+    async fn send(&self, frame: FirecrackerBridgeClientFrame) -> Result<()> {
+        self.outgoing.send(frame).await.map_err(|_| {
             anyhow!(
                 "Firecracker Lima bridge is closed: {}",
                 self.state.close_reason()
@@ -588,10 +559,13 @@ impl LimaBridgeConnection {
             .lock()
             .map_err(|_| anyhow!("Firecracker bridge request lock is poisoned"))?
             .insert(id, sender);
-        if let Err(error) = self.send(FirecrackerBridgeClientFrame::Request {
-            id,
-            request: Box::new(request),
-        }) {
+        if let Err(error) = self
+            .send(FirecrackerBridgeClientFrame::Request {
+                id,
+                request: Box::new(request),
+            })
+            .await
+        {
             self.state.remove_request(id);
             return Err(error);
         }
@@ -607,8 +581,8 @@ impl LimaBridgeConnection {
     ) -> Result<SandboxProcessParts> {
         let id = self.next_id();
         let (opened_sender, opened_receiver) = oneshot::channel();
-        let (stdout_sender, stdout_receiver) = mpsc::unbounded_channel();
-        let (stderr_sender, stderr_receiver) = mpsc::unbounded_channel();
+        let (stdout_sender, stdout_receiver) = mpsc::channel(BRIDGE_STREAM_QUEUE_DEPTH);
+        let (stderr_sender, stderr_receiver) = mpsc::channel(BRIDGE_STREAM_QUEUE_DEPTH);
         let (exit_sender, exit_receiver) = oneshot::channel();
         self.state.insert_stream(
             id,
@@ -616,14 +590,16 @@ impl LimaBridgeConnection {
                 opened: Some(opened_sender),
                 stdout: Some(stdout_sender),
                 stderr: Some(stderr_sender),
-                tcp: None,
                 exited: Some(exit_sender),
             },
         )?;
-        if let Err(error) = self.send(FirecrackerBridgeClientFrame::Request {
-            id,
-            request: Box::new(request),
-        }) {
+        if let Err(error) = self
+            .send(FirecrackerBridgeClientFrame::Request {
+                id,
+                request: Box::new(request),
+            })
+            .await
+        {
             self.state.remove_stream(id);
             return Err(error);
         }
@@ -645,51 +621,15 @@ impl LimaBridgeConnection {
         Ok(SandboxProcessParts {
             stdout: Box::pin(BridgeReadStream::new(stdout_receiver).compat()),
             stderr: Box::pin(BridgeReadStream::new(stderr_receiver).compat()),
-            stdin: Box::pin(
-                BridgeWriteStream::new(id, self.outgoing.clone(), false).compat_write(),
-            ),
+            stdin: Box::pin(BridgeWriteStream::new(id, self.outgoing.clone()).compat_write()),
             wait,
-        })
-    }
-
-    async fn connect_tcp(&self, request: FirecrackerBridgeRequest) -> Result<LimaTcpStream> {
-        let id = self.next_id();
-        let (opened_sender, opened_receiver) = oneshot::channel();
-        let (tcp_sender, tcp_receiver) = mpsc::unbounded_channel();
-        self.state.insert_stream(
-            id,
-            ClientStreamRoutes {
-                opened: Some(opened_sender),
-                stdout: None,
-                stderr: None,
-                tcp: Some(tcp_sender),
-                exited: None,
-            },
-        )?;
-        if let Err(error) = self.send(FirecrackerBridgeClientFrame::Request {
-            id,
-            request: Box::new(request),
-        }) {
-            self.state.remove_stream(id);
-            return Err(error);
-        }
-        opened_receiver
-            .await
-            .map_err(|_| anyhow!("Firecracker Lima bridge dropped TCP open {id}"))?
-            .map_err(|message| anyhow!(message))?;
-        Ok(LimaTcpStream {
-            id,
-            reader: BridgeReadStream::new(tcp_receiver),
-            outgoing: self.outgoing.clone(),
-            state: Arc::clone(&self.state),
-            write_closed: false,
         })
     }
 
     fn shutdown(&self) {
         if self
             .outgoing
-            .send(FirecrackerBridgeClientFrame::Shutdown)
+            .try_send(FirecrackerBridgeClientFrame::Shutdown)
             .is_err()
         {
             tracing::debug!("Firecracker Lima bridge was already closed during shutdown");
@@ -736,7 +676,7 @@ impl LimaBridgeClientState {
         }
     }
 
-    fn handle_frame(&self, frame: FirecrackerBridgeServerFrame) -> Result<()> {
+    async fn handle_frame(&self, frame: FirecrackerBridgeServerFrame) -> Result<()> {
         match frame {
             FirecrackerBridgeServerFrame::Response {
                 id,
@@ -779,13 +719,12 @@ impl LimaBridgeClientState {
             }
             FirecrackerBridgeServerFrame::StreamData { id, channel, data } => {
                 let bytes = BASE64.decode(data)?;
-                self.send_stream_event(id, channel, BridgeReadEvent::Data(bytes))?;
+                self.send_stream_event(id, channel, BridgeReadEvent::Data(bytes))
+                    .await?;
             }
             FirecrackerBridgeServerFrame::StreamClosed { id, channel } => {
-                self.send_stream_event(id, channel, BridgeReadEvent::Closed)?;
-                if channel == FirecrackerBridgeStreamChannel::Tcp {
-                    self.remove_stream(id);
-                }
+                self.send_stream_event(id, channel, BridgeReadEvent::Closed)
+                    .await?;
             }
             FirecrackerBridgeServerFrame::ProcessExited { id, exit_code } => {
                 let Some(mut routes) = self.remove_stream(id) else {
@@ -807,26 +746,28 @@ impl LimaBridgeClientState {
         Ok(())
     }
 
-    fn send_stream_event(
+    async fn send_stream_event(
         &self,
         id: u64,
         channel: FirecrackerBridgeStreamChannel,
         event: BridgeReadEvent,
     ) -> Result<()> {
-        let streams = self
-            .streams
-            .lock()
-            .map_err(|_| anyhow!("Firecracker bridge stream lock is poisoned"))?;
-        let Some(routes) = streams.get(&id) else {
-            return Ok(());
+        let sender = {
+            let streams = self
+                .streams
+                .lock()
+                .map_err(|_| anyhow!("Firecracker bridge stream lock is poisoned"))?;
+            let Some(routes) = streams.get(&id) else {
+                return Ok(());
+            };
+            match channel {
+                FirecrackerBridgeStreamChannel::Stdout => routes.stdout.as_ref(),
+                FirecrackerBridgeStreamChannel::Stderr => routes.stderr.as_ref(),
+            }
+            .context("Firecracker bridge data used the wrong stream channel")?
+            .clone()
         };
-        let sender = match channel {
-            FirecrackerBridgeStreamChannel::Stdout => routes.stdout.as_ref(),
-            FirecrackerBridgeStreamChannel::Stderr => routes.stderr.as_ref(),
-            FirecrackerBridgeStreamChannel::Tcp => routes.tcp.as_ref(),
-        }
-        .context("Firecracker bridge data used the wrong stream channel")?;
-        if sender.send(event).is_err() {
+        if sender.send(event).await.is_err() {
             tracing::debug!(id, ?channel, "Firecracker bridge stream reader was dropped");
         }
         Ok(())
@@ -861,11 +802,8 @@ impl LimaBridgeClientState {
 
 impl ClientStreamRoutes {
     fn close_outputs(&mut self) {
-        for sender in [&self.stdout, &self.stderr, &self.tcp]
-            .into_iter()
-            .flatten()
-        {
-            if sender.send(BridgeReadEvent::Closed).is_err() {
+        for sender in [&self.stdout, &self.stderr].into_iter().flatten() {
+            if sender.try_send(BridgeReadEvent::Closed).is_err() {
                 tracing::debug!("Firecracker bridge stream reader already closed");
             }
         }
@@ -877,12 +815,12 @@ impl ClientStreamRoutes {
         {
             tracing::debug!("Firecracker bridge stream opener already closed");
         }
-        for sender in [self.stdout.take(), self.stderr.take(), self.tcp.take()]
+        for sender in [self.stdout.take(), self.stderr.take()]
             .into_iter()
             .flatten()
         {
             if sender
-                .send(BridgeReadEvent::Error(message.clone()))
+                .try_send(BridgeReadEvent::Error(message.clone()))
                 .is_err()
             {
                 tracing::debug!("Firecracker bridge stream reader already closed");
@@ -897,14 +835,14 @@ impl ClientStreamRoutes {
 }
 
 struct BridgeReadStream {
-    receiver: mpsc::UnboundedReceiver<BridgeReadEvent>,
+    receiver: mpsc::Receiver<BridgeReadEvent>,
     buffer: Vec<u8>,
     offset: usize,
     closed: bool,
 }
 
 impl BridgeReadStream {
-    fn new(receiver: mpsc::UnboundedReceiver<BridgeReadEvent>) -> Self {
+    fn new(receiver: mpsc::Receiver<BridgeReadEvent>) -> Self {
         Self {
             receiver,
             buffer: Vec::new(),
@@ -950,36 +888,43 @@ impl AsyncRead for BridgeReadStream {
 
 struct BridgeWriteStream {
     id: u64,
-    outgoing: mpsc::UnboundedSender<FirecrackerBridgeClientFrame>,
+    outgoing: mpsc::Sender<FirecrackerBridgeClientFrame>,
+    poll_sender: PollSender<FirecrackerBridgeClientFrame>,
     closed: bool,
-    cancel_on_drop: bool,
 }
 
 impl BridgeWriteStream {
-    fn new(
-        id: u64,
-        outgoing: mpsc::UnboundedSender<FirecrackerBridgeClientFrame>,
-        cancel_on_drop: bool,
-    ) -> Self {
+    fn new(id: u64, outgoing: mpsc::Sender<FirecrackerBridgeClientFrame>) -> Self {
         Self {
             id,
+            poll_sender: PollSender::new(outgoing.clone()),
             outgoing,
             closed: false,
-            cancel_on_drop,
         }
     }
 
-    fn send(&self, frame: FirecrackerBridgeClientFrame) -> io::Result<()> {
-        self.outgoing
-            .send(frame)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Firecracker bridge closed"))
+    fn poll_send(
+        &mut self,
+        context: &mut Context<'_>,
+        frame: FirecrackerBridgeClientFrame,
+    ) -> Poll<io::Result<()>> {
+        match self.poll_sender.poll_reserve(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Firecracker bridge closed",
+            ))),
+            Poll::Ready(Ok(())) => Poll::Ready(self.poll_sender.send_item(frame).map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "Firecracker bridge closed")
+            })),
+        }
     }
 }
 
 impl AsyncWrite for BridgeWriteStream {
     fn poll_write(
-        self: Pin<&mut Self>,
-        _context: &mut Context<'_>,
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
         if self.closed {
@@ -988,21 +933,33 @@ impl AsyncWrite for BridgeWriteStream {
                 "Firecracker bridge stream input is closed",
             )));
         }
-        self.send(FirecrackerBridgeClientFrame::StreamInput {
+        let written = buffer.len().min(BRIDGE_STREAM_CHUNK_BYTES);
+        let frame = FirecrackerBridgeClientFrame::StreamInput {
             id: self.id,
-            data: BASE64.encode(buffer),
-        })?;
-        Poll::Ready(Ok(buffer.len()))
+            data: BASE64.encode(&buffer[..written]),
+        };
+        match self.poll_send(context, frame) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(written)),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.closed {
-            self.send(FirecrackerBridgeClientFrame::StreamInputClosed { id: self.id })?;
-            self.closed = true;
+            let id = self.id;
+            match self.poll_send(
+                context,
+                FirecrackerBridgeClientFrame::StreamInputClosed { id },
+            ) {
+                Poll::Ready(Ok(())) => self.closed = true,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
         }
         Poll::Ready(Ok(()))
     }
@@ -1010,26 +967,10 @@ impl AsyncWrite for BridgeWriteStream {
 
 impl Drop for BridgeWriteStream {
     fn drop(&mut self) {
-        if self.cancel_on_drop {
-            if self
-                .outgoing
-                .send(FirecrackerBridgeClientFrame::StreamCancel { id: self.id })
-                .is_err()
-            {
-                tracing::debug!(
-                    id = self.id,
-                    "Firecracker bridge already closed during cancel"
-                );
-            }
-        } else if !self.closed
-            && self
-                .outgoing
-                .send(FirecrackerBridgeClientFrame::StreamInputClosed { id: self.id })
-                .is_err()
-        {
-            tracing::debug!(
-                id = self.id,
-                "Firecracker bridge already closed during stdin close"
+        if !self.closed {
+            send_bridge_frame_on_drop(
+                &self.outgoing,
+                FirecrackerBridgeClientFrame::StreamInputClosed { id: self.id },
             );
         }
     }
@@ -1037,7 +978,7 @@ impl Drop for BridgeWriteStream {
 
 struct BridgeStreamCancel {
     id: u64,
-    outgoing: mpsc::UnboundedSender<FirecrackerBridgeClientFrame>,
+    outgoing: mpsc::Sender<FirecrackerBridgeClientFrame>,
     state: Arc<LimaBridgeClientState>,
     armed: bool,
 }
@@ -1045,7 +986,7 @@ struct BridgeStreamCancel {
 impl BridgeStreamCancel {
     fn new(
         id: u64,
-        outgoing: mpsc::UnboundedSender<FirecrackerBridgeClientFrame>,
+        outgoing: mpsc::Sender<FirecrackerBridgeClientFrame>,
         state: Arc<LimaBridgeClientState>,
     ) -> Self {
         Self {
@@ -1067,87 +1008,31 @@ impl Drop for BridgeStreamCancel {
             return;
         }
         self.state.remove_stream(self.id);
-        if self
-            .outgoing
-            .send(FirecrackerBridgeClientFrame::StreamCancel { id: self.id })
-            .is_err()
-        {
-            tracing::debug!(
-                id = self.id,
-                "Firecracker bridge already closed during cancel"
-            );
+        send_bridge_frame_on_drop(
+            &self.outgoing,
+            FirecrackerBridgeClientFrame::StreamCancel { id: self.id },
+        );
+    }
+}
+
+fn send_bridge_frame_on_drop(
+    outgoing: &mpsc::Sender<FirecrackerBridgeClientFrame>,
+    frame: FirecrackerBridgeClientFrame,
+) {
+    match outgoing.try_send(frame) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::debug!("Firecracker bridge already closed while dropping a stream");
         }
-    }
-}
-
-struct LimaTcpStream {
-    id: u64,
-    reader: BridgeReadStream,
-    outgoing: mpsc::UnboundedSender<FirecrackerBridgeClientFrame>,
-    state: Arc<LimaBridgeClientState>,
-    write_closed: bool,
-}
-
-impl AsyncRead for LimaTcpStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.reader).poll_read(context, buffer)
-    }
-}
-
-impl AsyncWrite for LimaTcpStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _context: &mut Context<'_>,
-        buffer: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        if self.write_closed {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "Firecracker TCP bridge input is closed",
-            )));
-        }
-        self.outgoing
-            .send(FirecrackerBridgeClientFrame::StreamInput {
-                id: self.id,
-                data: BASE64.encode(buffer),
-            })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Firecracker bridge closed"))?;
-        Poll::Ready(Ok(buffer.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if !self.write_closed {
-            self.outgoing
-                .send(FirecrackerBridgeClientFrame::StreamInputClosed { id: self.id })
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "Firecracker bridge closed")
-                })?;
-            self.write_closed = true;
-        }
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl Drop for LimaTcpStream {
-    fn drop(&mut self) {
-        self.state.remove_stream(self.id);
-        if self
-            .outgoing
-            .send(FirecrackerBridgeClientFrame::StreamCancel { id: self.id })
-            .is_err()
-        {
-            tracing::debug!(
-                id = self.id,
-                "Firecracker bridge already closed during TCP cancel"
-            );
+        Err(mpsc::error::TrySendError::Full(frame)) => {
+            let outgoing = outgoing.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    if outgoing.send(frame).await.is_err() {
+                        tracing::debug!("Firecracker bridge closed while dropping a stream");
+                    }
+                });
+            }
         }
     }
 }

@@ -294,7 +294,7 @@ fn cache_local_image(state_root: &Path, source: &str) -> Result<(PathBuf, bool)>
         metadata.ctime(),
         metadata.ctime_nsec()
     );
-    let digest = hex::encode(Sha256::digest(identity.as_bytes()));
+    let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
     let local_root = state_root
         .join("images")
         .join(format!("v{MATERIALIZER_VERSION}"))
@@ -514,7 +514,7 @@ fn validate_blob(path: &Path, descriptor: &OciDescriptor) -> Result<()> {
         }
         hasher.update(&buffer[..count]);
     }
-    let actual = hex::encode(hasher.finalize());
+    let actual = format!("{:x}", hasher.finalize());
     if actual != expected {
         bail!("OCI layer digest mismatch: expected sha256:{expected}, got sha256:{actual}");
     }

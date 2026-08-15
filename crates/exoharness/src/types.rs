@@ -44,22 +44,9 @@ pub trait SandboxHandle: SnapshotHandle {
     async fn list_sandboxes(&self) -> Result<Vec<SandboxRecord>>;
     async fn create_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId>;
     async fn fork_sandbox(&self, request: ForkSandboxRequest) -> Result<SandboxId>;
-    async fn terminate_sandbox(&self, id: SandboxId) -> Result<()>;
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId>;
     async fn detach_sandbox(&self, id: SandboxId) -> Result<SandboxAttachment>;
     async fn stop_sandbox(&self, id: SandboxId) -> Result<()>;
-    #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
-    async fn sandbox_supports_tcp(&self, _id: SandboxId) -> Result<bool> {
-        Ok(false)
-    }
-    #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
-    async fn connect_sandbox_tcp(
-        &self,
-        _id: SandboxId,
-        _port: u16,
-    ) -> Result<Option<crate::BoxSandboxTcpStream>> {
-        Ok(None)
-    }
     async fn start_sandbox_process(
         &self,
         request: StartSandboxProcessRequest,

@@ -4,6 +4,7 @@
 //! https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::future::Future;
 use std::io::{BufRead, BufReader as StdBufReader, Read, Seek, SeekFrom, Write};
@@ -25,13 +26,12 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 use crate::sandbox::{
-    BoxSandboxTcpStream, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
-    SandboxCommandOutput, SandboxKey, SandboxNetworkPolicy, SandboxRequest, SandboxSpec,
-    SnapshotPayload, sandbox_spec_hash,
+    ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput, SandboxKey,
+    SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotPayload, sandbox_spec_hash,
 };
 use crate::sandbox_provider::process_bridge;
 use crate::{FileSystemMountMode, SandboxAttachment, SandboxProcessParts};
@@ -41,7 +41,7 @@ use super::firecracker_image::resolve_image;
 use super::firecracker_image::validate_ext4_image;
 
 const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(30);
-const PID_FILE_STARTUP_TIMEOUT: Duration = Duration::from_secs(1);
+const PID_FILE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
 const MAX_GUEST_REQUEST_BYTES: usize = 1024 * 1024;
@@ -71,7 +71,6 @@ const SNAPSHOT_CACHE_VERSION: u32 = 1;
 const FIRECRACKER_API_SOCKET: &str = "firecracker.socket";
 const FIRECRACKER_API_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRECRACKER_SNAPSHOT_CREATE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const DEVICE_MAPPER_CHUNK_SECTORS: u64 = 8;
 // Firecracker forwards guest packets without filtering them. Keep special-use,
 // link-local, host-private, and cross-VM ranges closed unless explicitly admitted.
 // https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md#filtering-guest-egress-network-traffic
@@ -112,7 +111,6 @@ pub struct FirecrackerConfig {
     pub dns_server: Ipv4Addr,
     pub allowed_egress_cidrs: Vec<String>,
     pub network_bytes_per_second: u64,
-    pub snapshot_enabled: bool,
 }
 
 impl FirecrackerConfig {
@@ -143,7 +141,6 @@ impl FirecrackerConfig {
                 "EXO_FIRECRACKER_NETWORK_BYTES_PER_SECOND",
                 DEFAULT_NETWORK_BYTES_PER_SECOND,
             )?,
-            snapshot_enabled: false,
         })
     }
 }
@@ -164,6 +161,7 @@ struct FirecrackerProviderState {
 struct MachineRecord {
     machine_id: String,
     spec_hash: String,
+    resolved_image: String,
     slot: u32,
     network_enabled: bool,
     workspace_id: Option<String>,
@@ -171,15 +169,7 @@ struct MachineRecord {
     // manifest lets a later CLI process reap a VM without process-local state.
     idle_ttl_seconds: Option<u64>,
     snapshot_template: Option<String>,
-    #[serde(default)]
     snapshot_network_slot: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CowResources {
-    device_name: String,
-    origin_loop: PathBuf,
-    cow_loop: PathBuf,
 }
 
 enum GuestReadiness {
@@ -190,11 +180,6 @@ enum GuestReadiness {
 #[derive(Serialize)]
 struct FirecrackerVmState<'a> {
     state: &'a str,
-}
-
-#[derive(Serialize)]
-struct FirecrackerAction<'a> {
-    action_type: &'a str,
 }
 
 #[derive(Serialize)]
@@ -541,17 +526,13 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         &self,
         source: SandboxRequest,
         mut target: SandboxRequest,
-    ) -> Result<Option<Arc<dyn ManagedSandboxHandle>>> {
-        if !self.shared.config.snapshot_enabled {
-            bail!("Firecracker forking requires snapshots to be enabled")
-        }
-        if source.spec != target.spec {
-            bail!("Firecracker fork source and target specifications must match")
-        }
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         if !source.spec.durable_file_systems.is_empty() {
             bail!("Firecracker forking does not support durable filesystems")
         }
 
+        let mut source = prepare_request(source)?;
+        target = prepare_request(target)?;
         let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
         let source_entry = self
             .shared
@@ -569,28 +550,11 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         if !process_running(&self.shared.pid_path(&source_record.machine_id)) {
             bail!("Firecracker fork source is not running")
         }
-        if source_record.snapshot_template.is_none() {
-            bail!("Firecracker fork source was not launched in snapshot-capable mode")
+        source.spec.image = source_record.resolved_image.clone();
+        if sandbox_spec_hash(&source.spec) != source_record.spec_hash {
+            bail!("Firecracker fork source specification does not match the running machine")
         }
 
-        GuestClient::new(
-            Arc::clone(&self.shared),
-            machine_from_record(&self.shared.config, source_record.clone()).vsock_path,
-        )
-        .sync_filesystem(&source.spec.default_workdir)
-        .await
-        .context("syncing Firecracker fork source filesystem")?;
-        let config = self.shared.config.clone();
-        let source_record_for_snapshot = source_record.clone();
-        let template_key = tokio::task::spawn_blocking(move || {
-            let template_key = fork_snapshot_template_key(&config, &source_record_for_snapshot)?;
-            ensure_fork_snapshot_template(&config, &source_record_for_snapshot, &template_key)?;
-            Ok::<String, anyhow::Error>(template_key)
-        })
-        .await
-        .context("joining Firecracker fork snapshot creation")??;
-
-        target = prepare_request(target)?;
         let image = resolve_image(
             &self.shared.config.state_root,
             &target.spec.image,
@@ -598,21 +562,49 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         )
         .await?;
         target.spec.image = image.to_string_lossy().into_owned();
+        if source.spec != target.spec {
+            bail!("Firecracker fork source and target specifications must match")
+        }
         let target_spec_hash = sandbox_spec_hash(&target.spec);
         let target_machine_id = machine_id(&target.key, &target_spec_hash);
+        let template_key = fork_snapshot_template_key(&source_record, &target_machine_id);
+        GuestClient::new(
+            Arc::clone(&self.shared),
+            machine_from_record(&self.shared.config, source_record.clone()).vsock_path,
+        )
+        .sync_filesystem(&source.spec.default_workdir)
+        .await
+        .context("syncing Firecracker fork source filesystem")?;
         self.shared
             .new_fork_machine_record(
                 &target,
                 &target_machine_id,
                 &target_spec_hash,
-                template_key,
+                template_key.clone(),
                 source_record.slot,
             )
             .await?;
+        let config = self.shared.config.clone();
+        let source_record_for_snapshot = source_record.clone();
+        let snapshot_result = tokio::task::spawn_blocking(move || {
+            create_fork_snapshot(&config, &source_record_for_snapshot, &template_key)
+        })
+        .await
+        .context("joining Firecracker fork snapshot creation")
+        .and_then(|result| result);
+        if let Err(error) = snapshot_result {
+            if let Err(cleanup_error) = self.shared.cleanup_machine(&target_machine_id, true).await
+            {
+                return Err(error).context(format!(
+                    "cleaning up failed Firecracker fork also failed: {cleanup_error:#}"
+                ));
+            }
+            return Err(error);
+        }
         drop(_lifecycle_guard);
 
         match self.acquire_resolved(target).await {
-            Ok(handle) => Ok(Some(handle)),
+            Ok(handle) => Ok(handle),
             Err(error) => {
                 if let Err(cleanup_error) =
                     self.shared.cleanup_machine(&target_machine_id, true).await
@@ -730,18 +722,6 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
         GuestClient::new(Arc::clone(&self.shared), machine.vsock_path)
             .start_process(&self.request.spec, command, cleanup_machine_id)
             .await
-    }
-
-    fn supports_tcp(&self) -> bool {
-        true
-    }
-
-    async fn connect_tcp(&self, port: u16) -> Result<Option<BoxSandboxTcpStream>> {
-        if !self.machine.record.network_enabled {
-            bail!("Firecracker sandbox does not have networking enabled");
-        }
-        let address = (self.machine.record.network().guest_ip, port);
-        Ok(Some(Box::pin(TcpStream::connect(address).await?)))
     }
 
     async fn stop(&self) -> Result<()> {
@@ -896,7 +876,6 @@ impl Shared {
         let state_root = self.config.state_root.clone();
         let machine_id = machine_id.to_string();
         let spec_hash = spec_hash.to_string();
-        let config = self.config.clone();
         let image = request.spec.image.clone();
         let network_enabled = request.spec.network == SandboxNetworkPolicy::Enabled;
         let workspace_id = request
@@ -906,33 +885,16 @@ impl Shared {
             .map(|file_system| stable_fnv1a_hex(&format!("{}\n{}", request.key, file_system.name)));
         let idle_ttl_seconds = request.lifecycle.idle_ttl.map(|ttl| ttl.as_secs());
         tokio::task::spawn_blocking(move || {
-            let snapshot_eligible = config.snapshot_enabled && workspace_id.is_none();
-            // Snapshot-capable machines allocate from a dense slot pool so a
-            // sequential one-shot workload reuses slot 0's NIC/vsock-specific
-            // template instead of generating a template for every random ID.
-            let slot = if snapshot_eligible {
-                allocate_resource_slot_from(&state_root, &machine_id, 0)?
-            } else {
-                allocate_resource_slot(&state_root, &machine_id)?
-            };
-            let snapshot_template = if snapshot_eligible {
-                Some(snapshot_template_key(
-                    &config,
-                    Path::new(&image),
-                    slot,
-                    network_enabled,
-                )?)
-            } else {
-                None
-            };
+            let slot = allocate_resource_slot(&state_root, &machine_id)?;
             let record = MachineRecord {
                 machine_id,
                 spec_hash,
+                resolved_image: image,
                 slot,
                 network_enabled,
                 workspace_id,
                 idle_ttl_seconds,
-                snapshot_template,
+                snapshot_template: None,
                 snapshot_network_slot: None,
             };
             if let Err(error) = write_manifest(&state_root, &record) {
@@ -962,6 +924,7 @@ impl Shared {
         let state_root = self.config.state_root.clone();
         let machine_id = machine_id.to_string();
         let spec_hash = spec_hash.to_string();
+        let resolved_image = request.spec.image.clone();
         let network_enabled = request.spec.network == SandboxNetworkPolicy::Enabled;
         let idle_ttl_seconds = request.lifecycle.idle_ttl.map(|ttl| ttl.as_secs());
         tokio::task::spawn_blocking(move || {
@@ -970,6 +933,7 @@ impl Shared {
             let record = MachineRecord {
                 machine_id,
                 spec_hash,
+                resolved_image,
                 slot,
                 network_enabled,
                 workspace_id: None,
@@ -1047,10 +1011,10 @@ impl Shared {
             let config = self.config.clone();
             let record = record.clone();
             tokio::task::spawn_blocking(move || {
-                cleanup_cow_resources(&config, &record, delete_rootfs)
+                cleanup_snapshot_overlay(&config, &record, delete_rootfs)
             })
             .await
-            .context("joining Firecracker COW cleanup")??;
+            .context("joining Firecracker snapshot overlay cleanup")??;
         }
         if let Some(record) = record.as_ref().filter(|record| record.network_enabled) {
             self.cleanup_network(&record.network()).await;
@@ -1080,6 +1044,11 @@ impl Shared {
             let jail_dir = self.jail_dir(machine_id);
             let manifest = self.manifest_path(machine_id);
             let lease = lease_path(&self.config.state_root, machine_id);
+            let owned_snapshot = record
+                .as_ref()
+                .and_then(|record| record.snapshot_template.as_deref())
+                .map(|key| snapshot_template_dir(&self.config, key))
+                .transpose()?;
             let slot_claim = record
                 .as_ref()
                 .map(|record| (record.slot, record.machine_id.clone()));
@@ -1098,6 +1067,13 @@ impl Shared {
                 if lease.try_exists()? {
                     fs::remove_file(&lease).with_context(|| {
                         format!("removing Firecracker lease {}", lease.display())
+                    })?;
+                }
+                if let Some(snapshot) = owned_snapshot
+                    && snapshot.try_exists()?
+                {
+                    fs::remove_dir_all(&snapshot).with_context(|| {
+                        format!("removing Firecracker fork snapshot {}", snapshot.display())
                     })?;
                 }
                 if let Some((slot, machine_id)) = slot_claim {
@@ -1252,31 +1228,6 @@ fn validate_host(config: &FirecrackerConfig) -> Result<()> {
         trusted_host_command(program)
             .with_context(|| format!("required trusted host command {program}"))?;
     }
-    if config.snapshot_enabled {
-        for program in ["dmsetup", "losetup", "mount", "mountpoint", "umount"] {
-            trusted_host_command(program)
-                .with_context(|| format!("required Firecracker snapshot command {program}"))?;
-        }
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/loop-control")
-            .context("Firecracker snapshots require access to /dev/loop-control")?;
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/mapper/control")
-            .context("Firecracker snapshots require device-mapper control access")?;
-        if config
-            .state_root
-            .as_os_str()
-            .as_bytes()
-            .iter()
-            .any(|byte| byte.is_ascii_whitespace())
-        {
-            bail!("Firecracker snapshot state root cannot contain whitespace");
-        }
-    }
     if config.vcpu_count == 0 || config.vcpu_count > 32 {
         bail!("Firecracker vCPU count must be between 1 and 32");
     }
@@ -1351,7 +1302,7 @@ fn cache_immutable_artifact(state_root: &Path, label: &str, source: &Path) -> Re
         }
         hasher.update(&buffer[..count]);
     }
-    let digest = hex::encode(hasher.finalize());
+    let digest = format!("{:x}", hasher.finalize());
     let artifacts = state_root.join("artifacts");
     let cached = artifacts.join(format!("{label}-{digest}"));
     if !cached.try_exists()? {
@@ -1514,38 +1465,6 @@ fn stable_fnv1a(input: &str) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
-}
-
-fn snapshot_template_key(
-    config: &FirecrackerConfig,
-    image: &Path,
-    slot: u32,
-    network_enabled: bool,
-) -> Result<String> {
-    let mut hasher = Sha256::new();
-    hasher.update(SNAPSHOT_CACHE_VERSION.to_le_bytes());
-    hasher.update(slot.to_le_bytes());
-    hasher.update([u8::from(network_enabled), config.vcpu_count]);
-    hasher.update(config.memory_mib.to_le_bytes());
-    hasher.update(config.image_size_gib.to_le_bytes());
-    for path in [
-        config.firecracker_bin.as_path(),
-        config.kernel.as_path(),
-        config.initramfs.as_path(),
-        image,
-    ] {
-        let metadata = fs::metadata(path)
-            .with_context(|| format!("reading snapshot input metadata {}", path.display()))?;
-        let modified = metadata
-            .modified()?
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .context("snapshot input modification time predates the Unix epoch")?;
-        hasher.update(path.as_os_str().as_bytes());
-        hasher.update(metadata.len().to_le_bytes());
-        hasher.update(modified.as_secs().to_le_bytes());
-        hasher.update(modified.subsec_nanos().to_le_bytes());
-    }
-    Ok(hex::encode(hasher.finalize()))
 }
 
 fn hash_snapshot_string(hasher: &mut Sha256, value: &str) {
@@ -1906,210 +1825,7 @@ fn prepare_network(
         ],
     )?;
 
-    run_checked("nft", &["add", "table", "inet", &network.nft_table])?;
-    run_checked(
-        "nft",
-        &[
-            "add",
-            "chain",
-            "inet",
-            &network.nft_table,
-            "input",
-            "{ type filter hook input priority filter; policy accept; }",
-        ],
-    )?;
-    run_checked(
-        "nft",
-        &[
-            "add",
-            "chain",
-            "inet",
-            &network.nft_table,
-            "forward",
-            "{ type filter hook forward priority filter; policy accept; }",
-        ],
-    )?;
-    run_checked(
-        "nft",
-        &[
-            "add",
-            "chain",
-            "inet",
-            &network.nft_table,
-            "postrouting",
-            "{ type nat hook postrouting priority srcnat; policy accept; }",
-        ],
-    )?;
-    // Permit only replies to host-initiated connections before rejecting all
-    // unsolicited guest-to-host traffic. This lets host controllers reach a
-    // selected guest service without exposing host listeners to the guest.
-    // https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md#filtering-guest-egress-network-traffic
-    run_checked(
-        "nft",
-        &[
-            "add",
-            "rule",
-            "inet",
-            &network.nft_table,
-            "input",
-            "iifname",
-            &network.host_veth,
-            "ct",
-            "state",
-            "established,related",
-            "counter",
-            "accept",
-        ],
-    )?;
-    run_checked(
-        "nft",
-        &[
-            "add",
-            "rule",
-            "inet",
-            &network.nft_table,
-            "input",
-            "iifname",
-            &network.host_veth,
-            "counter",
-            "drop",
-        ],
-    )?;
-    run_checked(
-        "nft",
-        &[
-            "add",
-            "rule",
-            "inet",
-            &network.nft_table,
-            "forward",
-            "iifname",
-            &network.host_veth,
-            "ip",
-            "saddr",
-            "!=",
-            &network.guest_cidr,
-            "counter",
-            "drop",
-        ],
-    )?;
-    // Never let an explicit private-CIDR exception admit another Exo VM. Each
-    // VM receives two /30s from this range, so this rule preserves tenant
-    // separation independently of the configurable destination allowlist.
-    run_checked(
-        "nft",
-        &[
-            "add",
-            "rule",
-            "inet",
-            &network.nft_table,
-            "forward",
-            "iifname",
-            &network.host_veth,
-            "ip",
-            "daddr",
-            EXO_NETWORK_CIDR,
-            "counter",
-            "reject",
-        ],
-    )?;
-    for cidr in &config.allowed_egress_cidrs {
-        run_checked(
-            "nft",
-            &[
-                "add",
-                "rule",
-                "inet",
-                &network.nft_table,
-                "forward",
-                "iifname",
-                &network.host_veth,
-                "ip",
-                "daddr",
-                cidr,
-                "counter",
-                "accept",
-            ],
-        )?;
-    }
-    let blocked_cidrs = format!("{{ {} }}", BLOCKED_EGRESS_CIDRS.join(", "));
-    run_checked(
-        "nft",
-        &[
-            "add",
-            "rule",
-            "inet",
-            &network.nft_table,
-            "forward",
-            "iifname",
-            &network.host_veth,
-            "ip",
-            "daddr",
-            &blocked_cidrs,
-            "counter",
-            "reject",
-        ],
-    )?;
-    run_checked(
-        "nft",
-        &[
-            "add",
-            "rule",
-            "inet",
-            &network.nft_table,
-            "forward",
-            "iifname",
-            &network.host_veth,
-            "counter",
-            "accept",
-        ],
-    )?;
-    run_checked(
-        "nft",
-        &[
-            "add",
-            "rule",
-            "inet",
-            &network.nft_table,
-            "forward",
-            "oifname",
-            &network.host_veth,
-            "ct",
-            "state",
-            "established,related",
-            "counter",
-            "accept",
-        ],
-    )?;
-    run_checked(
-        "nft",
-        &[
-            "add",
-            "rule",
-            "inet",
-            &network.nft_table,
-            "forward",
-            "oifname",
-            &network.host_veth,
-            "counter",
-            "drop",
-        ],
-    )?;
-    run_checked(
-        "nft",
-        &[
-            "add",
-            "rule",
-            "inet",
-            &network.nft_table,
-            "postrouting",
-            "ip",
-            "saddr",
-            &network.guest_cidr,
-            "counter",
-            "masquerade",
-        ],
-    )?;
+    install_network_firewall(config, network)?;
     // Docker and similar host services commonly leave the compatibility
     // FORWARD chain at DROP. An accept verdict in our nftables base chain does
     // not override a later base-chain drop, so admit only this VM's veth there.
@@ -2147,6 +1863,71 @@ fn prepare_network(
         ],
     )?;
     Ok(())
+}
+
+fn install_network_firewall(config: &FirecrackerConfig, network: &NetworkConfig) -> Result<()> {
+    let mut rules = String::new();
+    let table = &network.nft_table;
+    let interface = &network.host_veth;
+    writeln!(rules, "add table inet {table}")?;
+    writeln!(
+        rules,
+        "add chain inet {table} input {{ type filter hook input priority filter; policy accept; }}"
+    )?;
+    writeln!(
+        rules,
+        "add chain inet {table} forward {{ type filter hook forward priority filter; policy accept; }}"
+    )?;
+    writeln!(
+        rules,
+        "add chain inet {table} postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}"
+    )?;
+    writeln!(
+        rules,
+        "add rule inet {table} input iifname {interface} ct state established,related counter accept"
+    )?;
+    writeln!(
+        rules,
+        "add rule inet {table} input iifname {interface} counter drop"
+    )?;
+    writeln!(
+        rules,
+        "add rule inet {table} forward iifname {interface} ip saddr != {} counter drop",
+        network.guest_cidr
+    )?;
+    writeln!(
+        rules,
+        "add rule inet {table} forward iifname {interface} ip daddr {EXO_NETWORK_CIDR} counter reject"
+    )?;
+    for cidr in &config.allowed_egress_cidrs {
+        writeln!(
+            rules,
+            "add rule inet {table} forward iifname {interface} ip daddr {cidr} counter accept"
+        )?;
+    }
+    writeln!(
+        rules,
+        "add rule inet {table} forward iifname {interface} ip daddr {{ {} }} counter reject",
+        BLOCKED_EGRESS_CIDRS.join(", ")
+    )?;
+    writeln!(
+        rules,
+        "add rule inet {table} forward iifname {interface} counter accept"
+    )?;
+    writeln!(
+        rules,
+        "add rule inet {table} forward oifname {interface} ct state established,related counter accept"
+    )?;
+    writeln!(
+        rules,
+        "add rule inet {table} forward oifname {interface} counter drop"
+    )?;
+    writeln!(
+        rules,
+        "add rule inet {table} postrouting ip saddr {} counter masquerade",
+        network.guest_cidr
+    )?;
+    run_checked_input("nft", &["-f", "-"], rules.as_bytes())
 }
 
 fn cleanup_network_blocking(network: &NetworkConfig) {
@@ -2190,6 +1971,33 @@ fn run_checked(program: &str, arguments: &[&str]) -> Result<()> {
         .args(arguments)
         .output()
         .with_context(|| format!("running {}", executable.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    bail!(
+        "{} failed with status {}: {}",
+        program,
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+fn run_checked_input(program: &str, arguments: &[&str], input: &[u8]) -> Result<()> {
+    let executable = trusted_host_command(program)?;
+    let mut child = Command::new(&executable)
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running {}", executable.display()))?;
+    child
+        .stdin
+        .as_mut()
+        .context("opening command stdin")?
+        .write_all(input)?;
+    child.stdin = None;
+    let output = child.wait_with_output()?;
     if output.status.success() {
         return Ok(());
     }
@@ -2285,11 +2093,10 @@ fn prepare_and_launch_blocking(
     request: &SandboxRequest,
     record: &MachineRecord,
 ) -> Result<GuestReadiness> {
-    if let Some(template_key) = record.snapshot_template.as_deref() {
-        ensure_snapshot_template(config, request, record, template_key)?;
-        if prepare_snapshot_cow(config, record, template_key)? {
-            return launch_snapshot_clone(config, request, record, template_key);
-        }
+    if let Some(template_key) = record.snapshot_template.as_deref()
+        && prepare_snapshot_overlay(config, record, template_key)?
+    {
+        return launch_snapshot_clone(config, request, record, template_key);
     }
     let rootfs_link_started = Instant::now();
     let root = jail_root(config, &record.machine_id);
@@ -2370,6 +2177,7 @@ fn prepare_and_launch_blocking(
     })?;
     let host_uid = jailer_uid(config, record)?;
     let ownership = format!("{host_uid}:{host_uid}");
+    prepare_api_run_dir(&root, host_uid)?;
     run_checked("chown", &[&ownership, &overlay.to_string_lossy()])?;
     fs::set_permissions(&overlay, Permissions::from_mode(0o600))?;
 
@@ -2421,14 +2229,19 @@ fn prepare_and_launch_blocking(
         "jail_setup",
         jail_setup_started.elapsed(),
     );
-    // A config file starts cold VMs without serial API setup; snapshot restores
-    // use the API-only path below because loading state is an API operation.
-    // https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md#configuring-the-microvm-without-sending-api-requests
+    // Keep the API available so fork() can pause and snapshot the running VM.
+    // The config file still starts the VM atomically without a sequence of API
+    // setup requests.
     spawn_jailed_firecracker(
         config,
         record,
         stderr,
-        &["--no-api", "--config-file", "/vm-config.json"],
+        &[
+            "--api-sock",
+            "/run/firecracker.socket",
+            "--config-file",
+            "/vm-config.json",
+        ],
     )?;
     Ok(GuestReadiness::Signal(ready_listener))
 }
@@ -2436,7 +2249,7 @@ fn prepare_and_launch_blocking(
 fn spawn_jailed_firecracker(
     config: &FirecrackerConfig,
     record: &MachineRecord,
-    stderr: File,
+    output: File,
     firecracker_arguments: &[&str],
 ) -> Result<()> {
     let host_uid = jailer_uid(config, record)?;
@@ -2481,8 +2294,8 @@ fn spawn_jailed_firecracker(
         .arg("--")
         .args(firecracker_arguments)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr));
+        .stdout(Stdio::from(output.try_clone()?))
+        .stderr(Stdio::from(output));
     // Deliberately do not pass --no-seccomp or a custom filter. Release builds'
     // embedded default filters are Firecracker's recommended production setting.
     // https://github.com/firecracker-microvm/firecracker/blob/main/docs/seccomp.md#default-filters-recommended
@@ -2617,17 +2430,6 @@ fn snapshot_cow_path(config: &FirecrackerConfig, machine_id: &str) -> PathBuf {
         .join(format!("{machine_id}.img"))
 }
 
-fn cow_resources_path(config: &FirecrackerConfig, machine_id: &str) -> PathBuf {
-    config
-        .state_root
-        .join("cows")
-        .join(format!("{machine_id}.json"))
-}
-
-fn snapshot_device_name(machine_id: &str) -> String {
-    format!("exo-fc-{}", stable_fnv1a_hex(machine_id))
-}
-
 fn replace_hard_link(source: &Path, destination: &Path) -> Result<()> {
     if destination.try_exists()? {
         fs::remove_file(destination)
@@ -2691,7 +2493,8 @@ fn wait_for_firecracker_api(root: &Path, machine_id: &str) -> Result<PathBuf> {
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    bail!("Firecracker {machine_id} API did not become ready")
+    let stderr = tail_file(&root.join("firecracker.stderr"))?;
+    bail!("Firecracker {machine_id} API did not become ready: {stderr}")
 }
 
 fn firecracker_api_put<T: Serialize>(socket: &Path, path: &str, body: &T) -> Result<()> {
@@ -2770,35 +2573,6 @@ fn firecracker_api_request<T: Serialize>(
     )
 }
 
-fn configure_and_start_firecracker(
-    socket: &Path,
-    config: &FirecrackerConfig,
-    request: &SandboxRequest,
-    record: &MachineRecord,
-) -> Result<()> {
-    let vm = firecracker_vm_configuration(config, request, record);
-    firecracker_api_put(socket, "/machine-config", &vm.machine_config)?;
-    firecracker_api_put(socket, "/boot-source", &vm.boot_source)?;
-    for drive in &vm.drives {
-        firecracker_api_put(socket, &format!("/drives/{}", drive.drive_id), drive)?;
-    }
-    for interface in &vm.network_interfaces {
-        firecracker_api_put(
-            socket,
-            &format!("/network-interfaces/{}", interface.iface_id),
-            interface,
-        )?;
-    }
-    firecracker_api_put(socket, "/vsock", &vm.vsock)?;
-    firecracker_api_put(
-        socket,
-        "/actions",
-        &FirecrackerAction {
-            action_type: "InstanceStart",
-        },
-    )
-}
-
 fn validate_snapshot_template(config: &FirecrackerConfig, directory: &Path) -> Result<bool> {
     let complete = directory.join("complete");
     if !complete.try_exists()? {
@@ -2833,227 +2607,34 @@ fn validate_snapshot_template(config: &FirecrackerConfig, directory: &Path) -> R
     Ok(true)
 }
 
-fn cleanup_snapshot_template_runtime(config: &FirecrackerConfig, machine_id: &str) -> Result<()> {
-    let root = jail_root(config, machine_id);
-    if process_running(&root.join("firecracker.pid")) {
-        stop_machine_process_blocking(machine_id, &root.join("firecracker.pid"))?;
-    }
-    let jail = jail_dir(config, machine_id);
-    if jail.try_exists()? {
-        fs::remove_dir_all(&jail)
-            .with_context(|| format!("removing Firecracker template jail {}", jail.display()))?;
-    }
-    remove_firecracker_cgroup(&firecracker_cgroup_dir(config, machine_id))
-}
-
-fn ensure_snapshot_template(
-    config: &FirecrackerConfig,
-    request: &SandboxRequest,
-    record: &MachineRecord,
-    template_key: &str,
-) -> Result<()> {
-    let destination = snapshot_template_dir(config, template_key)?;
-    if validate_snapshot_template(config, &destination)? {
-        return Ok(());
-    }
-    if destination.try_exists()? {
-        fs::remove_dir_all(&destination).with_context(|| {
-            format!(
-                "removing incomplete Firecracker snapshot {}",
-                destination.display()
-            )
-        })?;
-    }
-    let sequence = ARTIFACT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary = config.state_root.join("snapshots").join(format!(
-        ".{template_key}.{}.{}",
-        std::process::id(),
-        sequence
-    ));
-    fs::create_dir(&temporary)?;
-    fs::set_permissions(&temporary, Permissions::from_mode(0o700))?;
-
-    // Keep the transient jail id short enough that its guest-ready AF_UNIX
-    // socket remains below sockaddr_un.sun_path's 108-byte limit. The durable
-    // snapshot directory still uses the full SHA-256 template key.
-    let template_id = format!("fc-t-{}-{:04x}", &template_key[..12], record.slot);
-    let mut template_record = record.clone();
-    template_record.machine_id = template_id.clone();
-    template_record.workspace_id = None;
-    template_record.snapshot_template = None;
-    cleanup_snapshot_template_runtime(config, &template_id)?;
-
-    let result = (|| {
-        let root = prepare_snapshot_jail_files(config, request, &template_record)?;
-        let ready_listener = prepare_ready_listener(&root)?;
-        let host_uid = jailer_uid(config, &template_record)?;
-        prepare_api_run_dir(&root, host_uid)?;
-
-        let overlay = temporary.join("overlay.ext4");
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&overlay)?;
-        file.set_len(config.image_size_gib * 1024 * 1024 * 1024)?;
-        run_checked(
-            "mkfs.ext4",
-            &[
-                "-q",
-                "-F",
-                "-E",
-                "lazy_itable_init=1,lazy_journal_init=1",
-                &overlay.to_string_lossy(),
-            ],
-        )?;
-        replace_hard_link(&overlay, &root.join("overlay.ext4"))?;
-        let ownership = format!("{host_uid}:{host_uid}");
-        run_checked(
-            "chown",
-            &[&ownership, &root.join("overlay.ext4").to_string_lossy()],
-        )?;
-        fs::set_permissions(root.join("overlay.ext4"), Permissions::from_mode(0o600))?;
-
-        let snapshot_output = root.join("snapshot");
-        fs::create_dir(&snapshot_output)?;
-        run_checked("chown", &[&ownership, &snapshot_output.to_string_lossy()])?;
-        fs::set_permissions(&snapshot_output, Permissions::from_mode(0o700))?;
-        let stderr_path = root.join("firecracker.stderr");
-        let stderr = File::create(&stderr_path)?;
-        fs::set_permissions(&stderr_path, Permissions::from_mode(0o600))?;
-        spawn_jailed_firecracker(
-            config,
-            &template_record,
-            stderr,
-            &["--api-sock", "/run/firecracker.socket"],
-        )?;
-        let api = wait_for_firecracker_api(&root, &template_id)?;
-        configure_and_start_firecracker(&api, config, request, &template_record)?;
-        wait_for_guest_blocking(
-            &template_id,
-            &root.join("firecracker.pid"),
-            &stderr_path,
-            ready_listener,
-        )?;
-        firecracker_api_patch(&api, "/vm", &FirecrackerVmState { state: "Paused" })?;
-        let snapshot_started = Instant::now();
-        // A full snapshot is generated once per immutable image/config/slot. Its
-        // memory file is later mapped MAP_PRIVATE and faulted lazily by each clone.
-        // https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md#full-and-diff-snapshots
-        // https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md#memory-backend
-        firecracker_api_put_with_timeout(
-            &api,
-            "/snapshot/create",
-            &FirecrackerSnapshotCreate {
-                snapshot_type: "Full",
-                snapshot_path: "/snapshot/state",
-                mem_file_path: "/snapshot/memory",
-            },
-            FIRECRACKER_SNAPSHOT_CREATE_TIMEOUT,
-        )?;
-        record_launch_timing(
-            &record.machine_id,
-            "snapshot_create",
-            snapshot_started.elapsed(),
-        );
-        // Never resume the template after snapshotting it. Reusing both sides of
-        // the same captured state duplicates identifiers and random state.
-        // https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md#snapshot-security-and-uniqueness
-        // The template is paused and its disk/snapshot files are already synced;
-        // it must never resume, so terminate it immediately instead of spending
-        // the normal graceful-shutdown window on a paused VMM.
-        kill_machine_process_blocking(&template_id, &root.join("firecracker.pid"))?;
-
-        replace_hard_link(&snapshot_output.join("state"), &temporary.join("state"))?;
-        replace_hard_link(&snapshot_output.join("memory"), &temporary.join("memory"))?;
-        for path in [
-            temporary.join("state"),
-            temporary.join("memory"),
-            overlay.clone(),
-        ] {
-            run_checked("chown", &["0:0", &path.to_string_lossy()])?;
-            fs::set_permissions(&path, Permissions::from_mode(0o444))?;
-            File::open(path)?.sync_all()?;
-        }
-        let complete = temporary.join("complete");
-        File::create(&complete)?.sync_all()?;
-        fs::set_permissions(&complete, Permissions::from_mode(0o444))?;
-        Ok::<(), anyhow::Error>(())
-    })();
-
-    let cleanup = cleanup_snapshot_template_runtime(config, &template_id);
-    if let Err(error) = result {
-        if let Err(cleanup_error) = cleanup {
-            return Err(error).context(format!(
-                "building Firecracker snapshot template; cleanup also failed: {cleanup_error:#}"
-            ));
-        }
-        if temporary.try_exists()? {
-            fs::remove_dir_all(&temporary)?;
-        }
-        return Err(error).context("building Firecracker snapshot template");
-    }
-    cleanup?;
-    match fs::rename(&temporary, &destination) {
-        Ok(()) => {}
-        Err(error) if validate_snapshot_template(config, &destination)? => {
-            fs::remove_dir_all(&temporary)?;
-            tracing::debug!(%error, template = template_key, "another process published the Firecracker snapshot first");
-        }
-        Err(error) => {
-            fs::remove_dir_all(&temporary)?;
-            return Err(error).with_context(|| {
-                format!(
-                    "publishing Firecracker snapshot template {}",
-                    destination.display()
-                )
-            });
-        }
-    }
-    validate_snapshot_template(config, &destination)?;
-    Ok(())
-}
-
-fn fork_snapshot_template_key(
-    config: &FirecrackerConfig,
-    source: &MachineRecord,
-) -> Result<String> {
-    let pid = fs::read_to_string(jail_root(config, &source.machine_id).join("firecracker.pid"))?;
-    let stat = fs::read_to_string(format!("/proc/{}/stat", pid.trim()))?;
-    let fields = stat
-        .rsplit_once(')')
-        .context("invalid Firecracker process stat")?
-        .1
-        .split_whitespace()
-        .collect::<Vec<_>>();
-    let start_time = fields
-        .get(19)
-        .context("Firecracker process stat is missing its start time")?;
+fn fork_snapshot_template_key(source: &MachineRecord, target_machine_id: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(SNAPSHOT_CACHE_VERSION.to_le_bytes());
     hash_snapshot_string(&mut hasher, "live-fork");
     hash_snapshot_string(&mut hasher, &source.machine_id);
     hash_snapshot_string(&mut hasher, &source.spec_hash);
-    hash_snapshot_string(&mut hasher, pid.trim());
-    hash_snapshot_string(&mut hasher, start_time);
-    Ok(hex::encode(hasher.finalize()))
+    hash_snapshot_string(&mut hasher, target_machine_id);
+    format!("{:x}", hasher.finalize())
 }
 
-fn ensure_fork_snapshot_template(
+fn remove_directory_if_present(path: &Path) -> Result<()> {
+    if path.try_exists()? {
+        fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn create_fork_snapshot(
     config: &FirecrackerConfig,
     source: &MachineRecord,
     template_key: &str,
 ) -> Result<()> {
     let destination = snapshot_template_dir(config, template_key)?;
-    if validate_snapshot_template(config, &destination)? {
-        return Ok(());
-    }
     if destination.try_exists()? {
-        fs::remove_dir_all(&destination).with_context(|| {
-            format!(
-                "removing incomplete Firecracker fork snapshot {}",
-                destination.display()
-            )
-        })?;
+        bail!(
+            "Firecracker fork snapshot already exists: {}",
+            destination.display()
+        );
     }
 
     let sequence = ARTIFACT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -3068,9 +2649,7 @@ fn ensure_fork_snapshot_template(
     let root = jail_root(config, &source.machine_id);
     let output_name = format!("fork-{}", &template_key[..12]);
     let output = root.join(&output_name);
-    if output.try_exists()? {
-        fs::remove_dir_all(&output)?;
-    }
+    remove_directory_if_present(&output)?;
     fs::create_dir(&output)?;
     let ownership = format!(
         "{}:{}",
@@ -3081,7 +2660,12 @@ fn ensure_fork_snapshot_template(
     fs::set_permissions(&output, Permissions::from_mode(0o700))?;
 
     let api = wait_for_firecracker_api(&root, &source.machine_id)?;
-    firecracker_api_patch(&api, "/vm", &FirecrackerVmState { state: "Paused" })?;
+    if let Err(error) = firecracker_api_patch(&api, "/vm", &FirecrackerVmState { state: "Paused" })
+    {
+        remove_directory_if_present(&temporary)?;
+        remove_directory_if_present(&output)?;
+        return Err(error).context("pausing Firecracker fork source");
+    }
     let snapshot_path = format!("/{output_name}/state");
     let memory_path = format!("/{output_name}/memory");
     let result = (|| {
@@ -3129,19 +2713,29 @@ fn ensure_fork_snapshot_template(
         Ok::<(), anyhow::Error>(())
     })();
     let resume = firecracker_api_patch(&api, "/vm", &FirecrackerVmState { state: "Resumed" });
-    if let Err(error) = result {
-        if temporary.try_exists()? {
-            fs::remove_dir_all(&temporary)?;
+    let output_cleanup = remove_directory_if_present(&output);
+    let result = match (result, resume, output_cleanup) {
+        (Err(error), Err(resume_error), _) => Err(error).context(format!(
+            "creating Firecracker fork snapshot; source resume also failed: {resume_error:#}"
+        )),
+        (Err(error), _, Err(cleanup_error)) => Err(error).context(format!(
+            "creating Firecracker fork snapshot; jail cleanup also failed: {cleanup_error:#}"
+        )),
+        (Err(error), _, _) => Err(error).context("creating Firecracker fork snapshot"),
+        (Ok(()), Err(error), _) => Err(error).context("resuming Firecracker fork source"),
+        (Ok(()), Ok(()), Err(error)) => {
+            Err(error).context("cleaning up Firecracker fork snapshot jail output")
         }
-        if let Err(resume_error) = resume {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+    };
+    if let Err(error) = result {
+        if let Err(cleanup_error) = remove_directory_if_present(&temporary) {
             return Err(error).context(format!(
-                "creating Firecracker fork snapshot; source resume also failed: {resume_error:#}"
+                "cleaning up failed Firecracker fork snapshot also failed: {cleanup_error:#}"
             ));
         }
-        return Err(error).context("creating Firecracker fork snapshot");
+        return Err(error);
     }
-    resume.context("resuming Firecracker fork source")?;
-    fs::remove_dir_all(&output)?;
     fs::rename(&temporary, &destination).with_context(|| {
         format!(
             "publishing Firecracker fork snapshot {}",
@@ -3152,197 +2746,51 @@ fn ensure_fork_snapshot_template(
     Ok(())
 }
 
-fn run_checked_output(program: &str, arguments: &[&str]) -> Result<String> {
-    let executable = trusted_host_command(program)?;
-    let output = Command::new(&executable)
-        .args(arguments)
-        .output()
-        .with_context(|| format!("running {}", executable.display()))?;
-    if !output.status.success() {
-        bail!(
-            "{} failed with status {}: {}",
-            program,
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    String::from_utf8(output.stdout).with_context(|| format!("decoding {program} output"))
-}
-
-fn parse_loop_device(output: &str) -> Result<PathBuf> {
-    let path = PathBuf::from(output.trim());
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        bail!("losetup returned an invalid loop device")
-    };
-    if path.parent() != Some(Path::new("/dev"))
-        || !name.starts_with("loop")
-        || !name[4..].bytes().all(|byte| byte.is_ascii_digit())
-    {
-        bail!("losetup returned an unexpected device: {}", path.display());
-    }
-    Ok(path)
-}
-
-fn loop_attached_to(loop_device: &Path, backing_file: &Path) -> Result<bool> {
-    let output = run_checked_output(
-        "losetup",
-        &[
-            "--associated",
-            &backing_file.to_string_lossy(),
-            "--output",
-            "NAME",
-            "--noheadings",
-        ],
-    )?;
-    Ok(output
-        .lines()
-        .map(str::trim)
-        .any(|line| Path::new(line) == loop_device))
-}
-
-fn command_succeeds(program: &str, arguments: &[&str]) -> Result<bool> {
-    let executable = trusted_host_command(program)?;
-    Ok(Command::new(executable)
-        .args(arguments)
-        .output()?
-        .status
-        .success())
-}
-
-fn prepare_snapshot_cow(
+fn prepare_snapshot_overlay(
     config: &FirecrackerConfig,
     record: &MachineRecord,
     template_key: &str,
 ) -> Result<bool> {
-    cleanup_cow_resources(config, record, false)?;
-    let template = snapshot_template_dir(config, template_key)?;
-    let origin = template.join("overlay.ext4");
     let cow = snapshot_cow_path(config, &record.machine_id);
     let created = !cow.try_exists()?;
     if created {
-        let file = OpenOptions::new().create_new(true).write(true).open(&cow)?;
-        file.set_len(fs::metadata(&origin)?.len())?;
+        let origin = snapshot_template_dir(config, template_key)?.join("overlay.ext4");
+        run_checked(
+            "cp",
+            &[
+                "--sparse=always",
+                "--reflink=auto",
+                &origin.to_string_lossy(),
+                &cow.to_string_lossy(),
+            ],
+        )?;
         fs::set_permissions(&cow, Permissions::from_mode(0o600))?;
     }
-    let origin_loop = parse_loop_device(&run_checked_output(
-        "losetup",
-        &["--find", "--show", "--read-only", &origin.to_string_lossy()],
-    )?)?;
-    let cow_loop =
-        match run_checked_output("losetup", &["--find", "--show", &cow.to_string_lossy()]) {
-            Ok(output) => parse_loop_device(&output)?,
-            Err(error) => {
-                run_checked("losetup", &["--detach", &origin_loop.to_string_lossy()])?;
-                return Err(error);
-            }
-        };
-    let device_name = snapshot_device_name(&record.machine_id);
-    let bytes = fs::metadata(&origin)?.len();
-    if bytes % 512 != 0 {
-        bail!("Firecracker snapshot overlay size must be sector-aligned");
-    }
-    let sectors = bytes / 512;
-    // Device-mapper snapshots give every clone an independent writable block
-    // device while the ext4 template remains immutable and page-cache shareable.
-    // The persistent exception store also lets a crashed clone cold-boot from
-    // its existing COW without reverting user-visible filesystem state.
-    // https://github.com/torvalds/linux/blob/master/Documentation/admin-guide/device-mapper/snapshot.rst
-    let table = format!(
-        "0 {sectors} snapshot {} {} P {DEVICE_MAPPER_CHUNK_SECTORS}",
-        origin_loop.display(),
-        cow_loop.display()
-    );
-    if let Err(error) = run_checked("dmsetup", &["create", &device_name, "--table", &table]) {
-        run_checked("losetup", &["--detach", &cow_loop.to_string_lossy()])?;
-        run_checked("losetup", &["--detach", &origin_loop.to_string_lossy()])?;
-        return Err(error);
-    }
-    let resources = CowResources {
-        device_name: device_name.clone(),
-        origin_loop,
-        cow_loop,
-    };
-    let resources_path = cow_resources_path(config, &record.machine_id);
-    fs::write(&resources_path, serde_json::to_vec(&resources)?)?;
-    fs::set_permissions(&resources_path, Permissions::from_mode(0o600))?;
-
     let root = jail_root(config, &record.machine_id);
     fs::create_dir_all(&root)?;
     fs::set_permissions(&root, Permissions::from_mode(0o700))?;
     let overlay = root.join("overlay.ext4");
-    if overlay.try_exists()? {
-        fs::remove_file(&overlay)?;
-    }
-    File::create(&overlay)?;
-    let mapped = PathBuf::from("/dev/mapper").join(&device_name);
-    let mount_result = run_checked(
-        "mount",
-        &[
-            "--bind",
-            &mapped.to_string_lossy(),
-            &overlay.to_string_lossy(),
-        ],
-    );
-    if let Err(error) = mount_result {
-        cleanup_cow_resources(config, record, false)?;
-        return Err(error);
-    }
+    replace_hard_link(&cow, &overlay)?;
     let uid = jailer_uid(config, record)?;
-    if let Err(error) = run_checked(
+    run_checked(
         "chown",
-        &[&format!("{uid}:{uid}"), &mapped.to_string_lossy()],
-    ) {
-        cleanup_cow_resources(config, record, false)?;
-        return Err(error);
-    }
-    fs::set_permissions(&mapped, Permissions::from_mode(0o600))?;
+        &[&format!("{uid}:{uid}"), &overlay.to_string_lossy()],
+    )?;
+    fs::set_permissions(&overlay, Permissions::from_mode(0o600))?;
     Ok(created)
 }
 
-fn cleanup_cow_resources(
+fn cleanup_snapshot_overlay(
     config: &FirecrackerConfig,
     record: &MachineRecord,
-    delete_cow: bool,
+    delete: bool,
 ) -> Result<()> {
-    let resources_path = cow_resources_path(config, &record.machine_id);
-    if resources_path.try_exists()? {
-        let resources = serde_json::from_slice::<CowResources>(&fs::read(&resources_path)?)
-            .context("decoding Firecracker COW resources")?;
-        if resources.device_name != snapshot_device_name(&record.machine_id) {
-            bail!("Firecracker COW resource name does not match its machine");
-        }
-        let overlay = jail_root(config, &record.machine_id).join("overlay.ext4");
-        if command_succeeds("mountpoint", &["--quiet", &overlay.to_string_lossy()])? {
-            run_checked("umount", &[&overlay.to_string_lossy()])?;
-        }
-        if command_succeeds("dmsetup", &["info", &resources.device_name])? {
-            run_checked("dmsetup", &["remove", &resources.device_name])?;
-        }
-        let template_key = record
-            .snapshot_template
-            .as_deref()
-            .context("Firecracker COW record is missing its snapshot template")?;
-        let origin = snapshot_template_dir(config, template_key)?.join("overlay.ext4");
-        if loop_attached_to(&resources.origin_loop, &origin)? {
-            run_checked(
-                "losetup",
-                &["--detach", &resources.origin_loop.to_string_lossy()],
-            )?;
-        }
-        let cow = snapshot_cow_path(config, &record.machine_id);
-        if loop_attached_to(&resources.cow_loop, &cow)? {
-            run_checked(
-                "losetup",
-                &["--detach", &resources.cow_loop.to_string_lossy()],
-            )?;
-        }
-        fs::remove_file(&resources_path)?;
-    }
-    if delete_cow {
+    if delete {
         let cow = snapshot_cow_path(config, &record.machine_id);
         if cow.try_exists()? {
-            fs::remove_file(&cow)
-                .with_context(|| format!("removing Firecracker COW {}", cow.display()))?;
+            fs::remove_file(&cow).with_context(|| {
+                format!("removing Firecracker snapshot overlay {}", cow.display())
+            })?;
         }
     }
     Ok(())
@@ -3430,18 +2878,6 @@ fn process_running(pid_path: &Path) -> bool {
 }
 
 fn stop_machine_process_blocking(machine_id: &str, pid_path: &Path) -> Result<()> {
-    terminate_machine_process_blocking(machine_id, pid_path, true)
-}
-
-fn kill_machine_process_blocking(machine_id: &str, pid_path: &Path) -> Result<()> {
-    terminate_machine_process_blocking(machine_id, pid_path, false)
-}
-
-fn terminate_machine_process_blocking(
-    machine_id: &str,
-    pid_path: &Path,
-    graceful: bool,
-) -> Result<()> {
     let Ok(pid) = fs::read_to_string(pid_path) else {
         return Ok(());
     };
@@ -3476,15 +2912,13 @@ fn terminate_machine_process_blocking(
     if !is_firecracker || !has_machine_id || !in_machine_cgroup {
         bail!("refusing to stop pid {pid}: it does not match Firecracker machine {machine_id}");
     }
-    if graceful {
-        run_checked("kill", &["-TERM", &pid.to_string()])?;
-        let started = Instant::now();
-        while started.elapsed() < PROCESS_STOP_TIMEOUT {
-            if !proc_dir.exists() {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(50));
+    run_checked("kill", &["-TERM", &pid.to_string()])?;
+    let started = Instant::now();
+    while started.elapsed() < PROCESS_STOP_TIMEOUT {
+        if !proc_dir.exists() {
+            return Ok(());
         }
+        std::thread::sleep(Duration::from_millis(50));
     }
     run_checked("kill", &["-KILL", &pid.to_string()])?;
     let killed = Instant::now();
@@ -4159,23 +3593,13 @@ mod tests {
     }
 
     #[test]
-    fn loop_device_parser_accepts_only_kernel_loop_paths() {
-        assert_eq!(
-            parse_loop_device("/dev/loop12\n").unwrap(),
-            PathBuf::from("/dev/loop12")
-        );
-        assert!(parse_loop_device("/dev/mapper/root").is_err());
-        assert!(parse_loop_device("/tmp/loop12").is_err());
-        assert!(parse_loop_device("/dev/loop-control").is_err());
-    }
-
-    #[test]
     fn manifest_publish_does_not_replace_an_existing_machine() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("manifests")).unwrap();
         let first = MachineRecord {
             machine_id: "fc-machine".to_string(),
             spec_hash: "first".to_string(),
+            resolved_image: "/images/base.ext4".to_string(),
             slot: 1,
             network_enabled: false,
             workspace_id: None,
@@ -4204,6 +3628,7 @@ mod tests {
         let record = MachineRecord {
             machine_id: "fc-machine".to_string(),
             spec_hash: "spec".to_string(),
+            resolved_image: "/images/base.ext4".to_string(),
             slot: 1,
             network_enabled: false,
             workspace_id: None,
@@ -4227,6 +3652,26 @@ mod tests {
             expired_machine_ids(directory.path(), last_used + Duration::from_secs(60)).unwrap(),
             vec![record.machine_id]
         );
+    }
+
+    #[test]
+    fn fork_snapshots_are_unique_per_target() {
+        let source = MachineRecord {
+            machine_id: "fc-source".to_string(),
+            spec_hash: "spec".to_string(),
+            resolved_image: "/images/base.ext4".to_string(),
+            slot: 1,
+            network_enabled: false,
+            workspace_id: None,
+            idle_ttl_seconds: Some(60),
+            snapshot_template: Some("a".repeat(64)),
+            snapshot_network_slot: None,
+        };
+
+        let first = fork_snapshot_template_key(&source, "fc-target-1");
+        let second = fork_snapshot_template_key(&source, "fc-target-2");
+        assert_ne!(first, second);
+        assert_eq!(first, fork_snapshot_template_key(&source, "fc-target-1"));
     }
 
     #[tokio::test]
