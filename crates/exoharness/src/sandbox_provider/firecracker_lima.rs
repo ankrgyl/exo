@@ -44,6 +44,12 @@ use super::firecracker_bridge::{
 
 const DEFAULT_LIMA_INSTANCE: &str = "exo-firecracker";
 const DEFAULT_LIMA_TARGET_DIR: &str = "/var/tmp/exo-firecracker-bridge-target";
+// The bridge runs as root inside the Lima VM, so the path sudo executes must
+// be root-owned rather than the unprivileged build output under sticky-bit
+// /var/tmp, where any uid in the VM could have pre-claimed the directory and
+// where the builder uid could swap the binary between build and every exec.
+// The build result is copied here with root ownership before it is run.
+const BRIDGE_INSTALL_PATH: &str = "/usr/local/libexec/exo-firecracker-bridge";
 const BRIDGE_FRAME_QUEUE_DEPTH: usize = 16;
 const BRIDGE_STREAM_QUEUE_DEPTH: usize = 16;
 const BRIDGE_STREAM_CHUNK_BYTES: usize = 64 * 1024;
@@ -65,7 +71,7 @@ impl LimaFirecrackerSandboxBackend {
         let target_dir = env_path("EXO_FIRECRACKER_LIMA_TARGET_DIR", DEFAULT_LIMA_TARGET_DIR);
         let bridge_binary = env::var_os("EXO_FIRECRACKER_LIMA_EXO_BINARY")
             .map(PathBuf::from)
-            .unwrap_or_else(|| target_dir.join("debug/exo"));
+            .unwrap_or_else(|| PathBuf::from(BRIDGE_INSTALL_PATH));
         let bridge = Arc::new(LimaBridgeManager::new(limactl, instance, bridge_binary));
         bridge.prepare_bridge(&target_dir).await?;
         bridge.connection().await?;
@@ -279,6 +285,37 @@ impl LimaBridgeManager {
     }
 
     async fn prepare_bridge(&self, target_dir: &Path) -> Result<()> {
+        // `limactl start <name>` silently provisions a brand-new VM from
+        // template:default when no instance with that name exists — and that
+        // template mounts the user's whole $HOME into the VM. A typo'd
+        // instance name must fail loudly rather than hand a root Firecracker
+        // stack an implicit home-directory mount; only the curated instance
+        // from the README (writable mount limited to the Exo checkout) is
+        // acceptable.
+        let instances = Command::new(&self.limactl)
+            .arg("list")
+            .arg("--format")
+            .arg("{{.Name}}")
+            .output()
+            .await
+            .context("listing Lima instances")?;
+        if !instances.status.success() {
+            bail!(
+                "listing Lima instances failed ({}): {}",
+                instances.status,
+                String::from_utf8_lossy(&instances.stderr).trim()
+            );
+        }
+        if !String::from_utf8_lossy(&instances.stdout)
+            .lines()
+            .any(|name| name.trim() == self.instance)
+        {
+            bail!(
+                "Lima instance {:?} does not exist; create the dedicated Firecracker VM first \
+                 (see support/firecracker/README.md, macOS development)",
+                self.instance
+            );
+        }
         self.run_checked(
             Command::new(&self.limactl).arg("start").arg(&self.instance),
             "starting the Firecracker Lima VM",
@@ -318,7 +355,33 @@ impl LimaBridgeManager {
             .arg("--bin")
             .arg("exo");
         self.run_checked(&mut command, "building the Exo Firecracker bridge in Lima")
-            .await
+            .await?;
+        // Copy the unprivileged build output to a root-owned path and execute
+        // only that: sudo must never run a binary that the build user (or any
+        // other uid, via the sticky-bit /var/tmp target directory) can still
+        // replace after this point. This also lets a hardened sudoers restrict
+        // the lima user to exactly this root-owned path.
+        let mut install = Command::new(&self.limactl);
+        install
+            .arg("shell")
+            .arg(&self.instance)
+            .arg("--")
+            .arg("sudo")
+            .arg("-n")
+            .arg("install")
+            .arg("-o")
+            .arg("root")
+            .arg("-g")
+            .arg("root")
+            .arg("-m")
+            .arg("0755")
+            .arg(target_dir.join("debug/exo"))
+            .arg(BRIDGE_INSTALL_PATH);
+        self.run_checked(
+            &mut install,
+            "installing the Exo Firecracker bridge as root in Lima",
+        )
+        .await
     }
 
     async fn run_checked(&self, command: &mut Command, description: &str) -> Result<()> {
@@ -556,11 +619,7 @@ impl LimaBridgeConnection {
     ) -> Result<FirecrackerBridgeResponse> {
         let id = self.next_id();
         let (sender, receiver) = oneshot::channel();
-        self.state
-            .requests
-            .lock()
-            .map_err(|_| anyhow!("Firecracker bridge request lock is poisoned"))?
-            .insert(id, sender);
+        self.state.insert_request(id, sender)?;
         if let Err(error) = self
             .send(FirecrackerBridgeClientFrame::Request {
                 id,
@@ -832,6 +891,24 @@ impl LimaBridgeClientState {
         Ok(())
     }
 
+    // Both insert paths re-check `closed` after inserting: fail() drains the
+    // maps exactly once, so an entry inserted after that drain would never be
+    // completed and its caller would wait forever (requests have no timeout so
+    // long-running execs can finish). fail() stores `closed` before draining,
+    // which makes this check sufficient to close the race in every
+    // interleaving: either fail() sees our entry, or we see `closed`.
+    fn insert_request(&self, id: u64, sender: oneshot::Sender<RpcResult>) -> Result<()> {
+        self.requests
+            .lock()
+            .map_err(|_| anyhow!("Firecracker bridge request lock is poisoned"))?
+            .insert(id, sender);
+        if self.closed.load(Ordering::Acquire) {
+            self.remove_request(id);
+            bail!("Firecracker Lima bridge is closed: {}", self.close_reason());
+        }
+        Ok(())
+    }
+
     fn insert_stream(&self, id: u64, routes: ClientStreamRoutes) -> Result<()> {
         if self
             .streams
@@ -841,6 +918,10 @@ impl LimaBridgeClientState {
             .is_some()
         {
             bail!("duplicate Firecracker bridge stream id {id}");
+        }
+        if self.closed.load(Ordering::Acquire) {
+            self.remove_stream(id);
+            bail!("Firecracker Lima bridge is closed: {}", self.close_reason());
         }
         Ok(())
     }
@@ -1095,6 +1176,7 @@ fn send_bridge_frame_on_drop(
 
 fn env_path(name: &str, default: &str) -> PathBuf {
     env::var_os(name)
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(default))
 }

@@ -1319,56 +1319,83 @@ impl AgentHandle for BasicAgentHandle {
             return Ok(false);
         }
 
-        let sandboxes = self
-            .harness
-            .inner
-            .storage
-            .list_json_matching_suffix::<StoredSandbox>(conversation_dir.join("sandboxes"), ".json")
-            .await?;
         let sandbox_handle =
             BasicScopedSandboxHandle::conversation(&self.harness, *id, conversation_dir.clone());
-        for sandbox in sandboxes {
-            if sandbox.running && sandbox.attachment.is_none() {
-                sandbox_handle.terminate_sandbox(sandbox.id).await?;
+        // Sandbox creation persists its record under the write lock, so the
+        // only way to guarantee no VM outlives its conversation record is to
+        // observe "no running sandboxes" while holding that lock and delete
+        // without releasing it. terminate_sandbox takes the write lock itself,
+        // so terminations run outside it and the locked check loops until it
+        // finds nothing new — bounded, so a caller racing sandbox creation
+        // against deletion gets an error instead of a silently leaked VM.
+        for _ in 0..5 {
+            let sandboxes = self
+                .harness
+                .inner
+                .storage
+                .list_json_matching_suffix::<StoredSandbox>(
+                    conversation_dir.join("sandboxes"),
+                    ".json",
+                )
+                .await?;
+            for sandbox in sandboxes {
+                if sandbox.running && sandbox.attachment.is_none() {
+                    sandbox_handle.terminate_sandbox(sandbox.id).await?;
+                }
             }
-        }
 
-        let _guard = self.harness.inner.write_lock.lock().await;
-        if self
-            .harness
-            .inner
-            .storage
-            .list_keys(&conversation_dir)
-            .await?
-            .is_empty()
-        {
-            return Ok(false);
+            let _guard = self.harness.inner.write_lock.lock().await;
+            if self
+                .harness
+                .inner
+                .storage
+                .list_keys(&conversation_dir)
+                .await?
+                .is_empty()
+            {
+                return Ok(false);
+            }
+            if self
+                .harness
+                .inner
+                .storage
+                .list_json_matching_suffix::<StoredSandbox>(
+                    conversation_dir.join("sandboxes"),
+                    ".json",
+                )
+                .await?
+                .into_iter()
+                .any(|sandbox| sandbox.running && sandbox.attachment.is_none())
+            {
+                continue;
+            }
+            if let Ok(mut record) = self
+                .harness
+                .inner
+                .storage
+                .get_json::<ConversationRecord>(conversation_dir.join("record.json"))
+                .await
+            {
+                append_events_to_conversation(
+                    &self.harness.inner,
+                    &conversation_dir,
+                    record.id,
+                    None,
+                    None,
+                    record.latest_event_id,
+                    vec![EventData::ThreadDeleted],
+                    &mut record,
+                )
+                .await?;
+            }
+            self.harness
+                .inner
+                .storage
+                .delete_prefix(conversation_dir)
+                .await?;
+            return Ok(true);
         }
-        if let Ok(mut record) = self
-            .harness
-            .inner
-            .storage
-            .get_json::<ConversationRecord>(conversation_dir.join("record.json"))
-            .await
-        {
-            append_events_to_conversation(
-                &self.harness.inner,
-                &conversation_dir,
-                record.id,
-                None,
-                None,
-                record.latest_event_id,
-                vec![EventData::ThreadDeleted],
-                &mut record,
-            )
-            .await?;
-        }
-        self.harness
-            .inner
-            .storage
-            .delete_prefix(conversation_dir)
-            .await?;
-        Ok(true)
+        bail!("conversation {id} kept acquiring sandboxes while it was being deleted")
     }
 
     async fn list_bindings(&self) -> Result<Vec<BindingRecord>> {

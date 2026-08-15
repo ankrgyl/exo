@@ -166,7 +166,19 @@ impl BridgeBackendCache {
         if let Some(backend) = backends.get(&key) {
             return Ok(Arc::clone(backend));
         }
-        let backend = Arc::new(FirecrackerSandboxBackend::new(config)?);
+        // Construction hashes the kernel and initramfs; keep that off the
+        // async executor while the cache lock is held.
+        let backend = tokio::task::spawn_blocking(move || FirecrackerSandboxBackend::new(config))
+            .await
+            .context("joining Firecracker backend construction")??;
+        let backend = Arc::new(backend);
+        // Jailed VMMs deliberately outlive the bridge process, and expired
+        // machines are otherwise only reaped inside future acquires. Reaping
+        // when a backend first exists for this state root keeps abandoned VMs
+        // from running indefinitely on a host nobody acquires from again.
+        if let Err(error) = backend.reap_expired().await {
+            tracing::warn!(%error, "failed reaping expired Firecracker machines at backend startup");
+        }
         backends.insert(key, Arc::clone(&backend));
         Ok(backend)
     }
@@ -236,7 +248,25 @@ pub async fn run_firecracker_bridge() -> Result<Option<i32>> {
                         },
                     };
                     if let Err(error) = send_server_frame(&writer, &frame).await {
-                        tracing::debug!(%error, id, "failed to send Firecracker bridge response");
+                        // A response can exceed the frame limit (eg. exec
+                        // output whose JSON escaping outgrows 16 MiB). The
+                        // client has no request timeout — long execs must be
+                        // allowed to run — so a silently dropped response
+                        // would hang it forever. write_frame checks the size
+                        // before writing any bytes, so the pipe is still
+                        // consistent and this small error frame can answer
+                        // the request in-band. If even it fails, the pipe is
+                        // broken and the client fails every pending request.
+                        let fallback = FirecrackerBridgeServerFrame::Response {
+                            id,
+                            response: None,
+                            error: Some(format!(
+                                "sending Firecracker bridge response failed: {error:#}"
+                            )),
+                        };
+                        if let Err(fallback_error) = send_server_frame(&writer, &fallback).await {
+                            tracing::debug!(%fallback_error, id, "failed to send Firecracker bridge response fallback");
+                        }
                     }
                 });
             }

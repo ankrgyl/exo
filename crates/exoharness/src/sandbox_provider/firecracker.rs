@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::future::Future;
-use std::io::{BufRead, BufReader as StdBufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader as StdBufReader, Read, Seek, SeekFrom, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -69,6 +69,12 @@ const DEFAULT_JAILER_UID_BASE: u32 = 100_000;
 const DEFAULT_VCPU_COUNT: u8 = 2;
 const DEFAULT_MEMORY_MIB: u32 = 4096;
 const SNAPSHOT_CACHE_VERSION: u32 = 1;
+// Upstream warns that a compromised guest kernel can reactivate the serial
+// device even with 8250.nr_uarts=0, and unbounded console output written to a
+// host file is their named disk-fill DoS. VMM console output is therefore
+// captured through a pipe and only this many bytes are kept on disk.
+// https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md#8250-serial-device
+const VMM_LOG_MAX_BYTES: u64 = 1024 * 1024;
 const FIRECRACKER_API_SOCKET: &str = "firecracker.socket";
 const FIRECRACKER_API_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRECRACKER_SNAPSHOT_CREATE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -226,6 +232,12 @@ struct FirecrackerVmConfiguration {
     machine_config: FirecrackerMachineConfiguration,
     network_interfaces: Vec<FirecrackerNetworkInterface>,
     vsock: FirecrackerVsock,
+    entropy: FirecrackerEntropy,
+}
+
+#[derive(Serialize)]
+struct FirecrackerEntropy {
+    rate_limiter: FirecrackerRateLimiter,
 }
 
 #[derive(Serialize)]
@@ -333,6 +345,26 @@ impl FirecrackerSandboxBackend {
         config.initramfs = fs::canonicalize(&config.initramfs)?;
         config.state_root = fs::canonicalize(&config.state_root)?;
         validate_private_root(&config.state_root)?;
+        // Best-effort reclamation of temporaries stranded by crashed prior
+        // processes. Every publish in the state root stages under a dotted or
+        // .tmp name and renames atomically, so anything still carrying a
+        // staging name after a day is garbage that would otherwise accumulate
+        // on the root-owned volume forever.
+        super::firecracker_image::sweep_stale_image_artifacts(&config.state_root);
+        super::firecracker_image::sweep_stale_temporaries(
+            &config.state_root.join("artifacts"),
+            &|name| name.starts_with('.'),
+        );
+        super::firecracker_image::sweep_stale_temporaries(
+            &config.state_root.join("snapshots"),
+            &|name| name.starts_with('.'),
+        );
+        for directory in ["manifests", "leases"] {
+            super::firecracker_image::sweep_stale_temporaries(
+                &config.state_root.join(directory),
+                &|name| name.ends_with(".tmp"),
+            );
+        }
         config.kernel = cache_immutable_artifact(&config.state_root, "kernel", &config.kernel)?;
         config.initramfs =
             cache_immutable_artifact(&config.state_root, "initramfs", &config.initramfs)?;
@@ -345,6 +377,14 @@ impl FirecrackerSandboxBackend {
                 lifecycle_lock: Mutex::new(()),
             }),
         })
+    }
+
+    // Entry point for the Lima bridge: expired machines are normally reaped
+    // inside acquire, but jailed VMMs outlive the bridge process, so a host
+    // nobody acquires from again would keep them running forever.
+    pub(super) async fn reap_expired(&self) -> Result<()> {
+        let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
+        self.reap_expired_machines().await
     }
 
     async fn reap_expired_machines(&self) -> Result<()> {
@@ -850,7 +890,16 @@ impl Shared {
                 .snapshot_network_slot
                 .is_some_and(|slot| slot != machine.record.slot)
         {
-            self.reconfigure_restored_network(&machine).await?;
+            // A clone that keeps the source's in-memory IP would be unreachable
+            // at its own address and could impersonate the source's inside its
+            // own namespace. Tear the machine down on failure like every other
+            // launch step rather than leaving a half-configured VM running.
+            if let Err(error) = self.reconfigure_restored_network(&machine).await {
+                if let Err(cleanup_error) = self.cleanup_machine(machine_id, true).await {
+                    tracing::warn!(%cleanup_error, machine_id, "failed cleaning up Firecracker clone after network reconfiguration failure");
+                }
+                return Err(error);
+            }
         }
         record_launch_timing(machine_id, "guest_ready", guest_ready_started.elapsed());
         record_launch_timing(machine_id, "total", launch_started.elapsed());
@@ -1919,6 +1968,14 @@ fn install_network_firewall(config: &FirecrackerConfig, network: &NetworkConfig)
         rules,
         "add rule inet {table} input iifname {interface} counter drop"
     )?;
+    // Every forward rule below matches with `ip ...` selectors, which only
+    // match IPv4. Without this drop, an IPv6 frame from the guest would fall
+    // through them all to the final accept; nothing routes IPv6 today, but the
+    // IPv4-only egress property should hold by rule, not by topology.
+    writeln!(
+        rules,
+        "add rule inet {table} forward iifname {interface} meta nfproto ipv6 counter drop"
+    )?;
     writeln!(
         rules,
         "add rule inet {table} forward iifname {interface} ip saddr != {} counter drop",
@@ -2250,9 +2307,6 @@ fn prepare_and_launch_blocking(
     run_checked("chown", &[&ownership, &vm_config_path.to_string_lossy()])?;
     fs::set_permissions(&vm_config_path, Permissions::from_mode(0o400))?;
 
-    let stderr_path = root.join("firecracker.stderr");
-    let stderr = File::create(&stderr_path)?;
-    fs::set_permissions(&stderr_path, Permissions::from_mode(0o600))?;
     record_launch_timing(
         &record.machine_id,
         "jail_setup",
@@ -2264,7 +2318,7 @@ fn prepare_and_launch_blocking(
     spawn_jailed_firecracker(
         config,
         record,
-        stderr,
+        &root,
         &[
             "--api-sock",
             "/run/firecracker.socket",
@@ -2278,7 +2332,7 @@ fn prepare_and_launch_blocking(
 fn spawn_jailed_firecracker(
     config: &FirecrackerConfig,
     record: &MachineRecord,
-    output: File,
+    jail_root: &Path,
     firecracker_arguments: &[&str],
 ) -> Result<()> {
     let host_uid = jailer_uid(config, record)?;
@@ -2317,22 +2371,34 @@ fn spawn_jailed_firecracker(
         .arg("--cgroup")
         .arg(format!("memory.max={memory_max}"))
         .arg("--cgroup")
-        .arg(format!("cpu.max={cpu_max}"))
+        .arg(format!("cpu.max={cpu_max}"));
+    // Route console output through a pipe instead of a file descriptor to a
+    // growable file: a compromised guest kernel can reactivate the serial
+    // device despite 8250.nr_uarts=0 and would otherwise control an unbounded
+    // root-owned file on the host. The drain thread persists a bounded prefix
+    // for diagnostics and discards the rest.
+    // https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md#8250-serial-device
+    let (console_reader, console_writer) = io::pipe()?;
+    command
         .arg("--resource-limit")
         .arg("no-file=4096")
         .arg("--")
         .args(firecracker_arguments)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(output.try_clone()?))
-        .stderr(Stdio::from(output));
+        .stdout(Stdio::from(console_writer.try_clone()?))
+        .stderr(Stdio::from(console_writer));
     // Deliberately do not pass --no-seccomp or a custom filter. Release builds'
     // embedded default filters are Firecracker's recommended production setting.
     // https://github.com/firecracker-microvm/firecracker/blob/main/docs/seccomp.md#default-filters-recommended
+    let log_path = jail_root.join("firecracker.stderr");
+    let log = File::create(&log_path)?;
+    fs::set_permissions(&log_path, Permissions::from_mode(0o600))?;
     let vmm_spawn_started = Instant::now();
     let mut child = command
         .spawn()
         .context("launching Firecracker through jailer")?;
     record_launch_timing(&record.machine_id, "vmm_spawn", vmm_spawn_started.elapsed());
+    std::thread::spawn(move || drain_vmm_console(console_reader, log));
     let machine_id = record.machine_id.clone();
     std::thread::spawn(move || match child.wait() {
         Ok(status) if !status.success() => {
@@ -2346,14 +2412,46 @@ fn spawn_jailed_firecracker(
     Ok(())
 }
 
+// Persists at most VMM_LOG_MAX_BYTES of console output, then keeps draining
+// the pipe into nothing so the VMM never blocks on a full pipe while the host
+// file stays bounded regardless of what the guest prints.
+fn drain_vmm_console(mut reader: io::PipeReader, mut log: File) {
+    let mut remaining = VMM_LOG_MAX_BYTES;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return,
+            Ok(count) => {
+                if remaining == 0 {
+                    continue;
+                }
+                let keep = count.min(usize::try_from(remaining).unwrap_or(usize::MAX));
+                if log.write_all(&buffer[..keep]).is_err() {
+                    remaining = 0;
+                    continue;
+                }
+                remaining -= keep as u64;
+                if remaining == 0 {
+                    let _ = log.write_all(
+                        b"\n[exo: console output limit reached; discarding further output]\n",
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
 fn firecracker_vm_configuration(
     config: &FirecrackerConfig,
     request: &SandboxRequest,
     record: &MachineRecord,
 ) -> FirecrackerVmConfiguration {
     let network = record.network();
-    // Disable the guest serial driver and discard VMM stdout so malicious guest
-    // writes cannot grow an unbounded host log.
+    // Disable the guest serial driver; the VMM console is additionally captured
+    // with a bounded drain (see spawn_jailed_firecracker) because upstream
+    // documents that a guest can reactivate the serial device.
     // https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md#8250-serial-device
     let mut boot_args =
         String::from("reboot=k panic=1 pci=off rdinit=/init 8250.nr_uarts=0 quiet loglevel=1");
@@ -2436,6 +2534,20 @@ fn firecracker_vm_configuration(
         vsock: FirecrackerVsock {
             guest_cid: record.slot + 3,
             uds_path: "/run/exo.vsock",
+        },
+        // virtio-rng is upstream's recommended extra entropy source for
+        // snapshot clones, alongside the VMGenID reseed: guests whose kernel
+        // has CONFIG_HW_RANDOM_VIRTIO feed it into their CSPRNG, and the fork
+        // path restores this device from the source's snapshot. Rate-limited
+        // so a guest cannot spin the host's CSPRNG at line speed.
+        // https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/random-for-clones.md
+        entropy: FirecrackerEntropy {
+            rate_limiter: FirecrackerRateLimiter {
+                bandwidth: FirecrackerTokenBucket {
+                    size: 64 * 1024,
+                    refill_time: 1000,
+                },
+            },
         },
     }
 }
@@ -2687,7 +2799,7 @@ fn create_fork_snapshot(
     }
     let snapshot_path = format!("/{output_name}/state");
     let memory_path = format!("/{output_name}/memory");
-    let result = (|| {
+    let paused_result = (|| {
         let snapshot_started = Instant::now();
         // A fork captures a full point-in-time device/RAM image once. Clones
         // map the immutable memory file privately and get independent COW disks.
@@ -2710,19 +2822,55 @@ fn create_fork_snapshot(
             snapshot_started.elapsed(),
         );
 
-        let overlay = temporary.join("overlay.ext4");
+        // Only the disk copy must happen inside the pause window: the overlay
+        // has to match the memory image byte-for-byte, and the source starts
+        // writing to it again the moment it resumes.
         run_checked(
             "cp",
             &[
                 "--sparse=always",
                 "--reflink=auto",
                 &root.join("overlay.ext4").to_string_lossy(),
-                &overlay.to_string_lossy(),
+                &temporary.join("overlay.ext4").to_string_lossy(),
             ],
         )?;
-        replace_hard_link(&output.join("state"), &temporary.join("state"))?;
-        replace_hard_link(&output.join("memory"), &temporary.join("memory"))?;
-        for path in [temporary.join("state"), temporary.join("memory"), overlay] {
+        Ok::<(), anyhow::Error>(())
+    })();
+    let resume = firecracker_api_patch(&api, "/vm", &FirecrackerVmState { state: "Resumed" });
+    let result = match (paused_result, resume) {
+        (Err(error), Err(resume_error)) => Err(error).context(format!(
+            "creating Firecracker fork snapshot; source resume also failed: {resume_error:#}"
+        )),
+        (Err(error), Ok(())) => Err(error).context("creating Firecracker fork snapshot"),
+        (Ok(()), Err(error)) => Err(error).context("resuming Firecracker fork source"),
+        (Ok(()), Ok(())) => Ok(()),
+    };
+    let result = result.and_then(|()| {
+        // Copy -- never hard-link -- the snapshot out of the source VM's jail.
+        // The state and memory files were created by the jailed VMM under its
+        // unprivileged uid, so a compromised VMM can hold an open fd to them; a
+        // hard link would leave the published template writable through that fd
+        // even after the chown/chmod below, and Firecracker treats snapshots as
+        // trusted VMM input when a clone loads them. Since the template is now
+        // reused by every future clone of this source, one tamper would poison
+        // all of them. The copy runs after the source resumed, so it costs no
+        // pause time, and reflink makes it metadata-only on XFS/btrfs.
+        for name in ["state", "memory"] {
+            run_checked(
+                "cp",
+                &[
+                    "--sparse=always",
+                    "--reflink=auto",
+                    &output.join(name).to_string_lossy(),
+                    &temporary.join(name).to_string_lossy(),
+                ],
+            )?;
+        }
+        for path in [
+            temporary.join("state"),
+            temporary.join("memory"),
+            temporary.join("overlay.ext4"),
+        ] {
             run_checked("chown", &["0:0", &path.to_string_lossy()])?;
             fs::set_permissions(&path, Permissions::from_mode(0o444))?;
             File::open(path)?.sync_all()?;
@@ -2730,23 +2878,18 @@ fn create_fork_snapshot(
         let complete = temporary.join("complete");
         File::create(&complete)?.sync_all()?;
         fs::set_permissions(&complete, Permissions::from_mode(0o444))?;
-        Ok::<(), anyhow::Error>(())
-    })();
-    let resume = firecracker_api_patch(&api, "/vm", &FirecrackerVmState { state: "Resumed" });
+        Ok(())
+    });
     let output_cleanup = remove_directory_if_present(&output);
-    let result = match (result, resume, output_cleanup) {
-        (Err(error), Err(resume_error), _) => Err(error).context(format!(
-            "creating Firecracker fork snapshot; source resume also failed: {resume_error:#}"
-        )),
-        (Err(error), _, Err(cleanup_error)) => Err(error).context(format!(
+    let result = match (result, output_cleanup) {
+        (Err(error), Err(cleanup_error)) => Err(error).context(format!(
             "creating Firecracker fork snapshot; jail cleanup also failed: {cleanup_error:#}"
         )),
-        (Err(error), _, _) => Err(error).context("creating Firecracker fork snapshot"),
-        (Ok(()), Err(error), _) => Err(error).context("resuming Firecracker fork source"),
-        (Ok(()), Ok(()), Err(error)) => {
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => {
             Err(error).context("cleaning up Firecracker fork snapshot jail output")
         }
-        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Ok(())) => Ok(()),
     };
     if let Err(error) = result {
         if let Err(cleanup_error) = remove_directory_if_present(&temporary) {
@@ -2818,13 +2961,10 @@ fn launch_snapshot_clone(
         fs::set_permissions(path, Permissions::from_mode(0o444))?;
     }
     fs::set_permissions(&snapshot, Permissions::from_mode(0o555))?;
-    let stderr_path = root.join("firecracker.stderr");
-    let stderr = File::create(&stderr_path)?;
-    fs::set_permissions(&stderr_path, Permissions::from_mode(0o600))?;
     spawn_jailed_firecracker(
         config,
         record,
-        stderr,
+        &root,
         &["--api-sock", "/run/firecracker.socket"],
     )?;
     let api = wait_for_firecracker_api(&root, &record.machine_id)?;

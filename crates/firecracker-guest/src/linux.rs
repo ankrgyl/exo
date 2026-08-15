@@ -210,6 +210,94 @@ impl EventQueue {
     }
 }
 
+// Direct children whose exit status a dedicated wait thread will collect. The
+// orphan reaper must leave these to their waiters and only reap processes that
+// reparented to PID 1; stealing a tracked child's status would break exit-code
+// reporting for the host.
+static DIRECT_CHILDREN: Mutex<Vec<libc::pid_t>> = Mutex::new(Vec::new());
+
+fn register_direct_child(pid: libc::pid_t) {
+    DIRECT_CHILDREN
+        .lock()
+        .expect("direct child registry poisoned")
+        .push(pid);
+}
+
+fn unregister_direct_child(pid: libc::pid_t) {
+    DIRECT_CHILDREN
+        .lock()
+        .expect("direct child registry poisoned")
+        .retain(|candidate| *candidate != pid);
+}
+
+fn is_direct_child(pid: libc::pid_t) -> bool {
+    DIRECT_CHILDREN
+        .lock()
+        .expect("direct child registry poisoned")
+        .contains(&pid)
+}
+
+// Keeps a pid registered for exactly as long as some code path still intends
+// to wait on it, including early error returns, so the orphan reaper can never
+// steal a tracked child's exit status.
+struct DirectChildRegistration(libc::pid_t);
+
+impl DirectChildRegistration {
+    fn new(pid: libc::pid_t) -> Self {
+        register_direct_child(pid);
+        Self(pid)
+    }
+}
+
+impl Drop for DirectChildRegistration {
+    fn drop(&mut self) {
+        unregister_direct_child(self.0);
+    }
+}
+
+// This agent is PID 1, so every double-forked/daemonized workload descendant
+// reparents to it when its parent dies. Without an init-style reaper those
+// accumulate as zombies for the VM's lifetime, and enough of them exhaust the
+// guest PID table — a denial of service a workload could trigger on purpose.
+// WNOWAIT peeks without consuming so tracked children still deliver their real
+// exit status to their wait threads.
+fn reap_orphans() {
+    loop {
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let result =
+            unsafe { libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            // ECHILD: nothing to wait for right now.
+            thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        let pid = unsafe { info.si_pid() };
+        if pid <= 0 {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        if is_direct_child(pid) {
+            // A tracked child is momentarily waitable until its own wait
+            // thread collects it; yield rather than stealing its status.
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        // Grace period closes the spawn-to-register window: a freshly spawned
+        // direct child that exited immediately gets a chance to appear in the
+        // registry before being treated as an orphan.
+        thread::sleep(Duration::from_millis(100));
+        if is_direct_child(pid) {
+            continue;
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+    }
+}
+
 struct ManagedProcess {
     process_group: i32,
     stdin: Mutex<Option<ChildStdin>>,
@@ -231,6 +319,7 @@ impl ManagedProcess {
             .stderr(Stdio::piped());
         let mut child = command.spawn().map_err(|error| error.to_string())?;
         let process_group = i32::try_from(child.id()).map_err(|error| error.to_string())?;
+        let registration = DirectChildRegistration::new(process_group);
         let stdin = child.stdin.take().ok_or("missing child stdin")?;
         let stdout = child.stdout.take().ok_or("missing child stdout")?;
         let stderr = child.stderr.take().ok_or("missing child stderr")?;
@@ -245,6 +334,7 @@ impl ManagedProcess {
         let wait_process = Arc::clone(&process);
         thread::spawn(move || {
             let result = child.wait();
+            drop(registration);
             let stdout_result = stdout_thread.join();
             let stderr_result = stderr_thread.join();
             wait_process.exited.store(true, Ordering::Release);
@@ -450,6 +540,7 @@ fn exec(
         Ok(process_group) => process_group,
         Err(error) => return command_error(cwd, error.to_string()),
     };
+    let _registration = DirectChildRegistration::new(process_group);
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => return command_error(cwd, "missing child stdout"),
@@ -660,6 +751,7 @@ fn configure_restored_network(address: Ipv4Addr, gateway: Ipv4Addr, prefix: u8) 
 
 pub fn run() -> Result<(), String> {
     initialize_guest()?;
+    thread::spawn(reap_orphans);
     let listener = vsock_listener()?;
     signal_ready_to_host()?;
     let state = Arc::new(AgentState::default());
@@ -698,14 +790,25 @@ pub fn run() -> Result<(), String> {
             drop(connection);
             continue;
         }
+        // Release the slot from a drop guard so a panic inside the handler
+        // cannot leak it: leaked slots accumulate until the agent refuses all
+        // host connections, permanently wedging the sandbox's control channel.
+        let slot = ConnectionSlot(Arc::clone(&active_connections));
         let state = Arc::clone(&state);
-        let active_connections = Arc::clone(&active_connections);
         thread::spawn(move || {
+            let _slot = slot;
             if let Err(error) = serve_connection(connection, &state) {
                 eprintln!("exo-firecracker-guest connection failed: {error}");
             }
-            active_connections.fetch_sub(1, Ordering::AcqRel);
         });
+    }
+}
+
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

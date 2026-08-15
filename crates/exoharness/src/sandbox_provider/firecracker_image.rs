@@ -6,15 +6,17 @@
 //! private to Exo's root-owned state directory and entries are published with
 //! an atomic directory rename so a crash never exposes a partial filesystem.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, Permissions};
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, Instant};
+use std::pin::Pin;
+use std::process::{Command, Stdio};
+use std::task::{Context as TaskContext, Poll};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use docker_credential::{CredentialRetrievalError, DockerCredential};
@@ -32,6 +34,18 @@ const EXT4_MAGIC_OFFSET: u64 = 1024 + 0x38;
 const EXT4_MAGIC: [u8; 2] = [0x53, 0xef];
 const GUEST_UID: u32 = 10_001;
 const GUEST_GID: u32 = 10_001;
+// The registry controls the manifest, so layer counts and sizes are untrusted.
+// Every budget below is derived from the operator-chosen ext4 image size: an
+// image whose content cannot fit in that filesystem could never materialize,
+// so rejecting it early costs no legitimate image anything.
+const MAX_IMAGE_LAYERS: usize = 512;
+// A crashed materialization leaves image-build-*/local-image-*/.tmp* entries
+// behind; anything older than this is unreachable by any live build.
+const STALE_TEMPORARY_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+// Docker defines this exact helper response as a cache miss, so continue
+// anonymously instead of treating a public registry as unavailable.
+// https://github.com/docker/docker-credential-helpers/blob/main/credentials/error.go#L10-L52
+const HELPER_CREDENTIALS_NOT_FOUND: &str = "credentials not found in native keychain";
 
 #[derive(Debug, Deserialize)]
 struct OciImageConfiguration {
@@ -194,10 +208,27 @@ pub(super) async fn resolve_image(
         false,
     );
 
+    let image_bytes = image_size_gib
+        .checked_mul(1024 * 1024 * 1024)
+        .context("Firecracker image size overflow")?;
+    if manifest.layers.len() > MAX_IMAGE_LAYERS {
+        bail!(
+            "OCI image {source} has {} layers, more than the supported {MAX_IMAGE_LAYERS}",
+            manifest.layers.len()
+        );
+    }
     let pull_started = Instant::now();
     let mut pull_stats = PullStats::default();
     let mut layers = Vec::with_capacity(manifest.layers.len());
     for descriptor in &manifest.layers {
+        let declared = u64::try_from(descriptor.size).context("negative OCI layer size")?;
+        if declared > image_bytes.saturating_mul(2) {
+            bail!(
+                "OCI layer {} declares {declared} bytes, larger than the {image_size_gib} GiB \
+                 image filesystem; raise EXO_FIRECRACKER_IMAGE_SIZE_GIB if this is intentional",
+                descriptor.digest
+            );
+        }
         let (path, cache_hit) = pull_blob(
             &client,
             &reference,
@@ -207,8 +238,16 @@ pub(super) async fn resolve_image(
         .await?;
         pull_stats.bytes = pull_stats
             .bytes
-            .checked_add(u64::try_from(descriptor.size).context("negative OCI layer size")?)
+            .checked_add(declared)
             .context("OCI layer byte count overflow")?;
+        if pull_stats.bytes > image_bytes.saturating_mul(4) {
+            bail!(
+                "OCI image {source} declares more than {} compressed layer bytes for a \
+                 {image_size_gib} GiB image filesystem; raise EXO_FIRECRACKER_IMAGE_SIZE_GIB \
+                 if this is intentional",
+                image_bytes.saturating_mul(4)
+            );
+        }
         if cache_hit {
             pull_stats.cache_hits += 1;
         } else {
@@ -312,21 +351,27 @@ fn cache_local_image(state_root: &Path, source: &str) -> Result<(PathBuf, bool)>
         .tempdir_in(&local_root)?;
     let staged = temporary.path().join("rootfs.ext4");
     let copy = super::firecracker::trusted_host_command("cp")?;
-    let status = Command::new(copy)
+    // Capture both output streams instead of inheriting them: on macOS this
+    // code runs inside the Lima bridge process, whose inherited stdout is the
+    // length-prefixed bridge protocol, and any stray byte from a child would
+    // corrupt its framing.
+    let output = Command::new(copy)
         .args(["--sparse=always", "--reflink=auto", "--"])
         .arg(&source)
         .arg(&staged)
-        .status()
+        .output()
         .with_context(|| {
             format!(
                 "staging local Firecracker image {} into its immutable cache",
                 source.display()
             )
         })?;
-    if !status.success() {
+    if !output.status.success() {
         bail!(
-            "staging local Firecracker image {} into its immutable cache failed with {status}",
-            source.display()
+            "staging local Firecracker image {} into its immutable cache failed with {}: {}",
+            source.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
         );
     }
     fs::set_permissions(&staged, Permissions::from_mode(0o444))?;
@@ -389,7 +434,13 @@ fn registry_auth(reference: &Reference) -> Result<RegistryAuth> {
     super::firecracker::validate_trusted_file("Docker credential configuration", &config_path)?;
 
     let server = reference.resolve_registry().trim_end_matches('/');
-    validate_docker_credential_helper(&config_path, server)?;
+    // When a helper is configured, execute the exact binary that passed the
+    // trusted-path validation. docker_credential resolves the helper name
+    // through PATH again at exec time, and a validate-here/execute-there split
+    // is how root ends up running a binary nobody checked.
+    if let Some(helper) = validate_docker_credential_helper(&config_path, server)? {
+        return invoke_credential_helper(&helper, server);
+    }
     match docker_credential::get_credential(server) {
         Ok(DockerCredential::UsernamePassword(username, password)) => {
             Ok(RegistryAuth::Basic(username, password))
@@ -406,15 +457,12 @@ fn credential_helper_has_no_credentials(error: &CredentialRetrievalError) -> boo
     let CredentialRetrievalError::HelperFailure { stdout, stderr, .. } = error else {
         return false;
     };
-
-    // Docker defines this exact helper response as a cache miss, so continue
-    // anonymously instead of treating a public registry as unavailable.
-    // https://github.com/docker/docker-credential-helpers/blob/main/credentials/error.go#L10-L52
-    const NOT_FOUND: &str = "credentials not found in native keychain";
-    stdout.trim() == NOT_FOUND || stderr.trim() == NOT_FOUND
+    stdout.trim() == HELPER_CREDENTIALS_NOT_FOUND || stderr.trim() == HELPER_CREDENTIALS_NOT_FOUND
 }
 
-fn validate_docker_credential_helper(config_path: &Path, server: &str) -> Result<()> {
+// Returns the validated absolute path of the credential helper configured for
+// this server, or None when the configuration names no helper.
+fn validate_docker_credential_helper(config_path: &Path, server: &str) -> Result<Option<PathBuf>> {
     let config: DockerCredentialConfiguration = serde_json::from_slice(&fs::read(config_path)?)
         .with_context(|| {
             format!(
@@ -433,7 +481,7 @@ fn validate_docker_credential_helper(config_path: &Path, server: &str) -> Result
                 .filter(|helper| !helper.is_empty())
         });
     let Some(helper) = helper else {
-        return Ok(());
+        return Ok(None);
     };
     if !helper
         .bytes()
@@ -441,9 +489,63 @@ fn validate_docker_credential_helper(config_path: &Path, server: &str) -> Result
     {
         bail!("invalid Docker credential helper name: {helper}");
     }
-    super::firecracker::trusted_host_command(&format!("docker-credential-{helper}"))
-        .with_context(|| format!("untrusted Docker credential helper {helper}"))?;
-    Ok(())
+    let executable =
+        super::firecracker::trusted_host_command(&format!("docker-credential-{helper}"))
+            .with_context(|| format!("untrusted Docker credential helper {helper}"))?;
+    Ok(Some(executable))
+}
+
+// Speaks the docker-credential-helper "get" protocol directly against the
+// validated executable. The server name goes over stdin, never argv, so it
+// cannot leak through the host process table.
+// https://github.com/docker/docker-credential-helpers#development
+fn invoke_credential_helper(executable: &Path, server: &str) -> Result<RegistryAuth> {
+    #[derive(Deserialize)]
+    struct HelperCredential {
+        #[serde(rename = "Username", default)]
+        username: String,
+        #[serde(rename = "Secret", default)]
+        secret: String,
+    }
+    let mut child = Command::new(executable)
+        .arg("get")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running credential helper {}", executable.display()))?;
+    child
+        .stdin
+        .take()
+        .context("opening credential helper stdin")?
+        .write_all(server.as_bytes())
+        .context("writing registry server to credential helper")?;
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("waiting for credential helper {}", executable.display()))?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stdout.trim() == HELPER_CREDENTIALS_NOT_FOUND
+            || stderr.trim() == HELPER_CREDENTIALS_NOT_FOUND
+        {
+            return Ok(RegistryAuth::Anonymous);
+        }
+        bail!(
+            "credential helper {} failed with {}: {}",
+            executable.display(),
+            output.status,
+            stderr.trim()
+        );
+    }
+    let credential: HelperCredential = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("decoding credential helper response for {server}"))?;
+    // Helpers signal an identity token by this reserved username.
+    // https://github.com/docker/docker-credential-helpers/blob/main/credentials/credentials.go
+    if credential.username == "<token>" {
+        return Ok(RegistryAuth::Bearer(credential.secret));
+    }
+    Ok(RegistryAuth::Basic(credential.username, credential.secret))
 }
 
 fn docker_config_path() -> Option<PathBuf> {
@@ -473,13 +575,19 @@ async fn pull_blob(
             blob_root.display()
         )
     })?;
-    let mut output = tokio::fs::File::from_std(temporary.reopen()?);
+    // The registry stream is untrusted: hold it to the manifest's declared size
+    // while it is written so a lying registry cannot fill the host disk. The
+    // digest check below still rejects any blob whose content is wrong.
+    let mut output = LimitedAsyncWriter {
+        inner: tokio::fs::File::from_std(temporary.reopen()?),
+        remaining: u64::try_from(descriptor.size).context("negative OCI layer size")?,
+    };
     client
         .pull_blob(reference, descriptor, &mut output)
         .await
         .with_context(|| format!("pulling OCI layer {}", descriptor.digest))?;
-    output.flush().await?;
-    output.sync_all().await?;
+    output.inner.flush().await?;
+    output.inner.sync_all().await?;
     drop(output);
     validate_blob(temporary.path(), descriptor)?;
     fs::set_permissions(temporary.path(), Permissions::from_mode(0o600))?;
@@ -496,6 +604,39 @@ async fn pull_blob(
                 destination.display()
             )
         }),
+    }
+}
+
+struct LimitedAsyncWriter<W> {
+    inner: W,
+    remaining: u64,
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for LimitedAsyncWriter<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.remaining < buffer.len() as u64 {
+            return Poll::Ready(Err(io::Error::other(
+                "OCI blob stream exceeds its declared descriptor size",
+            )));
+        }
+        let written = std::task::ready!(Pin::new(&mut self.inner).poll_write(context, buffer))?;
+        self.remaining -= written as u64;
+        Poll::Ready(Ok(written))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
     }
 }
 
@@ -555,9 +696,22 @@ fn build_and_publish_image(
     // its threat model. This target is consequently inside Exo's root-owned
     // 0700 cache and is never exposed to guest or unprivileged host processes.
     // https://github.com/alexcrichton/tar-rs/blob/main/src/lib.rs#L12-L25
+    let image_bytes = image_size_gib
+        .checked_mul(1024 * 1024 * 1024)
+        .context("Firecracker image size overflow")?;
     let extract_started = Instant::now();
     for layer in &layers {
-        apply_layer(&rootfs, layer)?;
+        apply_layer(&rootfs, layer, image_bytes.saturating_mul(2))?;
+        // Content that cannot fit in the ext4 image would only fail in
+        // mkfs.ext4 later; checking after each layer bounds how much host disk
+        // an oversized image can consume in the meantime.
+        let extracted = directory_tree_bytes(&rootfs)?;
+        if extracted > image_bytes {
+            bail!(
+                "extracted OCI image content ({extracted} bytes) exceeds the {image_size_gib} GiB \
+                 image filesystem; raise EXO_FIRECRACKER_IMAGE_SIZE_GIB"
+            );
+        }
     }
     record_step(
         source,
@@ -579,9 +733,6 @@ fn build_and_publish_image(
 
     let filesystem_started = Instant::now();
     let image = temporary.path().join("rootfs.ext4");
-    let image_bytes = image_size_gib
-        .checked_mul(1024 * 1024 * 1024)
-        .context("Firecracker image size overflow")?;
     let output = File::create(&image)?;
     output.set_len(image_bytes)?;
     drop(output);
@@ -590,14 +741,22 @@ fn build_and_publish_image(
     // attacker-controlled image contents on the host.
     // https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md#rootfs-and-kernel-image
     let mkfs = super::firecracker::trusted_host_command("mkfs.ext4")?;
-    let status = Command::new(mkfs)
+    // Capture both output streams instead of inheriting them: on macOS this
+    // code runs inside the Lima bridge process, whose inherited stdout is the
+    // length-prefixed bridge protocol, and any stray byte from a child would
+    // corrupt its framing.
+    let output = Command::new(mkfs)
         .args([OsStr::new("-q"), OsStr::new("-F"), OsStr::new("-d")])
         .arg(&rootfs)
         .arg(&image)
-        .status()
+        .output()
         .context("running mkfs.ext4 for Firecracker OCI image")?;
-    if !status.success() {
-        bail!("mkfs.ext4 failed while materializing {source}: {status}");
+    if !output.status.success() {
+        bail!(
+            "mkfs.ext4 failed while materializing {source}: {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     // The cache directories remain root-only. Making the image itself read-only
     // lets each jail hard-link the same immutable inode without changing its
@@ -652,12 +811,12 @@ fn build_and_publish_image(
     )
 }
 
-fn apply_layer(rootfs: &Path, layer: &CachedLayer) -> Result<()> {
+fn apply_layer(rootfs: &Path, layer: &CachedLayer, decompressed_budget: u64) -> Result<()> {
     // OCI whiteouts describe deletions from lower layers. Applying every
     // whiteout before unpacking the same layer preserves replacement entries and
     // opaque-directory semantics.
     // https://github.com/opencontainers/image-spec/blob/main/layer.md#whiteouts
-    let whiteouts = collect_whiteouts(layer)?;
+    let whiteouts = collect_whiteouts(layer, decompressed_budget)?;
     for whiteout in whiteouts {
         match whiteout {
             Whiteout::Remove(path) => remove_whiteout_target(rootfs, &path)?,
@@ -665,12 +824,15 @@ fn apply_layer(rootfs: &Path, layer: &CachedLayer) -> Result<()> {
         }
     }
 
-    let reader = layer_reader(&layer.path, &layer.media_type)?;
+    let reader = layer_reader(&layer.path, &layer.media_type, decompressed_budget)?;
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_preserve_ownerships(true);
     archive.set_preserve_mtime(true);
-    archive.set_unpack_xattrs(true);
+    // Do not materialize xattrs: extraction runs as root, and an image-supplied
+    // security.capability xattr would otherwise grant file capabilities that
+    // only the guest's nosuid mounts keep inert.
+    archive.set_unpack_xattrs(false);
     archive.set_overwrite(true);
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -690,18 +852,30 @@ fn apply_layer(rootfs: &Path, layer: &CachedLayer) -> Result<()> {
                 path.display()
             );
         }
+        let mode = entry.header().mode()?;
         if !entry.unpack_in(rootfs)? {
             bail!(
                 "OCI layer entry escapes the root filesystem: {}",
                 path.display()
             );
         }
+        // Image content is untrusted, so setuid/setgid never survive into the
+        // filesystem. Guest workloads run with no_new_privs on nosuid mounts,
+        // which makes these bits unusable anyway; stripping them here keeps
+        // that true even if a future mount option changes.
+        if mode & 0o6000 != 0 && (entry_type.is_file() || entry_type.is_dir()) {
+            let target = rootfs.join(&path);
+            let metadata = fs::symlink_metadata(&target)?;
+            if !metadata.file_type().is_symlink() {
+                fs::set_permissions(&target, Permissions::from_mode(metadata.mode() & 0o1777))?;
+            }
+        }
     }
     Ok(())
 }
 
-fn collect_whiteouts(layer: &CachedLayer) -> Result<Vec<Whiteout>> {
-    let reader = layer_reader(&layer.path, &layer.media_type)?;
+fn collect_whiteouts(layer: &CachedLayer, decompressed_budget: u64) -> Result<Vec<Whiteout>> {
+    let reader = layer_reader(&layer.path, &layer.media_type, decompressed_budget)?;
     let mut archive = tar::Archive::new(reader);
     let mut whiteouts = Vec::new();
     for entry in archive.entries()? {
@@ -735,17 +909,27 @@ fn whiteout_path(path: &Path) -> Result<Option<Whiteout>> {
     )))
 }
 
-fn layer_reader(path: &Path, media_type: &str) -> Result<Box<dyn Read>> {
+fn layer_reader(path: &Path, media_type: &str, decompressed_budget: u64) -> Result<Box<dyn Read>> {
     let mut file =
         File::open(path).with_context(|| format!("opening cached OCI layer {}", path.display()))?;
     let mut magic = [0_u8; 4];
     let count = file.read(&mut magic)?;
     file.seek(SeekFrom::Start(0))?;
+    // The budget wraps the decompressed side: compressed blob sizes are already
+    // held to the manifest's declared sizes, but a tiny blob can decompress
+    // without bound, and that expansion lands on the host disk before mkfs
+    // ever enforces the image size.
     if count >= 2 && magic[..2] == [0x1f, 0x8b] {
-        return Ok(Box::new(MultiGzDecoder::new(file)));
+        return Ok(Box::new(BoundedReader {
+            inner: MultiGzDecoder::new(file),
+            remaining: decompressed_budget,
+        }));
     }
     if count == 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
-        return Ok(Box::new(zstd::stream::read::Decoder::new(file)?));
+        return Ok(Box::new(BoundedReader {
+            inner: zstd::stream::read::Decoder::new(file)?,
+            remaining: decompressed_budget,
+        }));
     }
     if media_type.ends_with("+gzip") || media_type.ends_with(".gzip") {
         bail!(
@@ -759,7 +943,62 @@ fn layer_reader(path: &Path, media_type: &str) -> Result<Box<dyn Read>> {
             path.display()
         );
     }
-    Ok(Box::new(BufReader::new(file)))
+    Ok(Box::new(BoundedReader {
+        inner: BufReader::new(file),
+        remaining: decompressed_budget,
+    }))
+}
+
+struct BoundedReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: Read> Read for BoundedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            // Distinguish a stream that ends exactly at the budget from one
+            // that exceeds it.
+            let mut probe = [0_u8; 1];
+            if self.inner.read(&mut probe)? == 0 {
+                return Ok(0);
+            }
+            return Err(io::Error::other(
+                "OCI layer exceeds its decompression budget; raise EXO_FIRECRACKER_IMAGE_SIZE_GIB \
+                 if the image is legitimately this large",
+            ));
+        }
+        let capacity = buffer
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let count = self.inner.read(&mut buffer[..capacity])?;
+        self.remaining -= count as u64;
+        Ok(count)
+    }
+}
+
+// Sums regular-file bytes under a directory, counting each hard-linked inode
+// once so link-heavy images (eg. busybox) are not overcounted. Used to bound
+// host disk consumed by extraction, since only mkfs.ext4 enforces the image
+// size and it runs after all layers already landed on the host filesystem.
+fn directory_tree_bytes(path: &Path) -> Result<u64> {
+    let mut seen = HashSet::new();
+    let mut total = 0_u64;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() && seen.insert((metadata.dev(), metadata.ino())) {
+                total = total
+                    .checked_add(metadata.len())
+                    .context("extracted OCI image size overflow")?;
+            }
+        }
+    }
+    Ok(total)
 }
 
 fn validate_archive_path(path: &Path) -> Result<()> {
@@ -979,6 +1218,64 @@ pub(super) fn validate_ext4_image(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// Removes leftovers of materializations that died between staging and their
+// atomic publish rename. Only entries older than STALE_TEMPORARY_MAX_AGE are
+// touched so a concurrent in-flight build is never deleted, and the sweep is
+// best-effort: garbage on disk is a leak, not a reason to refuse to start.
+pub(super) fn sweep_stale_image_artifacts(state_root: &Path) {
+    let images = state_root.join("images");
+    sweep_stale_temporaries(&images, &|name| name.starts_with("image-build-"));
+    sweep_stale_temporaries(&images.join("blobs/sha256"), &|name| {
+        name.starts_with(".tmp")
+    });
+    sweep_stale_temporaries(
+        &images
+            .join(format!("v{MATERIALIZER_VERSION}"))
+            .join("local"),
+        &|name| name.starts_with("local-image-"),
+    );
+}
+
+pub(super) fn sweep_stale_temporaries(directory: &Path, is_temporary: &dyn Fn(&str) -> bool) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_temporary(name) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > STALE_TEMPORARY_MAX_AGE);
+        if !stale {
+            continue;
+        }
+        let result = if metadata.is_dir() {
+            fs::remove_dir_all(entry.path())
+        } else {
+            fs::remove_file(entry.path())
+        };
+        match result {
+            Ok(()) => {
+                tracing::info!(path = %entry.path().display(), "removed stale Firecracker temporary artifact");
+            }
+            Err(error) => {
+                tracing::warn!(%error, path = %entry.path().display(), "failed removing stale Firecracker temporary artifact");
+            }
+        }
+    }
+}
+
 fn prepare_private_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
     fs::set_permissions(path, Permissions::from_mode(0o700))?;
@@ -1008,17 +1305,18 @@ mod tests {
     use super::*;
     use tar::{Builder, EntryType, Header};
 
-    fn append_file(
+    fn append_file_with_mode(
         builder: &mut Builder<Vec<u8>>,
         path: &str,
         contents: &[u8],
         uid: u64,
         gid: u64,
+        mode: u32,
     ) {
         let mut header = Header::new_gnu();
         header.set_path(path).unwrap();
         header.set_size(contents.len() as u64);
-        header.set_mode(0o644);
+        header.set_mode(mode);
         header.set_uid(uid);
         header.set_gid(gid);
         header.set_mtime(0);
@@ -1026,6 +1324,18 @@ mod tests {
         header.set_cksum();
         builder.append(&header, contents).unwrap();
     }
+
+    fn append_file(
+        builder: &mut Builder<Vec<u8>>,
+        path: &str,
+        contents: &[u8],
+        uid: u64,
+        gid: u64,
+    ) {
+        append_file_with_mode(builder, path, contents, uid, gid, 0o644);
+    }
+
+    const TEST_LAYER_BUDGET: u64 = 1024 * 1024;
 
     fn write_layer(directory: &Path, name: &str, entries: &[(&str, &[u8])]) -> CachedLayer {
         let mut builder = Builder::new(Vec::new());
@@ -1072,8 +1382,8 @@ mod tests {
             ],
         );
 
-        apply_layer(&rootfs, &base).unwrap();
-        apply_layer(&rootfs, &upper).unwrap();
+        apply_layer(&rootfs, &base, TEST_LAYER_BUDGET).unwrap();
+        apply_layer(&rootfs, &upper, TEST_LAYER_BUDGET).unwrap();
 
         assert!(!rootfs.join("etc/old").exists());
         assert_eq!(fs::read(rootfs.join("etc/keep")).unwrap(), b"keep");
@@ -1096,8 +1406,94 @@ mod tests {
             &[("escape/.wh.precious", b"")],
         );
 
-        assert!(apply_layer(&rootfs, &layer).is_err());
+        assert!(apply_layer(&rootfs, &layer, TEST_LAYER_BUDGET).is_err());
         assert_eq!(fs::read(victim.join("precious")).unwrap(), b"safe");
+    }
+
+    #[test]
+    fn decompression_budget_rejects_layer_bombs() {
+        let directory = tempfile::tempdir().unwrap();
+        let rootfs = directory.path().join("rootfs");
+        fs::create_dir(&rootfs).unwrap();
+        // 4 MiB of zeros gzips to a few KiB: a stand-in for a blob whose
+        // declared (compressed) size is tiny but whose expansion is not.
+        let zeros = vec![0_u8; 4 * 1024 * 1024];
+        let metadata = fs::metadata(directory.path()).unwrap();
+        let mut builder = Builder::new(Vec::new());
+        append_file(
+            &mut builder,
+            "bomb",
+            &zeros,
+            u64::from(metadata.uid()),
+            u64::from(metadata.gid()),
+        );
+        let tar_bytes = builder.into_inner().unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&tar_bytes).unwrap();
+        let path = directory.path().join("bomb.tar.gz");
+        fs::write(&path, encoder.finish().unwrap()).unwrap();
+        let layer = CachedLayer {
+            path,
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+        };
+
+        let error = apply_layer(&rootfs, &layer, 64 * 1024).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("decompression budget"),
+            "unexpected error: {error:#}"
+        );
+        // An ample budget accepts the same layer.
+        apply_layer(&rootfs, &layer, 16 * 1024 * 1024).unwrap();
+    }
+
+    #[test]
+    fn setuid_and_setgid_bits_are_stripped_from_layers() {
+        let directory = tempfile::tempdir().unwrap();
+        let rootfs = directory.path().join("rootfs");
+        fs::create_dir(&rootfs).unwrap();
+        let metadata = fs::metadata(directory.path()).unwrap();
+        let mut builder = Builder::new(Vec::new());
+        append_file_with_mode(
+            &mut builder,
+            "bin/backdoor",
+            b"#!/bin/sh",
+            u64::from(metadata.uid()),
+            u64::from(metadata.gid()),
+            0o4755,
+        );
+        append_file_with_mode(
+            &mut builder,
+            "bin/sgid",
+            b"#!/bin/sh",
+            u64::from(metadata.uid()),
+            u64::from(metadata.gid()),
+            0o2755,
+        );
+        let bytes = builder.into_inner().unwrap();
+        let path = directory.path().join("suid.tar");
+        fs::write(&path, bytes).unwrap();
+        let layer = CachedLayer {
+            path,
+            media_type: "application/vnd.oci.image.layer.v1.tar".to_string(),
+        };
+
+        apply_layer(&rootfs, &layer, TEST_LAYER_BUDGET).unwrap();
+        let suid_mode = fs::metadata(rootfs.join("bin/backdoor")).unwrap().mode();
+        let sgid_mode = fs::metadata(rootfs.join("bin/sgid")).unwrap().mode();
+        assert_eq!(suid_mode & 0o7777, 0o755, "setuid bit must be stripped");
+        assert_eq!(sgid_mode & 0o7777, 0o755, "setgid bit must be stripped");
+    }
+
+    #[test]
+    fn directory_tree_bytes_counts_hard_links_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(directory.path().join("a"), vec![0_u8; 100]).unwrap();
+        fs::write(nested.join("b"), vec![0_u8; 50]).unwrap();
+        fs::hard_link(directory.path().join("a"), nested.join("a-link")).unwrap();
+
+        assert_eq!(directory_tree_bytes(directory.path()).unwrap(), 150);
     }
 
     #[test]
