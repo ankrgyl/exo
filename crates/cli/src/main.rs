@@ -71,7 +71,7 @@ struct Cli {
     master_key_path: Option<PathBuf>,
     #[arg(long, global = true, value_enum, env = "EXO_SANDBOX_BACKEND")]
     sandbox_backend: Option<SandboxBackendArg>,
-    /// Restrict the Firecracker image materializer to these OCI registries
+    /// Restrict the Firecracker materializer to these OCI registry entry points
     /// (repeat the flag or comma-separate values). Unset means unrestricted.
     #[arg(
         long = "firecracker-allowed-registry",
@@ -80,6 +80,22 @@ struct Cli {
         value_delimiter = ','
     )]
     firecracker_allowed_registries: Vec<String>,
+    /// Permit these exact local ext4 images as Firecracker roots (repeatable).
+    #[arg(
+        long = "firecracker-allowed-local-image",
+        global = true,
+        value_name = "PATH"
+    )]
+    firecracker_allowed_local_images: Vec<PathBuf>,
+    /// Admit these private or special-use IPv4 ranges for Firecracker egress
+    /// (repeat the flag or comma-separate values).
+    #[arg(
+        long = "firecracker-allowed-egress-cidr",
+        global = true,
+        value_name = "CIDR",
+        value_delimiter = ','
+    )]
+    firecracker_allowed_egress_cidrs: Vec<String>,
     #[arg(long, global = true)]
     env_file: Option<PathBuf>,
     #[arg(long, global = true)]
@@ -290,6 +306,8 @@ fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
         },
     };
     let firecracker_spec = FirecrackerBackendSpec {
+        allowed_egress_cidrs: cli.firecracker_allowed_egress_cidrs.clone(),
+        allowed_local_images: cli.firecracker_allowed_local_images.clone(),
         allowed_registries: cli.firecracker_allowed_registries.clone(),
     };
     let sandbox_backend = cli
@@ -3851,6 +3869,10 @@ mod create_tests {
             "docker.io,123456789012.dkr.ecr.us-east-1.amazonaws.com",
             "--firecracker-allowed-registry",
             "registry.example.com",
+            "--firecracker-allowed-local-image",
+            "/opt/exo/rootfs.ext4",
+            "--firecracker-allowed-egress-cidr",
+            "10.20.0.0/16,192.168.1.1/32",
             "agent",
             "create",
             "test",
@@ -3871,6 +3893,14 @@ mod create_tests {
                 "123456789012.dkr.ecr.us-east-1.amazonaws.com",
                 "registry.example.com"
             ]
+        );
+        assert_eq!(
+            cli.firecracker_allowed_egress_cidrs,
+            vec!["10.20.0.0/16", "192.168.1.1/32"]
+        );
+        assert_eq!(
+            cli.firecracker_allowed_local_images,
+            vec![std::path::PathBuf::from("/opt/exo/rootfs.ext4")]
         );
         assert!(matches!(
             cli.command,

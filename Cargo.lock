@@ -2614,6 +2614,7 @@ dependencies = [
  "docker_credential",
  "flate2",
  "futures",
+ "ipnet",
  "keyring",
  "keyring-core",
  "libc",
@@ -2621,6 +2622,7 @@ dependencies = [
  "object_store",
  "oci-client",
  "reqwest 0.12.28",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3680,6 +3682,9 @@ name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "iri-string"

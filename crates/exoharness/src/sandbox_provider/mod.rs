@@ -1,9 +1,15 @@
 //! Per-provider [`crate::sandbox::ManagedSandboxBackend`] implementations,
 //! selected via the harness's provider registry.
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
 type FirecrackerBackend = Arc<dyn crate::ManagedSandboxBackend>;
+
+const DEFAULT_FIRECRACKER_IMAGE: &str = "/var/lib/exo/firecracker/rootfs.ext4";
+
+pub fn default_firecracker_image() -> String {
+    DEFAULT_FIRECRACKER_IMAGE.to_string()
+}
 
 mod docker;
 
@@ -45,12 +51,6 @@ mod firecracker_image;
     feature = "firecracker"
 ))]
 mod firecracker_lima;
-#[cfg(not(all(not(target_arch = "wasm32"), feature = "firecracker")))]
-mod firecracker {
-    pub fn default_firecracker_image() -> String {
-        "/var/lib/exo/firecracker/rootfs.ext4".to_string()
-    }
-}
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub mod process_bridge;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
@@ -81,7 +81,6 @@ pub(crate) use docker::DEFAULT_DOCKER_IMAGE;
 pub use docker::default_docker_image;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use e2b::{DEFAULT_E2B_API_URL, DEFAULT_E2B_ENVD_PORT, E2bConfig, E2bSandboxBackend};
-pub use firecracker::default_firecracker_image;
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
 pub use firecracker::{FirecrackerConfig, FirecrackerSandboxBackend};
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
@@ -92,14 +91,23 @@ pub async fn firecracker_backend_from_env() -> anyhow::Result<FirecrackerBackend
     firecracker_backend_from_config(FirecrackerConfig::from_env()?).await
 }
 
-// The registry allowlist is deliberately not an environment variable: it is a
-// security control, and it arrives as an explicit CLI (clap) parameter so it
-// is visible in --help and in the invocation that granted it.
+// Policy exceptions are explicit CLI parameters so they are visible in
+// --help and in the invocation that granted them.
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
-pub async fn firecracker_backend_with_allowed_registries(
+pub async fn firecracker_backend_with_policy(
+    allowed_egress_cidrs: Vec<String>,
+    allowed_local_images: Vec<PathBuf>,
     allowed_registries: Vec<String>,
 ) -> anyhow::Result<FirecrackerBackend> {
     let mut config = FirecrackerConfig::from_env()?;
+    config.allowed_egress_cidrs = allowed_egress_cidrs
+        .into_iter()
+        .map(|cidr| {
+            cidr.parse()
+                .map_err(|error| anyhow::anyhow!("invalid Firecracker egress CIDR {cidr}: {error}"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    config.allowed_local_images.extend(allowed_local_images);
     config.allowed_registries = allowed_registries;
     firecracker_backend_from_config(config).await
 }

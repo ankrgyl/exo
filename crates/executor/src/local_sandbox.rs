@@ -904,24 +904,8 @@ impl SandboxHandle for LocalSandboxConversation {
             .create_sandbox(request.clone())
             .await?;
         self.map_local_sandbox(remote_id.clone(), local_id).await?;
-        self.append_remote_sandbox_events(vec![
-            EventData::SandboxCreated {
-                sandbox_id: remote_id.clone(),
-                name: request.name,
-                provider: request.provider,
-                image: request.image,
-                default_workdir: request.default_workdir.unwrap_or_default(),
-                file_system_mounts: request.file_system_mounts.unwrap_or_default(),
-                durable_file_systems: request.durable_file_systems.unwrap_or_default(),
-                enable_networking: request.enable_networking.unwrap_or(true),
-                idle_seconds: request.idle_seconds.unwrap_or(60),
-            },
-            EventData::SandboxStarted {
-                sandbox_id: remote_id.clone(),
-                snapshot_id: None,
-            },
-        ])
-        .await?;
+        self.append_remote_sandbox_events(sandbox_created_events(&remote_id, request))
+            .await?;
         Ok(remote_id)
     }
 
@@ -938,24 +922,8 @@ impl SandboxHandle for LocalSandboxConversation {
             .fork_sandbox(request)
             .await?;
         self.map_local_sandbox(remote_id.clone(), local_id).await?;
-        self.append_remote_sandbox_events(vec![
-            EventData::SandboxCreated {
-                sandbox_id: remote_id.clone(),
-                name: sandbox.name,
-                provider: sandbox.provider,
-                image: sandbox.image,
-                default_workdir: sandbox.default_workdir.unwrap_or_default(),
-                file_system_mounts: sandbox.file_system_mounts.unwrap_or_default(),
-                durable_file_systems: sandbox.durable_file_systems.unwrap_or_default(),
-                enable_networking: sandbox.enable_networking.unwrap_or(true),
-                idle_seconds: sandbox.idle_seconds.unwrap_or(60),
-            },
-            EventData::SandboxStarted {
-                sandbox_id: remote_id.clone(),
-                snapshot_id: None,
-            },
-        ])
-        .await?;
+        self.append_remote_sandbox_events(sandbox_created_events(&remote_id, sandbox))
+            .await?;
         Ok(remote_id)
     }
 
@@ -1085,6 +1053,26 @@ impl SandboxHandle for LocalSandboxConversation {
         };
         run_in_mapped_sandbox(self.local_conversation().await?, local_id, request).await
     }
+}
+
+fn sandbox_created_events(sandbox_id: &SandboxId, request: CreateSandboxRequest) -> Vec<EventData> {
+    vec![
+        EventData::SandboxCreated {
+            sandbox_id: sandbox_id.clone(),
+            name: request.name,
+            provider: request.provider,
+            image: request.image,
+            default_workdir: request.default_workdir.unwrap_or_default(),
+            file_system_mounts: request.file_system_mounts.unwrap_or_default(),
+            durable_file_systems: request.durable_file_systems.unwrap_or_default(),
+            enable_networking: request.enable_networking.unwrap_or(true),
+            idle_seconds: request.idle_seconds.unwrap_or(60),
+        },
+        EventData::SandboxStarted {
+            sandbox_id: sandbox_id.clone(),
+            snapshot_id: None,
+        },
+    ]
 }
 
 struct LocalSandboxTurnHandle {

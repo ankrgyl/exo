@@ -22,7 +22,7 @@ pub(super) const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const STREAM_INPUT_QUEUE_DEPTH: usize = 16;
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum FirecrackerBridgeRequest {
     Acquire {
@@ -68,7 +68,7 @@ impl FirecrackerBridgeRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum FirecrackerBridgeResponse {
-    Acquired {
+    Handle {
         id: String,
         provider_state: Option<Value>,
         effective_image: Option<String>,
@@ -76,13 +76,7 @@ pub enum FirecrackerBridgeResponse {
     Exec {
         output: SandboxCommandOutput,
     },
-    Stopped,
-    Forked {
-        id: String,
-        provider_state: Option<Value>,
-        effective_image: Option<String>,
-    },
-    Terminated,
+    Unit,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -118,8 +112,7 @@ pub enum FirecrackerBridgeStreamChannel {
 pub enum FirecrackerBridgeServerFrame {
     Response {
         id: u64,
-        response: Option<FirecrackerBridgeResponse>,
-        error: Option<String>,
+        result: std::result::Result<FirecrackerBridgeResponse, String>,
     },
     StreamOpened {
         id: u64,
@@ -149,28 +142,24 @@ enum BridgeStreamInput {
     Cancel,
 }
 
+#[derive(Default)]
 struct BridgeBackendCache {
-    backends: Mutex<HashMap<String, Arc<FirecrackerSandboxBackend>>>,
+    backends: Mutex<HashMap<FirecrackerConfig, Arc<FirecrackerSandboxBackend>>>,
 }
 
 impl BridgeBackendCache {
-    fn new() -> Self {
-        Self {
-            backends: Mutex::new(HashMap::new()),
-        }
-    }
-
     async fn backend(&self, config: FirecrackerConfig) -> Result<Arc<FirecrackerSandboxBackend>> {
-        let key = serde_json::to_string(&config)?;
         let mut backends = self.backends.lock().await;
-        if let Some(backend) = backends.get(&key) {
+        if let Some(backend) = backends.get(&config) {
             return Ok(Arc::clone(backend));
         }
         // Construction hashes the kernel and initramfs; keep that off the
         // async executor while the cache lock is held.
-        let backend = tokio::task::spawn_blocking(move || FirecrackerSandboxBackend::new(config))
-            .await
-            .context("joining Firecracker backend construction")??;
+        let backend_config = config.clone();
+        let backend =
+            tokio::task::spawn_blocking(move || FirecrackerSandboxBackend::new(backend_config))
+                .await
+                .context("joining Firecracker backend construction")??;
         let backend = Arc::new(backend);
         // Jailed VMMs deliberately outlive the bridge process, and expired
         // machines are otherwise only reaped inside future acquires. Reaping
@@ -179,7 +168,7 @@ impl BridgeBackendCache {
         if let Err(error) = backend.reap_expired().await {
             tracing::warn!(%error, "failed reaping expired Firecracker machines at backend startup");
         }
-        backends.insert(key, Arc::clone(&backend));
+        backends.insert(config, Arc::clone(&backend));
         Ok(backend)
     }
 
@@ -198,7 +187,7 @@ type BridgeStreams = Arc<Mutex<HashMap<u64, mpsc::Sender<BridgeStreamInput>>>>;
 pub async fn run_firecracker_bridge() -> Result<Option<i32>> {
     let writer = Arc::new(Mutex::new(tokio::io::stdout()));
     let streams = Arc::new(Mutex::new(HashMap::new()));
-    let backends = Arc::new(BridgeBackendCache::new());
+    let backends = Arc::new(BridgeBackendCache::default());
     let mut reader = tokio::io::stdin();
 
     loop {
@@ -235,17 +224,9 @@ pub async fn run_firecracker_bridge() -> Result<Option<i32>> {
                 let backends = Arc::clone(&backends);
                 tokio::spawn(async move {
                     let result = handle_request(*request, &backends).await;
-                    let frame = match result {
-                        Ok(response) => FirecrackerBridgeServerFrame::Response {
-                            id,
-                            response: Some(response),
-                            error: None,
-                        },
-                        Err(error) => FirecrackerBridgeServerFrame::Response {
-                            id,
-                            response: None,
-                            error: Some(format!("{error:#}")),
-                        },
+                    let frame = FirecrackerBridgeServerFrame::Response {
+                        id,
+                        result: result.map_err(|error| format!("{error:#}")),
                     };
                     if let Err(error) = send_server_frame(&writer, &frame).await {
                         // A response can exceed the frame limit (eg. exec
@@ -259,8 +240,7 @@ pub async fn run_firecracker_bridge() -> Result<Option<i32>> {
                         // broken and the client fails every pending request.
                         let fallback = FirecrackerBridgeServerFrame::Response {
                             id,
-                            response: None,
-                            error: Some(format!(
+                            result: Err(format!(
                                 "sending Firecracker bridge response failed: {error:#}"
                             )),
                         };
@@ -309,7 +289,7 @@ async fn handle_request(
     match request {
         FirecrackerBridgeRequest::Acquire { config, request } => {
             let handle = backends.acquire(config, request).await?;
-            Ok(FirecrackerBridgeResponse::Acquired {
+            Ok(FirecrackerBridgeResponse::Handle {
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),
                 effective_image: handle.effective_image(),
@@ -328,7 +308,7 @@ async fn handle_request(
         }),
         FirecrackerBridgeRequest::Stop { config, request } => {
             backends.acquire(config, request).await?.stop().await?;
-            Ok(FirecrackerBridgeResponse::Stopped)
+            Ok(FirecrackerBridgeResponse::Unit)
         }
         FirecrackerBridgeRequest::Fork {
             config,
@@ -340,7 +320,7 @@ async fn handle_request(
                 .await?
                 .fork_sandbox(source, target)
                 .await?;
-            Ok(FirecrackerBridgeResponse::Forked {
+            Ok(FirecrackerBridgeResponse::Handle {
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),
                 effective_image: handle.effective_image(),
@@ -348,7 +328,7 @@ async fn handle_request(
         }
         FirecrackerBridgeRequest::Terminate { config, request } => {
             backends.backend(config).await?.terminate(request).await?;
-            Ok(FirecrackerBridgeResponse::Terminated)
+            Ok(FirecrackerBridgeResponse::Unit)
         }
         FirecrackerBridgeRequest::StartProcess { .. }
         | FirecrackerBridgeRequest::ConnectTcp { .. } => {

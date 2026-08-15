@@ -10,7 +10,7 @@ use std::future::Future;
 use std::io::{self, BufRead, BufReader as StdBufReader, Read, Seek, SeekFrom, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
 use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -22,6 +22,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use ipnet::Ipv4Net;
+#[cfg(target_os = "linux")]
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+#[cfg(target_os = "linux")]
+use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -47,7 +52,7 @@ const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
 const MAX_GUEST_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_GUEST_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_MACHINE_ID: &str = "fc-0000000000000000-00000000";
+const MAX_MACHINE_ID: &str = "fc-00000000000000000000000000000000-00000000";
 // sockaddr_un.sun_path is 108 bytes including the trailing NUL on Linux.
 // https://github.com/torvalds/linux/blob/master/include/uapi/linux/un.h
 const UNIX_SOCKET_PATH_CAPACITY: usize = 108;
@@ -68,7 +73,7 @@ const DEFAULT_NETWORK_BYTES_PER_SECOND: u64 = 100 * 1024 * 1024;
 const DEFAULT_JAILER_UID_BASE: u32 = 100_000;
 const DEFAULT_VCPU_COUNT: u8 = 2;
 const DEFAULT_MEMORY_MIB: u32 = 4096;
-const SNAPSHOT_CACHE_VERSION: u32 = 1;
+const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 // Upstream warns that a compromised guest kernel can reactivate the serial
 // device even with 8250.nr_uarts=0, and unbounded console output written to a
 // host file is their named disk-fill DoS. VMM console output is therefore
@@ -105,11 +110,7 @@ static ONE_SHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 // within this process.
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-pub fn default_firecracker_image() -> String {
-    "/var/lib/exo/firecracker/rootfs.ext4".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FirecrackerConfig {
     pub firecracker_bin: PathBuf,
     pub jailer_bin: PathBuf,
@@ -122,13 +123,11 @@ pub struct FirecrackerConfig {
     pub workspace_size_gib: u64,
     pub jailer_uid_base: u32,
     pub dns_server: Ipv4Addr,
-    pub allowed_egress_cidrs: Vec<String>,
-    // Registries the root-run materializer may contact; empty = unrestricted.
-    // The registry host is trusted for process availability (manifest bodies
-    // are buffered unbounded by the OCI client), so operators can pin exactly
-    // which hosts ever get that trust. serde(default) keeps the bridge wire
-    // format compatible with a bridge built before this field existed.
-    #[serde(default)]
+    pub allowed_egress_cidrs: Vec<Ipv4Net>,
+    pub allowed_local_images: Vec<PathBuf>,
+    // Registry entry points the root-run materializer may contact; empty =
+    // unrestricted. Permitted registries are trusted for process availability
+    // and any cross-host blob redirects they return.
     pub allowed_registries: Vec<String>,
     pub network_bytes_per_second: u64,
 }
@@ -156,7 +155,8 @@ impl FirecrackerConfig {
             )?,
             jailer_uid_base: env_parse("EXO_FIRECRACKER_JAILER_UID_BASE", DEFAULT_JAILER_UID_BASE)?,
             dns_server: env_parse("EXO_FIRECRACKER_DNS_SERVER", Ipv4Addr::new(1, 1, 1, 1))?,
-            allowed_egress_cidrs: env_cidrs("EXO_FIRECRACKER_ALLOWED_EGRESS_CIDRS")?,
+            allowed_egress_cidrs: Vec::new(),
+            allowed_local_images: vec![PathBuf::from(super::default_firecracker_image())],
             // A security control, so it is an explicit CLI parameter
             // (--firecracker-allowed-registry) rather than an implicit
             // environment variable; the caller overrides this default.
@@ -450,7 +450,7 @@ impl FirecrackerSandboxBackend {
         self.reap_expired_machines().await?;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let stable_machine_id = machine_id(&request.key, &spec_hash);
-        let machine_key_prefix = format!("fc-{}-", stable_fnv1a_hex(&request.key.to_string()));
+        let machine_key_prefix = format!("fc-{}-", stable_id(&request.key.to_string()));
 
         if let Some(state) = request
             .provider_state
@@ -536,6 +536,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
             &self.shared.config.state_root,
             &request.spec.image,
             self.shared.config.image_size_gib,
+            &self.shared.config.allowed_local_images,
             &self.shared.config.allowed_registries,
         )
         .await?;
@@ -552,6 +553,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
     }
 
     async fn terminate(&self, request: SandboxRequest) -> Result<()> {
+        let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
         let persisted_machine_id = request
             .provider_state
             .as_ref()
@@ -559,7 +561,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
             .transpose()?
             .map(|state| state.machine_id);
         if let Some(machine_id) = persisted_machine_id.as_deref() {
-            let machine_key_prefix = format!("fc-{}-", stable_fnv1a_hex(&request.key.to_string()));
+            let machine_key_prefix = format!("fc-{}-", stable_id(&request.key.to_string()));
             if !valid_machine_id(machine_id) || !machine_id.starts_with(&machine_key_prefix) {
                 bail!("Firecracker provider state does not match the terminated sandbox key");
             }
@@ -616,6 +618,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
             &self.shared.config.state_root,
             &target.spec.image,
             self.shared.config.image_size_gib,
+            &self.shared.config.allowed_local_images,
             &self.shared.config.allowed_registries,
         )
         .await?;
@@ -625,49 +628,50 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         }
         let target_spec_hash = sandbox_spec_hash(&target.spec);
         let target_machine_id = machine_id(&target.key, &target_spec_hash);
-        let template_key = fork_snapshot_template_key(&source_record);
+        let template_key = fork_snapshot_template_key(&source_record, &target_machine_id);
+        GuestClient::new(
+            Arc::clone(&self.shared),
+            machine_from_record(&self.shared.config, source_record.clone()).vsock_path,
+        )
+        .sync_filesystem(&source.spec.default_workdir)
+        .await
+        .context("syncing Firecracker fork source filesystem")?;
         let config = self.shared.config.clone();
-        let template_key_for_check = template_key.clone();
-        let template_ready = tokio::task::spawn_blocking(move || {
-            fork_snapshot_template_ready(&config, &template_key_for_check)
+        let source_record_for_snapshot = source_record.clone();
+        let template_key_for_snapshot = template_key.clone();
+        tokio::task::spawn_blocking(move || {
+            create_fork_snapshot(
+                &config,
+                &source_record_for_snapshot,
+                &template_key_for_snapshot,
+            )
         })
         .await
-        .context("joining Firecracker fork snapshot cache check")??;
-        if !template_ready {
-            GuestClient::new(
-                Arc::clone(&self.shared),
-                machine_from_record(&self.shared.config, source_record.clone()).vsock_path,
-            )
-            .sync_filesystem(&source.spec.default_workdir)
-            .await
-            .context("syncing Firecracker fork source filesystem")?;
-            let config = self.shared.config.clone();
-            let source_record_for_snapshot = source_record.clone();
-            let template_key_for_snapshot = template_key.clone();
-            tokio::task::spawn_blocking(move || {
-                create_fork_snapshot(
-                    &config,
-                    &source_record_for_snapshot,
-                    &template_key_for_snapshot,
-                )
-            })
-            .await
-            .context("joining Firecracker fork snapshot creation")??;
-        }
-        self.shared
+        .context("joining Firecracker fork snapshot creation")??;
+        if let Err(error) = self
+            .shared
             .new_fork_machine_record(
                 &target,
                 &target_machine_id,
                 &target_spec_hash,
-                template_key,
+                template_key.clone(),
                 source_record.slot,
             )
-            .await?;
+            .await
+        {
+            if let Err(cleanup_error) = self.shared.remove_snapshot_template(&template_key).await {
+                return Err(error).context(format!(
+                    "cleaning up failed Firecracker fork snapshot also failed: {cleanup_error:#}"
+                ));
+            }
+            return Err(error);
+        }
         drop(_lifecycle_guard);
 
         match self.acquire_resolved(target).await {
             Ok(handle) => Ok(handle),
             Err(error) => {
+                let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
                 if let Err(cleanup_error) =
                     self.shared.cleanup_machine(&target_machine_id, true).await
                 {
@@ -726,28 +730,19 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
     }
 
     async fn exec(&self, command: &SandboxCommand) -> Result<SandboxCommandOutput> {
-        self.shared
-            .invalidate_fork_snapshot(&self.machine.record)
-            .await?;
         let machine = self
             .shared
-            .ensure_machine(
+            .ensure_active_machine(
                 &self.request,
                 &self.machine.record.machine_id,
                 &self.spec_hash,
             )
             .await?;
-        touch_machine(
-            &self.shared,
-            &self.shared.warm_machines,
-            &self.request.key,
-            &machine.record.machine_id,
-        )
-        .await?;
         let output = GuestClient::new(Arc::clone(&self.shared), machine.vsock_path)
             .exec(&self.request.spec, command)
             .await;
         if self.one_shot {
+            let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
             let cleanup = self
                 .shared
                 .cleanup_machine(&machine.record.machine_id, true)
@@ -757,35 +752,28 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
                 (Ok(_), Err(error)) | (Err(error), _) => Err(error),
             };
         }
-        touch_machine(
-            &self.shared,
-            &self.shared.warm_machines,
-            &self.request.key,
-            &machine.record.machine_id,
-        )
-        .await?;
+        {
+            let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
+            touch_machine(
+                &self.shared,
+                &self.shared.warm_machines,
+                &self.request.key,
+                &machine.record.machine_id,
+            )
+            .await?;
+        }
         output
     }
 
     async fn start_process(&self, command: &SandboxCommand) -> Result<SandboxProcessParts> {
-        self.shared
-            .invalidate_fork_snapshot(&self.machine.record)
-            .await?;
         let machine = self
             .shared
-            .ensure_machine(
+            .ensure_active_machine(
                 &self.request,
                 &self.machine.record.machine_id,
                 &self.spec_hash,
             )
             .await?;
-        touch_machine(
-            &self.shared,
-            &self.shared.warm_machines,
-            &self.request.key,
-            &machine.record.machine_id,
-        )
-        .await?;
         let cleanup_machine_id = self.one_shot.then(|| machine.record.machine_id.clone());
         GuestClient::new(Arc::clone(&self.shared), machine.vsock_path)
             .start_process(&self.request.spec, command, cleanup_machine_id)
@@ -800,14 +788,12 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
         if !self.machine.record.network_enabled {
             bail!("Firecracker sandbox does not have networking enabled");
         }
-        self.shared
-            .invalidate_fork_snapshot(&self.machine.record)
-            .await?;
         let address = (self.machine.record.network().guest_ip, port);
         Ok(Some(Box::pin(TcpStream::connect(address).await?)))
     }
 
     async fn stop(&self) -> Result<()> {
+        let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
         if self.machine.record.workspace_id.is_some()
             && process_running(&self.shared.pid_path(&self.machine.record.machine_id))
         {
@@ -840,6 +826,18 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
 }
 
 impl Shared {
+    async fn ensure_active_machine(
+        self: &Arc<Self>,
+        request: &SandboxRequest,
+        machine_id: &str,
+        spec_hash: &str,
+    ) -> Result<Machine> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        let machine = self.ensure_machine(request, machine_id, spec_hash).await?;
+        touch_machine(self, &self.warm_machines, &request.key, machine_id).await?;
+        Ok(machine)
+    }
+
     async fn ensure_machine(
         self: &Arc<Self>,
         request: &SandboxRequest,
@@ -974,7 +972,7 @@ impl Shared {
             .spec
             .durable_file_systems
             .first()
-            .map(|file_system| stable_fnv1a_hex(&format!("{}\n{}", request.key, file_system.name)));
+            .map(|file_system| stable_id(&format!("{}\n{}", request.key, file_system.name)));
         let idle_ttl_seconds = request.lifecycle.idle_ttl.map(|ttl| ttl.as_secs());
         tokio::task::spawn_blocking(move || {
             let slot = allocate_resource_slot(&state_root, &machine_id)?;
@@ -1136,8 +1134,12 @@ impl Shared {
             .await
             .context("joining Firecracker snapshot jail cleanup")??;
         }
-        if let Some(record) = record.as_ref() {
-            self.invalidate_fork_snapshot(record).await?;
+        if delete_rootfs
+            && let Some(template_key) = record
+                .as_ref()
+                .and_then(|record| record.snapshot_template.as_deref())
+        {
+            self.remove_snapshot_template(template_key).await?;
         }
         if delete_rootfs {
             let jail_dir = self.jail_dir(machine_id);
@@ -1174,12 +1176,11 @@ impl Shared {
         Ok(())
     }
 
-    async fn invalidate_fork_snapshot(&self, record: &MachineRecord) -> Result<()> {
-        let key = fork_snapshot_template_key(record);
-        let snapshot = snapshot_template_dir(&self.config, &key)?;
+    async fn remove_snapshot_template(&self, key: &str) -> Result<()> {
+        let snapshot = snapshot_template_dir(&self.config, key)?;
         tokio::task::spawn_blocking(move || remove_directory_if_present(&snapshot))
             .await
-            .context("joining Firecracker fork snapshot invalidation")?
+            .context("joining Firecracker fork snapshot cleanup")?
     }
 
     fn manifest_path(&self, machine_id: &str) -> PathBuf {
@@ -1249,39 +1250,6 @@ where
     }
 }
 
-fn env_cidrs(name: &str) -> Result<Vec<String>> {
-    let Some(value) = std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return Ok(Vec::new());
-    };
-    value
-        .split(',')
-        .map(|cidr| {
-            let cidr = cidr.trim();
-            validate_ipv4_cidr(cidr)?;
-            Ok(cidr.to_string())
-        })
-        .collect()
-}
-
-fn validate_ipv4_cidr(cidr: &str) -> Result<()> {
-    let (address, prefix) = cidr
-        .split_once('/')
-        .ok_or_else(|| anyhow!("IPv4 CIDR must contain a prefix: {cidr}"))?;
-    address
-        .parse::<Ipv4Addr>()
-        .with_context(|| format!("invalid IPv4 address in CIDR {cidr}"))?;
-    let prefix = prefix
-        .parse::<u8>()
-        .with_context(|| format!("invalid IPv4 prefix in CIDR {cidr}"))?;
-    if prefix > 32 {
-        bail!("invalid IPv4 prefix in CIDR {cidr}");
-    }
-    Ok(())
-}
-
 fn validate_host(config: &FirecrackerConfig) -> Result<()> {
     if !cfg!(target_os = "linux") {
         bail!("Firecracker sandbox execution is only supported on Linux");
@@ -1310,16 +1278,7 @@ fn validate_host(config: &FirecrackerConfig) -> Result<()> {
             bail!("Firecracker sandbox execution requires the cgroup v2 {required} controller");
         }
     }
-    for program in [
-        "chown",
-        "cp",
-        "ip",
-        "iptables",
-        "kill",
-        "mkfs.ext4",
-        "nft",
-        "sysctl",
-    ] {
+    for program in ["cp", "ip", "iptables", "mkfs.ext4", "nft", "sysctl"] {
         trusted_host_command(program)
             .with_context(|| format!("required trusted host command {program}"))?;
     }
@@ -1332,9 +1291,11 @@ fn validate_host(config: &FirecrackerConfig) -> Result<()> {
     if config.image_size_gib == 0 {
         bail!("Firecracker OCI image size must be positive");
     }
+    gib_bytes(config.image_size_gib, "image")?;
     if config.workspace_size_gib == 0 {
         bail!("Firecracker workspace size must be positive");
     }
+    gib_bytes(config.workspace_size_gib, "workspace")?;
     if config.network_bytes_per_second == 0 {
         bail!("Firecracker network rate limit must be positive");
     }
@@ -1345,9 +1306,6 @@ fn validate_host(config: &FirecrackerConfig) -> Result<()> {
         .jailer_uid_base
         .checked_add(MAX_RESOURCE_SLOTS)
         .context("Firecracker jailer UID range overflows u32")?;
-    for cidr in &config.allowed_egress_cidrs {
-        validate_ipv4_cidr(cidr)?;
-    }
     let firecracker_version = binary_version(&config.firecracker_bin)?;
     let jailer_version = binary_version(&config.jailer_bin)?;
     if firecracker_version != jailer_version {
@@ -1499,6 +1457,26 @@ pub(super) fn trusted_host_command(program: &str) -> Result<PathBuf> {
     Ok(executable)
 }
 
+pub(super) fn copy_sparse_reflink(source: &Path, destination: &Path) -> Result<()> {
+    let executable = trusted_host_command("cp")?;
+    let output = Command::new(executable)
+        .args(["--sparse=always", "--reflink=auto", "--"])
+        .arg(source)
+        .arg(destination)
+        .output()
+        .with_context(|| format!("copying {} to {}", source.display(), destination.display()))?;
+    if !output.status.success() {
+        bail!(
+            "copying {} to {} failed with {}: {}",
+            source.display(),
+            destination.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 fn binary_version(path: &Path) -> Result<String> {
     let output = Command::new(path)
         .arg("--version")
@@ -1521,17 +1499,13 @@ fn binary_version(path: &Path) -> Result<String> {
 }
 
 fn machine_id(key: &SandboxKey, spec_hash: &str) -> String {
-    format!(
-        "fc-{}-{}",
-        stable_fnv1a_hex(&key.to_string()),
-        &spec_hash[..8]
-    )
+    format!("fc-{}-{}", stable_id(&key.to_string()), &spec_hash[..8])
 }
 
 fn one_shot_machine_id(key: &SandboxKey, spec_hash: &str, sequence: u64) -> String {
     format!(
         "fc-{}-{}",
-        stable_fnv1a_hex(&format!("{key}\n{}\n{sequence}", std::process::id())),
+        stable_id(&format!("{key}\n{}\n{sequence}", std::process::id())),
         &spec_hash[..8]
     )
 }
@@ -1544,17 +1518,8 @@ fn valid_machine_id(machine_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
-fn stable_fnv1a_hex(input: &str) -> String {
-    format!("{:016x}", stable_fnv1a(input))
-}
-
-fn stable_fnv1a(input: &str) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in input.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
+fn stable_id(input: &str) -> String {
+    format!("{:x}", Sha256::digest(input.as_bytes()))[..32].to_string()
 }
 
 fn hash_snapshot_string(hasher: &mut Sha256, value: &str) {
@@ -1702,7 +1667,9 @@ fn write_manifest(state_root: &Path, record: &MachineRecord) -> Result<()> {
 }
 
 fn allocate_resource_slot(state_root: &Path, machine_id: &str) -> Result<u32> {
-    let first = (stable_fnv1a(machine_id) % u64::from(MAX_RESOURCE_SLOTS)) as u32;
+    let digest = Sha256::digest(machine_id.as_bytes());
+    let first =
+        u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) % MAX_RESOURCE_SLOTS;
     allocate_resource_slot_from(state_root, machine_id, first)
 }
 
@@ -2238,7 +2205,7 @@ fn prepare_and_launch_blocking(
             .create_new(true)
             .write(true)
             .open(&overlay)?;
-        file.set_len(config.image_size_gib * 1024 * 1024 * 1024)?;
+        file.set_len(gib_bytes(config.image_size_gib, "image")?)?;
         run_checked(
             "mkfs.ext4",
             &[
@@ -2274,9 +2241,8 @@ fn prepare_and_launch_blocking(
         )
     })?;
     let host_uid = jailer_uid(config, record)?;
-    let ownership = format!("{host_uid}:{host_uid}");
     prepare_api_run_dir(&root, host_uid)?;
-    run_checked("chown", &[&ownership, &overlay.to_string_lossy()])?;
+    chown(&overlay, Some(host_uid), Some(host_uid))?;
     fs::set_permissions(&overlay, Permissions::from_mode(0o600))?;
 
     if let Some(workspace_id) = record.workspace_id.as_ref() {
@@ -2295,7 +2261,7 @@ fn prepare_and_launch_blocking(
                         workspace.display()
                     )
                 })?;
-            file.set_len(config.workspace_size_gib * 1024 * 1024 * 1024)?;
+            file.set_len(gib_bytes(config.workspace_size_gib, "workspace")?)?;
             run_checked("mkfs.ext4", &["-q", "-F", &workspace.to_string_lossy()])?;
             fs::set_permissions(&workspace, Permissions::from_mode(0o600))?;
         }
@@ -2310,13 +2276,13 @@ fn prepare_and_launch_blocking(
                 jailed_workspace.display()
             )
         })?;
-        run_checked("chown", &[&ownership, &jailed_workspace.to_string_lossy()])?;
+        chown(&jailed_workspace, Some(host_uid), Some(host_uid))?;
     }
 
     let vm_config = firecracker_vm_configuration(config, request, record);
     let vm_config_path = root.join("vm-config.json");
     fs::write(&vm_config_path, serde_json::to_vec(&vm_config)?)?;
-    run_checked("chown", &[&ownership, &vm_config_path.to_string_lossy()])?;
+    chown(&vm_config_path, Some(host_uid), Some(host_uid))?;
     fs::set_permissions(&vm_config_path, Permissions::from_mode(0o400))?;
 
     record_launch_timing(
@@ -2443,10 +2409,14 @@ fn drain_vmm_console(mut reader: io::PipeReader, mut log: File) {
                     continue;
                 }
                 remaining -= keep as u64;
-                if remaining == 0 {
-                    let _ = log.write_all(
-                        b"\n[exo: console output limit reached; discarding further output]\n",
-                    );
+                if remaining == 0
+                    && log
+                        .write_all(
+                            b"\n[exo: console output limit reached; discarding further output]\n",
+                        )
+                        .is_err()
+                {
+                    return;
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -2621,7 +2591,7 @@ fn prepare_snapshot_jail_files(
 fn prepare_api_run_dir(root: &Path, uid: u32) -> Result<()> {
     let run = root.join("run");
     fs::create_dir_all(&run)?;
-    run_checked("chown", &[&format!("{uid}:{uid}"), &run.to_string_lossy()])?;
+    chown(&run, Some(uid), Some(uid))?;
     fs::set_permissions(run, Permissions::from_mode(0o700))
         .context("setting Firecracker API run directory permissions")
 }
@@ -2741,7 +2711,7 @@ fn validate_snapshot_template(config: &FirecrackerConfig, directory: &Path) -> R
         ),
         (
             directory.join("overlay.ext4"),
-            Some(config.image_size_gib * 1024 * 1024 * 1024),
+            Some(gib_bytes(config.image_size_gib, "image")?),
         ),
     ];
     for (path, expected_length) in expected {
@@ -2762,20 +2732,19 @@ fn validate_snapshot_template(config: &FirecrackerConfig, directory: &Path) -> R
     Ok(true)
 }
 
-fn fork_snapshot_template_ready(config: &FirecrackerConfig, key: &str) -> Result<bool> {
-    let directory = snapshot_template_dir(config, key)?;
-    if !directory.try_exists()? {
-        return Ok(false);
-    }
-    validate_snapshot_template(config, &directory)
+fn gib_bytes(size_gib: u64, label: &str) -> Result<u64> {
+    size_gib
+        .checked_mul(1024 * 1024 * 1024)
+        .with_context(|| format!("Firecracker {label} size overflows bytes"))
 }
 
-fn fork_snapshot_template_key(source: &MachineRecord) -> String {
+fn fork_snapshot_template_key(source: &MachineRecord, target_machine_id: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(SNAPSHOT_CACHE_VERSION.to_le_bytes());
-    hash_snapshot_string(&mut hasher, "live-fork");
+    hasher.update(SNAPSHOT_FORMAT_VERSION.to_le_bytes());
+    hash_snapshot_string(&mut hasher, "point-in-time-fork");
     hash_snapshot_string(&mut hasher, &source.machine_id);
     hash_snapshot_string(&mut hasher, &source.spec_hash);
+    hash_snapshot_string(&mut hasher, target_machine_id);
     format!("{:x}", hasher.finalize())
 }
 
@@ -2793,9 +2762,6 @@ fn create_fork_snapshot(
 ) -> Result<()> {
     let destination = snapshot_template_dir(config, template_key)?;
     if destination.try_exists()? {
-        if validate_snapshot_template(config, &destination)? {
-            return Ok(());
-        }
         remove_directory_if_present(&destination)?;
     }
 
@@ -2814,10 +2780,7 @@ fn create_fork_snapshot(
     remove_directory_if_present(&output)?;
     fs::create_dir(&output)?;
     let uid = jailer_uid(config, source)?;
-    run_checked(
-        "chown",
-        &[&format!("{uid}:{uid}"), &output.to_string_lossy()],
-    )?;
+    chown(&output, Some(uid), Some(uid))?;
     fs::set_permissions(&output, Permissions::from_mode(0o700))?;
 
     let api = wait_for_firecracker_api(&root, &source.machine_id)?;
@@ -2855,15 +2818,7 @@ fn create_fork_snapshot(
         // Only the disk copy must happen inside the pause window: the overlay
         // has to match the memory image byte-for-byte, and the source starts
         // writing to it again the moment it resumes.
-        run_checked(
-            "cp",
-            &[
-                "--sparse=always",
-                "--reflink=auto",
-                &root.join("overlay.ext4").to_string_lossy(),
-                &temporary.join("overlay.ext4").to_string_lossy(),
-            ],
-        )?;
+        copy_sparse_reflink(&root.join("overlay.ext4"), &temporary.join("overlay.ext4"))?;
         Ok::<(), anyhow::Error>(())
     })();
     let resume = firecracker_api_patch(&api, "/vm", &FirecrackerVmState { state: "Resumed" });
@@ -2881,27 +2836,18 @@ fn create_fork_snapshot(
         // unprivileged uid, so a compromised VMM can hold an open fd to them; a
         // hard link would leave the published template writable through that fd
         // even after the chown/chmod below, and Firecracker treats snapshots as
-        // trusted VMM input when a clone loads them. Since the template is now
-        // reused by every future clone of this source, one tamper would poison
-        // all of them. The copy runs after the source resumed, so it costs no
-        // pause time, and reflink makes it metadata-only on XFS/btrfs.
+        // trusted VMM input when a clone loads them. The copy runs after the
+        // source resumed, so it costs no pause time, and reflink makes it
+        // metadata-only on XFS/btrfs.
         for name in ["state", "memory"] {
-            run_checked(
-                "cp",
-                &[
-                    "--sparse=always",
-                    "--reflink=auto",
-                    &output.join(name).to_string_lossy(),
-                    &temporary.join(name).to_string_lossy(),
-                ],
-            )?;
+            copy_sparse_reflink(&output.join(name), &temporary.join(name))?;
         }
         for path in [
             temporary.join("state"),
             temporary.join("memory"),
             temporary.join("overlay.ext4"),
         ] {
-            run_checked("chown", &["0:0", &path.to_string_lossy()])?;
+            chown(&path, Some(0), Some(0))?;
             fs::set_permissions(&path, Permissions::from_mode(0o444))?;
             File::open(path)?.sync_all()?;
         }
@@ -2948,15 +2894,7 @@ fn prepare_snapshot_overlay(
     let created = !cow.try_exists()?;
     if created {
         let origin = snapshot_template_dir(config, template_key)?.join("overlay.ext4");
-        run_checked(
-            "cp",
-            &[
-                "--sparse=always",
-                "--reflink=auto",
-                &origin.to_string_lossy(),
-                &cow.to_string_lossy(),
-            ],
-        )?;
+        copy_sparse_reflink(&origin, &cow)?;
         fs::set_permissions(&cow, Permissions::from_mode(0o600))?;
     }
     let root = jail_root(config, &record.machine_id);
@@ -2965,10 +2903,7 @@ fn prepare_snapshot_overlay(
     let overlay = root.join("overlay.ext4");
     replace_hard_link(&cow, &overlay)?;
     let uid = jailer_uid(config, record)?;
-    run_checked(
-        "chown",
-        &[&format!("{uid}:{uid}"), &overlay.to_string_lossy()],
-    )?;
+    chown(&overlay, Some(uid), Some(uid))?;
     fs::set_permissions(&overlay, Permissions::from_mode(0o600))?;
     Ok(created)
 }
@@ -3053,6 +2988,7 @@ fn process_running(pid_path: &Path) -> bool {
     PathBuf::from(format!("/proc/{pid}")).exists()
 }
 
+#[cfg(target_os = "linux")]
 fn stop_machine_process_blocking(machine_id: &str, pid_path: &Path) -> Result<()> {
     let Ok(pid) = fs::read_to_string(pid_path) else {
         return Ok(());
@@ -3061,6 +2997,15 @@ fn stop_machine_process_blocking(machine_id: &str, pid_path: &Path) -> Result<()
         .trim()
         .parse::<u32>()
         .context("invalid Firecracker pid")?;
+    let rustix_pid = i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .context("invalid Firecracker pid")?;
+    let pidfd = match pidfd_open(rustix_pid, PidfdFlags::empty()) {
+        Ok(pidfd) => pidfd,
+        Err(rustix::io::Errno::SRCH) => return Ok(()),
+        Err(error) => return Err(error).context("opening Firecracker pidfd"),
+    };
     let proc_dir = PathBuf::from(format!("/proc/{pid}"));
     if !proc_dir.exists() {
         return Ok(());
@@ -3088,23 +3033,40 @@ fn stop_machine_process_blocking(machine_id: &str, pid_path: &Path) -> Result<()
     if !is_firecracker || !has_machine_id || !in_machine_cgroup {
         bail!("refusing to stop pid {pid}: it does not match Firecracker machine {machine_id}");
     }
-    run_checked("kill", &["-TERM", &pid.to_string()])?;
-    let started = Instant::now();
-    while started.elapsed() < PROCESS_STOP_TIMEOUT {
-        if !proc_dir.exists() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    if !signal_pidfd(&pidfd, Signal::TERM)? {
+        return Ok(());
     }
-    run_checked("kill", &["-KILL", &pid.to_string()])?;
-    let killed = Instant::now();
-    while killed.elapsed() < PROCESS_STOP_TIMEOUT {
-        if !proc_dir.exists() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(1));
+    if wait_for_pidfd(&pidfd, PROCESS_STOP_TIMEOUT)? {
+        return Ok(());
+    }
+    if !signal_pidfd(&pidfd, Signal::KILL)? {
+        return Ok(());
+    }
+    if wait_for_pidfd(&pidfd, PROCESS_STOP_TIMEOUT)? {
+        return Ok(());
     }
     bail!("Firecracker process {pid} remained after SIGKILL")
+}
+
+#[cfg(target_os = "linux")]
+fn signal_pidfd(pidfd: &std::os::fd::OwnedFd, signal: Signal) -> Result<bool> {
+    match pidfd_send_signal(pidfd, signal) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::SRCH) => Ok(false),
+        Err(error) => Err(error).context("signaling Firecracker process"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_pidfd(pidfd: &std::os::fd::OwnedFd, timeout: Duration) -> Result<bool> {
+    let timeout = Timespec::try_from(timeout).context("Firecracker stop timeout is too large")?;
+    let mut pollfd = [PollFd::new(pidfd, PollFlags::IN)];
+    Ok(poll(&mut pollfd, Some(&timeout))? > 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stop_machine_process_blocking(_machine_id: &str, _pid_path: &Path) -> Result<()> {
+    bail!("Firecracker sandbox execution is only supported on Linux")
 }
 
 fn tail_file(path: &Path) -> Result<String> {
@@ -3136,41 +3098,26 @@ impl GuestClient {
     }
 
     async fn ping_with_timeout(&self, timeout: Duration) -> Result<()> {
-        let response: OperationResponse = self
-            .invoke_with_timeout(
-                &PingRequest {
-                    request_type: "ping",
-                },
-                timeout,
-            )
+        let response: GuestResponse = self
+            .invoke_with_timeout(&GuestRequest::Ping, timeout)
             .await?;
-        if response.ok {
-            return Ok(());
-        }
-        bail!(
-            "Firecracker guest healthcheck failed: {}",
-            response
-                .error
-                .unwrap_or_else(|| "unknown error".to_string())
-        )
+        response.into_result("Firecracker guest healthcheck failed")
     }
 
-    async fn invoke<Request, Response>(&self, request: &Request) -> Result<Response>
+    async fn invoke<Response>(&self, request: &GuestRequest<'_>) -> Result<Response>
     where
-        Request: Serialize + ?Sized,
         Response: DeserializeOwned,
     {
         self.invoke_with_timeout(request, GUEST_REQUEST_TIMEOUT)
             .await
     }
 
-    async fn invoke_with_timeout<Request, Response>(
+    async fn invoke_with_timeout<Response>(
         &self,
-        request: &Request,
+        request: &GuestRequest<'_>,
         timeout: Duration,
     ) -> Result<Response>
     where
-        Request: Serialize + ?Sized,
         Response: DeserializeOwned,
     {
         let payload = serde_json::to_vec(request)?;
@@ -3207,10 +3154,9 @@ impl GuestClient {
             .timeout
             .and_then(|timeout| timeout.checked_add(Duration::from_secs(5)))
             .unwrap_or(GUEST_REQUEST_TIMEOUT);
-        let response: ExecResponse = self
+        let response: GuestResponse = self
             .invoke_with_timeout(
-                &ExecRequest {
-                    request_type: "exec",
+                &GuestRequest::Exec {
                     argv: &command.argv,
                     env: &command.env,
                     cwd: &cwd,
@@ -3221,9 +3167,6 @@ impl GuestClient {
                 request_timeout,
             )
             .await?;
-        let ok = response
-            .ok
-            .unwrap_or_else(|| response.exit_code.is_some_and(|code| code == 0));
         let mut stderr = response.stderr.unwrap_or_default();
         if let Some(error) = response.error {
             if !stderr.is_empty() {
@@ -3232,7 +3175,7 @@ impl GuestClient {
             stderr.push_str(&error);
         }
         Ok(SandboxCommandOutput {
-            ok,
+            ok: response.ok,
             exit_code: response.exit_code,
             stdout: response.stdout.unwrap_or_default(),
             stderr,
@@ -3257,9 +3200,8 @@ impl GuestClient {
             .cwd
             .clone()
             .unwrap_or_else(|| spec.default_workdir.clone());
-        let response: StartProcessResponse = self
-            .invoke(&StartProcessRequest {
-                request_type: "start_process",
+        let response: GuestResponse = self
+            .invoke(&GuestRequest::StartProcess {
                 argv: &command.argv,
                 env: &command.env,
                 cwd: &cwd,
@@ -3298,42 +3240,20 @@ impl GuestClient {
     }
 
     async fn kill_process(&self, process_id: &str) -> Result<()> {
-        let response: OperationResponse = self
-            .invoke(&KillProcessRequest {
-                request_type: "kill_process",
-                process_id,
-            })
+        let response: GuestResponse = self
+            .invoke(&GuestRequest::KillProcess { process_id })
             .await?;
-        if response.ok {
-            return Ok(());
-        }
-        bail!(
-            "Firecracker kill_process failed: {}",
-            response
-                .error
-                .unwrap_or_else(|| "unknown error".to_string())
-        )
+        response.into_result("Firecracker kill_process failed")
     }
 
     async fn sync_filesystem(&self, path: &str) -> Result<()> {
-        let response: OperationResponse = self
+        let response: GuestResponse = self
             .invoke_with_timeout(
-                &SyncFilesystemRequest {
-                    request_type: "sync_filesystem",
-                    path,
-                },
+                &GuestRequest::SyncFilesystem { path },
                 GUEST_REQUEST_TIMEOUT,
             )
             .await?;
-        if response.ok {
-            return Ok(());
-        }
-        bail!(
-            "Firecracker guest filesystem sync failed: {}",
-            response
-                .error
-                .unwrap_or_else(|| "unknown error".to_string())
-        )
+        response.into_result("Firecracker guest filesystem sync failed")
     }
 
     async fn configure_network(
@@ -3342,23 +3262,14 @@ impl GuestClient {
         gateway: Ipv4Addr,
         prefix: u8,
     ) -> Result<()> {
-        let response: OperationResponse = self
-            .invoke(&ConfigureNetworkRequest {
-                request_type: "configure_network",
+        let response: GuestResponse = self
+            .invoke(&GuestRequest::ConfigureNetwork {
                 address,
                 gateway,
                 prefix,
             })
             .await?;
-        if response.ok {
-            return Ok(());
-        }
-        bail!(
-            "Firecracker fork clone network reconfiguration failed: {}",
-            response
-                .error
-                .unwrap_or_else(|| "unknown error".to_string())
-        )
+        response.into_result("Firecracker fork clone network reconfiguration failed")
     }
 }
 
@@ -3406,24 +3317,41 @@ async fn vsock_request(path: &Path, payload: &[u8]) -> Result<Vec<u8>> {
 }
 
 #[derive(Serialize)]
-struct PingRequest {
-    #[serde(rename = "type")]
-    request_type: &'static str,
-}
-
-#[derive(Serialize)]
-struct ExecRequest<'a> {
-    #[serde(rename = "type")]
-    request_type: &'static str,
-    argv: &'a [String],
-    env: &'a HashMap<String, String>,
-    cwd: &'a str,
-    timeout_ms: Option<u64>,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum GuestRequest<'a> {
+    Ping,
+    Exec {
+        argv: &'a [String],
+        env: &'a HashMap<String, String>,
+        cwd: &'a str,
+        timeout_ms: Option<u64>,
+    },
+    StartProcess {
+        argv: &'a [String],
+        env: &'a HashMap<String, String>,
+        cwd: &'a str,
+    },
+    ProcessBridge {
+        process_id: &'a str,
+        request: process_bridge::Request,
+    },
+    KillProcess {
+        process_id: &'a str,
+    },
+    SyncFilesystem {
+        path: &'a str,
+    },
+    ConfigureNetwork {
+        address: Ipv4Addr,
+        gateway: Ipv4Addr,
+        prefix: u8,
+    },
 }
 
 #[derive(Deserialize)]
-struct ExecResponse {
-    ok: Option<bool>,
+struct GuestResponse {
+    ok: bool,
+    process_id: Option<String>,
     exit_code: Option<i32>,
     stdout: Option<String>,
     stderr: Option<String>,
@@ -3431,56 +3359,16 @@ struct ExecResponse {
     error: Option<String>,
 }
 
-#[derive(Serialize)]
-struct StartProcessRequest<'a> {
-    #[serde(rename = "type")]
-    request_type: &'static str,
-    argv: &'a [String],
-    env: &'a HashMap<String, String>,
-    cwd: &'a str,
-}
-
-#[derive(Deserialize)]
-struct StartProcessResponse {
-    process_id: Option<String>,
-    error: Option<String>,
-}
-
-#[derive(Serialize)]
-struct ProcessBridgeRequest<'a> {
-    #[serde(rename = "type")]
-    request_type: &'static str,
-    process_id: &'a str,
-    request: process_bridge::Request,
-}
-
-#[derive(Serialize)]
-struct KillProcessRequest<'a> {
-    #[serde(rename = "type")]
-    request_type: &'static str,
-    process_id: &'a str,
-}
-
-#[derive(Serialize)]
-struct SyncFilesystemRequest<'a> {
-    #[serde(rename = "type")]
-    request_type: &'static str,
-    path: &'a str,
-}
-
-#[derive(Serialize)]
-struct ConfigureNetworkRequest<'a> {
-    #[serde(rename = "type")]
-    request_type: &'a str,
-    address: Ipv4Addr,
-    gateway: Ipv4Addr,
-    prefix: u8,
-}
-
-#[derive(Deserialize)]
-struct OperationResponse {
-    ok: bool,
-    error: Option<String>,
+impl GuestResponse {
+    fn into_result(self, context: &str) -> Result<()> {
+        if self.ok {
+            return Ok(());
+        }
+        bail!(
+            "{context}: {}",
+            self.error.unwrap_or_else(|| "unknown error".to_string())
+        )
+    }
 }
 
 struct FirecrackerProcessBridgeClient {
@@ -3492,8 +3380,7 @@ struct FirecrackerProcessBridgeClient {
 impl process_bridge::Client for FirecrackerProcessBridgeClient {
     async fn request(&self, request: process_bridge::Request) -> Result<process_bridge::Response> {
         self.guest
-            .invoke(&ProcessBridgeRequest {
-                request_type: "process_bridge",
+            .invoke(&GuestRequest::ProcessBridge {
                 process_id: &self.process_id,
                 request,
             })
@@ -3520,9 +3407,11 @@ impl Drop for ProcessCleanup {
                 tracing::debug!(%error, process_id, "failed to clean up Firecracker guest process");
             }
             if let Some(machine_id) = machine_id
-                && let Err(error) = guest.shared.cleanup_machine(&machine_id, true).await
             {
-                tracing::warn!(%error, machine_id, "failed to clean up one-shot Firecracker machine");
+                let _lifecycle_guard = guest.shared.lifecycle_lock.lock().await;
+                if let Err(error) = guest.shared.cleanup_machine(&machine_id, true).await {
+                    tracing::warn!(%error, machine_id, "failed to clean up one-shot Firecracker machine");
+                }
             }
         });
     }
@@ -3711,7 +3600,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_machine_ids_and_cidrs() {
+    fn validates_machine_ids() {
         assert!(valid_machine_id("fc-0123456789abcdef-01234567"));
         assert!(!valid_machine_id("../firecracker"));
         let one_shot = one_shot_machine_id(
@@ -3724,9 +3613,6 @@ mod tests {
         );
         assert!(valid_machine_id(&one_shot));
         assert_eq!(one_shot.len(), MAX_MACHINE_ID.len());
-        assert!(validate_ipv4_cidr("203.0.113.0/24").is_ok());
-        assert!(validate_ipv4_cidr("203.0.113.0/33").is_err());
-        assert!(validate_ipv4_cidr("example.com/24").is_err());
     }
 
     #[test]
@@ -3834,7 +3720,7 @@ mod tests {
     }
 
     #[test]
-    fn fork_snapshots_are_reused_per_source() {
+    fn fork_snapshots_are_unique_per_target() {
         let source = MachineRecord {
             machine_id: "fc-source".to_string(),
             spec_hash: "spec".to_string(),
@@ -3847,12 +3733,16 @@ mod tests {
             snapshot_network_slot: None,
         };
 
-        let first = fork_snapshot_template_key(&source);
-        assert_eq!(first, fork_snapshot_template_key(&source));
+        let first = fork_snapshot_template_key(&source, "fc-target-1");
+        assert_eq!(first, fork_snapshot_template_key(&source, "fc-target-1"));
+        assert_ne!(first, fork_snapshot_template_key(&source, "fc-target-2"));
 
         let mut second_source = source;
         second_source.machine_id = "fc-source-2".to_string();
-        assert_ne!(first, fork_snapshot_template_key(&second_source));
+        assert_ne!(
+            first,
+            fork_snapshot_template_key(&second_source, "fc-target-1")
+        );
     }
 
     #[tokio::test]

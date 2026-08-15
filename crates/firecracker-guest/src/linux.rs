@@ -38,17 +38,13 @@ enum Request {
     Ping,
     Exec {
         argv: Vec<String>,
-        #[serde(default)]
         env: HashMap<String, String>,
-        #[serde(default = "default_cwd")]
         cwd: String,
         timeout_ms: Option<u64>,
     },
     StartProcess {
         argv: Vec<String>,
-        #[serde(default)]
         env: HashMap<String, String>,
-        #[serde(default = "default_cwd")]
         cwd: String,
     },
     ProcessBridge {
@@ -717,10 +713,6 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
         .code()
         .or_else(|| status.signal().map(|signal| -signal))
         .unwrap_or(-1)
-}
-
-fn default_cwd() -> String {
-    "/home/exo/workspace".to_string()
 }
 
 fn sync_filesystem(path: &str) -> Response {

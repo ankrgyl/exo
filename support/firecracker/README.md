@@ -1,8 +1,8 @@
 # Firecracker sandbox artifacts
 
 Exo's optional Firecracker backend accepts either an OCI image reference or an
-existing ext4 root filesystem, plus an uncompressed guest kernel and a minimal
-initramfs. It launches Firecracker only through the matching `jailer` binary,
+operator-approved ext4 root filesystem, plus an uncompressed guest kernel and
+a minimal initramfs. It launches Firecracker only through the matching `jailer` binary,
 communicates with a static Rust PID 1 over virtio-vsock, and adds a TAP device
 only when the sandbox requests networking.
 
@@ -125,19 +125,18 @@ addresses are anti-spoofed, guest-to-host and guest-to-guest traffic is
 blocked (guest-to-guest cannot be opened even by the allow-list), link-local
 ranges including the cloud metadata service and private/special-use ranges are
 rejected unless explicitly admitted via a comma-separated
-`EXO_FIRECRACKER_ALLOWED_EGRESS_CIDRS`, IPv6 is dropped outright, and each VM
-gets a bandwidth cap. Disabled networking creates no TAP interface at all —
-the control channel is vsock, so exec still works.
+`--firecracker-allowed-egress-cidr <CIDR>` (repeatable), IPv6 is dropped
+outright, and each VM gets a bandwidth cap. Disabled networking creates no TAP
+interface at all — the control channel is vsock, so exec still works.
 
 Forking pauses the source VM, snapshots memory and disk, and boots clones with
 their own copy-on-write disk, network namespace, and IP; snapshot templates
 are copied out of the source VM's jail (never shared by hard link) and
-published root-owned and immutable. Fork templates are reused across clones of
-the same source, so upstream's snapshot caveats apply: the source resumes
-alongside its clones, which briefly share identical userspace state (PRNG
-pools, session tokens, boot_id), and only a VMGenID-capable guest kernel
-(5.18+) reseeds the kernel CSPRNG on restore. Forks are an explicit API call,
-never guest-triggerable.
+published root-owned and immutable. Every fork snapshots the source at the
+time of that call. The source resumes alongside its clones, which briefly
+share identical userspace state (PRNG pools, session tokens, boot_id), and only
+a VMGenID-capable guest kernel (5.18+) reseeds the kernel CSPRNG on restore.
+Forks are an explicit API call, never guest-triggerable.
 
 ## Limitations and operator responsibilities
 
@@ -177,9 +176,11 @@ Be aware of what this backend does _not_ do, and what stays on the operator:
   reference; pass `--firecracker-allowed-registry <HOST>` (repeatable or
   comma-separated, eg.
   `--firecracker-allowed-registry docker.io,123456789012.dkr.ecr.us-east-1.amazonaws.com`)
-  to enforce which registries the materializer will ever contact, and only
-  materialize images from publishers you trust. The durable fix is a bounded
-  response read in the OCI client library.
+  to restrict registry entry points, and only materialize images from
+  publishers you trust. Permitted registries may redirect blob downloads to
+  other object-storage hosts, so this is a publisher allowlist rather than a
+  host-network allowlist. The durable fix is a bounded response read in the
+  OCI client library.
 - **The image cache grows without bound.** Every unique image digest and layer
   blob a full-scope client requests is retained under
   `EXO_FIRECRACKER_STATE_ROOT/images` — the standard behavior of a
@@ -189,7 +190,10 @@ Be aware of what this backend does _not_ do, and what stays on the operator:
   your image set, and prune `images/` offline when needed — it is a cache, so
   deleting entries while no materialization is running is always safe (VMs in
   flight keep their content alive via hard links). Local `.ext4` images are
-  operator-supplied trusted input and are not size-checked.
+  operator-supplied trusted input and are not size-checked. The standard
+  `/var/lib/exo/firecracker/rootfs.ext4` image is permitted by default; grant
+  any other exact path with a repeatable
+  `--firecracker-allowed-local-image <PATH>` flag.
 
 The implementation follows Firecracker's upstream guidance for
 [jailer operation](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md),

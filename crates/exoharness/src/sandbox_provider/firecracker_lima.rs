@@ -103,7 +103,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
                 request: request.clone(),
             })
             .await?;
-        let FirecrackerBridgeResponse::Acquired {
+        let FirecrackerBridgeResponse::Handle {
             id,
             provider_state,
             effective_image,
@@ -136,7 +136,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
             })
             .await?
         {
-            FirecrackerBridgeResponse::Terminated => Ok(()),
+            FirecrackerBridgeResponse::Unit => Ok(()),
             _ => bail!("Firecracker Lima bridge returned the wrong response to terminate"),
         }
     }
@@ -153,7 +153,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
                 target: target.clone(),
             })
             .await?;
-        let FirecrackerBridgeResponse::Forked {
+        let FirecrackerBridgeResponse::Handle {
             id,
             provider_state,
             effective_image,
@@ -253,7 +253,7 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
             })
             .await?
         {
-            FirecrackerBridgeResponse::Stopped => Ok(()),
+            FirecrackerBridgeResponse::Unit => Ok(()),
             _ => bail!("Firecracker Lima bridge returned the wrong response to stop"),
         }
     }
@@ -442,7 +442,7 @@ impl LimaBridgeManager {
         &self,
         request: FirecrackerBridgeRequest,
     ) -> Result<FirecrackerBridgeResponse> {
-        self.retry(|connection| Box::pin(connection.request(request.clone())))
+        self.with_connection(|connection| Box::pin(connection.request(request)))
             .await
     }
 
@@ -450,31 +450,29 @@ impl LimaBridgeManager {
         &self,
         request: FirecrackerBridgeRequest,
     ) -> Result<SandboxProcessParts> {
-        self.retry(|connection| Box::pin(connection.start_process(request.clone())))
+        self.with_connection(|connection| Box::pin(connection.start_process(request)))
             .await
     }
 
     async fn connect_tcp(&self, request: FirecrackerBridgeRequest) -> Result<LimaTcpStream> {
-        self.retry(|connection| Box::pin(connection.connect_tcp(request.clone())))
+        self.with_connection(|connection| Box::pin(connection.connect_tcp(request)))
             .await
     }
 
-    async fn retry<T: Send>(
+    async fn with_connection<T: Send>(
         &self,
-        operation: impl for<'a> Fn(&'a LimaBridgeConnection) -> BoxFuture<'a, Result<T>> + Sync,
+        operation: impl for<'a> FnOnce(&'a LimaBridgeConnection) -> BoxFuture<'a, Result<T>>,
     ) -> Result<T> {
-        for attempt in 0..2 {
-            let connection = self.connection().await?;
-            match operation(&connection).await {
-                Ok(result) => return Ok(result),
-                Err(error) if connection.is_closed() && attempt == 0 => {
-                    self.invalidate(&connection).await;
-                    tracing::debug!(%error, "restarting closed Firecracker Lima bridge");
-                }
-                Err(error) => return Err(error),
-            }
+        let connection = self.connection().await?;
+        let result = operation(&connection).await;
+        if result.is_err() && connection.is_closed() {
+            self.invalidate(&connection).await;
         }
-        unreachable!("Firecracker bridge retry loop must return")
+        // A closed connection makes the result ambiguous: the bridge may have
+        // completed the request before its response was lost. Replaying exec,
+        // start_process, or fork would duplicate side effects, so the next
+        // call reconnects but this one remains at-most-once.
+        result
     }
 }
 
@@ -500,6 +498,7 @@ struct LimaBridgeConnection {
     next_id: AtomicU64,
 }
 
+#[derive(Default)]
 struct LimaBridgeClientState {
     requests: StdMutex<HashMap<u64, oneshot::Sender<RpcResult>>>,
     streams: StdMutex<HashMap<u64, ClientStreamRoutes>>,
@@ -507,6 +506,7 @@ struct LimaBridgeClientState {
     close_reason: StdMutex<Option<String>>,
 }
 
+#[derive(Default)]
 struct ClientStreamRoutes {
     opened: Option<oneshot::Sender<OpenResult>>,
     stdout: Option<mpsc::Sender<BridgeReadResult>>,
@@ -530,7 +530,7 @@ impl LimaBridgeConnection {
             .stderr
             .take()
             .context("opening Firecracker bridge stderr")?;
-        let state = Arc::new(LimaBridgeClientState::new());
+        let state = Arc::new(LimaBridgeClientState::default());
         let (outgoing, mut outgoing_receiver) = mpsc::channel(BRIDGE_FRAME_QUEUE_DEPTH);
 
         let writer_state = Arc::clone(&state);
@@ -674,8 +674,8 @@ impl LimaBridgeConnection {
                 opened: Some(opened_sender),
                 stdout: Some(stdout_sender),
                 stderr: Some(stderr_sender),
-                tcp: None,
                 exited: Some(exit_sender),
+                ..ClientStreamRoutes::default()
             },
         )?;
         self.open_stream(id, request, opened_receiver, "process")
@@ -707,10 +707,8 @@ impl LimaBridgeConnection {
             id,
             ClientStreamRoutes {
                 opened: Some(opened_sender),
-                stdout: None,
-                stderr: None,
                 tcp: Some(tcp_sender),
-                exited: None,
+                ..ClientStreamRoutes::default()
             },
         )?;
         self.open_stream(id, request, opened_receiver, "TCP")
@@ -735,15 +733,6 @@ impl LimaBridgeConnection {
 }
 
 impl LimaBridgeClientState {
-    fn new() -> Self {
-        Self {
-            requests: StdMutex::new(HashMap::new()),
-            streams: StdMutex::new(HashMap::new()),
-            closed: AtomicBool::new(false),
-            close_reason: StdMutex::new(None),
-        }
-    }
-
     fn close_reason(&self) -> String {
         self.close_reason
             .lock()
@@ -775,22 +764,13 @@ impl LimaBridgeClientState {
 
     async fn handle_frame(&self, frame: FirecrackerBridgeServerFrame) -> Result<()> {
         match frame {
-            FirecrackerBridgeServerFrame::Response {
-                id,
-                response,
-                error,
-            } => {
+            FirecrackerBridgeServerFrame::Response { id, result } => {
                 let sender = self
                     .requests
                     .lock()
                     .map_err(|_| anyhow!("Firecracker bridge request lock is poisoned"))?
                     .remove(&id)
                     .context("Firecracker bridge response has an unknown request id")?;
-                let result = match (response, error) {
-                    (Some(response), None) => Ok(response),
-                    (None, Some(error)) => Err(error),
-                    _ => bail!("Firecracker bridge response must contain one result"),
-                };
                 if sender.send(result).is_err() {
                     tracing::debug!(
                         id,

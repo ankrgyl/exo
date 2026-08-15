@@ -24,8 +24,10 @@ firecracker = [
   "basic-backend",
   "dep:docker_credential",
   "dep:flate2",
+  "dep:ipnet",
   "dep:libc",
   "dep:oci-client",
+  "dep:rustix",
   "dep:sha2",
   "dep:tar",
   "dep:tempfile",
@@ -54,6 +56,7 @@ chrono.workspace = true
 docker_credential = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 futures.workspace = true
+ipnet = { workspace = true, optional = true }
 keyring = { version = "4.0.0-rc.3", optional = true }
 keyring-core = { version = "0.7.2", optional = true }
 libc = { workspace = true, optional = true }
@@ -61,6 +64,7 @@ lingua.workspace = true
 object_store = { workspace = true, optional = true }
 oci-client = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = { workspace = true, optional = true }

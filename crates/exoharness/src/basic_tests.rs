@@ -263,7 +263,7 @@ async fn firecracker_sandbox_contract_start_process_long_running_protocol() {
 #[cfg(feature = "firecracker")]
 #[ignore = "uses a real Firecracker sandbox; requires Linux KVM or nested virtualization through Lima on macOS"]
 async fn firecracker_fork_captures_current_source_state() {
-    let config = crate::FirecrackerConfig::from_env().expect("Firecracker config");
+    let config = firecracker_test_config();
     let backend = crate::sandbox_provider::firecracker_backend_for_test(config)
         .await
         .expect("Firecracker backend");
@@ -536,9 +536,18 @@ async fn firecracker_contract_backend() -> Arc<dyn ManagedSandboxBackend> {
             .with_test_writer()
             .try_init(),
     );
-    crate::firecracker_backend_from_env()
+    crate::sandbox_provider::firecracker_backend_for_test(firecracker_test_config())
         .await
         .expect("Firecracker backend from environment")
+}
+
+#[cfg(feature = "firecracker")]
+fn firecracker_test_config() -> crate::FirecrackerConfig {
+    let mut config = crate::FirecrackerConfig::from_env().expect("Firecracker config");
+    if let Some(image) = nonempty_env("FIRECRACKER_IMAGE") {
+        config.allowed_local_images.push(image.into());
+    }
+    config
 }
 
 #[cfg(feature = "firecracker")]

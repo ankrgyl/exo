@@ -93,6 +93,7 @@ pub(super) async fn resolve_image(
     state_root: &Path,
     source: &str,
     image_size_gib: u64,
+    allowed_local_images: &[PathBuf],
     allowed_registries: &[String],
 ) -> Result<PathBuf> {
     let total_started = Instant::now();
@@ -100,10 +101,12 @@ pub(super) async fn resolve_image(
         let lookup_started = Instant::now();
         let state_root = state_root.to_path_buf();
         let source_path = source.to_string();
-        let (image, cache_hit) =
-            tokio::task::spawn_blocking(move || cache_local_image(&state_root, &source_path))
-                .await
-                .context("joining local Firecracker image cache")??;
+        let allowed_local_images = allowed_local_images.to_vec();
+        let (image, cache_hit) = tokio::task::spawn_blocking(move || {
+            cache_local_image(&state_root, &source_path, &allowed_local_images)
+        })
+        .await
+        .context("joining local Firecracker image cache")??;
         record_step(
             source,
             None,
@@ -121,8 +124,9 @@ pub(super) async fn resolve_image(
     // Image references reach this point from any full-scope API client, not
     // only from static operator configuration, and the registry host they
     // name is trusted for this process's availability (see the manifest
-    // limitation below). The allowlist gives operators an enforced boundary
-    // on which registries root will ever speak to.
+    // limitation below). The allowlist pins the registry entry point. A
+    // permitted registry may still redirect blob downloads to object storage,
+    // so it is also trusted for the network destinations it returns.
     validate_allowed_registry(&reference, allowed_registries)?;
     let cache_root = state_root.join("images");
     prepare_private_dir(&cache_root)?;
@@ -133,7 +137,7 @@ pub(super) async fn resolve_image(
     // used without contacting the registry again. This keeps ECR authentication
     // and manifest lookup out of every warm VM launch.
     // https://github.com/opencontainers/distribution-spec/blob/main/spec.md#pulling-manifests
-    if let Some(source_digest) = immutable_reference_digest(source)? {
+    if let Some(source_digest) = immutable_reference_digest(&reference)? {
         let cache_dir = cache_image_dir(&cache_root, &platform, source_digest)?;
         if cache_dir.try_exists()? {
             let lookup_started = Instant::now();
@@ -176,7 +180,7 @@ pub(super) async fn resolve_image(
     // registry can still crash this process. Agents inside a turn cannot
     // reach create_sandbox (full-scope only), but any full-scope API client
     // can name an image; the --firecracker-allowed-registry CLI flag
-    // (enforced above) pins which hosts are ever contacted. A proper fix is a
+    // (enforced above) pins the initial registry endpoint. A proper fix is a
     // response size limit in oci-client or a hand-rolled bounded fetch. Layer
     // blobs are NOT affected: pull_blob streams them to disk through
     // LimitedAsyncWriter under declared-size and cumulative budgets.
@@ -355,23 +359,28 @@ fn validate_allowed_registry(reference: &Reference, allowed_registries: &[String
 }
 
 fn looks_like_local_image(source: &str) -> bool {
-    source.starts_with('/')
+    Path::new(source).is_absolute()
         || source.starts_with("./")
         || source.starts_with("../")
         || source.ends_with(".ext4")
 }
 
-fn immutable_reference_digest(source: &str) -> Result<Option<&str>> {
-    let Some((_, digest)) = source.rsplit_once('@') else {
+fn immutable_reference_digest(reference: &Reference) -> Result<Option<&str>> {
+    let Some(digest) = reference.digest() else {
         return Ok(None);
     };
     sha256_hex(digest)?;
     Ok(Some(digest))
 }
 
-fn cache_local_image(state_root: &Path, source: &str) -> Result<(PathBuf, bool)> {
+fn cache_local_image(
+    state_root: &Path,
+    source: &str,
+    allowed_local_images: &[PathBuf],
+) -> Result<(PathBuf, bool)> {
     let source = fs::canonicalize(source)
         .with_context(|| format!("resolving Firecracker root filesystem image {source}"))?;
+    validate_allowed_local_image(state_root, &source, allowed_local_images)?;
     validate_ext4_image(&source)?;
     let metadata = fs::metadata(&source)?;
     let identity = format!(
@@ -401,30 +410,15 @@ fn cache_local_image(state_root: &Path, source: &str) -> Result<(PathBuf, bool)>
         .prefix("local-image-")
         .tempdir_in(&local_root)?;
     let staged = temporary.path().join("rootfs.ext4");
-    let copy = super::firecracker::trusted_host_command("cp")?;
-    // Capture both output streams instead of inheriting them: on macOS this
-    // code runs inside the Lima bridge process, whose inherited stdout is the
-    // length-prefixed bridge protocol, and any stray byte from a child would
-    // corrupt its framing.
-    let output = Command::new(copy)
-        .args(["--sparse=always", "--reflink=auto", "--"])
-        .arg(&source)
-        .arg(&staged)
-        .output()
-        .with_context(|| {
-            format!(
-                "staging local Firecracker image {} into its immutable cache",
-                source.display()
-            )
-        })?;
-    if !output.status.success() {
-        bail!(
-            "staging local Firecracker image {} into its immutable cache failed with {}: {}",
-            source.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
+    // The shared helper captures both output streams instead of inheriting
+    // them. On macOS this code runs inside the Lima bridge process, whose
+    // stdout is the length-prefixed protocol.
+    super::firecracker::copy_sparse_reflink(&source, &staged).with_context(|| {
+        format!(
+            "staging local Firecracker image {} into its immutable cache",
+            source.display()
+        )
+    })?;
     fs::set_permissions(&staged, Permissions::from_mode(0o444))?;
     validate_ext4_image(&staged)?;
     let temporary_path = temporary.keep();
@@ -446,6 +440,26 @@ fn cache_local_image(state_root: &Path, source: &str) -> Result<(PathBuf, bool)>
     }
     validate_ext4_image(&cached)?;
     Ok((cached, false))
+}
+
+fn validate_allowed_local_image(
+    state_root: &Path,
+    source: &Path,
+    allowed_local_images: &[PathBuf],
+) -> Result<()> {
+    let cached_image = fs::canonicalize(state_root.join("images"))
+        .is_ok_and(|cache_root| source.starts_with(cache_root));
+    let explicitly_allowed = allowed_local_images
+        .iter()
+        .any(|allowed| fs::canonicalize(allowed).is_ok_and(|allowed| source == allowed));
+    if cached_image || explicitly_allowed {
+        return Ok(());
+    }
+    bail!(
+        "local Firecracker image {} is not permitted; pass --firecracker-allowed-local-image {}",
+        source.display(),
+        source.display()
+    )
 }
 
 fn registry_auth(reference: &Reference) -> Result<RegistryAuth> {
@@ -553,9 +567,9 @@ fn validate_docker_credential_helper(config_path: &Path, server: &str) -> Result
 fn invoke_credential_helper(executable: &Path, server: &str) -> Result<RegistryAuth> {
     #[derive(Deserialize)]
     struct HelperCredential {
-        #[serde(rename = "Username", default)]
+        #[serde(rename = "Username")]
         username: String,
-        #[serde(rename = "Secret", default)]
+        #[serde(rename = "Secret")]
         secret: String,
     }
     let mut child = Command::new(executable)
@@ -1641,6 +1655,29 @@ mod tests {
     }
 
     #[test]
+    fn local_image_allowlist_is_exact_and_always_allows_the_image_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let cache = state_root.join("images/cache/rootfs.ext4");
+        let workspace = state_root.join("workspaces/private.ext4");
+        let allowed = directory.path().join("allowed.ext4");
+        let denied = directory.path().join("denied.ext4");
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+        for path in [&cache, &workspace, &allowed, &denied] {
+            fs::write(path, []).unwrap();
+        }
+        let canonical = |path: &Path| fs::canonicalize(path).unwrap();
+
+        assert!(
+            validate_allowed_local_image(&state_root, &canonical(&allowed), &[allowed]).is_ok()
+        );
+        assert!(validate_allowed_local_image(&state_root, &canonical(&cache), &[]).is_ok());
+        assert!(validate_allowed_local_image(&state_root, &canonical(&denied), &[]).is_err());
+        assert!(validate_allowed_local_image(&state_root, &canonical(&workspace), &[]).is_err());
+    }
+
+    #[test]
     fn cache_path_is_versioned_platform_and_digest_addressed() {
         let digest = format!("sha256:{}", "a".repeat(64));
         assert_eq!(
@@ -1653,15 +1690,19 @@ mod tests {
     #[test]
     fn immutable_reference_digest_requires_sha256() {
         let digest = format!("sha256:{}", "a".repeat(64));
+        let pinned = format!("registry.example/repo@{digest}")
+            .parse::<Reference>()
+            .unwrap();
+        let tagged = "registry.example/repo:latest".parse::<Reference>().unwrap();
+        let invalid = format!("registry.example/repo@sha512:{}", "a".repeat(128))
+            .parse::<Reference>()
+            .unwrap();
         assert_eq!(
-            immutable_reference_digest(&format!("registry.example/repo@{digest}")).unwrap(),
+            immutable_reference_digest(&pinned).unwrap(),
             Some(digest.as_str())
         );
-        assert_eq!(
-            immutable_reference_digest("registry.example/repo:latest").unwrap(),
-            None
-        );
-        assert!(immutable_reference_digest("registry.example/repo@latest").is_err());
+        assert_eq!(immutable_reference_digest(&tagged).unwrap(), None);
+        assert!(immutable_reference_digest(&invalid).is_err());
     }
 
     #[test]
