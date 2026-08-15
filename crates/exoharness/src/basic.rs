@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -1714,7 +1714,7 @@ async fn agent_conversation_ids(
     harness: &BasicExoHarness,
     agent_dir: &Path,
 ) -> Result<Vec<ConversationId>> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut ids = Vec::new();
     for key in harness
         .inner

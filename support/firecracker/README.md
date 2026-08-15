@@ -75,7 +75,10 @@ counts.
 The guest kernel must contain `CONFIG_BLK_DEV_INITRD=y`, `CONFIG_EXT4_FS=y`,
 `CONFIG_OVERLAY_FS=y`, and `CONFIG_VIRTIO_VSOCKETS=y`; the host requires KVM,
 cgroup v2, iproute2, iptables, nftables, e2fsprogs, cpio, static glibc
-development files for the guest-runtime build, and `CONFIG_VHOST_VSOCK`. If you
+development files for the guest-runtime build, and `CONFIG_VHOST_VSOCK`.
+Networking-enabled sandboxes additionally require `net.ipv4.ip_forward=1`,
+which Exo checks but deliberately does not set — enable it persistently (eg.
+via `/etc/sysctl.d`) so it survives host reboots. If you
 use forks, the guest kernel must additionally be 5.18 or newer with
 `CONFIG_VMGENID=y` so clones reseed their CSPRNG on restore, and
 `CONFIG_HW_RANDOM_VIRTIO=y` lets the guest draw extra entropy from the

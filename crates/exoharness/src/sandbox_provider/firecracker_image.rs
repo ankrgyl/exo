@@ -265,14 +265,12 @@ pub(super) async fn resolve_image(
     }
 
     let pull_started = Instant::now();
-    let mut pull_stats = PullStats::default();
+    let mut pull_stats = PullStats {
+        bytes: declared_total,
+        ..PullStats::default()
+    };
     let mut layers = Vec::with_capacity(manifest.layers.len());
     for descriptor in &manifest.layers {
-        let declared = u64::try_from(descriptor.size).context("negative OCI layer size")?;
-        pull_stats.bytes = pull_stats
-            .bytes
-            .checked_add(declared)
-            .context("OCI layer byte count overflow")?;
         let (path, cache_hit) = pull_blob(
             &client,
             &reference,
@@ -711,21 +709,18 @@ fn validate_cached_blob(path: &Path, descriptor: &OciDescriptor) -> Result<()> {
 fn validate_blob(path: &Path, descriptor: &OciDescriptor) -> Result<()> {
     validate_cached_blob(path, descriptor)?;
     let expected = sha256_hex(&descriptor.digest)?;
-    let mut input = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = input.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    let actual = format!("{:x}", hasher.finalize());
+    let actual = sha256_hex_of_file(path)?;
     if actual != expected {
         bail!("OCI layer digest mismatch: expected sha256:{expected}, got sha256:{actual}");
     }
     Ok(())
+}
+
+pub(super) fn sha256_hex_of_file(path: &Path) -> Result<String> {
+    let mut input = File::open(path)?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut input, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn build_and_publish_image(
@@ -1325,19 +1320,19 @@ pub(super) fn validate_ext4_image(path: &Path) -> Result<()> {
 // best-effort: garbage on disk is a leak, not a reason to refuse to start.
 pub(super) fn sweep_stale_image_artifacts(state_root: &Path) {
     let images = state_root.join("images");
-    sweep_stale_temporaries(&images, &|name| name.starts_with("image-build-"));
-    sweep_stale_temporaries(&images.join("blobs/sha256"), &|name| {
+    sweep_stale_temporaries(&images, |name| name.starts_with("image-build-"));
+    sweep_stale_temporaries(&images.join("blobs/sha256"), |name| {
         name.starts_with(".tmp")
     });
     sweep_stale_temporaries(
         &images
             .join(format!("v{MATERIALIZER_VERSION}"))
             .join("local"),
-        &|name| name.starts_with("local-image-"),
+        |name| name.starts_with("local-image-"),
     );
 }
 
-pub(super) fn sweep_stale_temporaries(directory: &Path, is_temporary: &dyn Fn(&str) -> bool) {
+pub(super) fn sweep_stale_temporaries(directory: &Path, is_temporary: impl Fn(&str) -> bool) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };

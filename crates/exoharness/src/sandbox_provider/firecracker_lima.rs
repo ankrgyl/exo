@@ -36,10 +36,11 @@ use crate::sandbox::{
 };
 use crate::{SandboxAttachment, SandboxProcessParts};
 
-use super::firecracker::FirecrackerConfig;
+use super::firecracker::{FirecrackerConfig, env_path};
 use super::firecracker_bridge::{
     FirecrackerBridgeClientFrame, FirecrackerBridgeRequest, FirecrackerBridgeResponse,
-    FirecrackerBridgeServerFrame, FirecrackerBridgeStreamChannel, read_frame, write_frame,
+    FirecrackerBridgeServerFrame, FirecrackerBridgeStreamChannel, STREAM_CHUNK_BYTES, read_frame,
+    write_frame,
 };
 
 const DEFAULT_LIMA_INSTANCE: &str = "exo-firecracker";
@@ -52,7 +53,6 @@ const DEFAULT_LIMA_TARGET_DIR: &str = "/var/tmp/exo-firecracker-bridge-target";
 const BRIDGE_INSTALL_PATH: &str = "/usr/local/libexec/exo-firecracker-bridge";
 const BRIDGE_FRAME_QUEUE_DEPTH: usize = 16;
 const BRIDGE_STREAM_QUEUE_DEPTH: usize = 16;
-const BRIDGE_STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct LimaFirecrackerSandboxBackend {
@@ -1025,7 +1025,7 @@ impl AsyncWrite for BridgeWriteStream {
                 "Firecracker bridge stream input is closed",
             )));
         }
-        let written = buffer.len().min(BRIDGE_STREAM_CHUNK_BYTES);
+        let written = buffer.len().min(STREAM_CHUNK_BYTES);
         let frame = FirecrackerBridgeClientFrame::StreamInput {
             id: self.id,
             data: BASE64.encode(&buffer[..written]),
@@ -1172,11 +1172,4 @@ fn send_bridge_frame_on_drop(
             }
         }
     }
-}
-
-fn env_path(name: &str, default: &str) -> PathBuf {
-    env::var_os(name)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(default))
 }

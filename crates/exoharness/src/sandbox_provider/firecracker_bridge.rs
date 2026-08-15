@@ -18,7 +18,7 @@ use crate::{
 };
 
 const MAX_BRIDGE_FRAME_BYTES: usize = 16 * 1024 * 1024;
-const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+pub(super) const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const STREAM_INPUT_QUEUE_DEPTH: usize = 16;
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 

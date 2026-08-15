@@ -100,9 +100,10 @@ const BLOCKED_EGRESS_CIDRS: &[&str] = &[
     "240.0.0.0/4",
 ];
 static ONE_SHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static MANIFEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+// One counter serves every temporary-file name in the state root: the names
+// already differ by purpose and pid, so all the counter adds is uniqueness
+// within this process.
+static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn default_firecracker_image() -> String {
     "/var/lib/exo/firecracker/rootfs.ext4".to_string()
@@ -367,18 +368,16 @@ impl FirecrackerSandboxBackend {
         // staging name after a day is garbage that would otherwise accumulate
         // on the root-owned volume forever.
         super::firecracker_image::sweep_stale_image_artifacts(&config.state_root);
-        super::firecracker_image::sweep_stale_temporaries(
-            &config.state_root.join("artifacts"),
-            &|name| name.starts_with('.'),
-        );
-        super::firecracker_image::sweep_stale_temporaries(
-            &config.state_root.join("snapshots"),
-            &|name| name.starts_with('.'),
-        );
+        for directory in ["artifacts", "snapshots"] {
+            super::firecracker_image::sweep_stale_temporaries(
+                &config.state_root.join(directory),
+                |name| name.starts_with('.'),
+            );
+        }
         for directory in ["manifests", "leases"] {
             super::firecracker_image::sweep_stale_temporaries(
                 &config.state_root.join(directory),
-                &|name| name.ends_with(".tmp"),
+                |name| name.ends_with(".tmp"),
             );
         }
         config.kernel = cache_immutable_artifact(&config.state_root, "kernel", &config.kernel)?;
@@ -1230,7 +1229,7 @@ fn parse_provider_state(value: &Value) -> Result<FirecrackerProviderState> {
     serde_json::from_value(value.clone()).context("invalid Firecracker provider state")
 }
 
-fn env_path(name: &str, default: &str) -> PathBuf {
+pub(super) fn env_path(name: &str, default: &str) -> PathBuf {
     std::env::var_os(name)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -1388,21 +1387,11 @@ pub(super) fn validate_trusted_file(label: &str, path: &Path) -> Result<()> {
 }
 
 fn cache_immutable_artifact(state_root: &Path, label: &str, source: &Path) -> Result<PathBuf> {
-    let mut input = File::open(source)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = input.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = super::firecracker_image::sha256_hex_of_file(source)?;
     let artifacts = state_root.join("artifacts");
     let cached = artifacts.join(format!("{label}-{digest}"));
     if !cached.try_exists()? {
-        let sequence = ARTIFACT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let temporary = artifacts.join(format!(".{label}.{}.{}", std::process::id(), sequence));
         fs::copy(source, &temporary).with_context(|| {
             format!("staging immutable Firecracker {label} {}", source.display())
@@ -1490,6 +1479,11 @@ pub(super) fn trusted_host_command(program: &str) -> Result<PathBuf> {
     )?;
     let executable = parent.join(file_name);
     validate_trusted_file(&format!("host command {program}"), &executable)?;
+    // Not redundant with validate_trusted_file: that canonicalizes, so for a
+    // symlinked command (eg. iptables -> xtables-nft-multi) it walks the
+    // TARGET's parents. This walk covers the INVOCATION path's parents — the
+    // directory holding the symlink must be equally untamperable, or a local
+    // user could repoint the name root executes.
     for component in executable.ancestors().skip(1) {
         let metadata = fs::metadata(component)?;
         if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
@@ -1594,7 +1588,7 @@ fn touch_machine_lease(state_root: &Path, machine_id: &str) -> Result<()> {
         bail!("invalid Firecracker machine id: {machine_id}");
     }
     let path = lease_path(state_root, machine_id);
-    let sequence = LEASE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = path.with_extension(format!("{}.{sequence}.tmp", std::process::id()));
     let mut file = OpenOptions::new()
         .write(true)
@@ -1678,7 +1672,7 @@ fn expired_machine_ids(state_root: &Path, now: SystemTime) -> Result<Vec<String>
 
 fn write_manifest(state_root: &Path, record: &MachineRecord) -> Result<()> {
     let path = manifest_path(state_root, &record.machine_id);
-    let sequence = MANIFEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = path.with_extension(format!("{}.{sequence}.tmp", std::process::id()));
     let mut file = OpenOptions::new()
         .write(true)
@@ -2405,12 +2399,12 @@ fn spawn_jailed_firecracker(
         .stdin(Stdio::null())
         .stdout(Stdio::from(console_writer.try_clone()?))
         .stderr(Stdio::from(console_writer));
-    // Deliberately do not pass --no-seccomp or a custom filter. Release builds'
-    // embedded default filters are Firecracker's recommended production setting.
-    // https://github.com/firecracker-microvm/firecracker/blob/main/docs/seccomp.md#default-filters-recommended
     let log_path = jail_root.join("firecracker.stderr");
     let log = File::create(&log_path)?;
     fs::set_permissions(&log_path, Permissions::from_mode(0o600))?;
+    // Deliberately do not pass --no-seccomp or a custom filter. Release builds'
+    // embedded default filters are Firecracker's recommended production setting.
+    // https://github.com/firecracker-microvm/firecracker/blob/main/docs/seccomp.md#default-filters-recommended
     let vmm_spawn_started = Instant::now();
     let mut child = command
         .spawn()
@@ -2639,7 +2633,19 @@ fn wait_for_firecracker_api(root: &Path, machine_id: &str) -> Result<PathBuf> {
     let mut observed_process = false;
     while started.elapsed() < PID_FILE_STARTUP_TIMEOUT {
         if socket.try_exists()? {
-            return Ok(socket);
+            match StdUnixStream::connect(&socket) {
+                Ok(_) => return Ok(socket),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("checking Firecracker API readiness at {}", socket.display())
+                    });
+                }
+            }
         }
         if process_running(&pid_path) {
             observed_process = true;
@@ -2793,7 +2799,7 @@ fn create_fork_snapshot(
         remove_directory_if_present(&destination)?;
     }
 
-    let sequence = ARTIFACT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = config.state_root.join("snapshots").join(format!(
         ".{template_key}.fork.{}.{}",
         std::process::id(),
@@ -2807,12 +2813,11 @@ fn create_fork_snapshot(
     let output = root.join(&output_name);
     remove_directory_if_present(&output)?;
     fs::create_dir(&output)?;
-    let ownership = format!(
-        "{}:{}",
-        jailer_uid(config, source)?,
-        jailer_uid(config, source)?
-    );
-    run_checked("chown", &[&ownership, &output.to_string_lossy()])?;
+    let uid = jailer_uid(config, source)?;
+    run_checked(
+        "chown",
+        &[&format!("{uid}:{uid}"), &output.to_string_lossy()],
+    )?;
     fs::set_permissions(&output, Permissions::from_mode(0o700))?;
 
     let api = wait_for_firecracker_api(&root, &source.machine_id)?;
