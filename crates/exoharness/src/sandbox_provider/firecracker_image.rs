@@ -168,15 +168,18 @@ pub(super) async fn resolve_image(
     // https://github.com/opencontainers/distribution-spec/blob/main/spec.md#pulling-manifests
     //
     // KNOWN LIMITATION: oci-client buffers the manifest and config responses
-    // in memory with no size cap (`res.bytes().await` internally), so the
-    // registry HOST is trusted for this process's availability. Agents inside
-    // a turn cannot reach create_sandbox (full-scope only), but any full-scope
-    // API client can name a registry; the --firecracker-allowed-registry CLI
-    // flag (enforced above) lets operators pin which hosts ever get that
-    // trust. A proper fix is a response size limit in oci-client or a
-    // hand-rolled bounded fetch. Layer blobs are NOT affected: pull_blob
-    // streams them to disk through LimitedAsyncWriter under declared-size and
-    // cumulative budgets.
+    // in memory with no size cap (`res.bytes().await` internally). That
+    // trusts the registry HOST for this process's availability — and for the
+    // config blob it goes further: registries cap manifest sizes at push, but
+    // a published image can point its config descriptor at an arbitrarily
+    // large blob, so an attacker-published image on an honest, allowlisted
+    // registry can still crash this process. Agents inside a turn cannot
+    // reach create_sandbox (full-scope only), but any full-scope API client
+    // can name an image; the --firecracker-allowed-registry CLI flag
+    // (enforced above) pins which hosts are ever contacted. A proper fix is a
+    // response size limit in oci-client or a hand-rolled bounded fetch. Layer
+    // blobs are NOT affected: pull_blob streams them to disk through
+    // LimitedAsyncWriter under declared-size and cumulative budgets.
     let (manifest, manifest_digest, config_json, list_digest) = client
         .pull_manifest_and_config_and_list_digest(&reference, &auth)
         .await

@@ -1033,27 +1033,29 @@ impl ExoHarness for BasicExoHarness {
             }
             // Re-enumerate under the lock: a conversation created after the
             // sweep above would otherwise slip past the check.
-            let mut any_running =
-                scope_has_running_sandboxes(&BasicScopedSandboxHandle::agent(self, *id)).await?;
-            if !any_running {
-                for conversation_id in agent_conversation_ids(self, &agent_dir).await? {
-                    let conversation_dir = agent_dir
-                        .join("conversations")
-                        .join(conversation_id.to_string());
-                    if scope_has_running_sandboxes(&BasicScopedSandboxHandle::conversation(
-                        self,
-                        conversation_id,
-                        conversation_dir,
-                    ))
-                    .await?
-                    {
-                        any_running = true;
-                        break;
-                    }
+            let mut scopes = vec![BasicScopedSandboxHandle::agent(self, *id)];
+            for conversation_id in agent_conversation_ids(self, &agent_dir).await? {
+                let conversation_dir = agent_dir
+                    .join("conversations")
+                    .join(conversation_id.to_string());
+                scopes.push(BasicScopedSandboxHandle::conversation(
+                    self,
+                    conversation_id,
+                    conversation_dir,
+                ));
+            }
+            let mut any_running = false;
+            for scope in &scopes {
+                if scope_has_running_sandboxes(scope).await? {
+                    any_running = true;
+                    break;
                 }
             }
             if any_running {
                 continue;
+            }
+            for scope in &scopes {
+                release_scope_sandbox_handles(scope).await?;
             }
             // Release the slug before the record (its source) disappears.
             if let Some(record) = self
@@ -1411,6 +1413,7 @@ impl AgentHandle for BasicAgentHandle {
             if scope_has_running_sandboxes(&sandbox_handle).await? {
                 continue;
             }
+            release_scope_sandbox_handles(&sandbox_handle).await?;
             if let Ok(mut record) = self
                 .harness
                 .inner
@@ -1685,6 +1688,26 @@ async fn scope_has_running_sandboxes(scope: &BasicScopedSandboxHandle<'_>) -> Re
         .await?
         .into_iter()
         .any(|sandbox| sandbox.running && sandbox.attachment.is_none()))
+}
+
+// Called at the point of owner deletion, under the write lock, for every
+// scope whose records are about to be removed. Attached sandboxes are
+// deliberately not terminated (the external sandbox keeps running), but our
+// in-process handles must not outlive the records they belong to: repeated
+// attach/delete cycles would otherwise grow running_sandboxes forever, and
+// each stale Arc keeps whatever the provider handle holds alive with it.
+async fn release_scope_sandbox_handles(scope: &BasicScopedSandboxHandle<'_>) -> Result<()> {
+    let sandboxes = scope
+        .harness
+        .inner
+        .storage
+        .list_json_matching_suffix::<StoredSandbox>(scope.sandboxes_dir(), ".json")
+        .await?;
+    let mut running = scope.harness.inner.running_sandboxes.lock().await;
+    for sandbox in sandboxes {
+        running.remove(&sandbox.id);
+    }
+    Ok(())
 }
 
 async fn agent_conversation_ids(

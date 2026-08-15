@@ -162,17 +162,31 @@ Be aware of what this backend does _not_ do, and what stays on the operator:
   between sandboxes comes from KVM, not from anything inside the guest.
 - **Tag references are trust-on-first-use.** Only digest-pinned references
   anchor the full download chain to something you chose.
-- **The registry host is trusted for availability.** Manifest and config
-  responses are buffered in memory without a size cap (a limitation of the
-  underlying OCI client library), so a hostile registry _server_ could exhaust
-  the host process's memory. Layer blobs are not affected — they stream to
-  disk under strict size budgets. Agents inside a turn cannot create sandboxes
-  or choose images, but any full-scope API client can name a registry in an
-  image reference; pass `--firecracker-allowed-registry <HOST>` (repeatable or
+- **Manifest and config responses are buffered in memory without a size
+  cap** (a limitation of the underlying OCI client library). Two consequences:
+  a hostile registry _server_ can exhaust the host process's memory, and even
+  on an honest registry, a _published image_ can declare an oversized config
+  blob that gets buffered whole — real registries cap manifest sizes at push
+  but not config blobs. The failure mode is a crash of the Exo process, not a
+  guest escape or data exposure. Layer blobs are not affected — they stream
+  to disk under strict size budgets. Agents inside a turn cannot create
+  sandboxes or choose images, but any full-scope API client can name an image
+  reference; pass `--firecracker-allowed-registry <HOST>` (repeatable or
   comma-separated, eg.
   `--firecracker-allowed-registry docker.io,123456789012.dkr.ecr.us-east-1.amazonaws.com`)
-  to enforce which registries the materializer will ever contact. Unset means
-  unrestricted.
+  to enforce which registries the materializer will ever contact, and only
+  materialize images from publishers you trust. The durable fix is a bounded
+  response read in the OCI client library.
+- **The image cache grows without bound.** Every unique image digest and layer
+  blob a full-scope client requests is retained under
+  `EXO_FIRECRACKER_STATE_ROOT/images` — the standard behavior of a
+  digest-addressed store (Docker and containerd do the same), but there is no
+  quota or eviction yet. Each individual materialization is budget-capped;
+  the aggregate is bounded only by the volume. Size the state-root volume for
+  your image set, and prune `images/` offline when needed — it is a cache, so
+  deleting entries while no materialization is running is always safe (VMs in
+  flight keep their content alive via hard links). Local `.ext4` images are
+  operator-supplied trusted input and are not size-checked.
 
 The implementation follows Firecracker's upstream guidance for
 [jailer operation](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md),
