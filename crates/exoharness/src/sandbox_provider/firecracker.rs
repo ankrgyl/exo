@@ -52,8 +52,13 @@ const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
 const MAX_GUEST_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_GUEST_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_MACHINE_ID: &str = "fc-00000000000000000000000000000000-00000000";
+const MAX_MACHINE_ID: &str = "fc-0000000000000000-00000000";
 // sockaddr_un.sun_path is 108 bytes including the trailing NUL on Linux.
+// The machine id length is budgeted against it: the jailed API socket lives at
+// {state_root}/jailer/{bin}/{machine_id}/root/run/firecracker.socket, and with
+// the documented default state root a 16-hex-character id fits with one byte
+// to spare while a longer id does not. Growing the id breaks every install
+// using the README defaults — see default_state_root_fits_all_jailed_socket_paths.
 // https://github.com/torvalds/linux/blob/master/include/uapi/linux/un.h
 const UNIX_SOCKET_PATH_CAPACITY: usize = 108;
 // The guest agent drops to UID 10001 before binding, so keep its AF_VSOCK port
@@ -80,7 +85,14 @@ const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 // captured through a pipe and only this many bytes are kept on disk.
 // https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md#8250-serial-device
 const VMM_LOG_MAX_BYTES: u64 = 1024 * 1024;
-const FIRECRACKER_API_SOCKET: &str = "firecracker.socket";
+// Every Unix socket the jail binds, in one place. These in-jail absolute
+// paths are exactly what Firecracker receives, they resolve to host paths via
+// jailed_path_on_host, and validate_jailed_socket_paths budgets each of them
+// (including the "_<port>" ready-listener suffix Firecracker appends to the
+// vsock path) against sun_path. Machine-id length, state-root length, and
+// these names all trade against the same 107 usable bytes.
+const JAILED_API_SOCKET: &str = "/run/firecracker.socket";
+const JAILED_VSOCK: &str = "/run/exo.vsock";
 // The API socket peer is the jailed VMM, which counts as untrusted once a
 // guest compromises it. Bounding what root reads back keeps a hostile VMM
 // from ballooning this process's memory with endless status lines, headers,
@@ -383,7 +395,7 @@ impl FirecrackerSandboxBackend {
         config.kernel = cache_immutable_artifact(&config.state_root, "kernel", &config.kernel)?;
         config.initramfs =
             cache_immutable_artifact(&config.state_root, "initramfs", &config.initramfs)?;
-        validate_api_socket_path(&config)?;
+        validate_jailed_socket_paths(&config)?;
 
         Ok(Self {
             shared: Arc::new(Shared {
@@ -1403,15 +1415,32 @@ fn validate_private_root(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_api_socket_path(config: &FirecrackerConfig) -> Result<()> {
-    let path = jail_root(config, MAX_MACHINE_ID).join("run/firecracker.socket");
-    if path.as_os_str().as_bytes().len() >= UNIX_SOCKET_PATH_CAPACITY {
-        bail!(
-            "Firecracker state root is too long for the API Unix socket path: {}",
-            config.state_root.display()
-        );
+fn validate_jailed_socket_paths(config: &FirecrackerConfig) -> Result<()> {
+    let root = jail_root(config, MAX_MACHINE_ID);
+    for jailed in [
+        JAILED_API_SOCKET.to_string(),
+        // Firecracker binds the vsock UDS itself and the host binds the
+        // guest-ready listener at the port-suffixed variant; the suffixed form
+        // is the longer of the two.
+        format!("{JAILED_VSOCK}_{GUEST_READY_HOST_PORT}"),
+    ] {
+        let path = jailed_path_on_host(&root, &jailed);
+        if path.as_os_str().as_bytes().len() >= UNIX_SOCKET_PATH_CAPACITY {
+            bail!(
+                "Firecracker state root is too long for the jailed Unix socket {jailed}: {}",
+                config.state_root.display()
+            );
+        }
     }
     Ok(())
+}
+
+fn jailed_path_on_host(jail_root: &Path, jailed: &str) -> PathBuf {
+    jail_root.join(
+        jailed
+            .strip_prefix('/')
+            .expect("jailed socket paths are absolute"),
+    )
 }
 
 fn find_executable(program: &str) -> Result<PathBuf> {
@@ -1518,8 +1547,14 @@ fn valid_machine_id(machine_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
+// 16 hex characters (64 bits) of SHA-256. Sufficient because the backend caps
+// concurrent machines at MAX_RESOURCE_SLOTS (32,768) and sandbox ids are
+// generated UUIDv7s, so the random collision probability among live ids is
+// about n²/2⁶⁵ ≈ 3×10⁻¹¹ — and short enough that every jailed socket path
+// stays inside sun_path with the default state root. See the MAX_MACHINE_ID
+// comment before growing this.
 fn stable_id(input: &str) -> String {
-    format!("{:x}", Sha256::digest(input.as_bytes()))[..32].to_string()
+    format!("{:x}", Sha256::digest(input.as_bytes()))[..16].to_string()
 }
 
 fn hash_snapshot_string(hasher: &mut Sha256, value: &str) {
@@ -1528,7 +1563,7 @@ fn hash_snapshot_string(hasher: &mut Sha256, value: &str) {
 }
 
 fn machine_from_record(config: &FirecrackerConfig, record: MachineRecord) -> Machine {
-    let vsock_path = jail_root(config, &record.machine_id).join("run/exo.vsock");
+    let vsock_path = jailed_path_on_host(&jail_root(config, &record.machine_id), JAILED_VSOCK);
     Machine { record, vsock_path }
 }
 
@@ -2293,17 +2328,7 @@ fn prepare_and_launch_blocking(
     // Keep the API available so fork() can pause and snapshot the running VM.
     // The config file still starts the VM atomically without a sequence of API
     // setup requests.
-    spawn_jailed_firecracker(
-        config,
-        record,
-        &root,
-        &[
-            "--api-sock",
-            "/run/firecracker.socket",
-            "--config-file",
-            "/vm-config.json",
-        ],
-    )?;
+    spawn_jailed_firecracker(config, record, &root, &["--config-file", "/vm-config.json"])?;
     Ok(GuestReadiness::Signal(ready_listener))
 }
 
@@ -2350,6 +2375,10 @@ fn spawn_jailed_firecracker(
         .arg(format!("memory.max={memory_max}"))
         .arg("--cgroup")
         .arg(format!("cpu.max={cpu_max}"));
+    // The API socket path is injected here, next to the constant that
+    // validate_jailed_socket_paths budgets, so no call site can drift from
+    // the path the rest of the code waits on.
+    let api_socket_arguments = ["--api-sock", JAILED_API_SOCKET];
     // Route console output through a pipe instead of a file descriptor to a
     // growable file: a compromised guest kernel can reactivate the serial
     // device despite 8250.nr_uarts=0 and would otherwise control an unbounded
@@ -2361,6 +2390,7 @@ fn spawn_jailed_firecracker(
         .arg("--resource-limit")
         .arg("no-file=4096")
         .arg("--")
+        .args(api_socket_arguments)
         .args(firecracker_arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::from(console_writer.try_clone()?))
@@ -2515,7 +2545,7 @@ fn firecracker_vm_configuration(
         network_interfaces,
         vsock: FirecrackerVsock {
             guest_cid: record.slot + 3,
-            uds_path: "/run/exo.vsock",
+            uds_path: JAILED_VSOCK,
         },
         // virtio-rng is upstream's recommended extra entropy source for
         // snapshot clones, alongside the VMGenID reseed: guests whose kernel
@@ -2597,7 +2627,7 @@ fn prepare_api_run_dir(root: &Path, uid: u32) -> Result<()> {
 }
 
 fn wait_for_firecracker_api(root: &Path, machine_id: &str) -> Result<PathBuf> {
-    let socket = root.join("run").join(FIRECRACKER_API_SOCKET);
+    let socket = jailed_path_on_host(root, JAILED_API_SOCKET);
     let pid_path = root.join("firecracker.pid");
     let started = Instant::now();
     let mut observed_process = false;
@@ -2926,12 +2956,7 @@ fn launch_snapshot_clone(
         fs::set_permissions(path, Permissions::from_mode(0o444))?;
     }
     fs::set_permissions(&snapshot, Permissions::from_mode(0o555))?;
-    spawn_jailed_firecracker(
-        config,
-        record,
-        &root,
-        &["--api-sock", "/run/firecracker.socket"],
-    )?;
+    spawn_jailed_firecracker(config, record, &root, &[])?;
     let api = wait_for_firecracker_api(&root, &record.machine_id)?;
     let load_started = Instant::now();
     // Firecracker updates VMGenID before resuming vCPUs, so supported Linux
@@ -2961,7 +2986,7 @@ fn prepare_ready_listener(root: &Path) -> Result<StdUnixListener> {
     let run = root.join("run");
     fs::create_dir_all(&run)?;
     fs::set_permissions(&run, Permissions::from_mode(0o755))?;
-    let path = run.join(format!("exo.vsock_{GUEST_READY_HOST_PORT}"));
+    let path = jailed_path_on_host(root, &format!("{JAILED_VSOCK}_{GUEST_READY_HOST_PORT}"));
     if path.try_exists()? {
         fs::remove_file(&path)?;
     }
@@ -3613,6 +3638,32 @@ mod tests {
         );
         assert!(valid_machine_id(&one_shot));
         assert_eq!(one_shot.len(), MAX_MACHINE_ID.len());
+    }
+
+    // Caught live: growing machine ids from 16 to 32 hash characters pushed
+    // the jailed API socket past sun_path's 108 bytes and made the backend
+    // reject the README's default state root outright.
+    #[test]
+    fn default_state_root_fits_all_jailed_socket_paths() {
+        let config = FirecrackerConfig {
+            firecracker_bin: PathBuf::from("/usr/local/bin/firecracker"),
+            jailer_bin: PathBuf::from("/usr/local/bin/jailer"),
+            kernel: PathBuf::from("/var/lib/exo/firecracker/vmlinux"),
+            initramfs: PathBuf::from("/var/lib/exo/firecracker/exo-firecracker-initramfs.cpio"),
+            state_root: PathBuf::from("/var/lib/exo/firecracker/state"),
+            vcpu_count: DEFAULT_VCPU_COUNT,
+            memory_mib: DEFAULT_MEMORY_MIB,
+            image_size_gib: DEFAULT_IMAGE_SIZE_GIB,
+            workspace_size_gib: DEFAULT_WORKSPACE_SIZE_GIB,
+            jailer_uid_base: DEFAULT_JAILER_UID_BASE,
+            dns_server: Ipv4Addr::new(1, 1, 1, 1),
+            allowed_egress_cidrs: Vec::new(),
+            allowed_local_images: Vec::new(),
+            allowed_registries: Vec::new(),
+            network_bytes_per_second: DEFAULT_NETWORK_BYTES_PER_SECOND,
+        };
+        validate_jailed_socket_paths(&config)
+            .expect("default state root must fit the jailed socket path budget");
     }
 
     #[test]
