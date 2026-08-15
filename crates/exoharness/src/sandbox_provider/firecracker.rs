@@ -568,40 +568,44 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         }
         let target_spec_hash = sandbox_spec_hash(&target.spec);
         let target_machine_id = machine_id(&target.key, &target_spec_hash);
-        let template_key = fork_snapshot_template_key(&source_record, &target_machine_id);
-        GuestClient::new(
-            Arc::clone(&self.shared),
-            machine_from_record(&self.shared.config, source_record.clone()).vsock_path,
-        )
-        .sync_filesystem(&source.spec.default_workdir)
+        let template_key = fork_snapshot_template_key(&source_record);
+        let config = self.shared.config.clone();
+        let template_key_for_check = template_key.clone();
+        let template_ready = tokio::task::spawn_blocking(move || {
+            fork_snapshot_template_ready(&config, &template_key_for_check)
+        })
         .await
-        .context("syncing Firecracker fork source filesystem")?;
+        .context("joining Firecracker fork snapshot cache check")??;
+        if !template_ready {
+            GuestClient::new(
+                Arc::clone(&self.shared),
+                machine_from_record(&self.shared.config, source_record.clone()).vsock_path,
+            )
+            .sync_filesystem(&source.spec.default_workdir)
+            .await
+            .context("syncing Firecracker fork source filesystem")?;
+            let config = self.shared.config.clone();
+            let source_record_for_snapshot = source_record.clone();
+            let template_key_for_snapshot = template_key.clone();
+            tokio::task::spawn_blocking(move || {
+                create_fork_snapshot(
+                    &config,
+                    &source_record_for_snapshot,
+                    &template_key_for_snapshot,
+                )
+            })
+            .await
+            .context("joining Firecracker fork snapshot creation")??;
+        }
         self.shared
             .new_fork_machine_record(
                 &target,
                 &target_machine_id,
                 &target_spec_hash,
-                template_key.clone(),
+                template_key,
                 source_record.slot,
             )
             .await?;
-        let config = self.shared.config.clone();
-        let source_record_for_snapshot = source_record.clone();
-        let snapshot_result = tokio::task::spawn_blocking(move || {
-            create_fork_snapshot(&config, &source_record_for_snapshot, &template_key)
-        })
-        .await
-        .context("joining Firecracker fork snapshot creation")
-        .and_then(|result| result);
-        if let Err(error) = snapshot_result {
-            if let Err(cleanup_error) = self.shared.cleanup_machine(&target_machine_id, true).await
-            {
-                return Err(error).context(format!(
-                    "cleaning up failed Firecracker fork also failed: {cleanup_error:#}"
-                ));
-            }
-            return Err(error);
-        }
         drop(_lifecycle_guard);
 
         match self.acquire_resolved(target).await {
@@ -665,6 +669,9 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
     }
 
     async fn exec(&self, command: &SandboxCommand) -> Result<SandboxCommandOutput> {
+        self.shared
+            .invalidate_fork_snapshot(&self.machine.record)
+            .await?;
         let machine = self
             .shared
             .ensure_machine(
@@ -704,6 +711,9 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
     }
 
     async fn start_process(&self, command: &SandboxCommand) -> Result<SandboxProcessParts> {
+        self.shared
+            .invalidate_fork_snapshot(&self.machine.record)
+            .await?;
         let machine = self
             .shared
             .ensure_machine(
@@ -733,6 +743,9 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
         if !self.machine.record.network_enabled {
             bail!("Firecracker sandbox does not have networking enabled");
         }
+        self.shared
+            .invalidate_fork_snapshot(&self.machine.record)
+            .await?;
         let address = (self.machine.record.network().guest_ip, port);
         Ok(Some(Box::pin(TcpStream::connect(address).await?)))
     }
@@ -1057,15 +1070,13 @@ impl Shared {
             .await
             .context("joining Firecracker snapshot jail cleanup")??;
         }
+        if let Some(record) = record.as_ref() {
+            self.invalidate_fork_snapshot(record).await?;
+        }
         if delete_rootfs {
             let jail_dir = self.jail_dir(machine_id);
             let manifest = self.manifest_path(machine_id);
             let lease = lease_path(&self.config.state_root, machine_id);
-            let owned_snapshot = record
-                .as_ref()
-                .and_then(|record| record.snapshot_template.as_deref())
-                .map(|key| snapshot_template_dir(&self.config, key))
-                .transpose()?;
             let slot_claim = record
                 .as_ref()
                 .map(|record| (record.slot, record.machine_id.clone()));
@@ -1086,13 +1097,6 @@ impl Shared {
                         format!("removing Firecracker lease {}", lease.display())
                     })?;
                 }
-                if let Some(snapshot) = owned_snapshot
-                    && snapshot.try_exists()?
-                {
-                    fs::remove_dir_all(&snapshot).with_context(|| {
-                        format!("removing Firecracker fork snapshot {}", snapshot.display())
-                    })?;
-                }
                 if let Some((slot, machine_id)) = slot_claim {
                     release_resource_slot(&state_root, slot, &machine_id)?;
                 }
@@ -1102,6 +1106,14 @@ impl Shared {
             .context("joining Firecracker file cleanup")??;
         }
         Ok(())
+    }
+
+    async fn invalidate_fork_snapshot(&self, record: &MachineRecord) -> Result<()> {
+        let key = fork_snapshot_template_key(record);
+        let snapshot = snapshot_template_dir(&self.config, &key)?;
+        tokio::task::spawn_blocking(move || remove_directory_if_present(&snapshot))
+            .await
+            .context("joining Firecracker fork snapshot invalidation")?
     }
 
     fn manifest_path(&self, machine_id: &str) -> PathBuf {
@@ -2607,13 +2619,20 @@ fn validate_snapshot_template(config: &FirecrackerConfig, directory: &Path) -> R
     Ok(true)
 }
 
-fn fork_snapshot_template_key(source: &MachineRecord, target_machine_id: &str) -> String {
+fn fork_snapshot_template_ready(config: &FirecrackerConfig, key: &str) -> Result<bool> {
+    let directory = snapshot_template_dir(config, key)?;
+    if !directory.try_exists()? {
+        return Ok(false);
+    }
+    validate_snapshot_template(config, &directory)
+}
+
+fn fork_snapshot_template_key(source: &MachineRecord) -> String {
     let mut hasher = Sha256::new();
     hasher.update(SNAPSHOT_CACHE_VERSION.to_le_bytes());
     hash_snapshot_string(&mut hasher, "live-fork");
     hash_snapshot_string(&mut hasher, &source.machine_id);
     hash_snapshot_string(&mut hasher, &source.spec_hash);
-    hash_snapshot_string(&mut hasher, target_machine_id);
     format!("{:x}", hasher.finalize())
 }
 
@@ -2631,10 +2650,10 @@ fn create_fork_snapshot(
 ) -> Result<()> {
     let destination = snapshot_template_dir(config, template_key)?;
     if destination.try_exists()? {
-        bail!(
-            "Firecracker fork snapshot already exists: {}",
-            destination.display()
-        );
+        if validate_snapshot_template(config, &destination)? {
+            return Ok(());
+        }
+        remove_directory_if_present(&destination)?;
     }
 
     let sequence = ARTIFACT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -3640,7 +3659,7 @@ mod tests {
     }
 
     #[test]
-    fn fork_snapshots_are_unique_per_target() {
+    fn fork_snapshots_are_reused_per_source() {
         let source = MachineRecord {
             machine_id: "fc-source".to_string(),
             spec_hash: "spec".to_string(),
@@ -3653,10 +3672,12 @@ mod tests {
             snapshot_network_slot: None,
         };
 
-        let first = fork_snapshot_template_key(&source, "fc-target-1");
-        let second = fork_snapshot_template_key(&source, "fc-target-2");
-        assert_ne!(first, second);
-        assert_eq!(first, fork_snapshot_template_key(&source, "fc-target-1"));
+        let first = fork_snapshot_template_key(&source);
+        assert_eq!(first, fork_snapshot_template_key(&source));
+
+        let mut second_source = source;
+        second_source.machine_id = "fc-source-2".to_string();
+        assert_ne!(first, fork_snapshot_template_key(&second_source));
     }
 
     #[tokio::test]
