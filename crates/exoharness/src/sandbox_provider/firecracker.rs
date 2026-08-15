@@ -26,12 +26,13 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
-use tokio::net::UnixStream;
+use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::Mutex;
 
 use crate::sandbox::{
-    ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput, SandboxKey,
-    SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotPayload, sandbox_spec_hash,
+    BoxSandboxTcpStream, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
+    SandboxCommandOutput, SandboxKey, SandboxNetworkPolicy, SandboxRequest, SandboxSpec,
+    SnapshotPayload, sandbox_spec_hash,
 };
 use crate::sandbox_provider::process_bridge;
 use crate::{FileSystemMountMode, SandboxAttachment, SandboxProcessParts};
@@ -722,6 +723,18 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
         GuestClient::new(Arc::clone(&self.shared), machine.vsock_path)
             .start_process(&self.request.spec, command, cleanup_machine_id)
             .await
+    }
+
+    fn supports_tcp(&self) -> bool {
+        true
+    }
+
+    async fn connect_tcp(&self, port: u16) -> Result<Option<BoxSandboxTcpStream>> {
+        if !self.machine.record.network_enabled {
+            bail!("Firecracker sandbox does not have networking enabled");
+        }
+        let address = (self.machine.record.network().guest_ip, port);
+        Ok(Some(Box::pin(TcpStream::connect(address).await?)))
     }
 
     async fn stop(&self) -> Result<()> {

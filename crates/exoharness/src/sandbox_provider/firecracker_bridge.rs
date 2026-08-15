@@ -39,6 +39,11 @@ pub enum FirecrackerBridgeRequest {
         request: SandboxRequest,
         command: SandboxCommand,
     },
+    ConnectTcp {
+        config: FirecrackerConfig,
+        request: SandboxRequest,
+        port: u16,
+    },
     Stop {
         config: FirecrackerConfig,
         request: SandboxRequest,
@@ -56,7 +61,7 @@ pub enum FirecrackerBridgeRequest {
 
 impl FirecrackerBridgeRequest {
     fn is_stream(&self) -> bool {
-        matches!(self, Self::StartProcess { .. })
+        matches!(self, Self::StartProcess { .. } | Self::ConnectTcp { .. })
     }
 }
 
@@ -105,6 +110,7 @@ pub enum FirecrackerBridgeClientFrame {
 pub enum FirecrackerBridgeStreamChannel {
     Stdout,
     Stderr,
+    Tcp,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -314,7 +320,8 @@ async fn handle_request(
             backends.backend(config).await?.terminate(request).await?;
             Ok(FirecrackerBridgeResponse::Terminated)
         }
-        FirecrackerBridgeRequest::StartProcess { .. } => {
+        FirecrackerBridgeRequest::StartProcess { .. }
+        | FirecrackerBridgeRequest::ConnectTcp { .. } => {
             bail!("streaming Firecracker request reached the RPC handler")
         }
     }
@@ -344,6 +351,20 @@ async fn open_stream(
                 .await?;
             send_server_frame(writer, &FirecrackerBridgeServerFrame::StreamOpened { id }).await?;
             proxy_process(id, parts, input_receiver, writer).await?;
+        }
+        FirecrackerBridgeRequest::ConnectTcp {
+            config,
+            request,
+            port,
+        } => {
+            let stream = backends
+                .acquire(config, request)
+                .await?
+                .connect_tcp(port)
+                .await?
+                .context("Firecracker sandbox does not support TCP connections")?;
+            send_server_frame(writer, &FirecrackerBridgeServerFrame::StreamOpened { id }).await?;
+            proxy_tcp(id, stream, input_receiver, writer).await?;
         }
         _ => bail!("non-streaming Firecracker request reached the stream handler"),
     }
@@ -444,6 +465,51 @@ async fn copy_output(
         &FirecrackerBridgeServerFrame::StreamClosed { id, channel },
     )
     .await
+}
+
+async fn proxy_tcp(
+    id: u64,
+    stream: crate::BoxSandboxTcpStream,
+    mut input_receiver: mpsc::Receiver<BridgeStreamInput>,
+    writer: &BridgeWriter,
+) -> Result<()> {
+    let (mut reader, mut writer_half) = tokio::io::split(stream);
+    let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
+    loop {
+        tokio::select! {
+            read = reader.read(&mut buffer) => {
+                let read = read?;
+                if read == 0 {
+                    send_server_frame(
+                        writer,
+                        &FirecrackerBridgeServerFrame::StreamClosed {
+                            id,
+                            channel: FirecrackerBridgeStreamChannel::Tcp,
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                send_server_frame(
+                    writer,
+                    &FirecrackerBridgeServerFrame::StreamData {
+                        id,
+                        channel: FirecrackerBridgeStreamChannel::Tcp,
+                        data: BASE64.encode(&buffer[..read]),
+                    },
+                )
+                .await?;
+            }
+            input = input_receiver.recv() => match input {
+                Some(BridgeStreamInput::Data(data)) => {
+                    writer_half.write_all(&data).await?;
+                    writer_half.flush().await?;
+                }
+                Some(BridgeStreamInput::Closed) => writer_half.shutdown().await?,
+                Some(BridgeStreamInput::Cancel) | None => return Ok(()),
+            }
+        }
+    }
 }
 
 async fn send_server_frame(

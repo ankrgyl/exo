@@ -818,6 +818,10 @@ impl SandboxHandle for FakeAgentHandle {
         Err(anyhow!("not implemented"))
     }
 
+    async fn terminate_sandbox(&self, _id: SandboxId) -> Result<()> {
+        Err(anyhow!("not implemented"))
+    }
+
     async fn attach_sandbox(&self, _request: AttachSandboxRequest) -> Result<SandboxId> {
         Err(anyhow!("not implemented"))
     }
@@ -1103,6 +1107,10 @@ impl SandboxHandle for FakeConversationHandle {
     }
 
     async fn fork_sandbox(&self, _request: ForkSandboxRequest) -> Result<SandboxId> {
+        Err(anyhow!("not implemented"))
+    }
+
+    async fn terminate_sandbox(&self, _id: SandboxId) -> Result<()> {
         Err(anyhow!("not implemented"))
     }
 

@@ -230,6 +230,20 @@ async fn http_fork_sandbox(
     }
 }
 
+async fn http_terminate_sandbox(
+    harness: &HttpExoHarness,
+    scope: SandboxScope,
+    sandbox_id: SandboxId,
+) -> Result<()> {
+    match harness
+        .request(Request::TerminateSandbox { scope, sandbox_id })
+        .await?
+    {
+        Response::Unit => Ok(()),
+        response => unexpected_response(response, "unit"),
+    }
+}
+
 async fn http_attach_sandbox(
     harness: &HttpExoHarness,
     scope: SandboxScope,
@@ -691,6 +705,10 @@ impl SandboxHandle for HttpAgentHandle {
         http_fork_sandbox(&self.harness, self.sandbox_scope(), request).await
     }
 
+    async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {
+        http_terminate_sandbox(&self.harness, self.sandbox_scope(), id).await
+    }
+
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {
         http_attach_sandbox(&self.harness, self.sandbox_scope(), request).await
     }
@@ -1073,6 +1091,10 @@ impl SandboxHandle for HttpConversationHandle {
 
     async fn fork_sandbox(&self, request: ForkSandboxRequest) -> Result<SandboxId> {
         http_fork_sandbox(&self.harness, self.sandbox_scope(), request).await
+    }
+
+    async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {
+        http_terminate_sandbox(&self.harness, self.sandbox_scope(), id).await
     }
 
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {

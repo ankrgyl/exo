@@ -88,7 +88,7 @@ pub use firecracker::{FirecrackerConfig, FirecrackerSandboxBackend};
 pub use firecracker_bridge::run_firecracker_bridge;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
-pub(crate) async fn firecracker_backend_from_env() -> anyhow::Result<FirecrackerBackend> {
+pub async fn firecracker_backend_from_env() -> anyhow::Result<FirecrackerBackend> {
     firecracker_backend_from_config(FirecrackerConfig::from_env()?).await
 }
 
