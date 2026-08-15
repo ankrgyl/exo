@@ -397,8 +397,21 @@ fn registry_auth(reference: &Reference) -> Result<RegistryAuth> {
         Ok(DockerCredential::IdentityToken(token)) => Ok(RegistryAuth::Bearer(token)),
         Err(CredentialRetrievalError::ConfigNotFound)
         | Err(CredentialRetrievalError::NoCredentialConfigured) => Ok(RegistryAuth::Anonymous),
+        Err(error) if credential_helper_has_no_credentials(&error) => Ok(RegistryAuth::Anonymous),
         Err(error) => Err(anyhow!(error)).context("loading OCI registry credentials"),
     }
+}
+
+fn credential_helper_has_no_credentials(error: &CredentialRetrievalError) -> bool {
+    let CredentialRetrievalError::HelperFailure { stdout, stderr, .. } = error else {
+        return false;
+    };
+
+    // Docker defines this exact helper response as a cache miss, so continue
+    // anonymously instead of treating a public registry as unavailable.
+    // https://github.com/docker/docker-credential-helpers/blob/main/credentials/error.go#L10-L52
+    const NOT_FOUND: &str = "credentials not found in native keychain";
+    stdout.trim() == NOT_FOUND || stderr.trim() == NOT_FOUND
 }
 
 fn validate_docker_credential_helper(config_path: &Path, server: &str) -> Result<()> {
@@ -1109,5 +1122,22 @@ mod tests {
             None
         );
         assert!(immutable_reference_digest("registry.example/repo@latest").is_err());
+    }
+
+    #[test]
+    fn missing_helper_credential_allows_anonymous_registry_access() {
+        let missing = CredentialRetrievalError::HelperFailure {
+            helper: "docker-credential-ecr-login".to_string(),
+            stdout: "credentials not found in native keychain\n".to_string(),
+            stderr: String::new(),
+        };
+        let failure = CredentialRetrievalError::HelperFailure {
+            helper: "docker-credential-ecr-login".to_string(),
+            stdout: String::new(),
+            stderr: "permission denied".to_string(),
+        };
+
+        assert!(credential_helper_has_no_credentials(&missing));
+        assert!(!credential_helper_has_no_credentials(&failure));
     }
 }
