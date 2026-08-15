@@ -43,7 +43,7 @@ fn sandbox_backend_registration_uses_backend_locality() {
     assert!(SandboxBackendRegistration::apple_container().is_local());
     assert!(SandboxBackendRegistration::docker().is_local());
     assert_eq!(
-        SandboxBackendRegistration::firecracker().is_local(),
+        SandboxBackendRegistration::firecracker(Default::default()).is_local(),
         cfg!(all(
             any(target_os = "linux", target_os = "macos"),
             feature = "firecracker"

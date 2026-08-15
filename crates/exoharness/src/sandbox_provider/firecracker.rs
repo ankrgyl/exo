@@ -122,6 +122,13 @@ pub struct FirecrackerConfig {
     pub jailer_uid_base: u32,
     pub dns_server: Ipv4Addr,
     pub allowed_egress_cidrs: Vec<String>,
+    // Registries the root-run materializer may contact; empty = unrestricted.
+    // The registry host is trusted for process availability (manifest bodies
+    // are buffered unbounded by the OCI client), so operators can pin exactly
+    // which hosts ever get that trust. serde(default) keeps the bridge wire
+    // format compatible with a bridge built before this field existed.
+    #[serde(default)]
+    pub allowed_registries: Vec<String>,
     pub network_bytes_per_second: u64,
 }
 
@@ -149,6 +156,10 @@ impl FirecrackerConfig {
             jailer_uid_base: env_parse("EXO_FIRECRACKER_JAILER_UID_BASE", DEFAULT_JAILER_UID_BASE)?,
             dns_server: env_parse("EXO_FIRECRACKER_DNS_SERVER", Ipv4Addr::new(1, 1, 1, 1))?,
             allowed_egress_cidrs: env_cidrs("EXO_FIRECRACKER_ALLOWED_EGRESS_CIDRS")?,
+            // A security control, so it is an explicit CLI parameter
+            // (--firecracker-allowed-registry) rather than an implicit
+            // environment variable; the caller overrides this default.
+            allowed_registries: Vec::new(),
             network_bytes_per_second: env_parse(
                 "EXO_FIRECRACKER_NETWORK_BYTES_PER_SECOND",
                 DEFAULT_NETWORK_BYTES_PER_SECOND,
@@ -526,6 +537,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
             &self.shared.config.state_root,
             &request.spec.image,
             self.shared.config.image_size_gib,
+            &self.shared.config.allowed_registries,
         )
         .await?;
         request.spec.image = image.to_string_lossy().into_owned();
@@ -605,6 +617,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
             &self.shared.config.state_root,
             &target.spec.image,
             self.shared.config.image_size_gib,
+            &self.shared.config.allowed_registries,
         )
         .await?;
         target.spec.image = image.to_string_lossy().into_owned();

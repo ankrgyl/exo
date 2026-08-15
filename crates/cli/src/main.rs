@@ -31,15 +31,16 @@ use executor::{
     CreateConversationRequest, CreateSandboxRequest, DaytonaBackendSpec, DurableFileSystem,
     E2bBackendSpec, EventKind, EventQuery, EventQueryDirection, ExoHarness,
     ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount, FileSystemMountMode,
-    ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART, HTTP_EXOHARNESS_TRACING_TARGET,
-    Harness, HarnessAgent, HarnessConversation, HttpExoHarness, LocalSandboxExoHarness,
-    PutSecretRequest, RlmHarness, SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment,
-    SandboxBackendRegistration, SandboxProvider, SandboxProviderConfig, SandboxScope, Secret,
-    SecretBackendChoice, SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness,
-    TypeScriptHarnessConfig, Uuid7, VercelBackendSpec, default_aws_agentcore_image,
-    default_daytona_image, default_docker_image, default_e2b_template, default_firecracker_image,
-    default_vercel_image, effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config,
-    record_host_event, send_conversation_wakeup, serve_exoharness_http_listener_with_options,
+    FirecrackerBackendSpec, ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART,
+    HTTP_EXOHARNESS_TRACING_TARGET, Harness, HarnessAgent, HarnessConversation, HttpExoHarness,
+    LocalSandboxExoHarness, PutSecretRequest, RlmHarness, SANDBOX_MAIN_MOUNT_DIR,
+    SandboxAttachment, SandboxBackendRegistration, SandboxProvider, SandboxProviderConfig,
+    SandboxScope, Secret, SecretBackendChoice, SpritesBackendSpec, ToolRequest, ToolRuntime,
+    TypeScriptHarness, TypeScriptHarnessConfig, Uuid7, VercelBackendSpec,
+    default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
+    default_firecracker_image, default_vercel_image, effective_sandbox_scope,
+    finalize_rebuild_update_file, load_agent_config, record_host_event, send_conversation_wakeup,
+    serve_exoharness_http_listener_with_options,
 };
 use serde::Deserialize;
 use tabwriter::TabWriter;
@@ -70,6 +71,15 @@ struct Cli {
     master_key_path: Option<PathBuf>,
     #[arg(long, global = true, value_enum, env = "EXO_SANDBOX_BACKEND")]
     sandbox_backend: Option<SandboxBackendArg>,
+    /// Restrict the Firecracker image materializer to these OCI registries
+    /// (repeat the flag or comma-separate values). Unset means unrestricted.
+    #[arg(
+        long = "firecracker-allowed-registry",
+        global = true,
+        value_name = "REGISTRY",
+        value_delimiter = ','
+    )]
+    firecracker_allowed_registries: Vec<String>,
     #[arg(long, global = true)]
     env_file: Option<PathBuf>,
     #[arg(long, global = true)]
@@ -261,13 +271,13 @@ enum SandboxBackendArg {
     LocalProcess,
 }
 
-impl From<SandboxBackendArg> for SandboxBackendRegistration {
-    fn from(value: SandboxBackendArg) -> Self {
-        match value {
-            SandboxBackendArg::AppleContainer => Self::apple_container(),
-            SandboxBackendArg::Docker => Self::docker(),
-            SandboxBackendArg::Firecracker => Self::firecracker(),
-            SandboxBackendArg::LocalProcess => Self::local_process(),
+impl SandboxBackendArg {
+    fn registration(self, firecracker: FirecrackerBackendSpec) -> SandboxBackendRegistration {
+        match self {
+            Self::AppleContainer => SandboxBackendRegistration::apple_container(),
+            Self::Docker => SandboxBackendRegistration::docker(),
+            Self::Firecracker => SandboxBackendRegistration::firecracker(firecracker),
+            Self::LocalProcess => SandboxBackendRegistration::local_process(),
         }
     }
 }
@@ -279,12 +289,15 @@ fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
             path: cli.master_key_path.clone(),
         },
     };
+    let firecracker_spec = FirecrackerBackendSpec {
+        allowed_registries: cli.firecracker_allowed_registries.clone(),
+    };
     let sandbox_backend = cli
         .sandbox_backend
-        .map(SandboxBackendRegistration::from)
+        .map(|backend| backend.registration(firecracker_spec.clone()))
         .unwrap_or_else(default_sandbox_backend);
     let sandbox_default = sandbox_backend.provider();
-    let mut sandbox_backends = default_sandbox_backends();
+    let mut sandbox_backends = default_sandbox_backends(firecracker_spec);
     if !sandbox_backends
         .iter()
         .any(|backend| backend.provider() == sandbox_default)
@@ -301,10 +314,12 @@ fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
 
 /// Default providers: the OS-local container backend, local processes, and
 /// Daytona (offered even with no key set — credentials resolve lazily).
-fn default_sandbox_backends() -> Vec<SandboxBackendRegistration> {
+fn default_sandbox_backends(
+    firecracker: FirecrackerBackendSpec,
+) -> Vec<SandboxBackendRegistration> {
     vec![
         default_sandbox_backend(),
-        SandboxBackendRegistration::firecracker(),
+        SandboxBackendRegistration::firecracker(firecracker),
         SandboxBackendRegistration::local_process(),
         SandboxBackendRegistration::daytona(DaytonaBackendSpec::default()),
         SandboxBackendRegistration::e2b(E2bBackendSpec::default()),
@@ -3832,6 +3847,10 @@ mod create_tests {
             "exo",
             "--sandbox-backend",
             "firecracker",
+            "--firecracker-allowed-registry",
+            "docker.io,123456789012.dkr.ecr.us-east-1.amazonaws.com",
+            "--firecracker-allowed-registry",
+            "registry.example.com",
             "agent",
             "create",
             "test",
@@ -3845,6 +3864,14 @@ mod create_tests {
             cli.sandbox_backend,
             Some(super::SandboxBackendArg::Firecracker)
         ));
+        assert_eq!(
+            cli.firecracker_allowed_registries,
+            vec![
+                "docker.io",
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+                "registry.example.com"
+            ]
+        );
         assert!(matches!(
             cli.command,
             super::Commands::Agent {

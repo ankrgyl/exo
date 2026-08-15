@@ -166,8 +166,13 @@ Be aware of what this backend does _not_ do, and what stays on the operator:
   responses are buffered in memory without a size cap (a limitation of the
   underlying OCI client library), so a hostile registry _server_ could exhaust
   the host process's memory. Layer blobs are not affected — they stream to
-  disk under strict size budgets. Image references come from operator
-  configuration, not from agents, so point Exo only at registries you trust.
+  disk under strict size budgets. Agents inside a turn cannot create sandboxes
+  or choose images, but any full-scope API client can name a registry in an
+  image reference; pass `--firecracker-allowed-registry <HOST>` (repeatable or
+  comma-separated, eg.
+  `--firecracker-allowed-registry docker.io,123456789012.dkr.ecr.us-east-1.amazonaws.com`)
+  to enforce which registries the materializer will ever contact. Unset means
+  unrestricted.
 
 The implementation follows Firecracker's upstream guidance for
 [jailer operation](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md),

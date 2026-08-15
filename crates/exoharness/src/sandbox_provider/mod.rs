@@ -92,6 +92,18 @@ pub async fn firecracker_backend_from_env() -> anyhow::Result<FirecrackerBackend
     firecracker_backend_from_config(FirecrackerConfig::from_env()?).await
 }
 
+// The registry allowlist is deliberately not an environment variable: it is a
+// security control, and it arrives as an explicit CLI (clap) parameter so it
+// is visible in --help and in the invocation that granted it.
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+pub async fn firecracker_backend_with_allowed_registries(
+    allowed_registries: Vec<String>,
+) -> anyhow::Result<FirecrackerBackend> {
+    let mut config = FirecrackerConfig::from_env()?;
+    config.allowed_registries = allowed_registries;
+    firecracker_backend_from_config(config).await
+}
+
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
 async fn firecracker_backend_from_config(
     config: FirecrackerConfig,

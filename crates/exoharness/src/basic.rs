@@ -99,7 +99,7 @@ impl SandboxBackendRegistration {
             )),
             "docker" => Ok(Self::docker()),
             "e2b" => Ok(Self::e2b(E2bBackendSpec::default())),
-            "firecracker" => Ok(Self::firecracker()),
+            "firecracker" => Ok(Self::firecracker(FirecrackerBackendSpec::default())),
             "local_process" => Ok(Self::local_process()),
             "sprites" => Ok(Self::sprites(SpritesBackendSpec::default())),
             "vercel" => Ok(Self::vercel(VercelBackendSpec::with_conventional_secrets())),
@@ -133,16 +133,21 @@ impl SandboxBackendRegistration {
     }
 
     #[cfg(feature = "firecracker")]
-    pub fn firecracker() -> Self {
+    pub fn firecracker(spec: FirecrackerBackendSpec) -> Self {
         Self::from_factory(
             SandboxProvider::Firecracker,
             cfg!(any(target_os = "linux", target_os = "macos")),
-            |_| Box::pin(crate::firecracker_backend_from_env()),
+            move |_| {
+                let spec = spec.clone();
+                Box::pin(crate::firecracker_backend_with_allowed_registries(
+                    spec.allowed_registries,
+                ))
+            },
         )
     }
 
     #[cfg(not(feature = "firecracker"))]
-    pub fn firecracker() -> Self {
+    pub fn firecracker(_spec: FirecrackerBackendSpec) -> Self {
         Self::from_factory(SandboxProvider::Firecracker, false, |_| {
             Box::pin(async move {
                 bail!("Firecracker support requires building Exo with --features firecracker")
@@ -261,6 +266,16 @@ impl SandboxBackendRegistration {
             factory: Arc::new(factory),
         }
     }
+}
+
+/// Firecracker backend options supplied by the caller (CLI flags), applied on
+/// top of the host-derived configuration.
+#[derive(Debug, Clone, Default)]
+pub struct FirecrackerBackendSpec {
+    /// OCI registries the root-run image materializer may contact; empty
+    /// means unrestricted. The registry host is trusted for process
+    /// availability, so operators can pin exactly which hosts get that trust.
+    pub allowed_registries: Vec<String>,
 }
 
 /// Daytona connection config plus the secret-store names for its credentials,
@@ -986,30 +1001,81 @@ impl ExoHarness for BasicExoHarness {
     }
 
     async fn delete_agent(&self, id: &AgentId) -> Result<bool> {
-        let _guard = self.inner.write_lock.lock().await;
         let agent_dir = self.agents_dir().join(id.to_string());
         if self.inner.storage.list_keys(&agent_dir).await?.is_empty() {
             return Ok(false);
         }
-        // Release the slug before the record (its source) disappears.
-        if let Some(record) = self
-            .inner
-            .storage
-            .get_json_if_exists::<AgentRecord>(&agent_dir.join("record.json"))
-            .await?
-        {
-            self.inner
-                .storage
-                .delete_key_if_exists(self.slug_marker_path(&record.slug))
+        // Deleting the agent's prefix erases every sandbox record it and its
+        // conversations own; without terminating those sandboxes first their
+        // VMs (and registered in-process handles) would keep running with no
+        // record left that could ever find them. Same protocol as
+        // delete_conversation: terminate outside the write lock, since
+        // terminate_sandbox takes that lock itself, then delete only after a
+        // locked re-check sees nothing running — bounded, so racing sandbox
+        // creation yields an error instead of a leaked VM.
+        for _ in 0..5 {
+            terminate_running_sandboxes(&BasicScopedSandboxHandle::agent(self, *id)).await?;
+            for conversation_id in agent_conversation_ids(self, &agent_dir).await? {
+                let conversation_dir = agent_dir
+                    .join("conversations")
+                    .join(conversation_id.to_string());
+                terminate_running_sandboxes(&BasicScopedSandboxHandle::conversation(
+                    self,
+                    conversation_id,
+                    conversation_dir,
+                ))
                 .await?;
-        } else {
-            tracing::warn!(
-                %id,
-                "agent dir exists without record.json; cannot release slug marker, continuing with delete"
-            );
+            }
+
+            let _guard = self.inner.write_lock.lock().await;
+            if self.inner.storage.list_keys(&agent_dir).await?.is_empty() {
+                return Ok(false);
+            }
+            // Re-enumerate under the lock: a conversation created after the
+            // sweep above would otherwise slip past the check.
+            let mut any_running =
+                scope_has_running_sandboxes(&BasicScopedSandboxHandle::agent(self, *id)).await?;
+            if !any_running {
+                for conversation_id in agent_conversation_ids(self, &agent_dir).await? {
+                    let conversation_dir = agent_dir
+                        .join("conversations")
+                        .join(conversation_id.to_string());
+                    if scope_has_running_sandboxes(&BasicScopedSandboxHandle::conversation(
+                        self,
+                        conversation_id,
+                        conversation_dir,
+                    ))
+                    .await?
+                    {
+                        any_running = true;
+                        break;
+                    }
+                }
+            }
+            if any_running {
+                continue;
+            }
+            // Release the slug before the record (its source) disappears.
+            if let Some(record) = self
+                .inner
+                .storage
+                .get_json_if_exists::<AgentRecord>(&agent_dir.join("record.json"))
+                .await?
+            {
+                self.inner
+                    .storage
+                    .delete_key_if_exists(self.slug_marker_path(&record.slug))
+                    .await?;
+            } else {
+                tracing::warn!(
+                    %id,
+                    "agent dir exists without record.json; cannot release slug marker, continuing with delete"
+                );
+            }
+            self.inner.storage.delete_prefix(agent_dir).await?;
+            return Ok(true);
         }
-        self.inner.storage.delete_prefix(agent_dir).await?;
-        Ok(true)
+        bail!("agent {id} kept acquiring sandboxes while it was being deleted")
     }
 
     async fn list_bindings(&self) -> Result<Vec<BindingRecord>> {
@@ -1329,20 +1395,7 @@ impl AgentHandle for BasicAgentHandle {
         // finds nothing new — bounded, so a caller racing sandbox creation
         // against deletion gets an error instead of a silently leaked VM.
         for _ in 0..5 {
-            let sandboxes = self
-                .harness
-                .inner
-                .storage
-                .list_json_matching_suffix::<StoredSandbox>(
-                    conversation_dir.join("sandboxes"),
-                    ".json",
-                )
-                .await?;
-            for sandbox in sandboxes {
-                if sandbox.running && sandbox.attachment.is_none() {
-                    sandbox_handle.terminate_sandbox(sandbox.id).await?;
-                }
-            }
+            terminate_running_sandboxes(&sandbox_handle).await?;
 
             let _guard = self.harness.inner.write_lock.lock().await;
             if self
@@ -1355,18 +1408,7 @@ impl AgentHandle for BasicAgentHandle {
             {
                 return Ok(false);
             }
-            if self
-                .harness
-                .inner
-                .storage
-                .list_json_matching_suffix::<StoredSandbox>(
-                    conversation_dir.join("sandboxes"),
-                    ".json",
-                )
-                .await?
-                .into_iter()
-                .any(|sandbox| sandbox.running && sandbox.attachment.is_none())
-            {
+            if scope_has_running_sandboxes(&sandbox_handle).await? {
                 continue;
             }
             if let Ok(mut record) = self
@@ -1614,6 +1656,65 @@ fn paginate_conversation_records(
 enum SandboxOwner {
     Agent(AgentId),
     Conversation(ConversationId),
+}
+
+// Deletion helpers shared by delete_agent and delete_conversation: an owner's
+// storage prefix must never be removed while sandboxes it owns are running,
+// or their VMs would outlive every record that could find them.
+async fn terminate_running_sandboxes(scope: &BasicScopedSandboxHandle<'_>) -> Result<()> {
+    for sandbox in scope
+        .harness
+        .inner
+        .storage
+        .list_json_matching_suffix::<StoredSandbox>(scope.sandboxes_dir(), ".json")
+        .await?
+    {
+        if sandbox.running && sandbox.attachment.is_none() {
+            scope.terminate_sandbox(sandbox.id).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn scope_has_running_sandboxes(scope: &BasicScopedSandboxHandle<'_>) -> Result<bool> {
+    Ok(scope
+        .harness
+        .inner
+        .storage
+        .list_json_matching_suffix::<StoredSandbox>(scope.sandboxes_dir(), ".json")
+        .await?
+        .into_iter()
+        .any(|sandbox| sandbox.running && sandbox.attachment.is_none()))
+}
+
+async fn agent_conversation_ids(
+    harness: &BasicExoHarness,
+    agent_dir: &Path,
+) -> Result<Vec<ConversationId>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::new();
+    for key in harness
+        .inner
+        .storage
+        .list_keys(agent_dir.join("conversations"))
+        .await?
+    {
+        let Some((_, rest)) = key.split_once("/conversations/") else {
+            continue;
+        };
+        let Some(component) = rest.split('/').next() else {
+            continue;
+        };
+        if !seen.insert(component.to_string()) {
+            continue;
+        }
+        // A component that is not a conversation id means the storage layout
+        // is corrupt; refusing the delete beats leaking whatever lives there.
+        ids.push(component.parse::<ConversationId>().map_err(|error| {
+            anyhow!("parsing conversation id {component:?} under the agent directory: {error}")
+        })?);
+    }
+    Ok(ids)
 }
 
 struct BasicScopedSandboxHandle<'a> {

@@ -93,6 +93,7 @@ pub(super) async fn resolve_image(
     state_root: &Path,
     source: &str,
     image_size_gib: u64,
+    allowed_registries: &[String],
 ) -> Result<PathBuf> {
     let total_started = Instant::now();
     if looks_like_local_image(source) {
@@ -117,6 +118,12 @@ pub(super) async fn resolve_image(
     let reference = source
         .parse::<Reference>()
         .with_context(|| format!("parsing Firecracker OCI image reference {source}"))?;
+    // Image references reach this point from any full-scope API client, not
+    // only from static operator configuration, and the registry host they
+    // name is trusted for this process's availability (see the manifest
+    // limitation below). The allowlist gives operators an enforced boundary
+    // on which registries root will ever speak to.
+    validate_allowed_registry(&reference, allowed_registries)?;
     let cache_root = state_root.join("images");
     prepare_private_dir(&cache_root)?;
     prepare_private_dir(&cache_root.join("blobs/sha256"))?;
@@ -162,12 +169,14 @@ pub(super) async fn resolve_image(
     //
     // KNOWN LIMITATION: oci-client buffers the manifest and config responses
     // in memory with no size cap (`res.bytes().await` internally), so the
-    // registry HOST is trusted for this process's availability. Image
-    // references come from operator configuration, never from agents, which
-    // is why this is documented rather than worked around; a proper fix is a
-    // response size limit in oci-client or a hand-rolled bounded fetch. Layer
-    // blobs are NOT affected: pull_blob streams them to disk through
-    // LimitedAsyncWriter under declared-size and cumulative budgets.
+    // registry HOST is trusted for this process's availability. Agents inside
+    // a turn cannot reach create_sandbox (full-scope only), but any full-scope
+    // API client can name a registry; the --firecracker-allowed-registry CLI
+    // flag (enforced above) lets operators pin which hosts ever get that
+    // trust. A proper fix is a response size limit in oci-client or a
+    // hand-rolled bounded fetch. Layer blobs are NOT affected: pull_blob
+    // streams them to disk through LimitedAsyncWriter under declared-size and
+    // cumulative budgets.
     let (manifest, manifest_digest, config_json, list_digest) = client
         .pull_manifest_and_config_and_list_digest(&reference, &auth)
         .await
@@ -226,9 +235,10 @@ pub(super) async fn resolve_image(
             manifest.layers.len()
         );
     }
-    let pull_started = Instant::now();
-    let mut pull_stats = PullStats::default();
-    let mut layers = Vec::with_capacity(manifest.layers.len());
+    // Preflight the whole manifest before pulling anything: an over-budget
+    // manifest must be rejected with zero of its blobs downloaded or cached,
+    // not discovered at layer N after N-1 layers already landed on disk.
+    let mut declared_total = 0_u64;
     for descriptor in &manifest.layers {
         let declared = u64::try_from(descriptor.size).context("negative OCI layer size")?;
         if declared > image_bytes.saturating_mul(2) {
@@ -238,13 +248,10 @@ pub(super) async fn resolve_image(
                 descriptor.digest
             );
         }
-        // Enforce the cumulative budget before downloading, so an over-budget
-        // manifest is rejected without its blobs ever landing in the cache.
-        pull_stats.bytes = pull_stats
-            .bytes
+        declared_total = declared_total
             .checked_add(declared)
             .context("OCI layer byte count overflow")?;
-        if pull_stats.bytes > image_bytes.saturating_mul(4) {
+        if declared_total > image_bytes.saturating_mul(4) {
             bail!(
                 "OCI image {source} declares more than {} compressed layer bytes for a \
                  {image_size_gib} GiB image filesystem; raise EXO_FIRECRACKER_IMAGE_SIZE_GIB \
@@ -252,6 +259,17 @@ pub(super) async fn resolve_image(
                 image_bytes.saturating_mul(4)
             );
         }
+    }
+
+    let pull_started = Instant::now();
+    let mut pull_stats = PullStats::default();
+    let mut layers = Vec::with_capacity(manifest.layers.len());
+    for descriptor in &manifest.layers {
+        let declared = u64::try_from(descriptor.size).context("negative OCI layer size")?;
+        pull_stats.bytes = pull_stats
+            .bytes
+            .checked_add(declared)
+            .context("OCI layer byte count overflow")?;
         let (path, cache_hit) = pull_blob(
             &client,
             &reference,
@@ -312,6 +330,27 @@ pub(super) async fn resolve_image(
         false,
     );
     Ok(image)
+}
+
+// Empty allowlist means unrestricted (the default). Entries match either the
+// reference's literal registry (eg. "docker.io") or its resolved endpoint
+// (eg. "index.docker.io"), case-insensitively.
+fn validate_allowed_registry(reference: &Reference, allowed_registries: &[String]) -> Result<()> {
+    if allowed_registries.is_empty() {
+        return Ok(());
+    }
+    let registry = reference.registry();
+    let resolved = reference.resolve_registry();
+    if allowed_registries.iter().any(|allowed| {
+        allowed.eq_ignore_ascii_case(registry) || allowed.eq_ignore_ascii_case(resolved)
+    }) {
+        return Ok(());
+    }
+    bail!(
+        "OCI registry {registry} is not permitted by --firecracker-allowed-registry; \
+         allowed registries: {}",
+        allowed_registries.join(", ")
+    )
 }
 
 fn looks_like_local_image(source: &str) -> bool {
@@ -711,16 +750,29 @@ fn build_and_publish_image(
         .checked_mul(1024 * 1024 * 1024)
         .context("Firecracker image size overflow")?;
     let extract_started = Instant::now();
+    // mkfs.ext4's default inode ratio is one inode per 16384 bytes of
+    // filesystem, so a tree with more inodes than this could never fit the
+    // generated ext4 anyway; rejecting early bounds host inode consumption.
+    let inode_budget = (image_bytes / 16384).max(65_536);
     for layer in &layers {
         apply_layer(&rootfs, layer, image_bytes.saturating_mul(2))?;
         // Content that cannot fit in the ext4 image would only fail in
-        // mkfs.ext4 later; checking after each layer bounds how much host disk
-        // an oversized image can consume in the meantime.
-        let extracted = directory_tree_bytes(&rootfs)?;
-        if extracted > image_bytes {
+        // mkfs.ext4 later; checking after each layer bounds how much host
+        // disk and how many host inodes an oversized image can consume in
+        // the meantime.
+        let extracted = directory_tree_usage(&rootfs)?;
+        if extracted.bytes > image_bytes {
             bail!(
-                "extracted OCI image content ({extracted} bytes) exceeds the {image_size_gib} GiB \
-                 image filesystem; raise EXO_FIRECRACKER_IMAGE_SIZE_GIB"
+                "extracted OCI image content ({} bytes) exceeds the {image_size_gib} GiB \
+                 image filesystem; raise EXO_FIRECRACKER_IMAGE_SIZE_GIB",
+                extracted.bytes
+            );
+        }
+        if extracted.inodes > inode_budget {
+            bail!(
+                "extracted OCI image content ({} inodes) exceeds what a {image_size_gib} GiB \
+                 ext4 filesystem can hold; raise EXO_FIRECRACKER_IMAGE_SIZE_GIB",
+                extracted.inodes
             );
         }
     }
@@ -1000,13 +1052,20 @@ impl<R: Read> Read for BoundedReader<R> {
     }
 }
 
-// Sums regular-file bytes under a directory, counting each hard-linked inode
-// once so link-heavy images (eg. busybox) are not overcounted. Used to bound
-// host disk consumed by extraction, since only mkfs.ext4 enforces the image
-// size and it runs after all layers already landed on the host filesystem.
-fn directory_tree_bytes(path: &Path) -> Result<u64> {
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DirectoryTreeUsage {
+    bytes: u64,
+    inodes: u64,
+}
+
+// Sums regular-file bytes and inode count under a directory, counting each
+// hard-linked inode once so link-heavy images (eg. busybox) are not
+// overcounted. Used to bound host disk and inodes consumed by extraction,
+// since only mkfs.ext4 enforces the image size and it runs after all layers
+// already landed on the host filesystem.
+fn directory_tree_usage(path: &Path) -> Result<DirectoryTreeUsage> {
     let mut seen = HashSet::new();
-    let mut total = 0_u64;
+    let mut usage = DirectoryTreeUsage::default();
     let mut pending = vec![path.to_path_buf()];
     while let Some(directory) = pending.pop() {
         for entry in fs::read_dir(&directory)? {
@@ -1014,22 +1073,30 @@ fn directory_tree_bytes(path: &Path) -> Result<u64> {
             // DirEntry::metadata has lstat semantics — unlike fs::metadata it
             // never follows symlinks — so an image that plants a link to /
             // cannot pull this walk outside the staging tree, loop it, or
-            // inflate the reported size. This is easy to misread (and has
+            // inflate the reported usage. This is easy to misread (and has
             // been flagged in review as if it followed links); the property
-            // is pinned by the directory_tree_bytes_never_follows_symlinks
+            // is pinned by the directory_tree_usage_never_follows_symlinks
             // test, so don't "fix" this to fs::symlink_metadata or fs::metadata.
             // https://doc.rust-lang.org/std/fs/struct.DirEntry.html#method.metadata
             let metadata = entry.metadata()?;
             if metadata.is_dir() {
+                usage.inodes += 1;
                 pending.push(entry.path());
-            } else if metadata.is_file() && seen.insert((metadata.dev(), metadata.ino())) {
-                total = total
-                    .checked_add(metadata.len())
-                    .context("extracted OCI image size overflow")?;
+            } else if metadata.is_file() {
+                if seen.insert((metadata.dev(), metadata.ino())) {
+                    usage.inodes += 1;
+                    usage.bytes = usage
+                        .bytes
+                        .checked_add(metadata.len())
+                        .context("extracted OCI image size overflow")?;
+                }
+            } else {
+                // Symlinks and any other entry type still consume an inode.
+                usage.inodes += 1;
             }
         }
     }
-    Ok(total)
+    Ok(usage)
 }
 
 fn validate_archive_path(path: &Path) -> Result<()> {
@@ -1516,7 +1583,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_tree_bytes_counts_hard_links_once() {
+    fn directory_tree_usage_counts_hard_links_once() {
         let directory = tempfile::tempdir().unwrap();
         let nested = directory.path().join("nested");
         fs::create_dir(&nested).unwrap();
@@ -1524,11 +1591,18 @@ mod tests {
         fs::write(nested.join("b"), vec![0_u8; 50]).unwrap();
         fs::hard_link(directory.path().join("a"), nested.join("a-link")).unwrap();
 
-        assert_eq!(directory_tree_bytes(directory.path()).unwrap(), 150);
+        // Two unique files, one directory; the hard link shares its inode.
+        assert_eq!(
+            directory_tree_usage(directory.path()).unwrap(),
+            DirectoryTreeUsage {
+                bytes: 150,
+                inodes: 3
+            }
+        );
     }
 
     #[test]
-    fn directory_tree_bytes_never_follows_symlinks() {
+    fn directory_tree_usage_never_follows_symlinks() {
         let directory = tempfile::tempdir().unwrap();
         let outside = directory.path().join("outside");
         let rootfs = directory.path().join("rootfs");
@@ -1541,7 +1615,31 @@ mod tests {
         // A self-referential link must not loop the walk either.
         std::os::unix::fs::symlink(&rootfs, rootfs.join("self")).unwrap();
 
-        assert_eq!(directory_tree_bytes(&rootfs).unwrap(), 100);
+        // One real file plus three symlinks; nothing outside is counted.
+        assert_eq!(
+            directory_tree_usage(&rootfs).unwrap(),
+            DirectoryTreeUsage {
+                bytes: 100,
+                inodes: 4
+            }
+        );
+    }
+
+    #[test]
+    fn registry_allowlist_matches_literal_and_resolved_hosts() {
+        let reference = "docker.io/library/busybox:stable"
+            .parse::<Reference>()
+            .unwrap();
+        assert!(validate_allowed_registry(&reference, &[]).is_ok());
+        assert!(validate_allowed_registry(&reference, &["docker.io".to_string()]).is_ok());
+        assert!(validate_allowed_registry(&reference, &["index.docker.io".to_string()]).is_ok());
+        assert!(validate_allowed_registry(&reference, &["DOCKER.IO".to_string()]).is_ok());
+        let error = validate_allowed_registry(&reference, &["registry.example.com".to_string()])
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("--firecracker-allowed-registry"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
