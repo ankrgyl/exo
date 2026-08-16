@@ -9,12 +9,12 @@ use exoharness::{
     CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, CreateSandboxRequest,
     Event, EventData, EventId, EventKind, EventStream, ExoHarness, ForkConversationRequest,
     ForkSandboxRequest, GetEventsResult, ListConversationsRequest, ListConversationsResult,
-    NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest, Result,
-    RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess,
-    SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, SandboxProvider, Secret,
-    SecretId, SecretMetadata, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
-    StartSandboxRequest, TurnHandle, TurnRecord, Uuid7, WaitSandboxProcessRequest,
-    WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest,
+    RestoreSandboxRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle,
+    SandboxId, SandboxProcess, SandboxProcessEventQuery, SandboxProcessRecord,
+    SandboxProcessStatus, SandboxProvider, Secret, SecretId, SecretMetadata, SnapshotHandle,
+    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnRecord, Uuid7,
+    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -351,6 +351,17 @@ impl SandboxHandle for LocalSandboxAgent {
         };
         request.source_id = local_source_id;
         let local_id = self.local_agent().await?.fork_sandbox(request).await?;
+        let remote_id = local_id.clone();
+        self.map_local_sandbox(remote_id.clone(), local_id).await;
+        Ok(remote_id)
+    }
+
+    async fn restore_sandbox(&self, request: RestoreSandboxRequest) -> Result<SandboxId> {
+        if !self.wants_local_sandbox(&request.sandbox) {
+            return self.remote.restore_sandbox(request).await;
+        }
+
+        let local_id = self.local_agent().await?.restore_sandbox(request).await?;
         let remote_id = local_id.clone();
         self.map_local_sandbox(remote_id.clone(), local_id).await;
         Ok(remote_id)
@@ -924,6 +935,29 @@ impl SandboxHandle for LocalSandboxConversation {
         self.map_local_sandbox(remote_id.clone(), local_id).await?;
         self.append_remote_sandbox_events(sandbox_created_events(&remote_id, sandbox))
             .await?;
+        Ok(remote_id)
+    }
+
+    async fn restore_sandbox(&self, request: RestoreSandboxRequest) -> Result<SandboxId> {
+        if !self.wants_local_sandbox(&request.sandbox) {
+            return self.remote.restore_sandbox(request).await;
+        }
+
+        let snapshot_id = request.snapshot_id;
+        let sandbox = request.sandbox.clone();
+        let remote_id = format!("sandbox-{}", Uuid7::now());
+        let local_id = self
+            .local_conversation()
+            .await?
+            .restore_sandbox(request)
+            .await?;
+        self.map_local_sandbox(remote_id.clone(), local_id).await?;
+        let mut events = sandbox_created_events(&remote_id, sandbox);
+        events.push(EventData::SandboxStarted {
+            sandbox_id: remote_id.clone(),
+            snapshot_id: Some(snapshot_id),
+        });
+        self.append_remote_sandbox_events(events).await?;
         Ok(remote_id)
     }
 

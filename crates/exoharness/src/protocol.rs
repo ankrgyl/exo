@@ -7,10 +7,11 @@ use crate::{
     CreateSandboxRequest, Event, EventData, EventId, EventQuery, ForkConversationRequest,
     ForkSandboxRequest, GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
     ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
-    ReadArtifactRequest, SandboxAttachment, SandboxId, SandboxProcessEventQuery,
-    SandboxProcessRecord, SandboxProcessStatus, SandboxRecord, Secret, SecretId, SecretMetadata,
-    SessionId, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, ThreadRecord, TurnId,
-    TurnRecord, WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    ReadArtifactRequest, RestoreSandboxRequest, SandboxAttachment, SandboxId,
+    SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId,
+    SecretMetadata, SessionId, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest,
+    ThreadRecord, TurnId, TurnRecord, WaitSandboxProcessRequest, WriteArtifactRequest,
+    WriteSandboxProcessInputRequest,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -137,6 +138,10 @@ pub enum Request {
     ForkSandbox {
         scope: SandboxScope,
         request: ForkSandboxRequest,
+    },
+    RestoreSandbox {
+        scope: SandboxScope,
+        request: RestoreSandboxRequest,
     },
     TerminateSandbox {
         scope: SandboxScope,
@@ -329,6 +334,7 @@ impl Request {
             Self::ListSandboxes { .. } => "list_sandboxes",
             Self::CreateSandbox { .. } => "create_sandbox",
             Self::ForkSandbox { .. } => "fork_sandbox",
+            Self::RestoreSandbox { .. } => "restore_sandbox",
             Self::TerminateSandbox { .. } => "terminate_sandbox",
             Self::AttachSandbox { .. } => "attach_sandbox",
             Self::DetachSandbox { .. } => "detach_sandbox",

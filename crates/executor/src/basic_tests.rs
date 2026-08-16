@@ -10,9 +10,9 @@ use exoharness::{
     ConversationHandle, ConversationId, ConversationRecord, CreateSandboxRequest, Event, EventData,
     EventQuery, EventQueryDirection, EventStream, ExoHarness, ForkConversationRequest,
     ForkSandboxRequest, GetEventsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
-    ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId,
-    SandboxProcess, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessRecord,
-    SandboxProcessStatus, SandboxRecord, Secret, SecretMetadata, SecretType, SessionId,
+    ReadArtifactRequest, RestoreSandboxRequest, Result, RunInSandboxRequest, SandboxAttachment,
+    SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery, SandboxProcessParts,
+    SandboxProcessRecord, SandboxProcessStatus, Secret, SecretMetadata, SecretType, SessionId,
     SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, ToolRequest,
     ToolResult, TurnHandle, TurnId, TurnRecord, Uuid7, WriteArtifactRequest,
 };
@@ -818,6 +818,10 @@ impl SandboxHandle for FakeAgentHandle {
         Err(anyhow!("not implemented"))
     }
 
+    async fn restore_sandbox(&self, _request: RestoreSandboxRequest) -> Result<SandboxId> {
+        Err(anyhow!("not implemented"))
+    }
+
     async fn terminate_sandbox(&self, _id: SandboxId) -> Result<()> {
         Err(anyhow!("not implemented"))
     }
@@ -1107,6 +1111,10 @@ impl SandboxHandle for FakeConversationHandle {
     }
 
     async fn fork_sandbox(&self, _request: ForkSandboxRequest) -> Result<SandboxId> {
+        Err(anyhow!("not implemented"))
+    }
+
+    async fn restore_sandbox(&self, _request: RestoreSandboxRequest) -> Result<SandboxId> {
         Err(anyhow!("not implemented"))
     }
 

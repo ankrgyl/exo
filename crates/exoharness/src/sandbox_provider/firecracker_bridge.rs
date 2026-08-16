@@ -14,7 +14,8 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 
 use crate::{
     FirecrackerConfig, FirecrackerSandboxBackend, ManagedSandboxBackend, ManagedSandboxHandle,
-    SandboxCommand, SandboxCommandOutput, SandboxProcessParts, SandboxRequest,
+    SandboxCommand, SandboxCommandOutput, SandboxProcessParts, SandboxRequest, SnapshotKind,
+    SnapshotPayload,
 };
 
 const MAX_BRIDGE_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -53,6 +54,16 @@ pub enum FirecrackerBridgeRequest {
         source: SandboxRequest,
         target: SandboxRequest,
     },
+    AcquireFromSnapshot {
+        config: FirecrackerConfig,
+        request: SandboxRequest,
+        kind: SnapshotKind,
+        payload: String,
+    },
+    Snapshot {
+        config: FirecrackerConfig,
+        request: SandboxRequest,
+    },
     Terminate {
         config: FirecrackerConfig,
         request: SandboxRequest,
@@ -76,6 +87,10 @@ pub enum FirecrackerBridgeResponse {
     },
     Exec {
         output: SandboxCommandOutput,
+    },
+    Snapshot {
+        kind: SnapshotKind,
+        payload: String,
     },
     Unit,
 }
@@ -326,6 +341,40 @@ async fn handle_request(
                 provider_state: handle.provider_state(),
                 effective_image: handle.effective_image(),
                 startup_timing: handle.startup_timing(),
+            })
+        }
+        FirecrackerBridgeRequest::AcquireFromSnapshot {
+            config,
+            request,
+            kind,
+            payload,
+        } => {
+            let payload = BASE64
+                .decode(payload)
+                .context("decoding Firecracker snapshot bridge payload")?;
+            let handle = backends
+                .backend(config)
+                .await?
+                .acquire_from_snapshot(
+                    request,
+                    SnapshotPayload {
+                        kind,
+                        bytes: payload.into(),
+                    },
+                )
+                .await?;
+            Ok(FirecrackerBridgeResponse::Handle {
+                id: handle.id().to_string(),
+                provider_state: handle.provider_state(),
+                effective_image: handle.effective_image(),
+                startup_timing: handle.startup_timing(),
+            })
+        }
+        FirecrackerBridgeRequest::Snapshot { config, request } => {
+            let snapshot = backends.acquire(config, request).await?.snapshot().await?;
+            Ok(FirecrackerBridgeResponse::Snapshot {
+                kind: snapshot.kind,
+                payload: BASE64.encode(snapshot.bytes),
             })
         }
         FirecrackerBridgeRequest::Terminate { config, request } => {

@@ -44,6 +44,9 @@ pub trait SandboxHandle: SnapshotHandle {
     async fn list_sandboxes(&self) -> Result<Vec<SandboxRecord>>;
     async fn create_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId>;
     async fn fork_sandbox(&self, request: ForkSandboxRequest) -> Result<SandboxId>;
+    /// Create a new sandbox directly from an immutable snapshot. Unlike
+    /// `start_sandbox`, the target need not already exist.
+    async fn restore_sandbox(&self, request: RestoreSandboxRequest) -> Result<SandboxId>;
     async fn terminate_sandbox(&self, id: SandboxId) -> Result<()>;
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId>;
     async fn detach_sandbox(&self, id: SandboxId) -> Result<SandboxAttachment>;
@@ -654,6 +657,12 @@ pub struct CreateSandboxRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ForkSandboxRequest {
     pub source_id: SandboxId,
+    pub sandbox: CreateSandboxRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestoreSandboxRequest {
+    pub snapshot_id: SnapshotId,
     pub sandbox: CreateSandboxRequest,
 }
 

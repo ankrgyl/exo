@@ -139,6 +139,10 @@ pub enum SnapshotKind {
     /// Reference to a Sprites checkpoint id on a named sprite. Payload bytes are
     /// a small JSON manifest; restoring is `POST .../checkpoints/{id}/restore`.
     SpritesSnapshot,
+    /// Reference to an immutable Firecracker state/RAM/disk bundle in the
+    /// backend's private state root. Payload bytes are a small JSON manifest;
+    /// the multi-gigabyte snapshot remains local to that Firecracker host.
+    FirecrackerSnapshot,
 }
 
 #[async_trait]
@@ -640,6 +644,10 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
             (_, SnapshotKind::SpritesSnapshot) => bail!(
                 "SpritesSnapshot payloads can only be restored by the Sprites sandbox provider; \
                  select provider sprites to rewind this snapshot"
+            ),
+            (_, SnapshotKind::FirecrackerSnapshot) => bail!(
+                "FirecrackerSnapshot payloads can only be restored by the Firecracker sandbox provider; \
+                 select provider firecracker to rewind this snapshot"
             ),
         }
 

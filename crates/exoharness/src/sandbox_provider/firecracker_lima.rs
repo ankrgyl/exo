@@ -176,10 +176,34 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
 
     async fn acquire_from_snapshot(
         &self,
-        _request: SandboxRequest,
-        _payload: SnapshotPayload,
+        request: SandboxRequest,
+        payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        bail!("Firecracker sandboxes do not support restoring Exo snapshots")
+        let response = self
+            .request(FirecrackerBridgeRequest::AcquireFromSnapshot {
+                config: self.config.clone(),
+                request: request.clone(),
+                kind: payload.kind,
+                payload: BASE64.encode(payload.bytes),
+            })
+            .await?;
+        let FirecrackerBridgeResponse::Handle {
+            id,
+            provider_state,
+            effective_image,
+            startup_timing,
+        } = response
+        else {
+            bail!("Firecracker Lima bridge returned the wrong response to snapshot restore");
+        };
+        Ok(Arc::new(LimaFirecrackerSandboxHandle {
+            id,
+            provider_state,
+            effective_image,
+            startup_timing,
+            request,
+            backend: self.client(),
+        }))
     }
 }
 
@@ -272,7 +296,23 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
     }
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {
-        bail!("Firecracker sandbox snapshots are not implemented")
+        let response = self
+            .backend
+            .request(FirecrackerBridgeRequest::Snapshot {
+                config: self.backend.config.clone(),
+                request: self.request.clone(),
+            })
+            .await?;
+        let FirecrackerBridgeResponse::Snapshot { kind, payload } = response else {
+            bail!("Firecracker Lima bridge returned the wrong response to snapshot");
+        };
+        let bytes = BASE64
+            .decode(payload)
+            .context("decoding Firecracker snapshot bridge response")?;
+        Ok(SnapshotPayload {
+            kind,
+            bytes: Bytes::from(bytes),
+        })
     }
 }
 

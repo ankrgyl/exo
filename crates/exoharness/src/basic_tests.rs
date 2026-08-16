@@ -25,13 +25,13 @@ use crate::{
     BoxAsyncWrite, CloseSandboxProcessInputRequest, CreateSandboxRequest, DurableFileSystem,
     EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness, FileSystemMountMode,
     ForkConversationRequest, ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest,
-    NewConversationRequest, PutSecretRequest, RunInSandboxRequest, SandboxAttachment,
-    SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput, SandboxKey,
-    SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent, SandboxProcessEventQuery,
-    SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin, SandboxProvider,
-    SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotKind, SnapshotPayload,
-    StartSandboxProcessRequest, StartSandboxRequest, Uuid7, WaitSandboxProcessRequest,
-    WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    NewConversationRequest, PutSecretRequest, RestoreSandboxRequest, RunInSandboxRequest,
+    SandboxAttachment, SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput,
+    SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent,
+    SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin,
+    SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotKind,
+    SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
+    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const DEFAULT_DURABLE_CONTRACT_MOUNT_PATH: &str = "/home/exo/workspace";
@@ -324,6 +324,88 @@ async fn firecracker_fork_captures_current_source_state() {
         .terminate(source_request)
         .await
         .expect("terminate fork source");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "firecracker")]
+#[ignore = "uses a real Firecracker sandbox; requires Linux KVM or nested virtualization through Lima on macOS"]
+async fn firecracker_snapshot_restores_multiple_independent_targets() {
+    let config = firecracker_test_config();
+    let backend = crate::sandbox_provider::firecracker_backend_for_test(config)
+        .await
+        .expect("Firecracker backend");
+    let image = env_or("FIRECRACKER_IMAGE", &crate::default_firecracker_image());
+    let source_request =
+        provider_contract_request("firecracker", "snapshot-source", image.clone(), "/tmp");
+    let source = backend
+        .acquire(source_request.clone())
+        .await
+        .expect("acquire snapshot source");
+    let write = source
+        .exec(&SandboxCommand {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf %s captured > /tmp/exo-snapshot-state".to_string(),
+            ],
+            env: HashMap::new(),
+            display_argv: None,
+            cwd: Some("/".to_string()),
+            timeout: Some(Duration::from_secs(10)),
+        })
+        .await
+        .expect("write snapshot source state");
+    assert!(write.ok, "{}{}", write.stdout, write.stderr);
+    let snapshot = source.snapshot().await.expect("snapshot source");
+
+    let mutate = source
+        .exec(&SandboxCommand {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf %s mutated > /tmp/exo-snapshot-state".to_string(),
+            ],
+            env: HashMap::new(),
+            display_argv: None,
+            cwd: Some("/".to_string()),
+            timeout: Some(Duration::from_secs(10)),
+        })
+        .await
+        .expect("mutate source after snapshot");
+    assert!(mutate.ok, "{}{}", mutate.stdout, mutate.stderr);
+
+    for target in ["snapshot-target-1", "snapshot-target-2"] {
+        let target_request =
+            provider_contract_request("firecracker", target, image.clone(), "/tmp");
+        let restored = backend
+            .acquire_from_snapshot(target_request.clone(), snapshot.clone())
+            .await
+            .expect("restore snapshot target");
+        let read = restored
+            .exec(&SandboxCommand {
+                argv: vec![
+                    "/bin/cat".to_string(),
+                    "/tmp/exo-snapshot-state".to_string(),
+                ],
+                env: HashMap::new(),
+                display_argv: None,
+                cwd: Some("/".to_string()),
+                timeout: Some(Duration::from_secs(10)),
+            })
+            .await
+            .expect("read restored snapshot state");
+        assert!(read.ok, "{}{}", read.stdout, read.stderr);
+        assert_eq!(read.stdout, "captured");
+        backend
+            .terminate(target_request)
+            .await
+            .expect("terminate restored target");
+    }
+
+    backend
+        .terminate(source_request)
+        .await
+        .expect("terminate snapshot source");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2536,6 +2618,87 @@ async fn restored_sandbox_image_persists_for_cross_process_reattach() {
     // The reattach must target the restored image, not the originally
     // requested one; otherwise a real backend would boot a second container
     // with pre-restore state.
+    assert_eq!(
+        second_backend.acquired_images.lock().await.as_slice(),
+        &["restored-image".to_string()]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let first_backend = Arc::new(RestoreImageTestBackend::default());
+    let harness = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        first_backend.clone(),
+    )
+    .await
+    .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let agent_id = agent.record().id;
+
+    let source_id = agent
+        .create_sandbox(CreateSandboxRequest {
+            name: Some("source".to_string()),
+            provider: SandboxProvider::LocalProcess,
+            image: "original-image".to_string(),
+            default_workdir: Some("/".to_string()),
+            file_system_mounts: None,
+            durable_file_systems: None,
+            enable_networking: Some(true),
+            idle_seconds: Some(60),
+        })
+        .await
+        .expect("source sandbox should be created");
+    let snapshot_id = agent
+        .snapshot_sandbox(source_id.clone())
+        .await
+        .expect("snapshot should succeed");
+    first_backend.acquired_images.lock().await.clear();
+
+    let target_request = CreateSandboxRequest {
+        name: Some("target".to_string()),
+        provider: SandboxProvider::LocalProcess,
+        image: "original-image".to_string(),
+        default_workdir: Some("/".to_string()),
+        file_system_mounts: None,
+        durable_file_systems: None,
+        enable_networking: Some(true),
+        idle_seconds: Some(60),
+    };
+    let target_id = agent
+        .restore_sandbox(RestoreSandboxRequest {
+            snapshot_id,
+            sandbox: target_request.clone(),
+        })
+        .await
+        .expect("snapshot should restore into a new sandbox");
+    assert_ne!(target_id, source_id);
+    assert!(first_backend.acquired_images.lock().await.is_empty());
+
+    let second_backend = Arc::new(RestoreImageTestBackend::default());
+    let reloaded = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        second_backend.clone(),
+    )
+    .await
+    .expect("reloaded harness should initialize");
+    let reloaded_agent = reloaded
+        .get_agent(&agent_id)
+        .await
+        .expect("agent lookup should succeed")
+        .expect("agent should exist");
+    let reused_target_id = reloaded_agent
+        .create_sandbox(target_request)
+        .await
+        .expect("named target should be reused");
+    assert_eq!(reused_target_id, target_id);
     assert_eq!(
         second_backend.acquired_images.lock().await.as_slice(),
         &["restored-image".to_string()]
