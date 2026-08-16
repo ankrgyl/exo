@@ -16,7 +16,7 @@ mod tui;
 mod tui_app;
 
 use std::collections::HashMap;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -719,7 +719,8 @@ enum SandboxCommands {
     Stop {
         #[command(flatten)]
         owner: SandboxOwnerArgs,
-        #[arg(required = true, value_name = "SANDBOX_ID")]
+        /// Sandbox IDs; when omitted, read whitespace-delimited IDs from stdin.
+        #[arg(value_name = "SANDBOX_ID")]
         sandbox_ids: Vec<String>,
     },
     /// Destroy sandboxes and remove their retained records (alias: kill).
@@ -727,7 +728,8 @@ enum SandboxCommands {
     Terminate {
         #[command(flatten)]
         owner: SandboxOwnerArgs,
-        #[arg(required = true, value_name = "SANDBOX_ID")]
+        /// Sandbox IDs; when omitted, read whitespace-delimited IDs from stdin.
+        #[arg(value_name = "SANDBOX_ID")]
         sandbox_ids: Vec<String>,
     },
 }
@@ -2401,9 +2403,7 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
                 sandboxes.retain(|sandbox| sandbox.running);
             }
             if quiet {
-                for sandbox in sandboxes {
-                    println!("{}", sandbox.id);
-                }
+                write_sandbox_ids(sandboxes.into_iter().map(|sandbox| sandbox.id))?;
             } else {
                 print_table(
                     &["ID", "NAME", "PROVIDER", "STATE", "IMAGE"],
@@ -2412,7 +2412,10 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
                         .map(|sandbox| {
                             vec![
                                 sandbox.id,
-                                sandbox.name.unwrap_or_default(),
+                                sandbox
+                                    .name
+                                    .filter(|name| !name.trim().is_empty())
+                                    .unwrap_or_else(|| "<none>".to_string()),
                                 sandbox.provider.to_string(),
                                 if sandbox.running {
                                     "running"
@@ -2466,6 +2469,10 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
             }
         }
         SandboxCommands::Stop { owner, sandbox_ids } => {
+            let sandbox_ids = sandbox_ids_or_stdin(sandbox_ids)?;
+            if sandbox_ids.is_empty() {
+                return Ok(());
+            }
             let agent = sandbox_owner(harness, owner.agent.as_deref()).await?;
             for sandbox_id in sandbox_ids {
                 agent
@@ -2475,6 +2482,10 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
             }
         }
         SandboxCommands::Terminate { owner, sandbox_ids } => {
+            let sandbox_ids = sandbox_ids_or_stdin(sandbox_ids)?;
+            if sandbox_ids.is_empty() {
+                return Ok(());
+            }
             let agent = sandbox_owner(harness, owner.agent.as_deref()).await?;
             for sandbox_id in sandbox_ids {
                 agent
@@ -2482,6 +2493,36 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
                     .await
                     .with_context(|| format!("terminating sandbox {sandbox_id}"))?;
             }
+        }
+    }
+    Ok(())
+}
+
+fn sandbox_ids_or_stdin(sandbox_ids: Vec<String>) -> Result<Vec<String>> {
+    if !sandbox_ids.is_empty() {
+        return Ok(sandbox_ids);
+    }
+    if io::stdin().is_terminal() {
+        bail!("provide at least one sandbox ID or pipe IDs on stdin");
+    }
+
+    let mut input = String::new();
+    io::stdin().lock().read_to_string(&mut input)?;
+    let sandbox_ids = input
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    Ok(sandbox_ids)
+}
+
+fn write_sandbox_ids(ids: impl IntoIterator<Item = String>) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    for id in ids {
+        if let Err(error) = writeln!(stdout, "{id}") {
+            if error.kind() == io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(error.into());
         }
     }
     Ok(())
