@@ -12,7 +12,7 @@ use crossterm::event::{
 };
 use executor::{
     EventId, EventQuery, EventQueryDirection, ExecutionStreamEvent, HarnessAgent,
-    HarnessConversation, SendRequest, SessionId,
+    HarnessConversation, SendRequest, SessionId, format_user_facing_error,
 };
 use lingua::Message;
 use lingua::universal::UserContent;
@@ -611,7 +611,7 @@ impl TuiApp {
                     while let Some(event) = stream.next().await {
                         let app_event = match event {
                             Ok(event) => AppEvent::Stream(event),
-                            Err(error) => AppEvent::StreamError(format!("{error:#}")),
+                            Err(error) => AppEvent::StreamError(format_user_facing_error(&error)),
                         };
                         if tx.send(app_event).is_err() {
                             return;
@@ -619,7 +619,7 @@ impl TuiApp {
                     }
                 }
                 Err(error) => {
-                    let _ = tx.send(AppEvent::StreamError(format!("{error:#}")));
+                    let _ = tx.send(AppEvent::StreamError(format_user_facing_error(&error)));
                 }
             }
             let _ = tx.send(AppEvent::StreamDone);

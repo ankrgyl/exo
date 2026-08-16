@@ -30,6 +30,7 @@ use tokio::task::JoinHandle;
 use crate::execution_tracing::TurnExecutionTrace;
 use crate::harness_executor::{ExecutorHarnessRuntime, ExecutorStreamMode, HarnessExecutor};
 use crate::harness_facade::{SharedHarness, SharedHarnessBacked};
+use crate::harness_helpers::UnregisteredModelError;
 use crate::harness_tool::{BasicToolRuntime, ExoToolRuntime, ensure_shell_sandbox};
 use crate::shared::try_send_stream_event;
 use crate::{
@@ -442,6 +443,9 @@ impl TypeScriptRunnerProcess {
                         }
                         GuestToHostMessage::Done => return Ok(()),
                         GuestToHostMessage::Error { message, stack } => {
+                            if let Some(unregistered) = unregistered_model_from_guest(&message) {
+                                return Err(anyhow::Error::new(unregistered));
+                            }
                             let stack_suffix = stack
                                 .as_deref()
                                 .map(|stack| format!("\n{stack}"))
@@ -1283,6 +1287,14 @@ async fn write_protocol_message(
     Ok(())
 }
 
+fn unregistered_model_from_guest(message: &str) -> Option<UnregisteredModelError> {
+    message
+        .strip_prefix("model is not registered: ")
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && !name.contains(char::is_whitespace))
+        .map(UnregisteredModelError::new)
+}
+
 fn format_error_chain(error: &anyhow::Error, context: std::fmt::Arguments<'_>) -> String {
     let mut message = context.to_string();
     for (index, cause) in error.chain().enumerate() {
@@ -1416,5 +1428,14 @@ mod tests {
                 "expected {line} to be dropped",
             );
         }
+    }
+
+    #[test]
+    fn guest_unregistered_model_errors_become_typed() {
+        let error = unregistered_model_from_guest("model is not registered: gpt-5.6-terra")
+            .expect("exact guest message should map");
+        assert_eq!(error.name, "gpt-5.6-terra");
+        assert!(unregistered_model_from_guest("boom: model is not registered: x").is_none());
+        assert!(unregistered_model_from_guest("model is not registered:").is_none());
     }
 }
