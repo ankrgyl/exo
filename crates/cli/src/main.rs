@@ -683,9 +683,8 @@ enum SandboxCommands {
     Start(Box<SandboxStartArgs>),
     /// Start a sandbox, enter a shell, and destroy it when the shell exits.
     Play(Box<SandboxPlayArgs>),
-    /// List sandboxes (alias: ps). Running only unless --all is passed.
-    #[command(alias = "ps")]
-    List {
+    /// List sandboxes. Running only unless --all is passed.
+    Ps {
         #[command(flatten)]
         owner: SandboxOwnerArgs,
         /// Include stopped sandboxes.
@@ -723,8 +722,7 @@ enum SandboxCommands {
         #[arg(value_name = "SANDBOX_ID")]
         sandbox_ids: Vec<String>,
     },
-    /// Destroy sandboxes and remove their retained records (alias: kill).
-    #[command(alias = "kill")]
+    /// Destroy sandboxes and remove their retained records.
     Terminate {
         #[command(flatten)]
         owner: SandboxOwnerArgs,
@@ -2394,7 +2392,7 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
                 }
             }
         }
-        SandboxCommands::List { owner, all, quiet } => {
+        SandboxCommands::Ps { owner, all, quiet } => {
             let mut sandboxes = sandbox_owner(harness, owner.agent.as_deref())
                 .await?
                 .list_sandboxes()
