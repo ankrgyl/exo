@@ -153,9 +153,13 @@ async fn http_exoharness_runs_noninteractive_sandbox_commands() {
         })
         .await
         .expect("sandbox");
+    assert_eq!(
+        conversation.list_sandboxes().await.expect("list sandboxes")[0].id,
+        sandbox_id
+    );
     let process = conversation
         .run_in_sandbox(RunInSandboxRequest {
-            id: sandbox_id,
+            id: sandbox_id.clone(),
             command: vec![
                 "/bin/sh".to_string(),
                 "-lc".to_string(),

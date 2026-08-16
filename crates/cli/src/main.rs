@@ -400,7 +400,7 @@ enum Commands {
         #[command(subcommand)]
         command: ProviderCommands,
     },
-    /// Start and interact with sandboxes directly.
+    /// Manage sandboxes directly. Each command accepts --agent; omitted uses a shared owner.
     Sandbox {
         #[command(subcommand)]
         command: SandboxCommands,
@@ -683,8 +683,15 @@ enum SandboxCommands {
     Start(Box<SandboxStartArgs>),
     /// Start a sandbox, enter a shell, and destroy it when the shell exits.
     Play(Box<SandboxPlayArgs>),
+    /// List retained sandboxes.
+    List {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
+    },
     /// Run a command and stream its output.
     Exec {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
         sandbox_id: String,
         #[arg(long = "env", value_name = "NAME=VALUE")]
         env: Vec<String>,
@@ -693,6 +700,8 @@ enum SandboxCommands {
     },
     /// Connect stdin/stdout/stderr to an interactive shell (without a PTY).
     Connect {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
         sandbox_id: String,
         #[arg(long, default_value = "/bin/bash")]
         shell: String,
@@ -700,13 +709,30 @@ enum SandboxCommands {
         env: Vec<String>,
     },
     /// Stop a sandbox while retaining its stored record.
-    Stop { sandbox_id: String },
+    Stop {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
+        sandbox_id: String,
+    },
     /// Destroy a sandbox's retained backend state.
-    Terminate { sandbox_id: String },
+    Terminate {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
+        sandbox_id: String,
+    },
+}
+
+#[derive(Debug, Args)]
+struct SandboxOwnerArgs {
+    /// Agent that owns the sandbox; omitted uses the shared CLI owner.
+    #[arg(long, value_name = "AGENT")]
+    agent: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct SandboxStartArgs {
+    #[command(flatten)]
+    owner: SandboxOwnerArgs,
     #[arg(long)]
     name: Option<String>,
     #[command(flatten)]
@@ -744,6 +770,8 @@ struct SandboxCreateArgs {
 
 #[derive(Debug, Args)]
 struct SandboxPlayArgs {
+    #[command(flatten)]
+    owner: SandboxOwnerArgs,
     #[command(flatten)]
     sandbox: SandboxCreateArgs,
     #[arg(long, default_value = "/bin/bash")]
@@ -2308,18 +2336,23 @@ async fn main() -> Result<()> {
 async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands) -> Result<()> {
     match command {
         SandboxCommands::Start(args) => {
-            let SandboxStartArgs { name, sandbox } = *args;
-            let (_, sandbox_id) = start_sandbox(harness, name, sandbox).await?;
+            let SandboxStartArgs {
+                owner,
+                name,
+                sandbox,
+            } = *args;
+            let (_, sandbox_id) = start_sandbox(harness, owner.agent, name, sandbox).await?;
             println!("{sandbox_id}");
         }
         SandboxCommands::Play(args) => {
             let SandboxPlayArgs {
+                owner,
                 sandbox,
                 shell,
                 env,
             } = *args;
             let env = parse_environment(env)?;
-            let (agent, sandbox_id) = start_sandbox(harness, None, sandbox).await?;
+            let (agent, sandbox_id) = start_sandbox(harness, owner.agent, None, sandbox).await?;
             println!("started {sandbox_id}");
             let shell_result = tokio::select! {
                 result = run_sandbox_process(
@@ -2349,12 +2382,39 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
                 }
             }
         }
+        SandboxCommands::List { owner } => {
+            let sandboxes = sandbox_owner(harness, owner.agent.as_deref())
+                .await?
+                .list_sandboxes()
+                .await?;
+            print_table(
+                &["ID", "NAME", "PROVIDER", "STATE", "IMAGE"],
+                sandboxes
+                    .into_iter()
+                    .map(|sandbox| {
+                        vec![
+                            sandbox.id,
+                            sandbox.name.unwrap_or_default(),
+                            sandbox.provider.to_string(),
+                            if sandbox.running {
+                                "running"
+                            } else {
+                                "stopped"
+                            }
+                            .to_string(),
+                            sandbox.image,
+                        ]
+                    })
+                    .collect(),
+            )?;
+        }
         SandboxCommands::Exec {
+            owner,
             sandbox_id,
             env,
             command,
         } => {
-            let agent = sandbox_owner(harness).await?;
+            let agent = sandbox_owner(harness, owner.agent.as_deref()).await?;
             let exit_code = run_sandbox_process(
                 agent.as_ref(),
                 sandbox_id,
@@ -2368,11 +2428,12 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
             }
         }
         SandboxCommands::Connect {
+            owner,
             sandbox_id,
             shell,
             env,
         } => {
-            let agent = sandbox_owner(harness).await?;
+            let agent = sandbox_owner(harness, owner.agent.as_deref()).await?;
             let exit_code = run_sandbox_process(
                 agent.as_ref(),
                 sandbox_id,
@@ -2385,14 +2446,14 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
                 bail!("sandbox shell exited with status {exit_code}");
             }
         }
-        SandboxCommands::Stop { sandbox_id } => {
-            sandbox_owner(harness)
+        SandboxCommands::Stop { owner, sandbox_id } => {
+            sandbox_owner(harness, owner.agent.as_deref())
                 .await?
                 .stop_sandbox(sandbox_id)
                 .await?;
         }
-        SandboxCommands::Terminate { sandbox_id } => {
-            sandbox_owner(harness)
+        SandboxCommands::Terminate { owner, sandbox_id } => {
+            sandbox_owner(harness, owner.agent.as_deref())
                 .await?
                 .terminate_sandbox(sandbox_id)
                 .await?;
@@ -2401,8 +2462,22 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
     Ok(())
 }
 
-async fn sandbox_owner(harness: &dyn Harness) -> Result<Arc<dyn AgentHandle>> {
+async fn sandbox_owner(
+    harness: &dyn Harness,
+    agent_ref: Option<&str>,
+) -> Result<Arc<dyn AgentHandle>> {
     let exoharness = harness.exoharness_handle();
+    if let Some(agent_ref) = agent_ref {
+        return exoharness
+            .list_agents()
+            .await?
+            .into_iter()
+            .find(|agent| {
+                agent.record().slug == agent_ref || agent.record().id.to_string() == agent_ref
+            })
+            .ok_or_else(|| anyhow!("agent not found: {agent_ref}"));
+    }
+
     if let Some(agent) = exoharness
         .list_agents()
         .await?
@@ -2422,6 +2497,7 @@ async fn sandbox_owner(harness: &dyn Harness) -> Result<Arc<dyn AgentHandle>> {
 
 async fn start_sandbox(
     harness: &dyn Harness,
+    agent: Option<String>,
     name: Option<String>,
     args: SandboxCreateArgs,
 ) -> Result<(Arc<dyn AgentHandle>, String)> {
@@ -2443,7 +2519,7 @@ async fn start_sandbox(
     }
     mounts.extend(internal_mounts);
 
-    let agent = sandbox_owner(harness).await?;
+    let agent = sandbox_owner(harness, agent.as_deref()).await?;
     let sandbox_id = agent
         .create_sandbox(CreateSandboxRequest {
             name,

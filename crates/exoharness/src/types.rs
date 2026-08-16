@@ -41,6 +41,7 @@ pub trait SnapshotHandle: Send + Sync {
 
 #[async_trait]
 pub trait SandboxHandle: SnapshotHandle {
+    async fn list_sandboxes(&self) -> Result<Vec<SandboxRecord>>;
     async fn create_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId>;
     async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {
         self.stop_sandbox(id).await
@@ -615,6 +616,15 @@ pub struct DurableFileSystem {
     pub name: String,
     pub mount_path: String,
     pub mode: FileSystemMountMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SandboxRecord {
+    pub id: SandboxId,
+    pub name: Option<String>,
+    pub provider: SandboxProvider,
+    pub image: String,
+    pub running: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

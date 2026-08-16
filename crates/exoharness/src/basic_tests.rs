@@ -943,9 +943,18 @@ async fn basic_backend_runs_commands_in_created_sandbox() {
         .await
         .expect("sandbox should be created");
 
+    let sandboxes = conversation
+        .list_sandboxes()
+        .await
+        .expect("sandboxes should list");
+    assert_eq!(sandboxes.len(), 1);
+    assert_eq!(sandboxes[0].id, sandbox_id);
+    assert_eq!(sandboxes[0].provider, SandboxProvider::LocalProcess);
+    assert!(sandboxes[0].running);
+
     let process = conversation
         .run_in_sandbox(RunInSandboxRequest {
-            id: sandbox_id,
+            id: sandbox_id.clone(),
             command: vec!["/bin/sh".to_string(), "-lc".to_string(), "cat".to_string()],
             env: Default::default(),
         })
@@ -970,6 +979,12 @@ async fn basic_backend_runs_commands_in_created_sandbox() {
     assert_eq!(String::from_utf8_lossy(&stdout_bytes), "hello");
     assert_eq!(String::from_utf8_lossy(&stderr_bytes), "");
     assert_eq!(wait_result.expect("process should exit"), 0);
+
+    conversation
+        .stop_sandbox(sandbox_id)
+        .await
+        .expect("sandbox should stop");
+    assert!(!conversation.list_sandboxes().await.expect("sandboxes")[0].running);
 }
 
 #[tokio::test(flavor = "current_thread")]

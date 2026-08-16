@@ -11,9 +11,9 @@ use exoharness::{
     GetEventsResult, ListConversationsRequest, ListConversationsResult, NewAgentRequest,
     NewConversationRequest, PutSecretRequest, ReadArtifactRequest, Result, RunInSandboxRequest,
     SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery,
-    SandboxProcessRecord, SandboxProcessStatus, SandboxProvider, Secret, SecretId, SecretMetadata,
-    SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle,
-    TurnRecord, Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest,
+    SandboxProcessRecord, SandboxProcessStatus, SandboxProvider, SandboxRecord, Secret, SecretId,
+    SecretMetadata, SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest,
+    TurnHandle, TurnRecord, Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest,
     WriteSandboxProcessInputRequest,
 };
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,16 @@ const LOCAL_SANDBOX_MAP_EVENT: &str = "local_sandbox_mapped";
 struct LocalSandboxMapEvent {
     remote_sandbox_id: SandboxId,
     local_sandbox_id: SandboxId,
+}
+
+fn merge_sandbox_records(
+    mut remote: Vec<SandboxRecord>,
+    local: Vec<SandboxRecord>,
+) -> Vec<SandboxRecord> {
+    remote.extend(local);
+    remote.sort_unstable_by(|left, right| right.id.cmp(&left.id));
+    remote.dedup_by(|left, right| left.id == right.id);
+    remote
 }
 
 pub struct LocalSandboxExoHarness {
@@ -317,6 +327,13 @@ impl SnapshotHandle for LocalSandboxAgent {
 
 #[async_trait]
 impl SandboxHandle for LocalSandboxAgent {
+    async fn list_sandboxes(&self) -> Result<Vec<SandboxRecord>> {
+        Ok(merge_sandbox_records(
+            self.remote.list_sandboxes().await?,
+            self.local_agent().await?.list_sandboxes().await?,
+        ))
+    }
+
     async fn create_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId> {
         if !self.wants_local_sandbox(&request) {
             return self.remote.create_sandbox(request).await;
@@ -832,6 +849,25 @@ impl SnapshotHandle for LocalSandboxConversation {
 
 #[async_trait]
 impl SandboxHandle for LocalSandboxConversation {
+    async fn list_sandboxes(&self) -> Result<Vec<SandboxRecord>> {
+        let remote = self.remote.list_sandboxes().await?;
+        let local_to_remote = self
+            .state
+            .sandboxes
+            .lock()
+            .await
+            .iter()
+            .map(|(remote, local)| (local.clone(), remote.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut local = self.local_conversation().await?.list_sandboxes().await?;
+        for sandbox in &mut local {
+            if let Some(remote_id) = local_to_remote.get(&sandbox.id) {
+                sandbox.id = remote_id.clone();
+            }
+        }
+        Ok(merge_sandbox_records(remote, local))
+    }
+
     async fn create_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId> {
         if !self.wants_local_sandbox(&request) {
             return self.remote.create_sandbox(request).await;
@@ -1126,6 +1162,12 @@ mod tests {
             .expect("remote events should load")
             .events;
         assert_eq!(remote_events.len(), 2);
+        let sandboxes = conversation
+            .list_sandboxes()
+            .await
+            .expect("local sandboxes should list through the wrapper");
+        assert_eq!(sandboxes.len(), 1);
+        assert_eq!(sandboxes[0].id, sandbox_id);
 
         let remote_agent = remote
             .get_agent(&agent.record().id)

@@ -10,9 +10,9 @@ use crate::{
     AgentHandle, AgentId, AttachSandboxRequest, CancelSandboxProcessRequest,
     CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, CreateSandboxRequest,
     ExoHarness, GetSandboxProcessEventsResult, ListConversationsResult, Result, SandboxAttachment,
-    SandboxId, SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, SessionId,
-    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord,
-    WaitSandboxProcessRequest, WriteSandboxProcessInputRequest,
+    SandboxId, SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, SandboxRecord,
+    SessionId, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId,
+    TurnRecord, WaitSandboxProcessRequest, WriteSandboxProcessInputRequest,
 };
 
 pub struct ExoHarnessServer {
@@ -137,6 +137,9 @@ impl ExoHarnessServer {
                     artifact: agent.write_artifact(request).await?,
                 })
             }
+            Request::ListSandboxes { scope } => Ok(Response::Sandboxes {
+                sandboxes: self.list_sandboxes(scope).await?,
+            }),
             Request::CreateSandbox { scope, request } => Ok(Response::SandboxId {
                 sandbox_id: self.create_sandbox(scope, request).await?,
             }),
@@ -494,6 +497,25 @@ impl ExoHarnessServer {
         }
     }
 
+    async fn list_sandboxes(&self, scope: SandboxScope) -> Result<Vec<SandboxRecord>> {
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id).await?.list_sandboxes().await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .list_sandboxes()
+                    .await
+            }
+            SandboxScope::Turn { .. } => {
+                Err(anyhow!("list_sandboxes is not supported on a turn scope"))
+            }
+        }
+    }
     async fn attach_sandbox(
         &self,
         scope: SandboxScope,

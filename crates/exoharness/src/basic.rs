@@ -43,8 +43,8 @@ use crate::{
     ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId,
     SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessId,
     SandboxProcessMode, SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus,
-    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, Secret, SecretId, SecretMetadata,
-    SecretType, SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
+    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, SandboxRecord, Secret, SecretId,
+    SecretMetadata, SecretType, SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
     StartSandboxRequest, TurnHandle, TurnId, TurnRecord, Uuid7, WaitSandboxProcessRequest,
     WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
@@ -1087,6 +1087,10 @@ impl<T> SandboxHandle for T
 where
     T: BasicFullSandboxScope + Send + Sync,
 {
+    async fn list_sandboxes(&self) -> Result<Vec<SandboxRecord>> {
+        self.sandbox_handle().list_sandboxes().await
+    }
+
     async fn create_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId> {
         self.sandbox_handle().create_sandbox(request).await
     }
@@ -1587,6 +1591,20 @@ impl<'a> BasicScopedSandboxHandle<'a> {
 
     fn sandboxes_dir(&self) -> PathBuf {
         self.owner_dir.join("sandboxes")
+    }
+
+    async fn list_sandboxes(&self) -> Result<Vec<SandboxRecord>> {
+        let mut sandboxes = self
+            .harness
+            .inner
+            .storage
+            .list_json_matching_suffix::<StoredSandbox>(self.sandboxes_dir(), ".json")
+            .await?
+            .into_iter()
+            .map(SandboxRecord::from)
+            .collect::<Vec<_>>();
+        sandboxes.sort_unstable_by(|left, right| right.id.cmp(&left.id));
+        Ok(sandboxes)
     }
 
     async fn create_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId> {
@@ -3359,6 +3377,18 @@ struct StoredSandbox {
     latest_snapshot_id: Option<SnapshotId>,
     #[serde(default)]
     attachment: Option<SandboxAttachment>,
+}
+
+impl From<StoredSandbox> for SandboxRecord {
+    fn from(sandbox: StoredSandbox) -> Self {
+        Self {
+            id: sandbox.id,
+            name: sandbox.name,
+            provider: sandbox.provider,
+            image: sandbox.image,
+            running: sandbox.running,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
