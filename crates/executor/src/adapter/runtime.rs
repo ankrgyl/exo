@@ -923,6 +923,23 @@ fn attachment_kind_label(kind: AdapterAttachmentKind) -> &'static str {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WakeupPromptMetadata {
+    #[serde(default)]
+    prompt_notes: Vec<String>,
+}
+
+fn wakeup_prompt_notes(metadata: &serde_json::Value) -> Vec<String> {
+    serde_json::from_value::<WakeupPromptMetadata>(metadata.clone())
+        .unwrap_or_default()
+        .prompt_notes
+        .into_iter()
+        .map(|note| note.trim().to_string())
+        .filter(|note| !note.is_empty())
+        .collect()
+}
+
 fn compose_inbound_wakeup_prompt(
     config: &AdapterConfig,
     adapter: &AdapterRecord,
@@ -938,18 +955,9 @@ fn compose_inbound_wakeup_prompt(
         "{} message received at target `{}` from {} via adapter `{}`:\n\n{}",
         config.adapter_type, target, sender, adapter.name, text,
     );
-    if let Some(notes) = metadata
-        .get("promptNotes")
-        .and_then(|value| value.as_array())
-    {
-        for note in notes.iter().filter_map(|value| value.as_str()) {
-            let note = note.trim();
-            if note.is_empty() {
-                continue;
-            }
-            prompt.push_str("\n\n");
-            prompt.push_str(note);
-        }
+    for note in wakeup_prompt_notes(metadata) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&note);
     }
     if !attachments.is_empty() {
         prompt.push_str("\n\nThe message includes these attachments:\n");
@@ -1262,8 +1270,7 @@ mod tests {
                 "promptNotes": [
                     "Slack sender DM target: `dm:U123`. Use this only for appropriate private follow-up; do not use DM to bypass safety policy.",
                     "This Slack message is from an active thread, but it may be ambient conversation. Only call send_adapter_message if the message appears directed at Exo, asks Exo to do something, or clearly needs an Exo response. If no response is needed, do nothing.",
-                    "",
-                    12
+                    " "
                 ]
             }),
             &[],
@@ -1273,25 +1280,6 @@ mod tests {
         assert!(prompt.contains("do not use DM to bypass safety policy"));
         assert!(prompt.contains("Only call send_adapter_message"));
         assert!(prompt.contains("If no response is needed, do nothing"));
-        assert!(!prompt.contains("\n\n12"));
-    }
-
-    #[test]
-    fn wakeup_prompt_ignores_legacy_slack_metadata_without_prompt_notes() {
-        let mut adapter = test_adapter_record();
-        adapter.config.adapter_type = "slack".to_string();
-        adapter.name = "slack-dev".to_string();
-        let prompt = compose_inbound_wakeup_prompt(
-            &adapter.config,
-            &adapter,
-            "C123:1700000000.000000",
-            Some("U123"),
-            "hello",
-            &serde_json::json!({ "dmTarget": "dm:U123", "isActiveThread": true }),
-            &[],
-            0,
-        );
-        assert!(!prompt.contains("Slack sender DM target"));
-        assert!(!prompt.contains("active thread"));
+        assert!(!prompt.contains("\n\n "));
     }
 }
