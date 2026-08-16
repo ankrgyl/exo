@@ -22,26 +22,28 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use executor::{
     AgentHarnessKind, AttachSandboxRequest, BasicExoHarness, BasicExoHarnessConfig, BasicHarness,
     BasicToolRuntime, Binding, BraintrustProject, BraintrustRuntimeConfig, BraintrustTracingConfig,
-    ConversationModelConfig, CreateAgentRequest, CreateConversationRequest, DaytonaBackendSpec,
-    E2bBackendSpec, EventKind, EventQuery, EventQueryDirection, ExoHarness,
-    ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount, FileSystemMountMode,
-    ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART, HTTP_EXOHARNESS_TRACING_TARGET,
-    Harness, HarnessAgent, HarnessConversation, HttpExoHarness, LocalSandboxExoHarness,
-    PutSecretRequest, RlmHarness, SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment,
-    SandboxBackendRegistration, SandboxProvider, SandboxProviderConfig, SandboxScope, Secret,
-    SecretBackendChoice, SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness,
-    TypeScriptHarnessConfig, Uuid7, VercelBackendSpec, default_aws_agentcore_image,
-    default_daytona_image, default_docker_image, default_e2b_template, default_vercel_image,
-    effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config, record_host_event,
-    send_conversation_wakeup, serve_exoharness_http_listener_with_options,
+    ConversationModelConfig, CreateAgentRequest, CreateConversationRequest, CreateSandboxRequest,
+    DaytonaBackendSpec, DurableFileSystem, E2bBackendSpec, EventKind, EventQuery,
+    EventQueryDirection, ExoHarness, ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount,
+    FileSystemMountMode, ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART,
+    HTTP_EXOHARNESS_TRACING_TARGET, Harness, HarnessAgent, HarnessConversation, HttpExoHarness,
+    LocalSandboxExoHarness, PutSecretRequest, RlmHarness, RunInSandboxRequest,
+    SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment, SandboxBackendRegistration, SandboxProcess,
+    SandboxProvider, SandboxProviderConfig, SandboxScope, Secret, SecretBackendChoice,
+    SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness, TypeScriptHarnessConfig,
+    Uuid7, VercelBackendSpec, default_aws_agentcore_image, default_daytona_image,
+    default_docker_image, default_e2b_template, default_vercel_image, effective_sandbox_scope,
+    finalize_rebuild_update_file, load_agent_config, record_host_event, send_conversation_wakeup,
+    serve_exoharness_http_listener_with_options,
 };
 use serde::Deserialize;
 use tabwriter::TabWriter;
+use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::env::CliEnvironment;
@@ -396,6 +398,11 @@ enum Commands {
         #[command(subcommand)]
         command: ProviderCommands,
     },
+    /// Start and interact with sandboxes directly.
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommands,
+    },
     /// Manage local stored secrets.
     Secret {
         #[command(subcommand)]
@@ -669,6 +676,85 @@ enum ConversationSandboxCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum SandboxCommands {
+    /// Create and start a sandbox owned by an agent.
+    Start(SandboxStartArgs),
+    /// Start a sandbox, enter a shell, and destroy it when the shell exits.
+    Play(Box<SandboxPlayArgs>),
+    /// Run a command and stream its output.
+    Exec {
+        agent: String,
+        sandbox_id: String,
+        #[arg(long = "env", value_name = "NAME=VALUE")]
+        env: Vec<String>,
+        #[arg(required = true, trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+    /// Connect stdin/stdout/stderr to an interactive shell (without a PTY).
+    Connect {
+        agent: String,
+        sandbox_id: String,
+        #[arg(long, default_value = "/bin/bash")]
+        shell: String,
+        #[arg(long = "env", value_name = "NAME=VALUE")]
+        env: Vec<String>,
+    },
+    /// Stop a sandbox while retaining its stored record.
+    Stop { agent: String, sandbox_id: String },
+    /// Destroy a sandbox's retained backend state.
+    Terminate { agent: String, sandbox_id: String },
+}
+
+#[derive(Debug, Args)]
+struct SandboxStartArgs {
+    agent: String,
+    #[arg(long)]
+    name: Option<String>,
+    #[command(flatten)]
+    sandbox: SandboxCreateArgs,
+}
+
+#[derive(Debug, Args)]
+struct SandboxCreateArgs {
+    #[arg(long, value_enum)]
+    provider: SandboxProviderArg,
+    /// Image, template, or root filesystem understood by the provider.
+    /// Omitting it uses the provider binding's default.
+    #[arg(long, default_value = "")]
+    image: String,
+    #[arg(long)]
+    workdir: Option<String>,
+    #[arg(long, value_enum)]
+    networking: Option<EnabledDisabled>,
+    #[arg(long)]
+    idle_seconds: Option<u64>,
+    /// Host directory mount: HOST_PATH:GUEST_PATH[:ro|rw].
+    #[arg(long = "mount", value_name = "MOUNT", value_parser = parse_sandbox_mount)]
+    mounts: Vec<FileSystemMount>,
+    /// Internal host directory mount: HOST_PATH:GUEST_PATH[:ro|rw].
+    #[arg(
+        long = "internal-mount",
+        value_name = "MOUNT",
+        value_parser = parse_sandbox_mount
+    )]
+    internal_mounts: Vec<FileSystemMount>,
+    /// Durable filesystem: NAME:GUEST_PATH[:ro|rw].
+    #[arg(long = "durable", value_name = "MOUNT", value_parser = parse_durable_mount)]
+    durable_file_systems: Vec<DurableFileSystem>,
+}
+
+#[derive(Debug, Args)]
+struct SandboxPlayArgs {
+    agent: String,
+    #[command(flatten)]
+    sandbox: SandboxCreateArgs,
+    #[arg(long, default_value = "/bin/bash")]
+    shell: String,
+    #[arg(long = "env", value_name = "NAME=VALUE")]
+    env: Vec<String>,
+}
+
+#[derive(Debug, Subcommand)]
 enum SecretCommands {
     List,
     Set {
@@ -778,7 +864,7 @@ struct ConversationSandboxRuntimeUpdateArgs {
     clear_shell_program: bool,
     #[arg(long)]
     clear_sandbox_image: bool,
-    #[arg(long)]
+    #[arg(long = "clear-provider")]
     clear_sandbox_provider: bool,
 }
 
@@ -791,7 +877,7 @@ impl ConversationSandboxRuntimeUpdateArgs {
             bail!("provide either --clear-sandbox-image or --sandbox-image, not both");
         }
         if self.clear_sandbox_provider && self.runtime.sandbox_provider.is_some() {
-            bail!("provide either --clear-sandbox-provider or --sandbox-provider, not both");
+            bail!("provide either --clear-provider or --provider, not both");
         }
         self.runtime.validate()?;
 
@@ -874,8 +960,14 @@ async fn main() -> Result<()> {
         .map(|env| env_value_from_arg("--bearer-env", env, &env_vars))
         .transpose()?;
     let default_sandbox_provider = default_local_sandbox_provider();
-    let exoharness =
-        instantiate_exoharness(&exo_config, cli.exoharness_url.as_deref(), bearer_token).await?;
+    let route_local_sandboxes = !matches!(&cli.command, Commands::Sandbox { .. });
+    let exoharness = instantiate_exoharness(
+        &exo_config,
+        cli.exoharness_url.as_deref(),
+        bearer_token,
+        route_local_sandboxes,
+    )
+    .await?;
     let harness_kind = determine_harness_kind(
         exoharness.as_ref(),
         harness_selection.as_ref(),
@@ -893,7 +985,6 @@ async fn main() -> Result<()> {
         pricing,
     )
     .await?;
-
     match cli.command {
         Commands::Tools { .. } => unreachable!("tools commands return before harness startup"),
         Commands::Adapters { command } => {
@@ -1996,6 +2087,9 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Commands::Sandbox { command } => {
+            handle_sandbox_command(harness.as_ref(), command).await?;
+        }
         Commands::Secret { command } => match command {
             SecretCommands::List => {
                 let secrets = harness.exoharness_handle().list_secrets().await?;
@@ -2212,6 +2306,215 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands) -> Result<()> {
+    match command {
+        SandboxCommands::Start(args) => {
+            let (_, sandbox_id) =
+                start_sandbox(harness, args.agent, args.name, args.sandbox).await?;
+            println!("{sandbox_id}");
+        }
+        SandboxCommands::Play(args) => {
+            let SandboxPlayArgs {
+                agent,
+                sandbox,
+                shell,
+                env,
+            } = *args;
+            let env = parse_environment(env)?;
+            let (agent, sandbox_id) = start_sandbox(harness, agent, None, sandbox).await?;
+            println!("started {sandbox_id}");
+            let shell_result = tokio::select! {
+                result = run_sandbox_process(
+                    agent.as_ref(),
+                    sandbox_id.clone(),
+                    vec![shell, "-i".to_string()],
+                    env,
+                    true,
+                ) => result,
+                result = tokio::signal::ctrl_c() => {
+                    result?;
+                    Ok(130)
+                }
+            };
+            let cleanup_result = agent
+                .exoharness_handle()
+                .terminate_sandbox(sandbox_id)
+                .await;
+            match (shell_result, cleanup_result) {
+                (Ok(0), Ok(())) => {}
+                (Ok(exit_code), Ok(())) => {
+                    bail!("sandbox shell exited with status {exit_code}");
+                }
+                (Err(error), Ok(())) => return Err(error),
+                (Ok(_), Err(cleanup_error)) => return Err(cleanup_error),
+                (Err(error), Err(cleanup_error)) => {
+                    return Err(error).context(format!(
+                        "also failed to terminate the sandbox: {cleanup_error:#}"
+                    ));
+                }
+            }
+        }
+        SandboxCommands::Exec {
+            agent,
+            sandbox_id,
+            env,
+            command,
+        } => {
+            let agent = must_get_agent(harness, &agent).await?;
+            let exit_code = run_sandbox_process(
+                agent.as_ref(),
+                sandbox_id,
+                command,
+                parse_environment(env)?,
+                false,
+            )
+            .await?;
+            if exit_code != 0 {
+                bail!("sandbox command exited with status {exit_code}");
+            }
+        }
+        SandboxCommands::Connect {
+            agent,
+            sandbox_id,
+            shell,
+            env,
+        } => {
+            let agent = must_get_agent(harness, &agent).await?;
+            let exit_code = run_sandbox_process(
+                agent.as_ref(),
+                sandbox_id,
+                vec![shell, "-i".to_string()],
+                parse_environment(env)?,
+                true,
+            )
+            .await?;
+            if exit_code != 0 {
+                bail!("sandbox shell exited with status {exit_code}");
+            }
+        }
+        SandboxCommands::Stop { agent, sandbox_id } => {
+            let agent = must_get_agent(harness, &agent).await?;
+            agent.exoharness_handle().stop_sandbox(sandbox_id).await?;
+        }
+        SandboxCommands::Terminate { agent, sandbox_id } => {
+            let agent = must_get_agent(harness, &agent).await?;
+            agent
+                .exoharness_handle()
+                .terminate_sandbox(sandbox_id)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn start_sandbox(
+    harness: &dyn Harness,
+    agent: String,
+    name: Option<String>,
+    args: SandboxCreateArgs,
+) -> Result<(Arc<dyn HarnessAgent>, String)> {
+    let SandboxCreateArgs {
+        provider,
+        image,
+        workdir,
+        networking,
+        idle_seconds,
+        mut mounts,
+        mut internal_mounts,
+        durable_file_systems,
+    } = args;
+    if name.as_ref().is_some_and(|name| name.trim().is_empty()) {
+        bail!("sandbox name must not be empty");
+    }
+    for mount in &mut internal_mounts {
+        mount.internal = Some(true);
+    }
+    mounts.extend(internal_mounts);
+
+    let agent = must_get_agent(harness, &agent).await?;
+    let sandbox_id = agent
+        .exoharness_handle()
+        .create_sandbox(CreateSandboxRequest {
+            name,
+            provider: provider.into(),
+            image,
+            default_workdir: workdir,
+            file_system_mounts: (!mounts.is_empty()).then_some(mounts),
+            durable_file_systems: (!durable_file_systems.is_empty())
+                .then_some(durable_file_systems),
+            enable_networking: networking.map(EnabledDisabled::enabled),
+            idle_seconds,
+        })
+        .await?;
+    Ok((agent, sandbox_id))
+}
+
+async fn run_sandbox_process(
+    agent: &dyn HarnessAgent,
+    sandbox_id: String,
+    command: Vec<String>,
+    env: HashMap<String, String>,
+    connect_stdin: bool,
+) -> Result<i32> {
+    let process = agent
+        .exoharness_handle()
+        .run_in_sandbox(RunInSandboxRequest {
+            id: sandbox_id,
+            command,
+            env,
+        })
+        .await?;
+    stream_sandbox_process(process, connect_stdin).await
+}
+
+async fn stream_sandbox_process(
+    process: Box<dyn SandboxProcess>,
+    connect_stdin: bool,
+) -> Result<i32> {
+    let parts = process.into_parts();
+    let mut stdout_reader = parts.stdout.compat();
+    let mut stderr_reader = parts.stderr.compat();
+    let stdout = async move {
+        let mut stdout = tokio::io::stdout();
+        tokio::io::copy(&mut stdout_reader, &mut stdout).await?;
+        tokio::io::AsyncWriteExt::flush(&mut stdout).await?;
+        Result::<()>::Ok(())
+    };
+    let stderr = async move {
+        let mut stderr = tokio::io::stderr();
+        tokio::io::copy(&mut stderr_reader, &mut stderr).await?;
+        tokio::io::AsyncWriteExt::flush(&mut stderr).await?;
+        Result::<()>::Ok(())
+    };
+
+    let mut wait = parts.wait;
+    let lifecycle = async move {
+        let exit_code = if connect_stdin {
+            let mut stdin_writer = parts.stdin.compat_write();
+            let stdin = async move {
+                let mut stdin = tokio::io::stdin();
+                tokio::io::copy(&mut stdin, &mut stdin_writer).await?;
+                Result::<()>::Ok(())
+            };
+            tokio::pin!(stdin);
+            tokio::select! {
+                result = &mut wait => result?,
+                result = &mut stdin => {
+                    result?;
+                    wait.await?
+                }
+            }
+        } else {
+            drop(parts.stdin);
+            wait.await?
+        };
+        Result::<i32>::Ok(exit_code)
+    };
+
+    let (exit_code, (), ()) = tokio::try_join!(lifecycle, stdout, stderr)?;
+    Ok(exit_code)
+}
+
 async fn determine_harness_kind(
     exoharness: &dyn ExoHarness,
     selection: Option<&HarnessSelection>,
@@ -2264,6 +2567,14 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
             ConversationCommands::CompleteRebuildUpdate { .. } => None,
         },
         Commands::Repl { agent, .. } => Some(agent.as_deref().unwrap_or(DEFAULT_REPL_SLUG)),
+        Commands::Sandbox { command } => Some(match command {
+            SandboxCommands::Start(args) => args.agent.as_str(),
+            SandboxCommands::Play(args) => args.agent.as_str(),
+            SandboxCommands::Exec { agent, .. }
+            | SandboxCommands::Connect { agent, .. }
+            | SandboxCommands::Stop { agent, .. }
+            | SandboxCommands::Terminate { agent, .. } => agent.as_str(),
+        }),
         Commands::Secret { .. }
         | Commands::Model { .. }
         | Commands::Provider { .. }
@@ -2281,7 +2592,7 @@ struct ServeConfig {
 
 fn serve_config(command: &Commands) -> Option<ServeConfig> {
     match command {
-        Commands::Serve { bind, verbose } => Some(ServeConfig {
+        Commands::Serve { bind, verbose, .. } => Some(ServeConfig {
             bind: *bind,
             verbosity: *verbose,
         }),
@@ -2365,19 +2676,23 @@ async fn instantiate_exoharness(
     exo_config: &BasicExoHarnessConfig,
     http_url: Option<&str>,
     bearer_token: Option<String>,
+    route_local_sandboxes: bool,
 ) -> Result<Arc<dyn ExoHarness>> {
     if let Some(http_url) = http_url {
+        let mut harness = HttpExoHarness::new(http_url)?;
+        if let Some(bearer_token) = bearer_token {
+            harness = harness.with_bearer_token(bearer_token);
+        }
+        let remote: Arc<dyn ExoHarness> = Arc::new(harness);
+        if !route_local_sandboxes {
+            return Ok(remote);
+        }
         let local_sandbox_providers = exo_config
             .sandbox_backends
             .iter()
             .filter(|backend| backend.is_local())
             .map(SandboxBackendRegistration::provider)
             .collect::<Vec<_>>();
-        let mut harness = HttpExoHarness::new(http_url)?;
-        if let Some(bearer_token) = bearer_token {
-            harness = harness.with_bearer_token(bearer_token);
-        }
-        let remote: Arc<dyn ExoHarness> = Arc::new(harness);
         let local: Arc<dyn ExoHarness> = Arc::new(BasicExoHarness::new(exo_config.clone()).await?);
         return Ok(Arc::new(LocalSandboxExoHarness::new_with_local_providers(
             remote,
@@ -2793,6 +3108,57 @@ fn parse_optional_uuid7(value: Option<&str>, field: &str) -> Result<Option<Uuid7
         )),
         None => Ok(None),
     }
+}
+
+fn parse_sandbox_mount(value: &str) -> std::result::Result<FileSystemMount, String> {
+    let (host_path, mount_path, mode) = parse_mount_spec(value, "host path")?;
+    Ok(FileSystemMount {
+        host_path: host_path.to_string(),
+        mount_path: mount_path.to_string(),
+        mode,
+        internal: Some(false),
+    })
+}
+
+fn parse_durable_mount(value: &str) -> std::result::Result<DurableFileSystem, String> {
+    let (name, mount_path, mode) = parse_mount_spec(value, "filesystem name")?;
+    Ok(DurableFileSystem {
+        name: name.to_string(),
+        mount_path: mount_path.to_string(),
+        mode,
+    })
+}
+
+fn parse_mount_spec<'a>(
+    value: &'a str,
+    source_label: &str,
+) -> std::result::Result<(&'a str, &'a str, FileSystemMountMode), String> {
+    let (source, target) = value
+        .split_once(':')
+        .ok_or_else(|| format!("expected {source_label}:GUEST_PATH[:ro|rw]"))?;
+    if source.is_empty() {
+        return Err(format!("{source_label} must not be empty"));
+    }
+    let (mount_path, mode) = match target.rsplit_once(':') {
+        Some((mount_path, "ro")) => (mount_path, FileSystemMountMode::ReadOnly),
+        Some((mount_path, "rw")) => (mount_path, FileSystemMountMode::ReadWrite),
+        _ => (target, FileSystemMountMode::ReadOnly),
+    };
+    validate_mount_path(mount_path).map_err(|error| error.to_string())?;
+    Ok((source, mount_path, mode))
+}
+
+fn parse_environment(values: Vec<String>) -> Result<HashMap<String, String>> {
+    values
+        .into_iter()
+        .map(|value| {
+            let (name, value) = value
+                .split_once('=')
+                .ok_or_else(|| anyhow!("environment value must be NAME=VALUE"))?;
+            let name = parse_env_var_name(name).map_err(|error| anyhow!(error))?;
+            Ok((name, value.to_string()))
+        })
+        .collect()
 }
 
 fn canonicalize_directory(path: &PathBuf) -> Result<PathBuf> {
@@ -3272,7 +3638,7 @@ mod create_tests {
             "agent",
             "create",
             "test",
-            "--sandbox-provider",
+            "--provider",
             "local-process",
             "--model",
             "test-model",
