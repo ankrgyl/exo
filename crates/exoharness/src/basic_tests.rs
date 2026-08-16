@@ -981,10 +981,21 @@ async fn basic_backend_runs_commands_in_created_sandbox() {
     assert_eq!(wait_result.expect("process should exit"), 0);
 
     conversation
-        .stop_sandbox(sandbox_id)
+        .stop_sandbox(sandbox_id.clone())
         .await
         .expect("sandbox should stop");
     assert!(!conversation.list_sandboxes().await.expect("sandboxes")[0].running);
+    conversation
+        .terminate_sandbox(sandbox_id)
+        .await
+        .expect("sandbox should terminate");
+    assert!(
+        conversation
+            .list_sandboxes()
+            .await
+            .expect("sandboxes")
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

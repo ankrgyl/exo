@@ -683,10 +683,17 @@ enum SandboxCommands {
     Start(Box<SandboxStartArgs>),
     /// Start a sandbox, enter a shell, and destroy it when the shell exits.
     Play(Box<SandboxPlayArgs>),
-    /// List retained sandboxes.
+    /// List sandboxes (alias: ps). Running only unless --all is passed.
+    #[command(alias = "ps")]
     List {
         #[command(flatten)]
         owner: SandboxOwnerArgs,
+        /// Include stopped sandboxes.
+        #[arg(short, long)]
+        all: bool,
+        /// Print only sandbox IDs.
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Run a command and stream its output.
     Exec {
@@ -712,13 +719,16 @@ enum SandboxCommands {
     Stop {
         #[command(flatten)]
         owner: SandboxOwnerArgs,
-        sandbox_id: String,
+        #[arg(required = true, value_name = "SANDBOX_ID")]
+        sandbox_ids: Vec<String>,
     },
-    /// Destroy a sandbox's retained backend state.
+    /// Destroy sandboxes and remove their retained records (alias: kill).
+    #[command(alias = "kill")]
     Terminate {
         #[command(flatten)]
         owner: SandboxOwnerArgs,
-        sandbox_id: String,
+        #[arg(required = true, value_name = "SANDBOX_ID")]
+        sandbox_ids: Vec<String>,
     },
 }
 
@@ -2382,31 +2392,40 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
                 }
             }
         }
-        SandboxCommands::List { owner } => {
-            let sandboxes = sandbox_owner(harness, owner.agent.as_deref())
+        SandboxCommands::List { owner, all, quiet } => {
+            let mut sandboxes = sandbox_owner(harness, owner.agent.as_deref())
                 .await?
                 .list_sandboxes()
                 .await?;
-            print_table(
-                &["ID", "NAME", "PROVIDER", "STATE", "IMAGE"],
-                sandboxes
-                    .into_iter()
-                    .map(|sandbox| {
-                        vec![
-                            sandbox.id,
-                            sandbox.name.unwrap_or_default(),
-                            sandbox.provider.to_string(),
-                            if sandbox.running {
-                                "running"
-                            } else {
-                                "stopped"
-                            }
-                            .to_string(),
-                            sandbox.image,
-                        ]
-                    })
-                    .collect(),
-            )?;
+            if !all {
+                sandboxes.retain(|sandbox| sandbox.running);
+            }
+            if quiet {
+                for sandbox in sandboxes {
+                    println!("{}", sandbox.id);
+                }
+            } else {
+                print_table(
+                    &["ID", "NAME", "PROVIDER", "STATE", "IMAGE"],
+                    sandboxes
+                        .into_iter()
+                        .map(|sandbox| {
+                            vec![
+                                sandbox.id,
+                                sandbox.name.unwrap_or_default(),
+                                sandbox.provider.to_string(),
+                                if sandbox.running {
+                                    "running"
+                                } else {
+                                    "stopped"
+                                }
+                                .to_string(),
+                                sandbox.image,
+                            ]
+                        })
+                        .collect(),
+                )?;
+            }
         }
         SandboxCommands::Exec {
             owner,
@@ -2446,17 +2465,23 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
                 bail!("sandbox shell exited with status {exit_code}");
             }
         }
-        SandboxCommands::Stop { owner, sandbox_id } => {
-            sandbox_owner(harness, owner.agent.as_deref())
-                .await?
-                .stop_sandbox(sandbox_id)
-                .await?;
+        SandboxCommands::Stop { owner, sandbox_ids } => {
+            let agent = sandbox_owner(harness, owner.agent.as_deref()).await?;
+            for sandbox_id in sandbox_ids {
+                agent
+                    .stop_sandbox(sandbox_id.clone())
+                    .await
+                    .with_context(|| format!("stopping sandbox {sandbox_id}"))?;
+            }
         }
-        SandboxCommands::Terminate { owner, sandbox_id } => {
-            sandbox_owner(harness, owner.agent.as_deref())
-                .await?
-                .terminate_sandbox(sandbox_id)
-                .await?;
+        SandboxCommands::Terminate { owner, sandbox_ids } => {
+            let agent = sandbox_owner(harness, owner.agent.as_deref()).await?;
+            for sandbox_id in sandbox_ids {
+                agent
+                    .terminate_sandbox(sandbox_id.clone())
+                    .await
+                    .with_context(|| format!("terminating sandbox {sandbox_id}"))?;
+            }
         }
     }
     Ok(())

@@ -192,6 +192,12 @@ pub trait ManagedSandboxBackend: Send + Sync {
         request: SandboxRequest,
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>>;
+
+    /// Permanently remove provider-owned state after the active handle stops.
+    /// Backends without retained state need no extra cleanup.
+    async fn terminate(&self, _request: SandboxRequest) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub const DEFAULT_SANDBOX_IMAGE: &str = crate::sandbox_provider::DEFAULT_DOCKER_IMAGE;
