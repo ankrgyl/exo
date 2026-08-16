@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
+use std::num::NonZeroUsize;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -143,6 +144,7 @@ impl SandboxBackendRegistration {
                     spec.allowed_egress_cidrs,
                     spec.allowed_local_images,
                     spec.allowed_registries,
+                    spec.max_machines,
                 ))
             },
         )
@@ -283,6 +285,8 @@ pub struct FirecrackerBackendSpec {
     /// means unrestricted. The registry host is trusted for process
     /// availability, so operators can pin exactly which hosts get that trust.
     pub allowed_registries: Vec<String>,
+    /// Maximum number of Firecracker VMs owned by this Exo backend.
+    pub max_machines: Option<NonZeroUsize>,
 }
 
 /// Daytona connection config plus the secret-store names for its credentials,

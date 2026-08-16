@@ -72,6 +72,7 @@ pub enum FirecrackerBridgeResponse {
         id: String,
         provider_state: Option<Value>,
         effective_image: Option<String>,
+        startup_timing: Option<Value>,
     },
     Exec {
         output: SandboxCommandOutput,
@@ -161,10 +162,9 @@ impl BridgeBackendCache {
                 .await
                 .context("joining Firecracker backend construction")??;
         let backend = Arc::new(backend);
-        // Jailed VMMs deliberately outlive the bridge process, and expired
-        // machines are otherwise only reaped inside future acquires. Reaping
-        // when a backend first exists for this state root keeps abandoned VMs
-        // from running indefinitely on a host nobody acquires from again.
+        // The backend exclusively owns its state root. This first reap removes
+        // every manifest left by a crashed prior bridge before serving a new
+        // acquire; later reaps use the persisted idle leases.
         if let Err(error) = backend.reap_expired().await {
             tracing::warn!(%error, "failed reaping expired Firecracker machines at backend startup");
         }
@@ -293,6 +293,7 @@ async fn handle_request(
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),
                 effective_image: handle.effective_image(),
+                startup_timing: handle.startup_timing(),
             })
         }
         FirecrackerBridgeRequest::Exec {
@@ -324,6 +325,7 @@ async fn handle_request(
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),
                 effective_image: handle.effective_image(),
+                startup_timing: handle.startup_timing(),
             })
         }
         FirecrackerBridgeRequest::Terminate { config, request } => {

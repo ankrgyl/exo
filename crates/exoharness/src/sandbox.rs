@@ -149,6 +149,13 @@ pub trait ManagedSandboxHandle: Send + Sync {
         None
     }
 
+    /// Structured timings for the operation that produced this handle.
+    /// These are intentionally ephemeral diagnostics rather than persisted
+    /// provider state.
+    fn startup_timing(&self) -> Option<Value> {
+        None
+    }
+
     /// The image the sandbox is actually running when the backend substituted
     /// the requested one (e.g. a snapshot restore boots from a freshly loaded
     /// tag). Callers persist this so every process resolves the same warm

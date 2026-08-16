@@ -1,7 +1,7 @@
 //! Per-provider [`crate::sandbox::ManagedSandboxBackend`] implementations,
 //! selected via the harness's provider registry.
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
-use std::{path::PathBuf, sync::Arc};
+use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
 type FirecrackerBackend = Arc<dyn crate::ManagedSandboxBackend>;
 
@@ -91,6 +91,15 @@ pub async fn firecracker_backend_from_env() -> anyhow::Result<FirecrackerBackend
     firecracker_backend_from_config(FirecrackerConfig::from_env()?).await
 }
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+pub async fn firecracker_backend_with_capacity(
+    max_machines: NonZeroUsize,
+) -> anyhow::Result<FirecrackerBackend> {
+    let mut config = FirecrackerConfig::from_env()?;
+    config.max_machines = Some(max_machines);
+    firecracker_backend_from_config(config).await
+}
+
 // Policy exceptions are explicit CLI parameters so they are visible in
 // --help and in the invocation that granted them.
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
@@ -98,6 +107,7 @@ pub async fn firecracker_backend_with_policy(
     allowed_egress_cidrs: Vec<String>,
     allowed_local_images: Vec<PathBuf>,
     allowed_registries: Vec<String>,
+    max_machines: Option<NonZeroUsize>,
 ) -> anyhow::Result<FirecrackerBackend> {
     let mut config = FirecrackerConfig::from_env()?;
     config.allowed_egress_cidrs = allowed_egress_cidrs
@@ -109,6 +119,7 @@ pub async fn firecracker_backend_with_policy(
         .collect::<anyhow::Result<_>>()?;
     config.allowed_local_images.extend(allowed_local_images);
     config.allowed_registries = allowed_registries;
+    config.max_machines = max_machines;
     firecracker_backend_from_config(config).await
 }
 

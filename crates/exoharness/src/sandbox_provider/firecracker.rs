@@ -9,6 +9,7 @@ use std::fs::{self, File, OpenOptions, Permissions};
 use std::future::Future;
 use std::io::{self, BufRead, BufReader as StdBufReader, Read, Seek, SeekFrom, Write};
 use std::net::Ipv4Addr;
+use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
 use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -25,6 +26,7 @@ use async_trait::async_trait;
 use ipnet::Ipv4Net;
 #[cfg(target_os = "linux")]
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::fs::{FlockOperation, flock};
 #[cfg(target_os = "linux")]
 use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -142,6 +144,13 @@ pub struct FirecrackerConfig {
     // and any cross-host blob redirects they return.
     pub allowed_registries: Vec<String>,
     pub network_bytes_per_second: u64,
+    /// Hard ceiling for VMs owned by this backend. Firecracker deliberately
+    /// leaves host CPU/memory oversubscription policy to its caller, and each
+    /// Firecracker process owns exactly one microVM, so callers should derive
+    /// this from scheduler capacity plus reserved fork-source VMs.
+    /// https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md#L23-L24
+    /// https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md#L71-L72
+    pub max_machines: Option<NonZeroUsize>,
 }
 
 impl FirecrackerConfig {
@@ -177,6 +186,7 @@ impl FirecrackerConfig {
                 "EXO_FIRECRACKER_NETWORK_BYTES_PER_SECOND",
                 DEFAULT_NETWORK_BYTES_PER_SECOND,
             )?,
+            max_machines: None,
         })
     }
 }
@@ -191,6 +201,24 @@ struct FirecrackerProviderState {
     // and guest-to-guest firewall rules.
     // https://github.com/firecracker-microvm/firecracker/blob/main/docs/network-setup.md#host-network-setup
     guest_ip: Option<Ipv4Addr>,
+}
+
+#[derive(Debug, Serialize)]
+struct FirecrackerForkTiming {
+    source_sync_ms: f64,
+    snapshot_create_ms: f64,
+    clone_record_ms: f64,
+    clone_reap_ms: f64,
+    clone_prepare_ms: f64,
+    clone_restore_ms: f64,
+    total_ms: f64,
+}
+
+struct PendingFirecrackerForkTiming {
+    started_at: Instant,
+    source_sync_ms: f64,
+    snapshot_create_ms: f64,
+    clone_record_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -336,6 +364,11 @@ struct WarmMachineEntry {
 
 struct Shared {
     config: FirecrackerConfig,
+    // Firecracker has no attach-on-restart path. Holding one lock per state
+    // root makes every manifest left before this backend started unambiguously
+    // orphaned instead of risking one Exo process reaping another's live VM.
+    _state_lock: File,
+    startup_cleanup_pending: AtomicBool,
     warm_machines: Mutex<HashMap<SandboxKey, WarmMachineEntry>>,
     lifecycle_lock: Mutex<()>,
 }
@@ -374,6 +407,26 @@ impl FirecrackerSandboxBackend {
         config.initramfs = fs::canonicalize(&config.initramfs)?;
         config.state_root = fs::canonicalize(&config.state_root)?;
         validate_private_root(&config.state_root)?;
+        let state_lock_path = config.state_root.join("backend.lock");
+        let state_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&state_lock_path)
+            .with_context(|| {
+                format!(
+                    "opening Firecracker state-root lock {}",
+                    state_lock_path.display()
+                )
+            })?;
+        fs::set_permissions(&state_lock_path, Permissions::from_mode(0o600))?;
+        flock(&state_lock, FlockOperation::NonBlockingLockExclusive).with_context(|| {
+            format!(
+                "locking Firecracker state root {}; another backend may still own it",
+                config.state_root.display()
+            )
+        })?;
         // Best-effort reclamation of temporaries stranded by crashed prior
         // processes. Every publish in the state root stages under a dotted or
         // .tmp name and renames atomically, so anything still carrying a
@@ -400,21 +453,23 @@ impl FirecrackerSandboxBackend {
         Ok(Self {
             shared: Arc::new(Shared {
                 config,
+                _state_lock: state_lock,
+                startup_cleanup_pending: AtomicBool::new(true),
                 warm_machines: Mutex::new(HashMap::new()),
                 lifecycle_lock: Mutex::new(()),
             }),
         })
     }
 
-    // Entry point for the Lima bridge: expired machines are normally reaped
-    // inside acquire, but jailed VMMs outlive the bridge process, so a host
-    // nobody acquires from again would keep them running forever.
+    // Entry point for the Lima bridge: the first call reaps every machine left
+    // by the prior state-root owner; later calls use the persisted idle leases.
     pub(super) async fn reap_expired(&self) -> Result<()> {
         let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
         self.reap_expired_machines().await
     }
 
     async fn reap_expired_machines(&self) -> Result<()> {
+        let startup_cleanup = self.shared.startup_cleanup_pending.load(Ordering::Acquire);
         let now = Instant::now();
         let mut expired = {
             let mut machines = self.shared.warm_machines.lock().await;
@@ -434,7 +489,11 @@ impl FirecrackerSandboxBackend {
         };
         let state_root = self.shared.config.state_root.clone();
         let persisted = tokio::task::spawn_blocking(move || {
-            expired_machine_ids(&state_root, SystemTime::now())
+            if startup_cleanup {
+                manifest_machine_ids(&state_root)
+            } else {
+                expired_machine_ids(&state_root, SystemTime::now())
+            }
         })
         .await
         .context("joining Firecracker lease scan")??;
@@ -451,6 +510,11 @@ impl FirecrackerSandboxBackend {
         for machine_id in expired {
             self.shared.cleanup_machine(&machine_id, true).await?;
         }
+        if startup_cleanup {
+            self.shared
+                .startup_cleanup_pending
+                .store(false, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -458,8 +522,19 @@ impl FirecrackerSandboxBackend {
         &self,
         request: SandboxRequest,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        self.acquire_resolved_with_fork_timing(request, None).await
+    }
+
+    async fn acquire_resolved_with_fork_timing(
+        &self,
+        request: SandboxRequest,
+        fork_timing: Option<PendingFirecrackerForkTiming>,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
+        let acquire_started_at = Instant::now();
+        let reap_started_at = Instant::now();
         self.reap_expired_machines().await?;
+        let clone_reap_ms = reap_started_at.elapsed().as_secs_f64() * 1000.0;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let stable_machine_id = machine_id(&request.key, &spec_hash);
         let machine_key_prefix = format!("fc-{}-", stable_id(&request.key.to_string()));
@@ -482,10 +557,18 @@ impl FirecrackerSandboxBackend {
         if request.lifecycle.idle_ttl.is_none() {
             let sequence = ONE_SHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let machine_id = one_shot_machine_id(&request.key, &spec_hash, sequence);
+            let restore_started_at = Instant::now();
             let machine = self
                 .shared
                 .ensure_machine(&request, &machine_id, &spec_hash)
                 .await?;
+            let clone_restore_ms = restore_started_at.elapsed().as_secs_f64() * 1000.0;
+            let startup_timing = fork_startup_timing(
+                fork_timing,
+                acquire_started_at,
+                clone_reap_ms,
+                clone_restore_ms,
+            )?;
             return Ok(Arc::new(FirecrackerSandboxHandle {
                 id: format!("firecracker-oneshot:{machine_id}"),
                 machine,
@@ -493,6 +576,7 @@ impl FirecrackerSandboxBackend {
                 spec_hash,
                 shared: Arc::clone(&self.shared),
                 one_shot: true,
+                startup_timing,
             }));
         }
 
@@ -507,10 +591,12 @@ impl FirecrackerSandboxBackend {
         if let Some(entry) = replaced {
             self.shared.cleanup_machine(&entry.machine_id, true).await?;
         }
+        let restore_started_at = Instant::now();
         let machine = self
             .shared
             .ensure_machine(&request, &stable_machine_id, &spec_hash)
             .await?;
+        let clone_restore_ms = restore_started_at.elapsed().as_secs_f64() * 1000.0;
         self.shared.touch_machine_lease(&stable_machine_id).await?;
         self.shared.warm_machines.lock().await.insert(
             request.key.clone(),
@@ -521,6 +607,12 @@ impl FirecrackerSandboxBackend {
                 last_used_at: Instant::now(),
             },
         );
+        let startup_timing = fork_startup_timing(
+            fork_timing,
+            acquire_started_at,
+            clone_reap_ms,
+            clone_restore_ms,
+        )?;
         Ok(Arc::new(FirecrackerSandboxHandle {
             id: format!("firecracker:{stable_machine_id}"),
             machine,
@@ -528,8 +620,31 @@ impl FirecrackerSandboxBackend {
             spec_hash,
             shared: Arc::clone(&self.shared),
             one_shot: false,
+            startup_timing,
         }))
     }
+}
+
+fn fork_startup_timing(
+    pending: Option<PendingFirecrackerForkTiming>,
+    acquire_started_at: Instant,
+    clone_reap_ms: f64,
+    clone_restore_ms: f64,
+) -> Result<Option<Value>> {
+    let Some(pending) = pending else {
+        return Ok(None);
+    };
+    let acquire_ms = acquire_started_at.elapsed().as_secs_f64() * 1000.0;
+    let clone_prepare_ms = (acquire_ms - clone_reap_ms - clone_restore_ms).max(0.0);
+    Ok(Some(serde_json::to_value(FirecrackerForkTiming {
+        source_sync_ms: pending.source_sync_ms,
+        snapshot_create_ms: pending.snapshot_create_ms,
+        clone_record_ms: pending.clone_record_ms,
+        clone_reap_ms,
+        clone_prepare_ms,
+        clone_restore_ms,
+        total_ms: pending.started_at.elapsed().as_secs_f64() * 1000.0,
+    })?))
 }
 
 #[async_trait]
@@ -640,7 +755,12 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         }
         let target_spec_hash = sandbox_spec_hash(&target.spec);
         let target_machine_id = machine_id(&target.key, &target_spec_hash);
+        self.shared
+            .ensure_machine_capacity(&target_machine_id)
+            .await?;
         let template_key = fork_snapshot_template_key(&source_record, &target_machine_id);
+        let fork_started_at = Instant::now();
+        let source_sync_started_at = Instant::now();
         GuestClient::new(
             Arc::clone(&self.shared),
             machine_from_record(&self.shared.config, source_record.clone()).vsock_path,
@@ -648,9 +768,11 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         .sync_filesystem(&source.spec.default_workdir)
         .await
         .context("syncing Firecracker fork source filesystem")?;
+        let source_sync_ms = source_sync_started_at.elapsed().as_secs_f64() * 1000.0;
         let config = self.shared.config.clone();
         let source_record_for_snapshot = source_record.clone();
         let template_key_for_snapshot = template_key.clone();
+        let snapshot_started_at = Instant::now();
         tokio::task::spawn_blocking(move || {
             create_fork_snapshot(
                 &config,
@@ -660,6 +782,8 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         })
         .await
         .context("joining Firecracker fork snapshot creation")??;
+        let snapshot_create_ms = snapshot_started_at.elapsed().as_secs_f64() * 1000.0;
+        let clone_record_started_at = Instant::now();
         if let Err(error) = self
             .shared
             .new_fork_machine_record(
@@ -678,9 +802,19 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
             }
             return Err(error);
         }
+        let clone_record_ms = clone_record_started_at.elapsed().as_secs_f64() * 1000.0;
         drop(_lifecycle_guard);
 
-        match self.acquire_resolved(target).await {
+        let fork_timing = PendingFirecrackerForkTiming {
+            started_at: fork_started_at,
+            source_sync_ms,
+            snapshot_create_ms,
+            clone_record_ms,
+        };
+        match self
+            .acquire_resolved_with_fork_timing(target, Some(fork_timing))
+            .await
+        {
             Ok(handle) => Ok(handle),
             Err(error) => {
                 let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
@@ -714,6 +848,7 @@ struct FirecrackerSandboxHandle {
     spec_hash: String,
     shared: Arc<Shared>,
     one_shot: bool,
+    startup_timing: Option<Value>,
 }
 
 #[async_trait]
@@ -735,6 +870,10 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
             })
             .expect("Firecracker provider state should serialize")
         })
+    }
+
+    fn startup_timing(&self) -> Option<Value> {
+        self.startup_timing.clone()
     }
 
     fn effective_image(&self) -> Option<String> {
@@ -838,6 +977,23 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
 }
 
 impl Shared {
+    async fn ensure_machine_capacity(&self, machine_id: &str) -> Result<()> {
+        let Some(max_machines) = self.config.max_machines else {
+            return Ok(());
+        };
+        let state_root = self.config.state_root.clone();
+        let machine_id = machine_id.to_string();
+        let active_machine_ids =
+            tokio::task::spawn_blocking(move || manifest_machine_ids(&state_root))
+                .await
+                .context("joining Firecracker capacity scan")??;
+        ensure_machine_capacity(
+            max_machines,
+            active_machine_ids.len(),
+            active_machine_ids.iter().any(|id| id == &machine_id),
+        )
+    }
+
     async fn ensure_active_machine(
         self: &Arc<Self>,
         request: &SandboxRequest,
@@ -879,6 +1035,7 @@ impl Shared {
         let record = match existing {
             Some(record) if record.spec_hash == spec_hash => record,
             _ => {
+                self.ensure_machine_capacity(machine_id).await?;
                 self.new_machine_record(request, machine_id, spec_hash)
                     .await?
             }
@@ -1668,6 +1825,46 @@ fn expired_machine_ids(state_root: &Path, now: SystemTime) -> Result<Vec<String>
         }
     }
     Ok(expired)
+}
+
+fn manifest_machine_ids(state_root: &Path) -> Result<Vec<String>> {
+    let mut machine_ids = Vec::new();
+    for entry in fs::read_dir(state_root.join("manifests"))? {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_file()
+            || path.extension().and_then(|extension| extension.to_str()) != Some("json")
+        {
+            continue;
+        }
+        let record = fs::read(&path)
+            .with_context(|| format!("reading Firecracker manifest {}", path.display()))
+            .and_then(|bytes| {
+                serde_json::from_slice::<MachineRecord>(&bytes)
+                    .with_context(|| format!("decoding Firecracker manifest {}", path.display()))
+            })?;
+        if !valid_machine_id(&record.machine_id)
+            || manifest_path(state_root, &record.machine_id) != path
+        {
+            bail!("mismatched Firecracker manifest {}", path.display());
+        }
+        machine_ids.push(record.machine_id);
+    }
+    Ok(machine_ids)
+}
+
+fn ensure_machine_capacity(
+    max_machines: NonZeroUsize,
+    active_machines: usize,
+    target_already_exists: bool,
+) -> Result<()> {
+    if target_already_exists || active_machines < max_machines.get() {
+        return Ok(());
+    }
+    bail!(
+        "Firecracker host VM capacity exhausted: {active_machines} active, limit {}; reduce the caller's claimed-conversation capacity or terminate an idle sandbox",
+        max_machines.get()
+    )
 }
 
 fn write_manifest(state_root: &Path, record: &MachineRecord) -> Result<()> {
@@ -3661,6 +3858,7 @@ mod tests {
             allowed_local_images: Vec::new(),
             allowed_registries: Vec::new(),
             network_bytes_per_second: DEFAULT_NETWORK_BYTES_PER_SECOND,
+            max_machines: None,
         };
         validate_jailed_socket_paths(&config)
             .expect("default state root must fit the jailed socket path budget");
@@ -3693,6 +3891,43 @@ mod tests {
         assert!(release_resource_slot(directory.path(), first, "fc-second").is_err());
         release_resource_slot(directory.path(), first, "fc-first").unwrap();
         assert!(!resource_slot_path(directory.path(), first).exists());
+    }
+
+    #[test]
+    fn machine_capacity_allows_reuse_but_rejects_an_additional_vm() {
+        let max_machines = NonZeroUsize::new(2).unwrap();
+        ensure_machine_capacity(max_machines, 1, false).unwrap();
+        ensure_machine_capacity(max_machines, 2, true).unwrap();
+        assert!(ensure_machine_capacity(max_machines, 2, false).is_err());
+    }
+
+    #[test]
+    fn state_root_lock_is_exclusive() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("backend.lock");
+        let first = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        let second = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock(&first, FlockOperation::NonBlockingLockExclusive).unwrap();
+        assert!(flock(&second, FlockOperation::NonBlockingLockExclusive).is_err());
+    }
+
+    #[test]
+    fn capacity_scan_fails_closed_on_invalid_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifests = directory.path().join("manifests");
+        fs::create_dir(&manifests).unwrap();
+        fs::write(manifests.join("fc-invalid.json"), b"not json").unwrap();
+        assert!(manifest_machine_ids(directory.path()).is_err());
     }
 
     #[test]

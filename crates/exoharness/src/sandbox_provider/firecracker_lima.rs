@@ -107,6 +107,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
             id,
             provider_state,
             effective_image,
+            startup_timing,
         } = response
         else {
             bail!("Firecracker Lima bridge returned the wrong response to acquire");
@@ -115,6 +116,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
             id,
             provider_state,
             effective_image,
+            startup_timing,
             request,
             backend: self.client(),
         }))
@@ -157,6 +159,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
             id,
             provider_state,
             effective_image,
+            startup_timing,
         } = response
         else {
             bail!("Firecracker Lima bridge returned the wrong response to fork");
@@ -165,6 +168,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
             id,
             provider_state,
             effective_image,
+            startup_timing,
             request: target,
             backend: self.client(),
         }))
@@ -183,6 +187,7 @@ struct LimaFirecrackerSandboxHandle {
     id: String,
     provider_state: Option<serde_json::Value>,
     effective_image: Option<String>,
+    startup_timing: Option<serde_json::Value>,
     request: SandboxRequest,
     backend: Arc<LimaFirecrackerSandboxBackend>,
 }
@@ -199,6 +204,10 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
 
     fn effective_image(&self) -> Option<String> {
         self.effective_image.clone()
+    }
+
+    fn startup_timing(&self) -> Option<serde_json::Value> {
+        self.startup_timing.clone()
     }
 
     async fn exec(&self, command: &SandboxCommand) -> Result<SandboxCommandOutput> {

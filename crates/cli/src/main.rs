@@ -18,6 +18,7 @@ mod tui_app;
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpListener};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -96,6 +97,9 @@ struct Cli {
         value_delimiter = ','
     )]
     firecracker_allowed_egress_cidrs: Vec<String>,
+    /// Maximum number of Firecracker VMs this Exo process may own.
+    #[arg(long = "firecracker-max-machines", global = true, value_name = "COUNT")]
+    firecracker_max_machines: Option<NonZeroUsize>,
     #[arg(long, global = true)]
     env_file: Option<PathBuf>,
     #[arg(long, global = true)]
@@ -309,6 +313,7 @@ fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
         allowed_egress_cidrs: cli.firecracker_allowed_egress_cidrs.clone(),
         allowed_local_images: cli.firecracker_allowed_local_images.clone(),
         allowed_registries: cli.firecracker_allowed_registries.clone(),
+        max_machines: cli.firecracker_max_machines,
     };
     let sandbox_backend = cli
         .sandbox_backend
