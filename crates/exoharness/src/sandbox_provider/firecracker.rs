@@ -223,12 +223,60 @@ struct PendingFirecrackerForkTiming {
     clone_record_ms: f64,
 }
 
+struct CapturedFirecrackerSnapshot {
+    manifest: FirecrackerSnapshotManifest,
+    source_sync_ms: f64,
+    snapshot_create_ms: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FirecrackerSnapshotManifest {
     format_version: u32,
     template_key: String,
     spec_hash: String,
     source_network_slot: u32,
+}
+
+impl FirecrackerSnapshotManifest {
+    fn from_payload(payload: SnapshotPayload) -> Result<Self> {
+        if payload.kind != SnapshotKind::FirecrackerSnapshot {
+            bail!(
+                "Firecracker sandbox backend can only restore a FirecrackerSnapshot payload, got {:?}",
+                payload.kind
+            );
+        }
+        let manifest: Self = serde_json::from_slice(&payload.bytes)
+            .context("decoding FirecrackerSnapshot manifest")?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    fn into_payload(self) -> Result<SnapshotPayload> {
+        let bytes =
+            serde_json::to_vec(&self).context("serializing FirecrackerSnapshot manifest")?;
+        Ok(SnapshotPayload {
+            kind: SnapshotKind::FirecrackerSnapshot,
+            bytes: Bytes::from(bytes),
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.format_version != SNAPSHOT_FORMAT_VERSION {
+            bail!(
+                "unsupported Firecracker snapshot format version {}; expected {}",
+                self.format_version,
+                SNAPSHOT_FORMAT_VERSION
+            );
+        }
+        validate_snapshot_key(&self.template_key)?;
+        if self.source_network_slot >= MAX_RESOURCE_SLOTS {
+            bail!(
+                "invalid Firecracker snapshot source network slot: {}",
+                self.source_network_slot
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,6 +579,168 @@ impl FirecrackerSandboxBackend {
         Ok(())
     }
 
+    async fn resolve_request(&self, request: SandboxRequest) -> Result<SandboxRequest> {
+        let mut request = prepare_request(request)?;
+        let image = resolve_image(
+            &self.shared.config.state_root,
+            &request.spec.image,
+            self.shared.config.image_size_gib,
+            &self.shared.config.allowed_local_images,
+            &self.shared.config.allowed_registries,
+        )
+        .await?;
+        request.spec.image = image.to_string_lossy().into_owned();
+        Ok(request)
+    }
+
+    async fn capture_snapshot(
+        shared: &Arc<Shared>,
+        request: &SandboxRequest,
+        source_machine_id: &str,
+        source_spec_hash: &str,
+        template_key: String,
+    ) -> Result<CapturedFirecrackerSnapshot> {
+        if !request.spec.durable_file_systems.is_empty() {
+            bail!("Firecracker snapshotting does not support durable filesystems")
+        }
+        validate_snapshot_key(&template_key)?;
+
+        let _lifecycle_guard = shared.lifecycle_lock.lock().await;
+        let source = shared
+            .load_machine_record(source_machine_id)
+            .await?
+            .context("Firecracker snapshot source manifest is missing")?;
+        if source.spec_hash != source_spec_hash
+            || sandbox_spec_hash(&request.spec) != source_spec_hash
+        {
+            bail!("Firecracker snapshot source specification changed")
+        }
+        if !process_running(&shared.pid_path(&source.machine_id)) {
+            bail!("Firecracker snapshot source is not running")
+        }
+
+        let source_sync_started_at = Instant::now();
+        GuestClient::new(
+            Arc::clone(shared),
+            machine_from_record(&shared.config, source.clone()).vsock_path,
+        )
+        .sync_filesystem(&request.spec.default_workdir)
+        .await
+        .context("syncing Firecracker snapshot source filesystem")?;
+        let source_sync_ms = source_sync_started_at.elapsed().as_secs_f64() * 1000.0;
+
+        let config = shared.config.clone();
+        let source_for_snapshot = source.clone();
+        let key_for_snapshot = template_key.clone();
+        let snapshot_started_at = Instant::now();
+        tokio::task::spawn_blocking(move || {
+            capture_snapshot_template(&config, &source_for_snapshot, &key_for_snapshot)
+        })
+        .await
+        .context("joining Firecracker snapshot creation")??;
+        let snapshot_create_ms = snapshot_started_at.elapsed().as_secs_f64() * 1000.0;
+
+        Ok(CapturedFirecrackerSnapshot {
+            manifest: FirecrackerSnapshotManifest {
+                format_version: SNAPSHOT_FORMAT_VERSION,
+                template_key,
+                spec_hash: source.spec_hash,
+                source_network_slot: source.slot,
+            },
+            source_sync_ms,
+            snapshot_create_ms,
+        })
+    }
+
+    async fn restore_snapshot(
+        &self,
+        request: SandboxRequest,
+        manifest: FirecrackerSnapshotManifest,
+        lifecycle: SnapshotTemplateLifecycle,
+        mut fork_timing: Option<PendingFirecrackerForkTiming>,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        let template_key = manifest.template_key.clone();
+        let restore = async {
+            manifest.validate()?;
+            if request.lifecycle.idle_ttl.is_none() {
+                bail!("Firecracker snapshot restore requires a warm sandbox lifecycle")
+            }
+            if !request.spec.durable_file_systems.is_empty() {
+                bail!("Firecracker snapshot restore does not support durable filesystems")
+            }
+            let spec_hash = sandbox_spec_hash(&request.spec);
+            if spec_hash != manifest.spec_hash {
+                bail!("Firecracker snapshot specification does not match the requested sandbox")
+            }
+
+            let machine_id = machine_id(&request.key, &spec_hash);
+            let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
+            self.reap_expired_machines().await?;
+            self.shared.ensure_machine_capacity(&machine_id).await?;
+            let config = self.shared.config.clone();
+            let key = template_key.clone();
+            let template_ready =
+                tokio::task::spawn_blocking(move || snapshot_template_ready(&config, &key))
+                    .await
+                    .context("joining Firecracker snapshot template validation")??;
+            if !template_ready {
+                bail!("Firecracker snapshot {template_key} is not available on this host")
+            }
+            let clone_record_started_at = Instant::now();
+            self.shared
+                .new_snapshot_machine_record(
+                    &request,
+                    &machine_id,
+                    &spec_hash,
+                    SnapshotTemplateReference {
+                        key: template_key.clone(),
+                        lifecycle,
+                    },
+                    manifest.source_network_slot,
+                )
+                .await?;
+            if let Some(timing) = fork_timing.as_mut() {
+                timing.clone_record_ms = clone_record_started_at.elapsed().as_secs_f64() * 1000.0;
+            }
+            drop(_lifecycle_guard);
+
+            match self
+                .acquire_resolved_with_fork_timing(request, fork_timing)
+                .await
+            {
+                Ok(handle) => Ok(handle),
+                Err(error) => {
+                    let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
+                    if let Err(cleanup_error) = self.shared.cleanup_machine(&machine_id, true).await
+                    {
+                        tracing::warn!(
+                            machine_id,
+                            error = format!("{cleanup_error:#}"),
+                            "failed cleaning up unsuccessful Firecracker snapshot restore"
+                        );
+                    }
+                    Err(error)
+                }
+            }
+        }
+        .await;
+
+        match restore {
+            Err(error) if lifecycle == SnapshotTemplateLifecycle::Machine => {
+                let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
+                if let Err(cleanup_error) =
+                    self.shared.remove_snapshot_template(&template_key).await
+                {
+                    return Err(error).context(format!(
+                        "cleaning up failed single-use Firecracker snapshot also failed: {cleanup_error:#}"
+                    ));
+                }
+                Err(error)
+            }
+            result => result,
+        }
+    }
+
     async fn acquire_resolved(
         &self,
         request: SandboxRequest,
@@ -667,20 +877,11 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        let mut request = prepare_request(request)?;
         {
             let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
             self.reap_expired_machines().await?;
         }
-        let image = resolve_image(
-            &self.shared.config.state_root,
-            &request.spec.image,
-            self.shared.config.image_size_gib,
-            &self.shared.config.allowed_local_images,
-            &self.shared.config.allowed_registries,
-        )
-        .await?;
-        request.spec.image = image.to_string_lossy().into_owned();
+        let request = self.resolve_request(request).await?;
         self.acquire_resolved(request).await
     }
 
@@ -724,128 +925,63 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
     async fn fork_sandbox(
         &self,
         source: SandboxRequest,
-        mut target: SandboxRequest,
+        target: SandboxRequest,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        if !source.spec.durable_file_systems.is_empty() {
-            bail!("Firecracker forking does not support durable filesystems")
-        }
-
         let mut source = prepare_request(source)?;
-        target = prepare_request(target)?;
-        let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
-        let source_entry = self
-            .shared
-            .warm_machines
-            .lock()
-            .await
-            .get(&source.key)
-            .cloned()
-            .context("Firecracker fork source is not active")?;
-        let source_record = self
-            .shared
-            .load_machine_record(&source_entry.machine_id)
-            .await?
-            .context("Firecracker fork source manifest is missing")?;
-        if !process_running(&self.shared.pid_path(&source_record.machine_id)) {
-            bail!("Firecracker fork source is not running")
-        }
+        let target = self.resolve_request(target).await?;
+        let source_record = {
+            let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
+            let source_entry = self
+                .shared
+                .warm_machines
+                .lock()
+                .await
+                .get(&source.key)
+                .cloned()
+                .context("Firecracker fork source is not active")?;
+            self.shared
+                .load_machine_record(&source_entry.machine_id)
+                .await?
+                .context("Firecracker fork source manifest is missing")?
+        };
         source.spec.image = source_record.resolved_image.clone();
         if sandbox_spec_hash(&source.spec) != source_record.spec_hash {
             bail!("Firecracker fork source specification does not match the running machine")
         }
-
-        let image = resolve_image(
-            &self.shared.config.state_root,
-            &target.spec.image,
-            self.shared.config.image_size_gib,
-            &self.shared.config.allowed_local_images,
-            &self.shared.config.allowed_registries,
-        )
-        .await?;
-        target.spec.image = image.to_string_lossy().into_owned();
         if source.spec != target.spec {
             bail!("Firecracker fork source and target specifications must match")
         }
+
         let target_spec_hash = sandbox_spec_hash(&target.spec);
         let target_machine_id = machine_id(&target.key, &target_spec_hash);
-        self.shared
-            .ensure_machine_capacity(&target_machine_id)
-            .await?;
+        {
+            let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
+            self.shared
+                .ensure_machine_capacity(&target_machine_id)
+                .await?;
+        }
         let template_key = fork_snapshot_template_key(&source_record, &target_machine_id);
         let fork_started_at = Instant::now();
-        let source_sync_started_at = Instant::now();
-        GuestClient::new(
-            Arc::clone(&self.shared),
-            machine_from_record(&self.shared.config, source_record.clone()).vsock_path,
+        let captured = Self::capture_snapshot(
+            &self.shared,
+            &source,
+            &source_record.machine_id,
+            &source_record.spec_hash,
+            template_key,
         )
-        .sync_filesystem(&source.spec.default_workdir)
+        .await?;
+        self.restore_snapshot(
+            target,
+            captured.manifest,
+            SnapshotTemplateLifecycle::Machine,
+            Some(PendingFirecrackerForkTiming {
+                started_at: fork_started_at,
+                source_sync_ms: captured.source_sync_ms,
+                snapshot_create_ms: captured.snapshot_create_ms,
+                clone_record_ms: 0.0,
+            }),
+        )
         .await
-        .context("syncing Firecracker fork source filesystem")?;
-        let source_sync_ms = source_sync_started_at.elapsed().as_secs_f64() * 1000.0;
-        let config = self.shared.config.clone();
-        let source_record_for_snapshot = source_record.clone();
-        let template_key_for_snapshot = template_key.clone();
-        let snapshot_started_at = Instant::now();
-        tokio::task::spawn_blocking(move || {
-            create_fork_snapshot(
-                &config,
-                &source_record_for_snapshot,
-                &template_key_for_snapshot,
-            )
-        })
-        .await
-        .context("joining Firecracker fork snapshot creation")??;
-        let snapshot_create_ms = snapshot_started_at.elapsed().as_secs_f64() * 1000.0;
-        let clone_record_started_at = Instant::now();
-        if let Err(error) = self
-            .shared
-            .new_snapshot_machine_record(
-                &target,
-                &target_machine_id,
-                &target_spec_hash,
-                SnapshotTemplateReference {
-                    key: template_key.clone(),
-                    lifecycle: SnapshotTemplateLifecycle::Machine,
-                },
-                source_record.slot,
-            )
-            .await
-        {
-            if let Err(cleanup_error) = self.shared.remove_snapshot_template(&template_key).await {
-                return Err(error).context(format!(
-                    "cleaning up failed Firecracker fork snapshot also failed: {cleanup_error:#}"
-                ));
-            }
-            return Err(error);
-        }
-        let clone_record_ms = clone_record_started_at.elapsed().as_secs_f64() * 1000.0;
-        drop(_lifecycle_guard);
-
-        let fork_timing = PendingFirecrackerForkTiming {
-            started_at: fork_started_at,
-            source_sync_ms,
-            snapshot_create_ms,
-            clone_record_ms,
-        };
-        match self
-            .acquire_resolved_with_fork_timing(target, Some(fork_timing))
-            .await
-        {
-            Ok(handle) => Ok(handle),
-            Err(error) => {
-                let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
-                if let Err(cleanup_error) =
-                    self.shared.cleanup_machine(&target_machine_id, true).await
-                {
-                    tracing::warn!(
-                        machine_id = target_machine_id,
-                        error = format!("{cleanup_error:#}"),
-                        "failed cleaning up unsuccessful Firecracker fork"
-                    );
-                }
-                Err(error)
-            }
-        }
     }
 
     async fn acquire_from_snapshot(
@@ -853,94 +989,10 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         request: SandboxRequest,
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        if payload.kind != SnapshotKind::FirecrackerSnapshot {
-            bail!(
-                "Firecracker sandbox backend can only restore a FirecrackerSnapshot payload, got {:?}",
-                payload.kind
-            );
-        }
-        let manifest: FirecrackerSnapshotManifest = serde_json::from_slice(&payload.bytes)
-            .context("decoding FirecrackerSnapshot manifest")?;
-        if manifest.format_version != SNAPSHOT_FORMAT_VERSION {
-            bail!(
-                "unsupported Firecracker snapshot format version {}; expected {}",
-                manifest.format_version,
-                SNAPSHOT_FORMAT_VERSION
-            );
-        }
-        validate_snapshot_key(&manifest.template_key)?;
-        if manifest.source_network_slot >= MAX_RESOURCE_SLOTS {
-            bail!(
-                "invalid Firecracker snapshot source network slot: {}",
-                manifest.source_network_slot
-            );
-        }
-
-        let mut request = prepare_request(request)?;
-        if request.lifecycle.idle_ttl.is_none() {
-            bail!("Firecracker snapshot restore requires a warm sandbox lifecycle")
-        }
-        if !request.spec.durable_file_systems.is_empty() {
-            bail!("Firecracker snapshot restore does not support durable filesystems")
-        }
-        let image = resolve_image(
-            &self.shared.config.state_root,
-            &request.spec.image,
-            self.shared.config.image_size_gib,
-            &self.shared.config.allowed_local_images,
-            &self.shared.config.allowed_registries,
-        )
-        .await?;
-        request.spec.image = image.to_string_lossy().into_owned();
-        let spec_hash = sandbox_spec_hash(&request.spec);
-        if spec_hash != manifest.spec_hash {
-            bail!("Firecracker snapshot specification does not match the requested sandbox")
-        }
-
-        let machine_id = machine_id(&request.key, &spec_hash);
-        let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
-        self.reap_expired_machines().await?;
-        self.shared.ensure_machine_capacity(&machine_id).await?;
-        let config = self.shared.config.clone();
-        let template_key = manifest.template_key.clone();
-        let template_ready =
-            tokio::task::spawn_blocking(move || snapshot_template_ready(&config, &template_key))
-                .await
-                .context("joining Firecracker snapshot template validation")??;
-        if !template_ready {
-            bail!(
-                "Firecracker snapshot {} is not available on this host",
-                manifest.template_key
-            )
-        }
-        self.shared
-            .new_snapshot_machine_record(
-                &request,
-                &machine_id,
-                &spec_hash,
-                SnapshotTemplateReference {
-                    key: manifest.template_key,
-                    lifecycle: SnapshotTemplateLifecycle::Snapshot,
-                },
-                manifest.source_network_slot,
-            )
-            .await?;
-        drop(_lifecycle_guard);
-
-        match self.acquire_resolved(request).await {
-            Ok(handle) => Ok(handle),
-            Err(error) => {
-                let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
-                if let Err(cleanup_error) = self.shared.cleanup_machine(&machine_id, true).await {
-                    tracing::warn!(
-                        machine_id,
-                        error = format!("{cleanup_error:#}"),
-                        "failed cleaning up unsuccessful Firecracker snapshot restore"
-                    );
-                }
-                Err(error)
-            }
-        }
+        let manifest = FirecrackerSnapshotManifest::from_payload(payload)?;
+        let request = self.resolve_request(request).await?;
+        self.restore_snapshot(request, manifest, SnapshotTemplateLifecycle::Snapshot, None)
+            .await
     }
 }
 
@@ -1075,59 +1127,20 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
     }
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {
-        if !self.request.spec.durable_file_systems.is_empty() {
-            bail!("Firecracker snapshotting does not support durable filesystems")
-        }
-
-        let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
-        let source = self
-            .shared
-            .load_machine_record(&self.machine.record.machine_id)
-            .await?
-            .context("Firecracker snapshot source manifest is missing")?;
-        if source.spec_hash != self.spec_hash
-            || sandbox_spec_hash(&self.request.spec) != self.spec_hash
-        {
-            bail!("Firecracker snapshot source specification changed")
-        }
-        if !process_running(&self.shared.pid_path(&source.machine_id)) {
-            bail!("Firecracker snapshot source is not running")
-        }
-
-        GuestClient::new(
-            Arc::clone(&self.shared),
-            machine_from_record(&self.shared.config, source.clone()).vsock_path,
+        let captured = FirecrackerSandboxBackend::capture_snapshot(
+            &self.shared,
+            &self.request,
+            &self.machine.record.machine_id,
+            &self.spec_hash,
+            explicit_snapshot_template_key(&self.machine.record, Uuid::new_v4()),
         )
-        .sync_filesystem(&self.request.spec.default_workdir)
-        .await
-        .context("syncing Firecracker snapshot source filesystem")?;
-
-        let template_key = explicit_snapshot_template_key(&source, Uuid::new_v4());
-        let config = self.shared.config.clone();
-        let source_for_snapshot = source.clone();
-        let key_for_snapshot = template_key.clone();
-        tokio::task::spawn_blocking(move || {
-            create_fork_snapshot(&config, &source_for_snapshot, &key_for_snapshot)
-        })
-        .await
-        .context("joining Firecracker snapshot creation")??;
+        .await?;
 
         // The generic Exo payload stays small: copying multi-gigabyte RAM and
         // disk images through conversation storage would defeat local snapshot
         // restores. The reference is intentionally usable only by a backend
         // sharing this private Firecracker state root.
-        let manifest = FirecrackerSnapshotManifest {
-            format_version: SNAPSHOT_FORMAT_VERSION,
-            template_key,
-            spec_hash: source.spec_hash,
-            source_network_slot: source.slot,
-        };
-        let bytes =
-            serde_json::to_vec(&manifest).context("serializing FirecrackerSnapshot manifest")?;
-        Ok(SnapshotPayload {
-            kind: SnapshotKind::FirecrackerSnapshot,
-            bytes: Bytes::from(bytes),
-        })
+        captured.manifest.into_payload()
     }
 }
 
@@ -1507,7 +1520,7 @@ impl Shared {
         let snapshot = snapshot_template_dir(&self.config, key)?;
         tokio::task::spawn_blocking(move || remove_directory_if_present(&snapshot))
             .await
-            .context("joining Firecracker fork snapshot cleanup")?
+            .context("joining Firecracker snapshot cleanup")?
     }
 
     fn manifest_path(&self, machine_id: &str) -> PathBuf {
@@ -3123,7 +3136,7 @@ fn remove_directory_if_present(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_fork_snapshot(
+fn capture_snapshot_template(
     config: &FirecrackerConfig,
     source: &MachineRecord,
     template_key: &str,
@@ -3135,7 +3148,7 @@ fn create_fork_snapshot(
 
     let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = config.state_root.join("snapshots").join(format!(
-        ".{template_key}.fork.{}.{}",
+        ".{template_key}.capture.{}.{}",
         std::process::id(),
         sequence
     ));
@@ -3143,7 +3156,7 @@ fn create_fork_snapshot(
     fs::set_permissions(&temporary, Permissions::from_mode(0o700))?;
 
     let root = jail_root(config, &source.machine_id);
-    let output_name = format!("fork-{}", &template_key[..12]);
+    let output_name = format!("snapshot-{}", &template_key[..12]);
     let output = root.join(&output_name);
     remove_directory_if_present(&output)?;
     fs::create_dir(&output)?;
@@ -3156,13 +3169,13 @@ fn create_fork_snapshot(
     {
         remove_directory_if_present(&temporary)?;
         remove_directory_if_present(&output)?;
-        return Err(error).context("pausing Firecracker fork source");
+        return Err(error).context("pausing Firecracker snapshot source");
     }
     let snapshot_path = format!("/{output_name}/state");
     let memory_path = format!("/{output_name}/memory");
     let paused_result = (|| {
         let snapshot_started = Instant::now();
-        // A fork captures a full point-in-time device/RAM image once. Clones
+        // A snapshot captures a full point-in-time device/RAM image once. Clones
         // map the immutable memory file privately and get independent COW disks.
         // https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md#full-and-diff-snapshots
         // https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md#memory-backend
@@ -3179,7 +3192,7 @@ fn create_fork_snapshot(
         )?;
         record_launch_timing(
             &source.machine_id,
-            "fork_snapshot_create",
+            "snapshot_create",
             snapshot_started.elapsed(),
         );
 
@@ -3192,10 +3205,10 @@ fn create_fork_snapshot(
     let resume = firecracker_api_patch(&api, "/vm", &FirecrackerVmState { state: "Resumed" });
     let result = match (paused_result, resume) {
         (Err(error), Err(resume_error)) => Err(error).context(format!(
-            "creating Firecracker fork snapshot; source resume also failed: {resume_error:#}"
+            "creating Firecracker snapshot; source resume also failed: {resume_error:#}"
         )),
-        (Err(error), Ok(())) => Err(error).context("creating Firecracker fork snapshot"),
-        (Ok(()), Err(error)) => Err(error).context("resuming Firecracker fork source"),
+        (Err(error), Ok(())) => Err(error).context("creating Firecracker snapshot"),
+        (Ok(()), Err(error)) => Err(error).context("resuming Firecracker snapshot source"),
         (Ok(()), Ok(())) => Ok(()),
     };
     let result = result.and_then(|()| {
@@ -3227,28 +3240,22 @@ fn create_fork_snapshot(
     let output_cleanup = remove_directory_if_present(&output);
     let result = match (result, output_cleanup) {
         (Err(error), Err(cleanup_error)) => Err(error).context(format!(
-            "creating Firecracker fork snapshot; jail cleanup also failed: {cleanup_error:#}"
+            "creating Firecracker snapshot; jail cleanup also failed: {cleanup_error:#}"
         )),
         (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => {
-            Err(error).context("cleaning up Firecracker fork snapshot jail output")
-        }
+        (Ok(()), Err(error)) => Err(error).context("cleaning up Firecracker snapshot jail output"),
         (Ok(()), Ok(())) => Ok(()),
     };
     if let Err(error) = result {
         if let Err(cleanup_error) = remove_directory_if_present(&temporary) {
             return Err(error).context(format!(
-                "cleaning up failed Firecracker fork snapshot also failed: {cleanup_error:#}"
+                "cleaning up failed Firecracker snapshot also failed: {cleanup_error:#}"
             ));
         }
         return Err(error);
     }
-    fs::rename(&temporary, &destination).with_context(|| {
-        format!(
-            "publishing Firecracker fork snapshot {}",
-            destination.display()
-        )
-    })?;
+    fs::rename(&temporary, &destination)
+        .with_context(|| format!("publishing Firecracker snapshot {}", destination.display()))?;
     validate_snapshot_template(config, &destination)?;
     Ok(())
 }
