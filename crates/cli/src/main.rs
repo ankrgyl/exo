@@ -25,21 +25,21 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use executor::{
-    AgentHarnessKind, AttachSandboxRequest, BasicExoHarness, BasicExoHarnessConfig, BasicHarness,
-    BasicToolRuntime, Binding, BraintrustProject, BraintrustRuntimeConfig, BraintrustTracingConfig,
-    ConversationModelConfig, CreateAgentRequest, CreateConversationRequest, CreateSandboxRequest,
-    DaytonaBackendSpec, DurableFileSystem, E2bBackendSpec, EventKind, EventQuery,
-    EventQueryDirection, ExoHarness, ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount,
-    FileSystemMountMode, ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART,
-    HTTP_EXOHARNESS_TRACING_TARGET, Harness, HarnessAgent, HarnessConversation, HttpExoHarness,
-    LocalSandboxExoHarness, PutSecretRequest, RlmHarness, RunInSandboxRequest,
-    SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment, SandboxBackendRegistration, SandboxProcess,
-    SandboxProvider, SandboxProviderConfig, SandboxScope, Secret, SecretBackendChoice,
-    SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness, TypeScriptHarnessConfig,
-    Uuid7, VercelBackendSpec, default_aws_agentcore_image, default_daytona_image,
-    default_docker_image, default_e2b_template, default_vercel_image, effective_sandbox_scope,
-    finalize_rebuild_update_file, load_agent_config, record_host_event, send_conversation_wakeup,
-    serve_exoharness_http_listener_with_options,
+    AgentHandle, AgentHarnessKind, AttachSandboxRequest, BasicExoHarness, BasicExoHarnessConfig,
+    BasicHarness, BasicToolRuntime, Binding, BraintrustProject, BraintrustRuntimeConfig,
+    BraintrustTracingConfig, ConversationModelConfig, CreateAgentRequest,
+    CreateConversationRequest, CreateSandboxRequest, DaytonaBackendSpec, DurableFileSystem,
+    E2bBackendSpec, EventKind, EventQuery, EventQueryDirection, ExoHarness,
+    ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount, FileSystemMountMode,
+    ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART, HTTP_EXOHARNESS_TRACING_TARGET,
+    Harness, HarnessAgent, HarnessConversation, HttpExoHarness, LocalSandboxExoHarness,
+    NewAgentRequest, PutSecretRequest, RlmHarness, RunInSandboxRequest, SANDBOX_MAIN_MOUNT_DIR,
+    SandboxAttachment, SandboxBackendRegistration, SandboxProcess, SandboxProvider,
+    SandboxProviderConfig, SandboxScope, Secret, SecretBackendChoice, SpritesBackendSpec,
+    ToolRequest, ToolRuntime, TypeScriptHarness, TypeScriptHarnessConfig, Uuid7, VercelBackendSpec,
+    default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
+    default_vercel_image, effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config,
+    record_host_event, send_conversation_wakeup, serve_exoharness_http_listener_with_options,
 };
 use serde::Deserialize;
 use tabwriter::TabWriter;
@@ -49,6 +49,8 @@ use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 use crate::env::CliEnvironment;
 use crate::render::{Verbosity, print_message};
 use tui::run_chat_repl;
+
+const SANDBOX_CLI_AGENT_SLUG: &str = "__exo_sandbox_cli";
 
 #[derive(Debug, Parser)]
 #[command(name = "exo")]
@@ -677,13 +679,12 @@ enum ConversationSandboxCommands {
 
 #[derive(Debug, Subcommand)]
 enum SandboxCommands {
-    /// Create and start a sandbox owned by an agent.
-    Start(SandboxStartArgs),
+    /// Create and start a sandbox.
+    Start(Box<SandboxStartArgs>),
     /// Start a sandbox, enter a shell, and destroy it when the shell exits.
     Play(Box<SandboxPlayArgs>),
     /// Run a command and stream its output.
     Exec {
-        agent: String,
         sandbox_id: String,
         #[arg(long = "env", value_name = "NAME=VALUE")]
         env: Vec<String>,
@@ -692,7 +693,6 @@ enum SandboxCommands {
     },
     /// Connect stdin/stdout/stderr to an interactive shell (without a PTY).
     Connect {
-        agent: String,
         sandbox_id: String,
         #[arg(long, default_value = "/bin/bash")]
         shell: String,
@@ -700,14 +700,13 @@ enum SandboxCommands {
         env: Vec<String>,
     },
     /// Stop a sandbox while retaining its stored record.
-    Stop { agent: String, sandbox_id: String },
+    Stop { sandbox_id: String },
     /// Destroy a sandbox's retained backend state.
-    Terminate { agent: String, sandbox_id: String },
+    Terminate { sandbox_id: String },
 }
 
 #[derive(Debug, Args)]
 struct SandboxStartArgs {
-    agent: String,
     #[arg(long)]
     name: Option<String>,
     #[command(flatten)]
@@ -745,7 +744,6 @@ struct SandboxCreateArgs {
 
 #[derive(Debug, Args)]
 struct SandboxPlayArgs {
-    agent: String,
     #[command(flatten)]
     sandbox: SandboxCreateArgs,
     #[arg(long, default_value = "/bin/bash")]
@@ -1085,6 +1083,7 @@ async fn main() -> Result<()> {
                     &["AGENT", "ID", "NAME"],
                     agents
                         .into_iter()
+                        .filter(|agent| agent.slug != SANDBOX_CLI_AGENT_SLUG)
                         .map(|agent| vec![agent.slug, agent.id.to_string(), agent.name])
                         .collect(),
                 )?;
@@ -2309,19 +2308,18 @@ async fn main() -> Result<()> {
 async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands) -> Result<()> {
     match command {
         SandboxCommands::Start(args) => {
-            let (_, sandbox_id) =
-                start_sandbox(harness, args.agent, args.name, args.sandbox).await?;
+            let SandboxStartArgs { name, sandbox } = *args;
+            let (_, sandbox_id) = start_sandbox(harness, name, sandbox).await?;
             println!("{sandbox_id}");
         }
         SandboxCommands::Play(args) => {
             let SandboxPlayArgs {
-                agent,
                 sandbox,
                 shell,
                 env,
             } = *args;
             let env = parse_environment(env)?;
-            let (agent, sandbox_id) = start_sandbox(harness, agent, None, sandbox).await?;
+            let (agent, sandbox_id) = start_sandbox(harness, None, sandbox).await?;
             println!("started {sandbox_id}");
             let shell_result = tokio::select! {
                 result = run_sandbox_process(
@@ -2336,10 +2334,7 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
                     Ok(130)
                 }
             };
-            let cleanup_result = agent
-                .exoharness_handle()
-                .terminate_sandbox(sandbox_id)
-                .await;
+            let cleanup_result = agent.terminate_sandbox(sandbox_id).await;
             match (shell_result, cleanup_result) {
                 (Ok(0), Ok(())) => {}
                 (Ok(exit_code), Ok(())) => {
@@ -2355,12 +2350,11 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
             }
         }
         SandboxCommands::Exec {
-            agent,
             sandbox_id,
             env,
             command,
         } => {
-            let agent = must_get_agent(harness, &agent).await?;
+            let agent = sandbox_owner(harness).await?;
             let exit_code = run_sandbox_process(
                 agent.as_ref(),
                 sandbox_id,
@@ -2374,12 +2368,11 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
             }
         }
         SandboxCommands::Connect {
-            agent,
             sandbox_id,
             shell,
             env,
         } => {
-            let agent = must_get_agent(harness, &agent).await?;
+            let agent = sandbox_owner(harness).await?;
             let exit_code = run_sandbox_process(
                 agent.as_ref(),
                 sandbox_id,
@@ -2392,14 +2385,15 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
                 bail!("sandbox shell exited with status {exit_code}");
             }
         }
-        SandboxCommands::Stop { agent, sandbox_id } => {
-            let agent = must_get_agent(harness, &agent).await?;
-            agent.exoharness_handle().stop_sandbox(sandbox_id).await?;
+        SandboxCommands::Stop { sandbox_id } => {
+            sandbox_owner(harness)
+                .await?
+                .stop_sandbox(sandbox_id)
+                .await?;
         }
-        SandboxCommands::Terminate { agent, sandbox_id } => {
-            let agent = must_get_agent(harness, &agent).await?;
-            agent
-                .exoharness_handle()
+        SandboxCommands::Terminate { sandbox_id } => {
+            sandbox_owner(harness)
+                .await?
                 .terminate_sandbox(sandbox_id)
                 .await?;
         }
@@ -2407,12 +2401,30 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
     Ok(())
 }
 
+async fn sandbox_owner(harness: &dyn Harness) -> Result<Arc<dyn AgentHandle>> {
+    let exoharness = harness.exoharness_handle();
+    if let Some(agent) = exoharness
+        .list_agents()
+        .await?
+        .into_iter()
+        .find(|agent| agent.record().slug == SANDBOX_CLI_AGENT_SLUG)
+    {
+        return Ok(agent);
+    }
+
+    exoharness
+        .new_agent(NewAgentRequest {
+            slug: SANDBOX_CLI_AGENT_SLUG.to_string(),
+            name: "Sandbox CLI".to_string(),
+        })
+        .await
+}
+
 async fn start_sandbox(
     harness: &dyn Harness,
-    agent: String,
     name: Option<String>,
     args: SandboxCreateArgs,
-) -> Result<(Arc<dyn HarnessAgent>, String)> {
+) -> Result<(Arc<dyn AgentHandle>, String)> {
     let SandboxCreateArgs {
         provider,
         image,
@@ -2431,9 +2443,8 @@ async fn start_sandbox(
     }
     mounts.extend(internal_mounts);
 
-    let agent = must_get_agent(harness, &agent).await?;
+    let agent = sandbox_owner(harness).await?;
     let sandbox_id = agent
-        .exoharness_handle()
         .create_sandbox(CreateSandboxRequest {
             name,
             provider: provider.into(),
@@ -2450,14 +2461,13 @@ async fn start_sandbox(
 }
 
 async fn run_sandbox_process(
-    agent: &dyn HarnessAgent,
+    agent: &dyn AgentHandle,
     sandbox_id: String,
     command: Vec<String>,
     env: HashMap<String, String>,
     connect_stdin: bool,
 ) -> Result<i32> {
     let process = agent
-        .exoharness_handle()
         .run_in_sandbox(RunInSandboxRequest {
             id: sandbox_id,
             command,
@@ -2567,15 +2577,8 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
             ConversationCommands::CompleteRebuildUpdate { .. } => None,
         },
         Commands::Repl { agent, .. } => Some(agent.as_deref().unwrap_or(DEFAULT_REPL_SLUG)),
-        Commands::Sandbox { command } => Some(match command {
-            SandboxCommands::Start(args) => args.agent.as_str(),
-            SandboxCommands::Play(args) => args.agent.as_str(),
-            SandboxCommands::Exec { agent, .. }
-            | SandboxCommands::Connect { agent, .. }
-            | SandboxCommands::Stop { agent, .. }
-            | SandboxCommands::Terminate { agent, .. } => agent.as_str(),
-        }),
-        Commands::Secret { .. }
+        Commands::Sandbox { .. }
+        | Commands::Secret { .. }
         | Commands::Model { .. }
         | Commands::Provider { .. }
         | Commands::Adapters { .. }
