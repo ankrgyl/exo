@@ -68,7 +68,7 @@ them to take effect.
 ./exo.sh              # create or reuse the agent, start services + REPL
 ./exo.sh list         # list agents and conversations
 ./exo.sh stop-all     # stop scheduler and adapter loops
-./exo.sh fresh        # start over with a fresh agent
+./exo.sh fresh        # wipe local agent state and start over (prompts unless --force)
 ./exo.sh setup-profile
 ```
 
