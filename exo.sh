@@ -84,7 +84,7 @@ Choose a different template with --template.
 
 Subcommands:
   list             List agents and conversations
-  fresh            Rebuild, wipe local agent/conversation/adapter state, and start a clean REPL
+  fresh            Wipe local agent/conversation/adapter state and start a clean REPL
   stop-all         Stop the scheduler and adapter runners, preserving .exo state
   build            Install JS dependencies and build the exo CLI and scheduler
   register-model   Store an API-key secret and register a model binding; uses
@@ -779,10 +779,12 @@ confirm_fresh_wipe() {
   fi
   echo "This will delete local Exo state in this checkout:"
   echo "  agents, conversations, and their event history"
+  echo "  that agent's model bindings and stored secrets"
   echo "  adapter records and adapter logs"
   echo "  leftover local sandbox containers from this checkout"
-  echo "It keeps API keys, model bindings, .env, and .exo/exo-profile.md,"
-  echo "then starts a new agent."
+  echo "It keeps .env and .exo/exo-profile.md, then starts a new agent."
+  echo "Re-register the model after this if you used exo model register."
+  echo "Use --force to skip this prompt."
   echo
   read -r -p "Type 'fresh' to continue: " reply
   [[ "$reply" == "fresh" ]] || die "aborted"
