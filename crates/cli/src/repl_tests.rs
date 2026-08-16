@@ -39,12 +39,16 @@ fn pick_repl_model_requires_a_registered_model() {
 
 #[test]
 fn missing_model_repl_errors_skip_the_turn_failed_prefix() {
-    let error =
-        anyhow::anyhow!("typescript harness failed: model is not registered: gpt-5.6-terra");
+    let error = anyhow::Error::new(executor::UnregisteredModelError::new("gpt-5.6-terra"))
+        .context("typescript harness failed");
     let rendered = format_repl_failure(&error, "turn failed");
     assert!(rendered.starts_with("model `gpt-5.6-terra` is not registered."));
     assert!(!rendered.contains("turn failed"));
     assert!(!rendered.contains("typescript harness failed"));
+    assert_eq!(
+        format_repl_failure(&anyhow::anyhow!("sandbox exploded"), "turn failed"),
+        "turn failed: sandbox exploded"
+    );
 }
 
 #[test]

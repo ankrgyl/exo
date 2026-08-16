@@ -203,7 +203,7 @@ pub(crate) async fn resolve_model_binding(
         .await?
         .into_iter()
         .find(|binding| binding.name == name)
-        .ok_or_else(|| anyhow::anyhow!(unregistered_model_message(name)))?;
+        .ok_or_else(|| anyhow::Error::new(UnregisteredModelError::new(name)))?;
     let Binding::Llm {
         model,
         base_url,
@@ -388,50 +388,45 @@ fn render_assistant_content(content: &AssistantContent) -> String {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnregisteredModelError {
+    pub name: String,
+}
+
+impl UnregisteredModelError {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+impl std::fmt::Display for UnregisteredModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "model `{}` is not registered.\n  exo secret set openai --env OPENAI_API_KEY\n  exo model register {} --secret openai",
+            self.name, self.name
+        )
+    }
+}
+
+impl std::error::Error for UnregisteredModelError {}
+
 pub fn unregistered_model_message(name: &str) -> String {
-    format!(
-        "model `{name}` is not registered.\n  exo secret set openai --env OPENAI_API_KEY\n  exo model register {name} --secret openai"
-    )
+    UnregisteredModelError::new(name).to_string()
 }
 
 pub fn format_user_facing_error(error: &anyhow::Error) -> String {
-    if let Some(name) = unregistered_model_name(error) {
-        return unregistered_model_message(&name);
+    if let Some(unregistered) = error.downcast_ref::<UnregisteredModelError>() {
+        return unregistered.to_string();
     }
     format!("{error:#}")
-}
-
-fn unregistered_model_name(error: &anyhow::Error) -> Option<String> {
-    for cause in error.chain() {
-        let text = cause.to_string();
-        if let Some(name) = text
-            .split_once("model is not registered: ")
-            .map(|(_, rest)| rest)
-        {
-            return Some(
-                name.split([';', '\n', ' '])
-                    .next()
-                    .unwrap_or(name)
-                    .trim()
-                    .trim_matches('`')
-                    .to_string(),
-            );
-        }
-        if let Some(name) = text
-            .split_once("model `")
-            .and_then(|(_, rest)| rest.split("` is not registered").next())
-        {
-            return Some(name.to_string());
-        }
-    }
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{format_user_facing_error, to_lingua_value, unregistered_model_message};
+    use super::{UnregisteredModelError, format_user_facing_error, to_lingua_value};
 
     #[test]
     fn converts_std_json_to_lingua_json_structurally() {
@@ -452,11 +447,13 @@ mod tests {
 
     #[test]
     fn missing_model_errors_hide_the_harness_stack() {
-        let error = anyhow::anyhow!(
-            "typescript harness failed: model is not registered: gpt-5.6-terra; run `exo model register gpt-5.6-terra --secret <secret>`\nError: model is not registered: gpt-5.6-terra"
-        );
+        let error = anyhow::Error::new(UnregisteredModelError::new("gpt-5.6-terra"))
+            .context("typescript harness failed");
         let rendered = format_user_facing_error(&error);
-        assert_eq!(rendered, unregistered_model_message("gpt-5.6-terra"));
+        assert_eq!(
+            rendered,
+            UnregisteredModelError::new("gpt-5.6-terra").to_string()
+        );
         assert!(!rendered.contains("typescript harness failed"));
         assert!(!rendered.contains("Error:"));
     }
