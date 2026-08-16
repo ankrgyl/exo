@@ -1353,7 +1353,10 @@ impl Shared {
     }
 }
 
-fn prepare_request(request: SandboxRequest) -> Result<SandboxRequest> {
+fn prepare_request(mut request: SandboxRequest) -> Result<SandboxRequest> {
+    if request.spec.image.trim().is_empty() {
+        request.spec.image = super::default_firecracker_image();
+    }
     if !request.spec.mounts.is_empty() {
         bail!(
             "Firecracker does not support host bind mounts; use a durable block device or another provider"
