@@ -162,10 +162,23 @@ Like the other coding-agent harnesses, Pi runs inside the configured sandbox
 and treats exoharness events as canonical history. Each turn uses an in-memory
 Pi session, so no separate Pi session is persisted. The worker does not load
 ambient `~/.pi` or project extensions, skills, prompts, or context files.
+Prior history and tool results use the same bounded replay approach as the Codex
+harness, with truncation metadata recorded on `pi_turn_started` events.
+
+Pi text, tools, raw SDK messages, retries, compaction, and standard usage/cost
+records are projected into exoharness events. The worker removes the provider
+credential from its environment before starting Pi, so tool subprocesses do not
+inherit it. Worker messages are scoped to the current turn ID, and turns time
+out after ten minutes by default; set
+`EXO_PI_TURN_TIMEOUT_MS` to a positive number of milliseconds to override it.
+Agent `max_output_tokens` and `max_tool_round_trips` limits are forwarded to the
+Pi runtime.
 
 The preset enables networking because Pi makes model requests in the sandbox.
-It currently supports Pi's built-in model catalog; an Exo `--base-url` overrides
-the selected model's endpoint.
+Remote endpoints fail early with an actionable networking error when it is
+disabled; loopback endpoints remain available for sandbox-local inference. The
+harness currently supports Pi's built-in model catalog; an Exo `--base-url`
+overrides the selected model's endpoint.
 
 ## Live E2E
 

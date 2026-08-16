@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import {
   appendCustomEvent,
   assistantTextMessage,
@@ -26,25 +28,39 @@ import {
   resolveLlmBinding,
   sandboxCwd,
   WarmJsonlSandboxWorker,
+  WarmJsonlSandboxWorkerTimeoutError,
   WarmResourceCache,
   type ResolvedLlmBinding,
 } from "@exo/model-runtime/shared";
+import { capPiHistory } from "@exo/pi/history";
 import {
+  piResultUsageRecord,
+  projectPiAssistantMessage,
+} from "@exo/pi/projection";
+import {
+  parsePiWorkerEvent,
   type PiWorkerEvent,
   type PiWorkerRequest,
   type PiWorkerRunResult,
 } from "@exo/pi/protocol";
 
+const PI_WORKER_STARTUP_TIMEOUT_MS = 20_000;
+const DEFAULT_PI_TURN_TIMEOUT_MS = 10 * 60_000;
+
 interface PiTraceState {
   finalText: string;
+  lastPersistedAssistantText: string | null;
   promptMessages: Message[];
   rawMessages: JsonValue[];
+  requestId: string;
   runResult: PiWorkerRunResult | null;
   sawTextDelta: boolean;
   startedAt: number;
   streamedText: string;
   ttftMs: number | null;
+  usageEventsPersisted: number;
   observedToolCalls: Map<string, PendingToolCall>;
+  upstreamModel: string;
 }
 
 type PiSandboxWorker = WarmJsonlSandboxWorker<PiWorkerRequest, PiWorkerEvent>;
@@ -65,25 +81,38 @@ async function runPiHarnessTurn(
   turnParent: TraceParent,
   modelBinding: ResolvedLlmBinding,
 ): Promise<string | null> {
+  await requirePiSandboxNetworking(context, modelBinding);
+  const priorMessages = await materializePriorConversationMessages(context);
+  const cappedHistory = capPiHistory(priorMessages);
+  const requestId = context.exoharness.current.turn.record.id;
   const state: PiTraceState = {
     finalText: "",
-    promptMessages: await materializePriorConversationMessages(context),
+    lastPersistedAssistantText: null,
+    promptMessages: cappedHistory.messages,
     rawMessages: [],
+    requestId,
     runResult: null,
     sawTextDelta: false,
     startedAt: Date.now(),
     streamedText: "",
     ttftMs: null,
+    usageEventsPersisted: 0,
     observedToolCalls: new Map(),
+    upstreamModel: modelBinding.model,
   };
   const prompt = piPrompt(context, state.promptMessages);
 
   await appendCustomEvent(context.exoharness.current.turn, "pi_turn_started", {
     metadata: turnMetadata(context),
+    request_id: requestId,
     model: modelBinding.model,
     cwd: sandboxCwd(context),
     hydrated_from: "exoharness_events",
     sandbox_command: piSandboxCommand(context).join(" "),
+    prior_source_messages: cappedHistory.sourceMessageCount,
+    prior_dropped_messages: cappedHistory.droppedMessageCount,
+    prior_truncated_messages: cappedHistory.truncatedMessageCount,
+    prior_text_chars: cappedHistory.textChars,
   });
 
   try {
@@ -142,7 +171,11 @@ async function tracePiRun(
         await appendCustomEvent(
           context.exoharness.current.turn,
           "pi_run_failed",
-          { metadata: turnMetadata(context), error: message },
+          {
+            metadata: turnMetadata(context),
+            request_id: state.requestId,
+            error: message,
+          },
         );
         throw error;
       }
@@ -157,6 +190,7 @@ async function tracePiRun(
           ...turnMetadata(context),
           runtime: "pi_sdk",
           model: modelBinding.model,
+          request_id: state.requestId,
           streamed: context.streaming,
         },
       },
@@ -177,21 +211,50 @@ async function runPiSandboxWorker(
   );
   await appendCustomEvent(context.exoharness.current.turn, "pi_worker_ready", {
     metadata: turnMetadata(context),
+    request_id: state.requestId,
     warm_worker_reused: reused,
   });
   const request: PiWorkerRequest = {
+    requestId: state.requestId,
     prompt,
     systemPrompt: piSystemPrompt(context),
     model: modelBinding.model,
     baseUrl: modelBinding.baseUrl ?? undefined,
     cwd: sandboxCwd(context),
+    maxOutputTokens: context.agentConfig.maxOutputTokens ?? undefined,
+    maxToolRoundTrips: context.agentConfig.maxToolRoundTrips ?? undefined,
   };
+  const timeoutMs = piTurnTimeoutMs();
   try {
-    return await worker.request(request, async (event) => {
-      await handlePiWorkerEvent(context, turnParent, state, event);
-      return event.type === "completed" ? event.result : undefined;
-    });
+    return await worker.request(
+      request,
+      async (event) => {
+        if (event.requestId !== request.requestId) {
+          throw new Error(
+            `Pi worker returned request ${event.requestId} while handling ${request.requestId}`,
+          );
+        }
+        await handlePiWorkerEvent(context, turnParent, state, event);
+        return event.type === "completed" ? event.result : undefined;
+      },
+      {
+        startupTimeoutMs: PI_WORKER_STARTUP_TIMEOUT_MS,
+        timeoutMs,
+      },
+    );
   } catch (error) {
+    if (error instanceof WarmJsonlSandboxWorkerTimeoutError) {
+      await appendCustomEvent(
+        context.exoharness.current.turn,
+        "pi_worker_timeout",
+        {
+          metadata: turnMetadata(context),
+          request_id: state.requestId,
+          phase: error.phase === "request" ? "turn" : error.phase,
+          timeout_ms: error.timeoutMs,
+        },
+      );
+    }
     await piWorkers.delete(workerKey, (cachedWorker) => cachedWorker.close());
     throw error;
   }
@@ -203,7 +266,7 @@ async function startPiSandboxWorker(
 ): Promise<PiSandboxWorker> {
   return new WarmJsonlSandboxWorker({
     name: "Pi sandbox worker",
-    parseEvent: parseWorkerEvent,
+    parseEvent: parsePiWorkerEvent,
     process: await context.startSandboxProcess({
       command: piSandboxCommand(context),
       env: piSandboxEnv(modelBinding),
@@ -218,13 +281,22 @@ async function handlePiWorkerEvent(
   event: PiWorkerEvent,
 ): Promise<void> {
   switch (event.type) {
+    case "run_started":
+      await appendCustomEvent(
+        context.exoharness.current.turn,
+        "pi_run_started",
+        {
+          metadata: turnMetadata(context),
+          request_id: event.requestId,
+        },
+      );
+      return;
     case "delta":
       await streamTextDelta(context, state, event.text);
       return;
     case "message":
       state.rawMessages.push(event.message);
-      state.finalText =
-        assistantTextFromRawMessage(event.message) || state.finalText;
+      await projectPiMessage(context, state, event);
       return;
     case "tool_start":
     case "tool_end":
@@ -234,7 +306,11 @@ async function handlePiWorkerEvent(
       await appendCustomEvent(
         context.exoharness.current.turn,
         event.phase === "start" ? "pi_retry_started" : "pi_retry_finished",
-        { metadata: turnMetadata(context), details: event.details },
+        {
+          metadata: turnMetadata(context),
+          request_id: event.requestId,
+          details: event.details,
+        },
       );
       return;
     case "compaction":
@@ -243,7 +319,11 @@ async function handlePiWorkerEvent(
         event.phase === "start"
           ? "pi_compaction_started"
           : "pi_compaction_finished",
-        { metadata: turnMetadata(context), details: event.details },
+        {
+          metadata: turnMetadata(context),
+          request_id: event.requestId,
+          details: event.details,
+        },
       );
       return;
     case "completed":
@@ -255,11 +335,41 @@ async function handlePiWorkerEvent(
         "pi_worker_error",
         {
           metadata: turnMetadata(context),
+          request_id: event.requestId,
           error: event.message,
           details: event.error,
         },
       );
       throw new Error(event.message);
+  }
+}
+
+async function projectPiMessage(
+  context: TurnContext,
+  state: PiTraceState,
+  event: Extract<PiWorkerEvent, { type: "message" }>,
+): Promise<void> {
+  const projection = projectPiAssistantMessage(event.message, {
+    upstreamModel: state.upstreamModel,
+    durationMs: event.durationMs,
+    ttftMs: event.ttftMs,
+  });
+  if (!projection || (!projection.text && !projection.usage)) {
+    return;
+  }
+  if (projection.text) {
+    state.finalText = projection.text;
+    state.lastPersistedAssistantText = projection.text;
+  }
+  await context.exoharness.current.turn.addEvents([
+    messagesEvent(
+      projection.text ? [assistantTextMessage(projection.text)] : [],
+      undefined,
+      projection.usage,
+    ),
+  ]);
+  if (projection.usage) {
+    state.usageEventsPersisted += 1;
   }
 }
 
@@ -340,16 +450,26 @@ async function appendPiFinalEvents(
   state: PiTraceState,
   result: PiWorkerRunResult,
 ): Promise<void> {
-  if (state.finalText) {
+  const textMissing =
+    Boolean(state.finalText) &&
+    state.lastPersistedAssistantText !== state.finalText;
+  const usageMissing = state.usageEventsPersisted === 0;
+  if (textMissing || usageMissing) {
     await context.exoharness.current.turn.addEvents([
-      messagesEvent([assistantTextMessage(state.finalText)]),
+      messagesEvent(
+        textMissing ? [assistantTextMessage(state.finalText)] : [],
+        undefined,
+        usageMissing ? piResultUsageRecord(result, state.ttftMs) : undefined,
+      ),
     ]);
   }
   await appendCustomEvent(context.exoharness.current.turn, "pi_run_completed", {
     metadata: turnMetadata(context),
+    request_id: state.requestId,
     status: result.status,
     model: result.model,
     provider: result.provider,
+    duration_ms: result.durationMs,
     usage: result.usage,
   });
 }
@@ -363,6 +483,7 @@ async function flushPiRawMessages(
   }
   await appendCustomEvent(context.exoharness.current.turn, "pi_messages", {
     metadata: turnMetadata(context),
+    request_id: state.requestId,
     messages: state.rawMessages,
   });
   state.rawMessages = [];
@@ -399,22 +520,6 @@ function piPromptMessage(prompt: string): Message {
   return { role: "user", content: prompt };
 }
 
-function assistantTextFromRawMessage(message: JsonValue): string {
-  if (!isRecord(message) || message.role !== "assistant") {
-    return "";
-  }
-  const content = Array.isArray(message.content) ? message.content : [];
-  return content
-    .map((part) => {
-      return isRecord(part) &&
-        part.type === "text" &&
-        typeof part.text === "string"
-        ? part.text
-        : "";
-    })
-    .join("");
-}
-
 function piTraceOutput(
   state: PiTraceState,
   result: PiWorkerRunResult | null,
@@ -438,11 +543,60 @@ function piTraceMetrics(
     metrics.prompt_cached_tokens = result.usage.cacheRead;
     metrics.prompt_cache_creation_tokens = result.usage.cacheWrite;
     metrics.estimated_cost = result.usage.cost;
+    metrics.duration = result.durationMs / 1000;
+    if (result.usage.reasoning !== undefined) {
+      metrics.completion_reasoning_tokens = result.usage.reasoning;
+    }
   }
   if (state.ttftMs !== null) {
     metrics.time_to_first_token = state.ttftMs / 1000;
   }
   return metrics;
+}
+
+async function requirePiSandboxNetworking(
+  context: TurnContext,
+  modelBinding: ResolvedLlmBinding,
+): Promise<void> {
+  if (
+    context.agentConfig.sandbox.enableNetworking ||
+    isLoopbackUrl(modelBinding.baseUrl)
+  ) {
+    return;
+  }
+  await appendCustomEvent(
+    context.exoharness.current.turn,
+    "pi_networking_required",
+    {
+      metadata: turnMetadata(context),
+      model: modelBinding.model,
+      reason:
+        "Pi makes model requests inside the Exoharness sandbox, so remote providers require sandbox networking.",
+    },
+  );
+  throw new Error(
+    [
+      "Pi requires agent networking for remote model providers.",
+      `Enable it with: exo agent update ${context.exoharness.current.agent.record.slug} --networking enabled`,
+    ].join(" "),
+  );
+}
+
+function isLoopbackUrl(baseUrl: string | null | undefined): boolean {
+  if (!baseUrl) {
+    return false;
+  }
+  try {
+    const hostname = new URL(baseUrl).hostname;
+    return (
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "[::1]" ||
+      hostname === "::1"
+    );
+  } catch {
+    return false;
+  }
 }
 
 function piSandboxCommand(context: TurnContext): string[] {
@@ -476,17 +630,24 @@ function piWarmWorkerKey(
     model_binding: modelBinding.name,
     model: modelBinding.model,
     base_url: modelBinding.baseUrl ?? null,
+    credential_fingerprint: credentialFingerprint(modelBinding.apiKey),
     cwd: sandboxCwd(context),
     command: piSandboxCommand(context),
   });
 }
 
-function parseWorkerEvent(line: string): PiWorkerEvent {
-  const parsed = JSON.parse(line) as unknown;
-  if (!isRecord(parsed) || typeof parsed.type !== "string") {
-    throw new Error(`invalid Pi sandbox worker event: ${line}`);
+function credentialFingerprint(apiKey: string | undefined): string | null {
+  if (!apiKey) {
+    return null;
   }
-  return parsed as PiWorkerEvent;
+  return createHash("sha256").update(apiKey).digest("hex").slice(0, 16);
+}
+
+function piTurnTimeoutMs(): number {
+  const configured = Number(process.env.EXO_PI_TURN_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_PI_TURN_TIMEOUT_MS;
 }
 
 function jsonObjectOrEmpty(value: JsonValue): JsonObject {

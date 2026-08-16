@@ -78,6 +78,7 @@ interface ConversationEventsResult {
 
 interface EventRecord {
   id?: string;
+  data?: unknown;
 }
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -319,6 +320,9 @@ function runHistoryReplayCheck(
     toolMarker,
     `${harness.key} did not read the mounted marker file through a tool call`,
   );
+  if (harness.key === "pi") {
+    assertPiUsageEvents(agent.slug, conversation);
+  }
 
   const firstTurnEndedId = firstTurnEndedEventId(agent.slug, conversation);
   const fork = `fork-${harness.key}-${runId}`;
@@ -344,6 +348,29 @@ function runHistoryReplayCheck(
   );
 
   return { conversation, fork, codeWord };
+}
+
+function assertPiUsageEvents(agent: string, conversation: string): void {
+  const result = conversationEvents(agent, conversation, [
+    "--type",
+    "messages",
+    "--limit",
+    "100",
+  ]);
+  const serialized = JSON.stringify(result.events);
+  if (!serialized.includes('"usage"')) {
+    throw new Error("Pi did not persist usage on canonical message events");
+  }
+  for (const field of [
+    "model",
+    "prompt_tokens",
+    "completion_tokens",
+    "cost_usd",
+  ]) {
+    if (!serialized.includes(`"${field}"`)) {
+      throw new Error(`Pi canonical usage did not include ${field}`);
+    }
+  }
 }
 
 function runSandboxEscapeCheck(
