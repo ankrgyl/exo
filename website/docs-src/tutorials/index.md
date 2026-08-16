@@ -18,5 +18,5 @@ Step-by-step guides for building on exo:
   ground-truth state, and a small tool surface, shown end to end with a
   Game Boy emulator playing Pokemon Red.
 
-More coming: coding-agent harnesses (Codex, Claude Code, Cursor) and
+More coming: coding-agent harnesses (Codex, Claude Code, Cursor, Pi) and
 canonical-agent setup.

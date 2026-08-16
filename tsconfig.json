@@ -27,7 +27,8 @@
       ],
       "@exo/codex/app-server": ["./exoharness/typescript/codex/app-server.ts"],
       "@exo/cursor/sdk": ["./exoharness/typescript/cursor/sdk.ts"],
-      "@exo/cursor/protocol": ["./exoharness/typescript/cursor/protocol.ts"]
+      "@exo/cursor/protocol": ["./exoharness/typescript/cursor/protocol.ts"],
+      "@exo/pi/protocol": ["./exoharness/typescript/pi/protocol.ts"]
     },
     "resolveJsonModule": true,
     "isolatedModules": true,

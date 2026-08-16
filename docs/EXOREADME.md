@@ -25,8 +25,8 @@ agents can fork, rewind, or return to known-good states without losing critical
 state such as secrets, config, or history.
 
 This directory contains the exoharness. And everything you need to build your
-own agent from scratch, or to back Codex, Claude Code, or the Cursor SDK with
-durable sessions you can stop, resume, and rewind across runs.
+own agent from scratch, or to back Codex, Claude Code, the Cursor SDK, or Pi
+with durable sessions you can stop, resume, and rewind across runs.
 
 ## The Why and What of Exo
 
@@ -46,7 +46,7 @@ decisions run on: history, state, secrets, and sandboxing.
 Because the exoharness substrate doesn't depend on the executor, an agent built on exo can:
 
 - **Fork or rewind** at any past event, without losing secrets, sandboxes, or history.
-- **Swap executors**, running the same agent via Codex, Claude Code, the Cursor SDK, or your own executor, without rebuilding state.
+- **Swap executors**, running the same agent via Codex, Claude Code, the Cursor SDK, Pi, or your own executor, without rebuilding state.
 - **Evolve safely** to change its own policy processes, with access to inspect its own history and artifacts while the exoharness isolates secrets and compute resources to maintain safety.
 
 For the architectural model and terminology, see
@@ -110,8 +110,8 @@ Then create an agent backed by a TypeScript harness module:
   --model gpt-5.5
 ```
 
-The `exoharness/examples/typescript` directory also contains Codex, Claude Code, Cursor,
-and recursive-language-model harness experiments.
+The `exoharness/examples/typescript` directory also contains Codex, Claude Code,
+Cursor, Pi, and recursive-language-model harness experiments.
 
 For the coding-agent setup commands, see
 [exoharness/docs/coding-agent-harnesses.md](../exoharness/docs/coding-agent-harnesses.md).

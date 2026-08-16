@@ -264,5 +264,5 @@ command confirmed them.
 - Register more built-in tools, or add custom tools for anything the shell
   can't express directly.
 - Read [Executors & Harnesses](../concepts/executors) to see the
-  built-in `codex` / `claude-code` / `cursor` harnesses, which wrap full
-  coding-agent runtimes with durable exoharness state.
+  built-in `codex` / `claude-code` / `cursor` / `pi` harnesses, which wrap
+  full coding-agent runtimes with durable exoharness state.

@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-type HarnessKey = "codex" | "claude" | "cursor";
+type HarnessKey = "codex" | "claude" | "cursor" | "pi";
 
 interface HarnessDefinition {
   key: HarnessKey;
@@ -117,6 +117,19 @@ const harnesses: HarnessDefinition[] = [
     imageBuildArgs: [
       "-f",
       "exoharness/containers/cursor-sdk-sandbox/Containerfile",
+      ".",
+    ],
+  },
+  {
+    key: "pi",
+    envName: "ANTHROPIC_API_KEY",
+    secret: "pi-anthropic",
+    model: "anthropic/claude-sonnet-4-6",
+    module: "exoharness/examples/typescript/pi-harness.ts",
+    image: "exo-pi-sandbox:latest",
+    imageBuildArgs: [
+      "-f",
+      "exoharness/containers/pi-sandbox/Containerfile",
       ".",
     ],
   },
@@ -689,7 +702,12 @@ function parseArgs(rawArgs: string[]): CliArgs {
 }
 
 function isHarnessKey(value: string): value is HarnessKey {
-  return value === "codex" || value === "claude" || value === "cursor";
+  return (
+    value === "codex" ||
+    value === "claude" ||
+    value === "cursor" ||
+    value === "pi"
+  );
 }
 
 function readArgValue(rawArgs: string[], index: number, flag: string): string {
@@ -790,10 +808,10 @@ function fail(message: string): never {
 function printHelpAndExit(): never {
   console.log(`Usage: pnpm e2e:agent-harnesses [options]
 
-Runs live Codex/Claude/Cursor history replay checks against exoharness.
+Runs live Codex/Claude/Cursor/Pi history replay checks against exoharness.
 
 Options:
-  --only <codex|claude|cursor>  Run one harness. Repeatable.
+  --only <codex|claude|cursor|pi>  Run one harness. Repeatable.
   --sandbox                     Also run sandbox escape/network-denial checks.
   --build-images                Build the required Apple container images first.
   --braintrust                  Verify traces using BRAINTRUST_* env vars.
