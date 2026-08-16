@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::future::Future;
-use std::io::{self, BufRead, BufReader as StdBufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader as StdBufReader, Read, Seek, SeekFrom, Write};
 use std::net::Ipv4Addr;
 use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStrExt;
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -83,10 +83,10 @@ const DEFAULT_MEMORY_MIB: u32 = 4096;
 const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 // Upstream warns that a compromised guest kernel can reactivate the serial
 // device even with 8250.nr_uarts=0, and unbounded console output written to a
-// host file is their named disk-fill DoS. VMM console output is therefore
-// captured through a pipe and only this many bytes are kept on disk.
+// host file is their named disk-fill DoS. VMM output therefore goes to
+// /dev/null; importantly, that sink also remains valid after the controller
+// process exits so a later controller can adopt the running VM.
 // https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md#8250-serial-device
-const VMM_LOG_MAX_BYTES: u64 = 1024 * 1024;
 // Every Unix socket the jail binds, in one place. These in-jail absolute
 // paths are exactly what Firecracker receives, they resolve to host paths via
 // jailed_path_on_host, and validate_jailed_socket_paths budgets each of them
@@ -364,11 +364,10 @@ struct WarmMachineEntry {
 
 struct Shared {
     config: FirecrackerConfig,
-    // Firecracker has no attach-on-restart path. Holding one lock per state
-    // root makes every manifest left before this backend started unambiguously
-    // orphaned instead of risking one Exo process reaping another's live VM.
+    // Serialize controllers for a state root. A later controller adopts live,
+    // matching machines after the prior controller releases this lock; the
+    // lock prevents concurrent controllers from racing that reconciliation.
     _state_lock: File,
-    startup_cleanup_pending: AtomicBool,
     warm_machines: Mutex<HashMap<SandboxKey, WarmMachineEntry>>,
     lifecycle_lock: Mutex<()>,
 }
@@ -454,22 +453,20 @@ impl FirecrackerSandboxBackend {
             shared: Arc::new(Shared {
                 config,
                 _state_lock: state_lock,
-                startup_cleanup_pending: AtomicBool::new(true),
                 warm_machines: Mutex::new(HashMap::new()),
                 lifecycle_lock: Mutex::new(()),
             }),
         })
     }
 
-    // Entry point for the Lima bridge: the first call reaps every machine left
-    // by the prior state-root owner; later calls use the persisted idle leases.
+    // Entry point for the Lima bridge. Persisted leases are authoritative
+    // across bridge/controller restarts.
     pub(super) async fn reap_expired(&self) -> Result<()> {
         let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
         self.reap_expired_machines().await
     }
 
     async fn reap_expired_machines(&self) -> Result<()> {
-        let startup_cleanup = self.shared.startup_cleanup_pending.load(Ordering::Acquire);
         let now = Instant::now();
         let mut expired = {
             let mut machines = self.shared.warm_machines.lock().await;
@@ -489,11 +486,7 @@ impl FirecrackerSandboxBackend {
         };
         let state_root = self.shared.config.state_root.clone();
         let persisted = tokio::task::spawn_blocking(move || {
-            if startup_cleanup {
-                manifest_machine_ids(&state_root)
-            } else {
-                expired_machine_ids(&state_root, SystemTime::now())
-            }
+            expired_machine_ids(&state_root, SystemTime::now())
         })
         .await
         .context("joining Firecracker lease scan")??;
@@ -509,11 +502,6 @@ impl FirecrackerSandboxBackend {
         }
         for machine_id in expired {
             self.shared.cleanup_machine(&machine_id, true).await?;
-        }
-        if startup_cleanup {
-            self.shared
-                .startup_cleanup_pending
-                .store(false, Ordering::Release);
         }
         Ok(())
     }
@@ -2576,13 +2564,11 @@ fn spawn_jailed_firecracker(
     // validate_jailed_socket_paths budgets, so no call site can drift from
     // the path the rest of the code waits on.
     let api_socket_arguments = ["--api-sock", JAILED_API_SOCKET];
-    // Route console output through a pipe instead of a file descriptor to a
-    // growable file: a compromised guest kernel can reactivate the serial
-    // device despite 8250.nr_uarts=0 and would otherwise control an unbounded
-    // root-owned file on the host. The drain thread persists a bounded prefix
-    // for diagnostics and discards the rest.
+    // Never route VMM output to a growable file: a compromised guest kernel
+    // can reactivate the serial device despite 8250.nr_uarts=0. /dev/null also
+    // avoids tying the VMM to a pipe reader in this controller process, which
+    // is what lets the next controller adopt it after this process exits.
     // https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md#8250-serial-device
-    let (console_reader, console_writer) = io::pipe()?;
     command
         .arg("--resource-limit")
         .arg("no-file=4096")
@@ -2590,10 +2576,10 @@ fn spawn_jailed_firecracker(
         .args(api_socket_arguments)
         .args(firecracker_arguments)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(console_writer.try_clone()?))
-        .stderr(Stdio::from(console_writer));
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let log_path = jail_root.join("firecracker.stderr");
-    let log = File::create(&log_path)?;
+    File::create(&log_path)?;
     fs::set_permissions(&log_path, Permissions::from_mode(0o600))?;
     // Deliberately do not pass --no-seccomp or a custom filter. Release builds'
     // embedded default filters are Firecracker's recommended production setting.
@@ -2603,7 +2589,6 @@ fn spawn_jailed_firecracker(
         .spawn()
         .context("launching Firecracker through jailer")?;
     record_launch_timing(&record.machine_id, "vmm_spawn", vmm_spawn_started.elapsed());
-    std::thread::spawn(move || drain_vmm_console(console_reader, log));
     let machine_id = record.machine_id.clone();
     std::thread::spawn(move || match child.wait() {
         Ok(status) if !status.success() => {
@@ -2617,50 +2602,15 @@ fn spawn_jailed_firecracker(
     Ok(())
 }
 
-// Persists at most VMM_LOG_MAX_BYTES of console output, then keeps draining
-// the pipe into nothing so the VMM never blocks on a full pipe while the host
-// file stays bounded regardless of what the guest prints.
-fn drain_vmm_console(mut reader: io::PipeReader, mut log: File) {
-    let mut remaining = VMM_LOG_MAX_BYTES;
-    let mut buffer = [0_u8; 8192];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => return,
-            Ok(count) => {
-                if remaining == 0 {
-                    continue;
-                }
-                let keep = count.min(usize::try_from(remaining).unwrap_or(usize::MAX));
-                if log.write_all(&buffer[..keep]).is_err() {
-                    remaining = 0;
-                    continue;
-                }
-                remaining -= keep as u64;
-                if remaining == 0
-                    && log
-                        .write_all(
-                            b"\n[exo: console output limit reached; discarding further output]\n",
-                        )
-                        .is_err()
-                {
-                    return;
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return,
-        }
-    }
-}
-
 fn firecracker_vm_configuration(
     config: &FirecrackerConfig,
     request: &SandboxRequest,
     record: &MachineRecord,
 ) -> FirecrackerVmConfiguration {
     let network = record.network();
-    // Disable the guest serial driver; the VMM console is additionally captured
-    // with a bounded drain (see spawn_jailed_firecracker) because upstream
-    // documents that a guest can reactivate the serial device.
+    // Disable the guest serial driver; VMM output is additionally discarded in
+    // spawn_jailed_firecracker because upstream documents that a guest can
+    // reactivate the serial device.
     // https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md#8250-serial-device
     let mut boot_args =
         String::from("reboot=k panic=1 pci=off rdinit=/init 8250.nr_uarts=0 quiet loglevel=1");

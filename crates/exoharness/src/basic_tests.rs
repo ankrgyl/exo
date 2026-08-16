@@ -329,6 +329,83 @@ async fn firecracker_fork_captures_current_source_state() {
 #[tokio::test(flavor = "current_thread")]
 #[cfg(feature = "firecracker")]
 #[ignore = "uses a real Firecracker sandbox; requires Linux KVM or nested virtualization through Lima on macOS"]
+async fn firecracker_adopts_running_machine_after_backend_restart() {
+    let config = firecracker_test_config();
+    let mut request = provider_contract_request(
+        "firecracker",
+        "backend-restart",
+        env_or("FIRECRACKER_IMAGE", &crate::default_firecracker_image()),
+        "/tmp",
+    );
+    let token = format!("exo-reattach-{}", Uuid7::now());
+
+    let backend = crate::sandbox_provider::firecracker_backend_for_test(config.clone())
+        .await
+        .expect("first Firecracker backend");
+    let machine = backend
+        .acquire(request.clone())
+        .await
+        .expect("acquire Firecracker machine");
+    let launch = machine
+        .exec(&SandboxCommand {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "/usr/bin/python3 -c 'import time; time.sleep(300)' {token} >/dev/null 2>&1 & echo $!"
+                ),
+            ],
+            env: HashMap::new(),
+            display_argv: None,
+            cwd: Some("/".to_string()),
+            timeout: Some(Duration::from_secs(10)),
+        })
+        .await
+        .expect("start process that must survive controller restart");
+    assert!(launch.ok, "{}{}", launch.stdout, launch.stderr);
+    let pid = launch
+        .stdout
+        .trim()
+        .parse::<u32>()
+        .expect("guest process pid");
+    request.provider_state = machine.provider_state();
+    drop(machine);
+    drop(backend);
+
+    // On macOS the first Lima bridge exits asynchronously after its final
+    // client is dropped. A new CLI process naturally incurs this delay too.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let backend = crate::sandbox_provider::firecracker_backend_for_test(config)
+        .await
+        .expect("replacement Firecracker backend");
+    let machine = backend
+        .acquire(request.clone())
+        .await
+        .expect("adopt running Firecracker machine");
+    let probe = machine
+        .exec(&SandboxCommand {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("tr '\\0' '\\n' </proc/{pid}/cmdline | grep -Fx -- {token}"),
+            ],
+            env: HashMap::new(),
+            display_argv: None,
+            cwd: Some("/".to_string()),
+            timeout: Some(Duration::from_secs(10)),
+        })
+        .await
+        .expect("probe process after controller restart");
+    assert!(probe.ok, "{}{}", probe.stdout, probe.stderr);
+    backend
+        .terminate(request)
+        .await
+        .expect("terminate adopted Firecracker machine");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "firecracker")]
+#[ignore = "uses a real Firecracker sandbox; requires Linux KVM or nested virtualization through Lima on macOS"]
 async fn firecracker_sandbox_contract_durable_file_system_survives_stop_and_reacquire() {
     crate::contract_tests::sandbox_backend_durable_file_system_survives_stop_and_reacquire(
         firecracker_contract_backend().await,
