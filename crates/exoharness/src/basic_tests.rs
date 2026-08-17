@@ -702,7 +702,7 @@ async fn firecracker_contract_backend() -> Arc<dyn ManagedSandboxBackend> {
 
 #[cfg(feature = "firecracker")]
 fn firecracker_test_config() -> crate::FirecrackerConfig {
-    let mut config = crate::FirecrackerConfig::from_env().expect("Firecracker config");
+    let mut config = crate::FirecrackerConfig::default();
     if let Some(image) = nonempty_env("FIRECRACKER_IMAGE") {
         config.allowed_local_images.push(image.into());
     }

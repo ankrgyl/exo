@@ -7,7 +7,6 @@
 //! https://github.com/lima-vm/lima/blob/master/templates/default.yaml
 
 use std::collections::HashMap;
-use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -36,23 +35,19 @@ use crate::sandbox::{
 };
 use crate::{SandboxAttachment, SandboxProcessParts};
 
-use super::firecracker::{FirecrackerConfig, env_path};
+use super::FirecrackerLimaConfig;
+use super::firecracker::FirecrackerConfig;
 use super::firecracker_bridge::{
     FirecrackerBridgeClientFrame, FirecrackerBridgeRequest, FirecrackerBridgeResponse,
     FirecrackerBridgeServerFrame, FirecrackerBridgeStreamChannel, STREAM_CHUNK_BYTES, read_frame,
     write_frame,
 };
 
-const DEFAULT_LIMA_INSTANCE: &str = "exo-firecracker";
-const DEFAULT_LIMA_TARGET_DIR: &str = "/var/tmp/exo-firecracker-bridge-target";
-// The bridge runs as root inside the Lima VM, so the path sudo executes must
-// be root-owned rather than the unprivileged build output under sticky-bit
-// /var/tmp, where any uid in the VM could have pre-claimed the directory and
-// where the builder uid could swap the binary between build and every exec.
-// The build result is copied here with root ownership before it is run.
-const BRIDGE_INSTALL_PATH: &str = "/usr/local/libexec/exo-firecracker-bridge";
 const BRIDGE_FRAME_QUEUE_DEPTH: usize = 16;
 const BRIDGE_STREAM_QUEUE_DEPTH: usize = 16;
+// The bridge runs as root inside Lima. Install the locally built executable to
+// a root-owned path before sudo executes it so the build user cannot swap it.
+const BRIDGE_INSTALL_PATH: &str = "/usr/local/libexec/exo-firecracker-bridge";
 
 #[derive(Clone)]
 pub struct LimaFirecrackerSandboxBackend {
@@ -61,19 +56,16 @@ pub struct LimaFirecrackerSandboxBackend {
 }
 
 impl LimaFirecrackerSandboxBackend {
-    pub async fn from_env(mut config: FirecrackerConfig) -> Result<Self> {
-        if env::var_os("EXO_FIRECRACKER_MEMORY_MIB").is_none() {
-            config.memory_mib = 1024;
-        }
-        let limactl = env_path("EXO_FIRECRACKER_LIMACTL", "limactl");
-        let instance = env::var("EXO_FIRECRACKER_LIMA_INSTANCE")
-            .unwrap_or_else(|_| DEFAULT_LIMA_INSTANCE.to_string());
-        let target_dir = env_path("EXO_FIRECRACKER_LIMA_TARGET_DIR", DEFAULT_LIMA_TARGET_DIR);
-        let bridge_binary = env::var_os("EXO_FIRECRACKER_LIMA_EXO_BINARY")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(BRIDGE_INSTALL_PATH));
-        let bridge = Arc::new(LimaBridgeManager::new(limactl, instance, bridge_binary));
-        bridge.prepare_bridge(&target_dir).await?;
+    pub async fn new(config: FirecrackerConfig, lima: FirecrackerLimaConfig) -> Result<Self> {
+        let build_bridge = lima.bridge_binary.is_none();
+        let bridge = Arc::new(LimaBridgeManager::new(
+            lima.limactl,
+            lima.instance,
+            lima.bridge_binary
+                .unwrap_or_else(|| PathBuf::from(BRIDGE_INSTALL_PATH)),
+            build_bridge,
+        ));
+        bridge.prepare_bridge(&lima.target_dir).await?;
         bridge.connection().await?;
         Ok(Self { config, bridge })
     }
@@ -107,7 +99,6 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
             id,
             provider_state,
             effective_image,
-            startup_timing,
         } = response
         else {
             bail!("Firecracker Lima bridge returned the wrong response to acquire");
@@ -116,7 +107,6 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
             id,
             provider_state,
             effective_image,
-            startup_timing,
             request,
             backend: self.client(),
         }))
@@ -159,7 +149,6 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
             id,
             provider_state,
             effective_image,
-            startup_timing,
         } = response
         else {
             bail!("Firecracker Lima bridge returned the wrong response to fork");
@@ -168,7 +157,6 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
             id,
             provider_state,
             effective_image,
-            startup_timing,
             request: target,
             backend: self.client(),
         }))
@@ -191,7 +179,6 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
             id,
             provider_state,
             effective_image,
-            startup_timing,
         } = response
         else {
             bail!("Firecracker Lima bridge returned the wrong response to snapshot restore");
@@ -200,7 +187,6 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
             id,
             provider_state,
             effective_image,
-            startup_timing,
             request,
             backend: self.client(),
         }))
@@ -211,7 +197,6 @@ struct LimaFirecrackerSandboxHandle {
     id: String,
     provider_state: Option<serde_json::Value>,
     effective_image: Option<String>,
-    startup_timing: Option<serde_json::Value>,
     request: SandboxRequest,
     backend: Arc<LimaFirecrackerSandboxBackend>,
 }
@@ -228,10 +213,6 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
 
     fn effective_image(&self) -> Option<String> {
         self.effective_image.clone()
-    }
-
-    fn startup_timing(&self) -> Option<serde_json::Value> {
-        self.startup_timing.clone()
     }
 
     async fn exec(&self, command: &SandboxCommand) -> Result<SandboxCommandOutput> {
@@ -320,15 +301,17 @@ struct LimaBridgeManager {
     limactl: PathBuf,
     instance: String,
     bridge_binary: PathBuf,
+    build_bridge: bool,
     connection: Mutex<Option<Arc<LimaBridgeConnection>>>,
 }
 
 impl LimaBridgeManager {
-    fn new(limactl: PathBuf, instance: String, bridge_binary: PathBuf) -> Self {
+    fn new(limactl: PathBuf, instance: String, bridge_binary: PathBuf, build_bridge: bool) -> Self {
         Self {
             limactl,
             instance,
             bridge_binary,
+            build_bridge,
             connection: Mutex::new(None),
         }
     }
@@ -370,7 +353,7 @@ impl LimaBridgeManager {
             "starting the Firecracker Lima VM",
         )
         .await?;
-        if env::var_os("EXO_FIRECRACKER_LIMA_EXO_BINARY").is_some() {
+        if !self.build_bridge {
             return Ok(());
         }
         let source_root = Path::new(env!("CARGO_MANIFEST_DIR"))

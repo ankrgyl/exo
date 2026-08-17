@@ -16,7 +16,7 @@ use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::task::{Context as TaskContext, Poll};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use docker_credential::{CredentialRetrievalError, DockerCredential};
@@ -76,13 +76,6 @@ struct CachedLayer {
     media_type: String,
 }
 
-#[derive(Debug, Default)]
-struct PullStats {
-    bytes: u64,
-    cache_hits: usize,
-    cache_misses: usize,
-}
-
 #[derive(Debug)]
 enum Whiteout {
     Remove(PathBuf),
@@ -96,26 +89,15 @@ pub(super) async fn resolve_image(
     allowed_local_images: &[PathBuf],
     allowed_registries: &[String],
 ) -> Result<PathBuf> {
-    let total_started = Instant::now();
     if looks_like_local_image(source) {
-        let lookup_started = Instant::now();
         let state_root = state_root.to_path_buf();
         let source_path = source.to_string();
         let allowed_local_images = allowed_local_images.to_vec();
-        let (image, cache_hit) = tokio::task::spawn_blocking(move || {
+        return tokio::task::spawn_blocking(move || {
             cache_local_image(&state_root, &source_path, &allowed_local_images)
         })
         .await
-        .context("joining local Firecracker image cache")??;
-        record_step(
-            source,
-            None,
-            "cache_lookup",
-            lookup_started.elapsed(),
-            cache_hit,
-        );
-        record_step(source, None, "total", total_started.elapsed(), cache_hit);
-        return Ok(image);
+        .context("joining local Firecracker image cache")?;
     }
 
     let reference = source
@@ -140,31 +122,12 @@ pub(super) async fn resolve_image(
     if let Some(source_digest) = immutable_reference_digest(&reference)? {
         let cache_dir = cache_image_dir(&cache_root, &platform, source_digest)?;
         if cache_dir.try_exists()? {
-            let lookup_started = Instant::now();
-            let image = validate_cache_entry(&cache_dir, source_digest, None, &platform)?;
-            record_step(
-                source,
-                Some(source_digest),
-                "cache_lookup",
-                lookup_started.elapsed(),
-                true,
-            );
-            record_step(
-                source,
-                Some(source_digest),
-                "total",
-                total_started.elapsed(),
-                true,
-            );
-            return Ok(image);
+            return validate_cache_entry(&cache_dir, source_digest, None, &platform);
         }
     }
 
-    let auth_started = Instant::now();
     let auth = registry_auth(&reference)?;
-    record_step(source, None, "registry_auth", auth_started.elapsed(), false);
 
-    let manifest_started = Instant::now();
     let client = Client::default();
     // Resolve tags through the registry API and retain the returned immutable
     // digest; tags remain only a user-facing input and never identify cache
@@ -189,49 +152,19 @@ pub(super) async fn resolve_image(
         .await
         .with_context(|| format!("resolving OCI image manifest for {source}"))?;
     let source_digest = list_digest.unwrap_or_else(|| manifest_digest.clone());
-    record_step(
-        source,
-        Some(&manifest_digest),
-        "manifest_resolve",
-        manifest_started.elapsed(),
-        false,
-    );
 
     let image_config: OciImageConfiguration = serde_json::from_str(&config_json)
         .with_context(|| format!("decoding OCI image configuration for {source}"))?;
     validate_platform(&image_config)?;
     let cache_dir = cache_image_dir(&cache_root, &platform, &source_digest)?;
-    let cache_lookup_started = Instant::now();
     if cache_dir.try_exists()? {
-        let image = validate_cache_entry(
+        return validate_cache_entry(
             &cache_dir,
             &source_digest,
             Some(&manifest_digest),
             &platform,
-        )?;
-        record_step(
-            source,
-            Some(&manifest_digest),
-            "cache_lookup",
-            cache_lookup_started.elapsed(),
-            true,
         );
-        record_step(
-            source,
-            Some(&manifest_digest),
-            "total",
-            total_started.elapsed(),
-            true,
-        );
-        return Ok(image);
     }
-    record_step(
-        source,
-        Some(&manifest_digest),
-        "cache_lookup",
-        cache_lookup_started.elapsed(),
-        false,
-    );
 
     let image_bytes = image_size_gib
         .checked_mul(1024 * 1024 * 1024)
@@ -268,40 +201,20 @@ pub(super) async fn resolve_image(
         }
     }
 
-    let pull_started = Instant::now();
-    let mut pull_stats = PullStats {
-        bytes: declared_total,
-        ..PullStats::default()
-    };
     let mut layers = Vec::with_capacity(manifest.layers.len());
     for descriptor in &manifest.layers {
-        let (path, cache_hit) = pull_blob(
+        let path = pull_blob(
             &client,
             &reference,
             descriptor,
             &cache_root.join("blobs/sha256"),
         )
         .await?;
-        if cache_hit {
-            pull_stats.cache_hits += 1;
-        } else {
-            pull_stats.cache_misses += 1;
-        }
         layers.push(CachedLayer {
             path,
             media_type: descriptor.media_type.clone(),
         });
     }
-    tracing::info!(
-        image = source,
-        digest = manifest_digest,
-        step = "blob_pull",
-        duration_ms = pull_started.elapsed().as_secs_f64() * 1000.0,
-        bytes = pull_stats.bytes,
-        cache_hits = pull_stats.cache_hits,
-        cache_misses = pull_stats.cache_misses,
-        "Firecracker image materialization timing"
-    );
 
     let metadata = CachedImageMetadata {
         materializer_version: MATERIALIZER_VERSION,
@@ -313,28 +226,18 @@ pub(super) async fn resolve_image(
     let build_cache_root = cache_root.clone();
     let build_cache_dir = cache_dir.clone();
     let build_source = source.to_string();
-    let build_digest = manifest_digest.clone();
-    let image = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         build_and_publish_image(
             &build_cache_root,
             &build_cache_dir,
             &build_source,
-            &build_digest,
             layers,
             metadata,
             image_size_gib,
         )
     })
     .await
-    .context("joining Firecracker image materialization")??;
-    record_step(
-        source,
-        Some(&manifest_digest),
-        "total",
-        total_started.elapsed(),
-        false,
-    );
-    Ok(image)
+    .context("joining Firecracker image materialization")?
 }
 
 // Empty allowlist means unrestricted (the default). Entries match either the
@@ -377,7 +280,7 @@ fn cache_local_image(
     state_root: &Path,
     source: &str,
     allowed_local_images: &[PathBuf],
-) -> Result<(PathBuf, bool)> {
+) -> Result<PathBuf> {
     let source = fs::canonicalize(source)
         .with_context(|| format!("resolving Firecracker root filesystem image {source}"))?;
     validate_allowed_local_image(state_root, &source, allowed_local_images)?;
@@ -403,7 +306,7 @@ fn cache_local_image(
     let cached = cache_dir.join("rootfs.ext4");
     if cached.try_exists()? {
         validate_ext4_image(&cached)?;
-        return Ok((cached, true));
+        return Ok(cached);
     }
 
     let temporary = TempBuilder::new()
@@ -439,7 +342,7 @@ fn cache_local_image(
         }
     }
     validate_ext4_image(&cached)?;
-    Ok((cached, false))
+    Ok(cached)
 }
 
 fn validate_allowed_local_image(
@@ -625,12 +528,12 @@ async fn pull_blob(
     reference: &Reference,
     descriptor: &OciDescriptor,
     blob_root: &Path,
-) -> Result<(PathBuf, bool)> {
+) -> Result<PathBuf> {
     let digest = sha256_hex(&descriptor.digest)?;
     let destination = blob_root.join(digest);
     if destination.try_exists()? {
         validate_cached_blob(&destination, descriptor)?;
-        return Ok((destination, true));
+        return Ok(destination);
     }
 
     prepare_private_dir(blob_root)?;
@@ -657,10 +560,10 @@ async fn pull_blob(
     validate_blob(temporary.path(), descriptor)?;
     fs::set_permissions(temporary.path(), Permissions::from_mode(0o600))?;
     match fs::hard_link(temporary.path(), &destination) {
-        Ok(()) => Ok((destination, false)),
+        Ok(()) => Ok(destination),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             validate_cached_blob(&destination, descriptor)?;
-            Ok((destination, true))
+            Ok(destination)
         }
         Err(error) => Err(error).with_context(|| {
             format!(
@@ -741,7 +644,6 @@ fn build_and_publish_image(
     cache_root: &Path,
     cache_dir: &Path,
     source: &str,
-    manifest_digest: &str,
     layers: Vec<CachedLayer>,
     metadata: CachedImageMetadata,
     image_size_gib: u64,
@@ -761,7 +663,6 @@ fn build_and_publish_image(
     let image_bytes = image_size_gib
         .checked_mul(1024 * 1024 * 1024)
         .context("Firecracker image size overflow")?;
-    let extract_started = Instant::now();
     // mkfs.ext4's default inode ratio is one inode per 16384 bytes of
     // filesystem, so a tree with more inodes than this could never fit the
     // generated ext4 anyway; rejecting early bounds host inode consumption.
@@ -788,25 +689,8 @@ fn build_and_publish_image(
             );
         }
     }
-    record_step(
-        source,
-        Some(manifest_digest),
-        "layer_extract",
-        extract_started.elapsed(),
-        false,
-    );
-
-    let guest_root_started = Instant::now();
     prepare_guest_rootfs(&rootfs)?;
-    record_step(
-        source,
-        Some(manifest_digest),
-        "guest_root_prepare",
-        guest_root_started.elapsed(),
-        false,
-    );
 
-    let filesystem_started = Instant::now();
     let image = temporary.path().join("rootfs.ext4");
     let output = File::create(&image)?;
     output.set_len(image_bytes)?;
@@ -838,13 +722,6 @@ fn build_and_publish_image(
     // ownership or copying its data.
     fs::set_permissions(&image, Permissions::from_mode(0o444))?;
     validate_ext4_image(&image)?;
-    record_step(
-        source,
-        Some(manifest_digest),
-        "filesystem_create",
-        filesystem_started.elapsed(),
-        false,
-    );
 
     fs::write(
         temporary.path().join("metadata.json"),
@@ -1397,17 +1274,6 @@ fn prepare_private_dir(path: &Path) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn record_step(image: &str, digest: Option<&str>, step: &str, duration: Duration, cache_hit: bool) {
-    tracing::info!(
-        image,
-        digest,
-        step,
-        duration_ms = duration.as_secs_f64() * 1000.0,
-        cache_hit,
-        "Firecracker image materialization timing"
-    );
 }
 
 #[cfg(test)]

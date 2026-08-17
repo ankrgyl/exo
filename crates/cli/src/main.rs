@@ -16,8 +16,11 @@ mod tui;
 mod tui_app;
 
 use std::collections::HashMap;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
+#[cfg(feature = "firecracker")]
+use std::net::Ipv4Addr;
 use std::net::{SocketAddr, TcpListener};
+#[cfg(feature = "firecracker")]
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -48,6 +51,14 @@ use tabwriter::TabWriter;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
+#[cfg(feature = "firecracker")]
+use executor::{
+    DEFAULT_FIRECRACKER_BINARY, DEFAULT_FIRECRACKER_INITRAMFS, DEFAULT_FIRECRACKER_JAILER,
+    DEFAULT_FIRECRACKER_KERNEL, DEFAULT_FIRECRACKER_STATE_ROOT, DEFAULT_IMAGE_SIZE_GIB,
+    DEFAULT_JAILER_UID_BASE, DEFAULT_MEMORY_MIB, DEFAULT_NETWORK_BYTES_PER_SECOND,
+    DEFAULT_VCPU_COUNT, DEFAULT_WORKSPACE_SIZE_GIB, FirecrackerConfig, FirecrackerLimaConfig,
+};
+
 use crate::env::CliEnvironment;
 use crate::render::{Verbosity, print_message};
 use tui::run_chat_repl;
@@ -72,34 +83,6 @@ struct Cli {
     master_key_path: Option<PathBuf>,
     #[arg(long, global = true, value_enum, env = "EXO_SANDBOX_BACKEND")]
     sandbox_backend: Option<SandboxBackendArg>,
-    /// Restrict the Firecracker materializer to these OCI registry entry points
-    /// (repeat the flag or comma-separate values). Unset means unrestricted.
-    #[arg(
-        long = "firecracker-allowed-registry",
-        global = true,
-        value_name = "REGISTRY",
-        value_delimiter = ','
-    )]
-    firecracker_allowed_registries: Vec<String>,
-    /// Permit these exact local ext4 images as Firecracker roots (repeatable).
-    #[arg(
-        long = "firecracker-allowed-local-image",
-        global = true,
-        value_name = "PATH"
-    )]
-    firecracker_allowed_local_images: Vec<PathBuf>,
-    /// Admit these private or special-use IPv4 ranges for Firecracker egress
-    /// (repeat the flag or comma-separate values).
-    #[arg(
-        long = "firecracker-allowed-egress-cidr",
-        global = true,
-        value_name = "CIDR",
-        value_delimiter = ','
-    )]
-    firecracker_allowed_egress_cidrs: Vec<String>,
-    /// Maximum number of Firecracker VMs this Exo process may own.
-    #[arg(long = "firecracker-max-machines", global = true, value_name = "COUNT")]
-    firecracker_max_machines: Option<NonZeroUsize>,
     #[arg(long, global = true)]
     env_file: Option<PathBuf>,
     #[arg(long, global = true)]
@@ -135,6 +118,193 @@ struct Cli {
     pricing_url: Option<String>,
     #[command(subcommand)]
     command: Commands,
+}
+
+#[cfg(feature = "firecracker")]
+#[derive(Debug, Args)]
+struct FirecrackerArgs {
+    /// Restrict the materializer to these OCI registry entry points. Repeat or
+    /// comma-separate values; unset means unrestricted.
+    #[arg(
+        long = "firecracker-allowed-registry",
+        value_name = "REGISTRY",
+        value_delimiter = ','
+    )]
+    allowed_registries: Vec<String>,
+    /// Permit these exact local ext4 images as Firecracker roots (repeatable).
+    #[arg(long = "firecracker-allowed-local-image", value_name = "PATH")]
+    allowed_local_images: Vec<PathBuf>,
+    /// Admit these private or special-use IPv4 ranges for guest egress. Repeat
+    /// or comma-separate values.
+    #[arg(
+        long = "firecracker-allowed-egress-cidr",
+        value_name = "CIDR",
+        value_delimiter = ','
+    )]
+    allowed_egress_cidrs: Vec<String>,
+    /// Maximum number of Firecracker VMs this Exo process may own.
+    #[arg(long = "firecracker-max-machines", value_name = "COUNT")]
+    max_machines: Option<NonZeroUsize>,
+    /// Firecracker VMM executable.
+    #[arg(
+        long = "firecracker-binary",
+        env = "EXO_FIRECRACKER_BINARY",
+        default_value = DEFAULT_FIRECRACKER_BINARY
+    )]
+    firecracker_bin: PathBuf,
+    /// Jailer executable matching the Firecracker VMM version.
+    #[arg(
+        long = "firecracker-jailer",
+        env = "EXO_FIRECRACKER_JAILER",
+        default_value = DEFAULT_FIRECRACKER_JAILER
+    )]
+    jailer_bin: PathBuf,
+    /// Uncompressed guest kernel image.
+    #[arg(
+        long = "firecracker-kernel",
+        env = "EXO_FIRECRACKER_KERNEL",
+        default_value = DEFAULT_FIRECRACKER_KERNEL
+    )]
+    kernel: PathBuf,
+    /// Guest initramfs containing the Exo guest agent.
+    #[arg(
+        long = "firecracker-initramfs",
+        env = "EXO_FIRECRACKER_INITRAMFS",
+        default_value = DEFAULT_FIRECRACKER_INITRAMFS
+    )]
+    initramfs: PathBuf,
+    /// Root-owned directory for Firecracker state and jails.
+    #[arg(
+        long = "firecracker-state-root",
+        env = "EXO_FIRECRACKER_STATE_ROOT",
+        default_value = DEFAULT_FIRECRACKER_STATE_ROOT
+    )]
+    state_root: PathBuf,
+    /// Virtual CPUs assigned to each microVM.
+    #[arg(
+        long = "firecracker-vcpu-count",
+        env = "EXO_FIRECRACKER_VCPU_COUNT",
+        default_value_t = DEFAULT_VCPU_COUNT
+    )]
+    vcpu_count: u8,
+    /// Memory assigned to each microVM, in MiB.
+    #[arg(
+        long = "firecracker-memory-mib",
+        env = "EXO_FIRECRACKER_MEMORY_MIB",
+        default_value_t = DEFAULT_MEMORY_MIB
+    )]
+    memory_mib: u32,
+    /// Maximum materialized OCI root filesystem size, in GiB.
+    #[arg(
+        long = "firecracker-image-size-gib",
+        env = "EXO_FIRECRACKER_IMAGE_SIZE_GIB",
+        default_value_t = DEFAULT_IMAGE_SIZE_GIB
+    )]
+    image_size_gib: u64,
+    /// Sparse writable workspace size, in GiB.
+    #[arg(
+        long = "firecracker-workspace-size-gib",
+        env = "EXO_FIRECRACKER_WORKSPACE_SIZE_GIB",
+        default_value_t = DEFAULT_WORKSPACE_SIZE_GIB
+    )]
+    workspace_size_gib: u64,
+    /// First host UID/GID in the reserved per-VM jailer range.
+    #[arg(
+        long = "firecracker-jailer-uid-base",
+        env = "EXO_FIRECRACKER_JAILER_UID_BASE",
+        default_value_t = DEFAULT_JAILER_UID_BASE
+    )]
+    jailer_uid_base: u32,
+    /// DNS resolver supplied to networking-enabled guests.
+    #[arg(
+        long = "firecracker-dns-server",
+        env = "EXO_FIRECRACKER_DNS_SERVER",
+        default_value = "1.1.1.1"
+    )]
+    dns_server: Ipv4Addr,
+    /// Per-VM network rate limit, in bytes per second.
+    #[arg(
+        long = "firecracker-network-bytes-per-second",
+        env = "EXO_FIRECRACKER_NETWORK_BYTES_PER_SECOND",
+        default_value_t = DEFAULT_NETWORK_BYTES_PER_SECOND
+    )]
+    network_bytes_per_second: u64,
+    #[cfg(target_os = "macos")]
+    /// Lima executable used to manage the outer Firecracker development VM.
+    #[arg(
+        long = "firecracker-limactl",
+        env = "EXO_FIRECRACKER_LIMACTL",
+        default_value = "limactl"
+    )]
+    limactl: PathBuf,
+    #[cfg(target_os = "macos")]
+    /// Dedicated Lima instance that hosts Firecracker.
+    #[arg(
+        long = "firecracker-lima-instance",
+        env = "EXO_FIRECRACKER_LIMA_INSTANCE",
+        default_value = "exo-firecracker"
+    )]
+    lima_instance: String,
+    #[cfg(target_os = "macos")]
+    /// Build output directory inside the Lima VM.
+    #[arg(
+        long = "firecracker-lima-target-dir",
+        env = "EXO_FIRECRACKER_LIMA_TARGET_DIR",
+        default_value = "/var/tmp/exo-firecracker-bridge-target"
+    )]
+    lima_target_dir: PathBuf,
+    #[cfg(target_os = "macos")]
+    /// Prebuilt bridge executable inside Lima; otherwise Exo builds its own.
+    #[arg(
+        long = "firecracker-lima-exo-binary",
+        env = "EXO_FIRECRACKER_LIMA_EXO_BINARY"
+    )]
+    lima_bridge_binary: Option<PathBuf>,
+}
+
+#[cfg(feature = "firecracker")]
+impl FirecrackerArgs {
+    fn backend_spec(&self) -> Result<FirecrackerBackendSpec> {
+        let allowed_egress_cidrs = self
+            .allowed_egress_cidrs
+            .iter()
+            .map(|cidr| {
+                cidr.parse()
+                    .map_err(|error| anyhow!("invalid Firecracker egress CIDR {cidr}: {error}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let allowed_local_images = std::iter::once(PathBuf::from(default_firecracker_image()))
+            .chain(self.allowed_local_images.iter().cloned())
+            .collect();
+        let config = FirecrackerConfig {
+            firecracker_bin: self.firecracker_bin.clone(),
+            jailer_bin: self.jailer_bin.clone(),
+            kernel: self.kernel.clone(),
+            initramfs: self.initramfs.clone(),
+            state_root: self.state_root.clone(),
+            vcpu_count: self.vcpu_count,
+            memory_mib: self.memory_mib,
+            image_size_gib: self.image_size_gib,
+            workspace_size_gib: self.workspace_size_gib,
+            jailer_uid_base: self.jailer_uid_base,
+            dns_server: self.dns_server,
+            allowed_egress_cidrs,
+            allowed_local_images,
+            allowed_registries: self.allowed_registries.clone(),
+            network_bytes_per_second: self.network_bytes_per_second,
+            max_machines: self.max_machines,
+        };
+        #[cfg(target_os = "macos")]
+        let lima = FirecrackerLimaConfig {
+            limactl: self.limactl.clone(),
+            instance: self.lima_instance.clone(),
+            target_dir: self.lima_target_dir.clone(),
+            bridge_binary: self.lima_bridge_binary.clone(),
+        };
+        #[cfg(not(target_os = "macos"))]
+        let lima = FirecrackerLimaConfig::default();
+        Ok(FirecrackerBackendSpec { config, lima })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -309,12 +479,13 @@ fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
             path: cli.master_key_path.clone(),
         },
     };
-    let firecracker_spec = FirecrackerBackendSpec {
-        allowed_egress_cidrs: cli.firecracker_allowed_egress_cidrs.clone(),
-        allowed_local_images: cli.firecracker_allowed_local_images.clone(),
-        allowed_registries: cli.firecracker_allowed_registries.clone(),
-        max_machines: cli.firecracker_max_machines,
+    #[cfg(feature = "firecracker")]
+    let firecracker_spec = match &cli.command {
+        Commands::Serve { firecracker, .. } => firecracker.backend_spec()?,
+        _ => FirecrackerBackendSpec::default(),
     };
+    #[cfg(not(feature = "firecracker"))]
+    let firecracker_spec = FirecrackerBackendSpec::default();
     let sandbox_backend = cli
         .sandbox_backend
         .map(|backend| backend.registration(firecracker_spec.clone()))
@@ -477,6 +648,9 @@ enum Commands {
         bind: SocketAddr,
         #[arg(short, long, action = ArgAction::Count)]
         verbose: u8,
+        #[cfg(feature = "firecracker")]
+        #[command(flatten, next_help_heading = "Firecracker backend options")]
+        firecracker: FirecrackerArgs,
     },
 }
 
@@ -3857,61 +4031,6 @@ mod create_tests {
             super::Commands::Agent {
                 command: super::AgentCommands::Create {
                     sandbox_provider: Some(super::SandboxProviderArg::LocalProcess),
-                    ..
-                }
-            }
-        ));
-    }
-
-    #[test]
-    fn firecracker_backend_and_provider_parse() {
-        use clap::Parser;
-        let cli = super::Cli::try_parse_from([
-            "exo",
-            "--sandbox-backend",
-            "firecracker",
-            "--firecracker-allowed-registry",
-            "docker.io,123456789012.dkr.ecr.us-east-1.amazonaws.com",
-            "--firecracker-allowed-registry",
-            "registry.example.com",
-            "--firecracker-allowed-local-image",
-            "/opt/exo/rootfs.ext4",
-            "--firecracker-allowed-egress-cidr",
-            "10.20.0.0/16,192.168.1.1/32",
-            "agent",
-            "create",
-            "test",
-            "--sandbox-provider",
-            "firecracker",
-            "--model",
-            "test-model",
-        ])
-        .expect("Firecracker sandbox backend and provider parse");
-        assert!(matches!(
-            cli.sandbox_backend,
-            Some(super::SandboxBackendArg::Firecracker)
-        ));
-        assert_eq!(
-            cli.firecracker_allowed_registries,
-            vec![
-                "docker.io",
-                "123456789012.dkr.ecr.us-east-1.amazonaws.com",
-                "registry.example.com"
-            ]
-        );
-        assert_eq!(
-            cli.firecracker_allowed_egress_cidrs,
-            vec!["10.20.0.0/16", "192.168.1.1/32"]
-        );
-        assert_eq!(
-            cli.firecracker_allowed_local_images,
-            vec![std::path::PathBuf::from("/opt/exo/rootfs.ext4")]
-        );
-        assert!(matches!(
-            cli.command,
-            super::Commands::Agent {
-                command: super::AgentCommands::Create {
-                    sandbox_provider: Some(super::SandboxProviderArg::Firecracker),
                     ..
                 }
             }

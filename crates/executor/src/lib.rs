@@ -53,8 +53,6 @@ pub use executor_types::{
     ModelResponseStream, PendingToolCall, SandboxScope, SendRequest, SendResult, ToolDefinition,
     ToolRuntime, TypeScriptHarnessConfig, effective_sandbox_scope,
 };
-#[cfg(feature = "firecracker")]
-pub use exoharness::run_firecracker_bridge;
 pub use exoharness::{
     AgentHandle, AttachSandboxRequest, BasicExoHarness, BasicExoHarnessConfig, Binding,
     BindingRecord, ConversationHandle, DEFAULT_SANDBOX_IMAGE, DaytonaBackendSpec, E2bBackendSpec,
@@ -67,6 +65,14 @@ pub use exoharness::{
     default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
     default_firecracker_image, default_vercel_image, serve_exoharness_http_listener,
     serve_exoharness_http_listener_with_options,
+};
+#[cfg(feature = "firecracker")]
+pub use exoharness::{
+    DEFAULT_FIRECRACKER_BINARY, DEFAULT_FIRECRACKER_INITRAMFS, DEFAULT_FIRECRACKER_JAILER,
+    DEFAULT_FIRECRACKER_KERNEL, DEFAULT_FIRECRACKER_STATE_ROOT, DEFAULT_IMAGE_SIZE_GIB,
+    DEFAULT_JAILER_UID_BASE, DEFAULT_MEMORY_MIB, DEFAULT_NETWORK_BYTES_PER_SECOND,
+    DEFAULT_VCPU_COUNT, DEFAULT_WORKSPACE_SIZE_GIB, FirecrackerConfig, FirecrackerLimaConfig,
+    run_firecracker_bridge,
 };
 pub use harness_basic::BasicHarness;
 pub use harness_config::load_agent_config;

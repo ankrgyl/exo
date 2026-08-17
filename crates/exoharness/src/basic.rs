@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
-use std::num::NonZeroUsize;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -140,12 +139,7 @@ impl SandboxBackendRegistration {
             cfg!(any(target_os = "linux", target_os = "macos")),
             move |_| {
                 let spec = spec.clone();
-                Box::pin(crate::firecracker_backend_with_policy(
-                    spec.allowed_egress_cidrs,
-                    spec.allowed_local_images,
-                    spec.allowed_registries,
-                    spec.max_machines,
-                ))
+                Box::pin(crate::firecracker_backend(spec.config, spec.lima))
             },
         )
     }
@@ -272,21 +266,13 @@ impl SandboxBackendRegistration {
     }
 }
 
-/// Firecracker backend options supplied by the caller (CLI flags), applied on
-/// top of the host-derived configuration.
+/// Complete Firecracker configuration supplied by the frontend.
 #[derive(Debug, Clone, Default)]
 pub struct FirecrackerBackendSpec {
-    /// Private or special-use IPv4 ranges Firecracker guests may reach.
-    pub allowed_egress_cidrs: Vec<String>,
-    /// Exact local ext4 image paths full-scope clients may select. The built-in
-    /// default image and Exo's own immutable image cache are always permitted.
-    pub allowed_local_images: Vec<PathBuf>,
-    /// OCI registries the root-run image materializer may contact; empty
-    /// means unrestricted. The registry host is trusted for process
-    /// availability, so operators can pin exactly which hosts get that trust.
-    pub allowed_registries: Vec<String>,
-    /// Maximum number of Firecracker VMs owned by this Exo backend.
-    pub max_machines: Option<NonZeroUsize>,
+    #[cfg(feature = "firecracker")]
+    pub config: crate::FirecrackerConfig,
+    #[cfg(feature = "firecracker")]
+    pub lima: crate::FirecrackerLimaConfig,
 }
 
 /// Daytona connection config plus the secret-store names for its credentials,

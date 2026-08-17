@@ -83,7 +83,6 @@ pub enum FirecrackerBridgeResponse {
         id: String,
         provider_state: Option<Value>,
         effective_image: Option<String>,
-        startup_timing: Option<Value>,
     },
     Exec {
         output: SandboxCommandOutput,
@@ -169,14 +168,7 @@ impl BridgeBackendCache {
         if let Some(backend) = backends.get(&config) {
             return Ok(Arc::clone(backend));
         }
-        // Construction hashes the kernel and initramfs; keep that off the
-        // async executor while the cache lock is held.
-        let backend_config = config.clone();
-        let backend =
-            tokio::task::spawn_blocking(move || FirecrackerSandboxBackend::new(backend_config))
-                .await
-                .context("joining Firecracker backend construction")??;
-        let backend = Arc::new(backend);
+        let backend = Arc::new(FirecrackerSandboxBackend::new(config.clone()).await?);
         // The backend exclusively owns its state root. This first reap removes
         // every manifest left by a crashed prior bridge before serving a new
         // acquire; later reaps use the persisted idle leases.
@@ -308,7 +300,6 @@ async fn handle_request(
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),
                 effective_image: handle.effective_image(),
-                startup_timing: handle.startup_timing(),
             })
         }
         FirecrackerBridgeRequest::Exec {
@@ -340,7 +331,6 @@ async fn handle_request(
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),
                 effective_image: handle.effective_image(),
-                startup_timing: handle.startup_timing(),
             })
         }
         FirecrackerBridgeRequest::AcquireFromSnapshot {
@@ -367,7 +357,6 @@ async fn handle_request(
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),
                 effective_image: handle.effective_image(),
-                startup_timing: handle.startup_timing(),
             })
         }
         FirecrackerBridgeRequest::Snapshot { config, request } => {

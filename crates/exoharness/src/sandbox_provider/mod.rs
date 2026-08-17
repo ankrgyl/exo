@@ -1,7 +1,7 @@
 //! Per-provider [`crate::sandbox::ManagedSandboxBackend`] implementations,
 //! selected via the harness's provider registry.
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
-use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
 type FirecrackerBackend = Arc<dyn crate::ManagedSandboxBackend>;
 
@@ -82,64 +82,58 @@ pub use docker::default_docker_image;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use e2b::{DEFAULT_E2B_API_URL, DEFAULT_E2B_ENVD_PORT, E2bConfig, E2bSandboxBackend};
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
-pub use firecracker::{FirecrackerConfig, FirecrackerSandboxBackend};
+pub use firecracker::{
+    DEFAULT_FIRECRACKER_BINARY, DEFAULT_FIRECRACKER_INITRAMFS, DEFAULT_FIRECRACKER_JAILER,
+    DEFAULT_FIRECRACKER_KERNEL, DEFAULT_FIRECRACKER_STATE_ROOT, DEFAULT_IMAGE_SIZE_GIB,
+    DEFAULT_JAILER_UID_BASE, DEFAULT_MEMORY_MIB, DEFAULT_NETWORK_BYTES_PER_SECOND,
+    DEFAULT_VCPU_COUNT, DEFAULT_WORKSPACE_SIZE_GIB, FirecrackerConfig, FirecrackerSandboxBackend,
+};
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
 pub use firecracker_bridge::run_firecracker_bridge;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
-pub async fn firecracker_backend_from_env() -> anyhow::Result<FirecrackerBackend> {
-    firecracker_backend_from_config(FirecrackerConfig::from_env()?).await
+#[derive(Debug, Clone)]
+pub struct FirecrackerLimaConfig {
+    pub limactl: PathBuf,
+    pub instance: String,
+    pub target_dir: PathBuf,
+    /// Prebuilt bridge binary inside the Lima VM. When absent, Exo builds and
+    /// installs the bridge from the current checkout.
+    pub bridge_binary: Option<PathBuf>,
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
-pub async fn firecracker_backend_with_capacity(
-    max_machines: NonZeroUsize,
-) -> anyhow::Result<FirecrackerBackend> {
-    let mut config = FirecrackerConfig::from_env()?;
-    config.max_machines = Some(max_machines);
-    firecracker_backend_from_config(config).await
-}
-
-// Policy exceptions are explicit CLI parameters so they are visible in
-// --help and in the invocation that granted them.
-#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
-pub async fn firecracker_backend_with_policy(
-    allowed_egress_cidrs: Vec<String>,
-    allowed_local_images: Vec<PathBuf>,
-    allowed_registries: Vec<String>,
-    max_machines: Option<NonZeroUsize>,
-) -> anyhow::Result<FirecrackerBackend> {
-    let mut config = FirecrackerConfig::from_env()?;
-    config.allowed_egress_cidrs = allowed_egress_cidrs
-        .into_iter()
-        .map(|cidr| {
-            cidr.parse()
-                .map_err(|error| anyhow::anyhow!("invalid Firecracker egress CIDR {cidr}: {error}"))
-        })
-        .collect::<anyhow::Result<_>>()?;
-    config.allowed_local_images.extend(allowed_local_images);
-    config.allowed_registries = allowed_registries;
-    config.max_machines = max_machines;
-    firecracker_backend_from_config(config).await
+impl Default for FirecrackerLimaConfig {
+    fn default() -> Self {
+        Self {
+            limactl: PathBuf::from("limactl"),
+            instance: "exo-firecracker".to_string(),
+            target_dir: PathBuf::from("/var/tmp/exo-firecracker-bridge-target"),
+            bridge_binary: None,
+        }
+    }
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
-async fn firecracker_backend_from_config(
+pub async fn firecracker_backend(
     config: FirecrackerConfig,
+    lima: FirecrackerLimaConfig,
 ) -> anyhow::Result<FirecrackerBackend> {
     #[cfg(target_os = "linux")]
     {
-        Ok(Arc::new(FirecrackerSandboxBackend::new(config)?))
+        drop(lima);
+        Ok(Arc::new(FirecrackerSandboxBackend::new(config).await?))
     }
     #[cfg(target_os = "macos")]
     {
         Ok(Arc::new(
-            firecracker_lima::LimaFirecrackerSandboxBackend::from_env(config).await?,
+            firecracker_lima::LimaFirecrackerSandboxBackend::new(config, lima).await?,
         ))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         drop(config);
+        drop(lima);
         anyhow::bail!("Firecracker sandbox execution is only supported on Linux or macOS with Lima")
     }
 }
@@ -148,7 +142,7 @@ async fn firecracker_backend_from_config(
 pub(crate) async fn firecracker_backend_for_test(
     config: FirecrackerConfig,
 ) -> anyhow::Result<std::sync::Arc<dyn crate::ManagedSandboxBackend>> {
-    firecracker_backend_from_config(config).await
+    firecracker_backend(config, FirecrackerLimaConfig::default()).await
 }
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use sprites::{DEFAULT_SPRITES_API_URL, SpritesConfig, SpritesSandboxBackend};

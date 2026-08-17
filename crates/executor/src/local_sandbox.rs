@@ -90,6 +90,15 @@ impl LocalSandboxExoHarness {
     }
 }
 
+async fn forget_local_sandbox(state: &LocalSandboxState, id: &SandboxId) {
+    // Acquire both guards before mutating either map so cancellation cannot
+    // leave a terminated sandbox present in only one index.
+    let mut sandboxes = state.sandboxes.lock().await;
+    let mut detached_sandboxes = state.detached_sandboxes.lock().await;
+    sandboxes.remove(id);
+    detached_sandboxes.remove(id);
+}
+
 #[async_trait]
 impl ExoHarness for LocalSandboxExoHarness {
     async fn list_agents(&self) -> Result<Vec<Arc<dyn AgentHandle>>> {
@@ -375,8 +384,7 @@ impl SandboxHandle for LocalSandboxAgent {
             .await?
             .terminate_sandbox(local_id)
             .await?;
-        self.state.sandboxes.lock().await.remove(&id);
-        self.state.detached_sandboxes.lock().await.remove(&id);
+        forget_local_sandbox(&self.state, &id).await;
         Ok(())
     }
 
@@ -969,8 +977,7 @@ impl SandboxHandle for LocalSandboxConversation {
             .await?
             .terminate_sandbox(local_id)
             .await?;
-        self.state.sandboxes.lock().await.remove(&id);
-        self.state.detached_sandboxes.lock().await.remove(&id);
+        forget_local_sandbox(&self.state, &id).await;
         self.append_remote_sandbox_events(vec![EventData::SandboxStopped { sandbox_id: id }])
             .await
     }
