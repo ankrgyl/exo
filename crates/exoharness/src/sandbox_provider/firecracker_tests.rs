@@ -178,6 +178,90 @@ fn persisted_lease_expires_machine_after_idle_ttl() {
     );
 }
 
+fn create_snapshot_cache_entry(state_root: &Path, key: &str, last_used: SystemTime) -> PathBuf {
+    let directory = state_root.join("snapshots").join(key);
+    fs::create_dir(&directory).unwrap();
+    File::create(directory.join("complete")).unwrap();
+    let lease = File::create(directory.join(SNAPSHOT_LEASE_FILE)).unwrap();
+    lease.set_modified(last_used).unwrap();
+    directory
+}
+
+#[test]
+fn snapshot_cache_reaps_only_unreferenced_expired_templates() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("snapshots")).unwrap();
+    fs::create_dir(directory.path().join("manifests")).unwrap();
+    let config = FirecrackerConfig {
+        state_root: directory.path().to_path_buf(),
+        ..FirecrackerConfig::default()
+    };
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let stale_time = now - SNAPSHOT_CACHE_MAX_IDLE - Duration::from_secs(1);
+    let stale_key = "a".repeat(64);
+    let recent_key = "b".repeat(64);
+    let referenced_key = "c".repeat(64);
+    let stale = create_snapshot_cache_entry(directory.path(), &stale_key, stale_time);
+    let recent = create_snapshot_cache_entry(directory.path(), &recent_key, now);
+    let referenced = create_snapshot_cache_entry(directory.path(), &referenced_key, stale_time);
+    write_manifest(
+        directory.path(),
+        &MachineRecord {
+            machine_id: "fc-0123456789abcdef-01234567".to_string(),
+            spec_hash: "spec".to_string(),
+            resolved_image: "/images/base.ext4".to_string(),
+            slot: 1,
+            network_enabled: false,
+            workspace_id: None,
+            idle_ttl_seconds: Some(60),
+            snapshot_template: Some(SnapshotTemplateReference {
+                key: referenced_key,
+                lifecycle: SnapshotTemplateLifecycle::Snapshot,
+            }),
+            snapshot_network_slot: Some(0),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        reap_expired_snapshot_templates_blocking(&config, now, SNAPSHOT_CACHE_MAX_IDLE).unwrap(),
+        vec![stale_key]
+    );
+    assert!(!stale.exists());
+    assert!(recent.exists());
+    assert!(referenced.exists());
+}
+
+#[test]
+fn snapshot_cache_reaper_respects_shared_restore_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("snapshots")).unwrap();
+    fs::create_dir(directory.path().join("manifests")).unwrap();
+    let config = FirecrackerConfig {
+        state_root: directory.path().to_path_buf(),
+        ..FirecrackerConfig::default()
+    };
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let stale_time = now - SNAPSHOT_CACHE_MAX_IDLE - Duration::from_secs(1);
+    let key = "d".repeat(64);
+    let snapshot = create_snapshot_cache_entry(directory.path(), &key, stale_time);
+    let lease = File::open(snapshot.join(SNAPSHOT_LEASE_FILE)).unwrap();
+    flock(&lease, FlockOperation::LockShared).unwrap();
+
+    assert!(
+        reap_expired_snapshot_templates_blocking(&config, now, SNAPSHOT_CACHE_MAX_IDLE)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(snapshot.exists());
+    drop(lease);
+    assert_eq!(
+        reap_expired_snapshot_templates_blocking(&config, now, SNAPSHOT_CACHE_MAX_IDLE).unwrap(),
+        vec![key]
+    );
+    assert!(!snapshot.exists());
+}
+
 #[test]
 fn fork_snapshots_are_unique_per_target() {
     let source = MachineRecord {

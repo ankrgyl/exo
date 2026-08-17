@@ -575,6 +575,12 @@ async fn pull_blob(
     }
 }
 
+/*
+Tokio provides a limiting adapter for readers, but not for AsyncWrite. This
+writer must reject bytes beyond the OCI descriptor size rather than truncate
+them: silently accepting a prefix would hide an oversized, untrusted registry
+response and lose the disk-usage bound enforced while the blob is downloaded.
+*/
 struct LimitedAsyncWriter<W> {
     inner: W,
     remaining: u64,
@@ -913,6 +919,12 @@ fn layer_reader(path: &Path, media_type: &str, decompressed_budget: u64) -> Resu
     }))
 }
 
+/*
+Neither std::io::Take nor Tokio's limiting reader can distinguish input that
+ends exactly at the limit from input with more decompressed bytes waiting: both
+report EOF at the boundary. This adapter probes one byte past the budget so an
+oversized layer is rejected instead of being accepted as a valid truncated tar.
+*/
 struct BoundedReader<R> {
     inner: R,
     remaining: u64,
