@@ -21,7 +21,6 @@ HARNESS="exo"
 EXO_BIN="${EXO_BIN:-$ROOT_DIR/target/debug/exo}"
 SCHEDULER_BIN="${EXO_SCHEDULER_BIN:-$ROOT_DIR/target/debug/exo-scheduler-runner}"
 ENV_FILE="${EXO_ENV_FILE:-$ROOT_DIR/.env}"
-SANDBOX_BACKEND="${EXO_SANDBOX_BACKEND:-}"
 SCHEDULER_INTERVAL_SECONDS="${EXO_SCHEDULER_INTERVAL_SECONDS:-10}"
 ADAPTER_LIMIT="${EXO_ADAPTER_LIMIT:-50}"
 
@@ -60,7 +59,6 @@ Options:
   --env-file <path>         Env file to read if present (default: .env)
   --exo-bin <path>          exo binary path (default: ./target/debug/exo)
   --scheduler-bin <path>    Scheduler runner path
-  --sandbox-backend <name>  apple-container, docker, or local-process
   --scheduler-interval <n>  Scheduler polling interval seconds (default: 10)
   --adapter-limit <n>       Max adapters supervised by the runner (default: 50)
   --config <path>           Service guardian config path (default: .exo/exo-service-guardian.env)
@@ -96,7 +94,6 @@ write_config() {
     quote_var "EXO_BIN" "$EXO_BIN"
     quote_var "SCHEDULER_BIN" "$SCHEDULER_BIN"
     quote_var "ENV_FILE" "$ENV_FILE"
-    quote_var "SANDBOX_BACKEND" "$SANDBOX_BACKEND"
     quote_var "SCHEDULER_INTERVAL_SECONDS" "$SCHEDULER_INTERVAL_SECONDS"
     quote_var "ADAPTER_LIMIT" "$ADAPTER_LIMIT"
   } >"$CONFIG_FILE"
@@ -213,9 +210,6 @@ pid_running() {
 
 exo_global_args() {
   printf '%s\0' --env-file-if-exists "$ENV_FILE"
-  if [[ -n "$SANDBOX_BACKEND" ]]; then
-    printf '%s\0' --sandbox-backend "$SANDBOX_BACKEND"
-  fi
 }
 
 read_exo_global_args() {
@@ -250,9 +244,6 @@ start_scheduler() {
   rm -f "$(scheduler_lock_file)" "$(scheduler_restart_file)"
   echo "Starting scheduler..."
   local scheduler_args=(--env-file-if-exists "$ENV_FILE")
-  if [[ -n "$SANDBOX_BACKEND" ]]; then
-    scheduler_args+=(--sandbox-backend "$SANDBOX_BACKEND")
-  fi
   nohup "$SCHEDULER_BIN" "${scheduler_args[@]}" run --watch \
     --interval-seconds "$SCHEDULER_INTERVAL_SECONDS" >>"$log_file" 2>&1 &
   echo "$!" >"$pid_file"
@@ -400,9 +391,6 @@ status() {
   echo "exo: $EXO_BIN"
   echo "scheduler: $SCHEDULER_BIN"
   echo "env file: $ENV_FILE"
-  if [[ -n "$SANDBOX_BACKEND" ]]; then
-    echo "sandbox backend: $SANDBOX_BACKEND"
-  fi
   service_status "scheduler" "$(scheduler_pid_file)" "$(scheduler_log_file)"
   service_status "adapters" "$(adapters_pid_file)" "$(adapters_log_file)"
   if [[ -f "$(repl_restart_file)" ]]; then
@@ -461,14 +449,6 @@ while [[ $# -gt 0 ]]; do
     --scheduler-bin)
       SCHEDULER_BIN="${2:-}"
       [[ -n "$SCHEDULER_BIN" ]] || die "--scheduler-bin requires a value"
-      shift 2
-      ;;
-    --sandbox-backend)
-      SANDBOX_BACKEND="${2:-}"
-      case "$SANDBOX_BACKEND" in
-        apple-container|docker|local-process) ;;
-        *) die "--sandbox-backend must be apple-container, docker, or local-process" ;;
-      esac
       shift 2
       ;;
     --scheduler-interval)

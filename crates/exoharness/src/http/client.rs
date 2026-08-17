@@ -26,7 +26,7 @@ use crate::{
     NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest, Result,
     RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess,
     SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus,
-    Secret, SecretId, SecretMetadata, SessionId, SnapshotHandle, SnapshotId,
+    SandboxRecord, Secret, SecretId, SecretMetadata, SessionId, SnapshotHandle, SnapshotId,
     StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnRecord,
     WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
@@ -213,6 +213,30 @@ async fn http_create_sandbox(
     {
         Response::SandboxId { sandbox_id } => Ok(sandbox_id),
         response => unexpected_response(response, "sandbox_id"),
+    }
+}
+
+async fn http_list_sandboxes(
+    harness: &HttpExoHarness,
+    scope: SandboxScope,
+) -> Result<Vec<SandboxRecord>> {
+    match harness.request(Request::ListSandboxes { scope }).await? {
+        Response::Sandboxes { sandboxes } => Ok(sandboxes),
+        response => unexpected_response(response, "sandboxes"),
+    }
+}
+
+async fn http_terminate_sandbox(
+    harness: &HttpExoHarness,
+    scope: SandboxScope,
+    sandbox_id: SandboxId,
+) -> Result<()> {
+    match harness
+        .request(Request::TerminateSandbox { scope, sandbox_id })
+        .await?
+    {
+        Response::Unit => Ok(()),
+        response => unexpected_response(response, "unit"),
     }
 }
 
@@ -665,8 +689,16 @@ impl SnapshotHandle for HttpAgentHandle {
 
 #[async_trait]
 impl SandboxHandle for HttpAgentHandle {
+    async fn list_sandboxes(&self) -> Result<Vec<SandboxRecord>> {
+        http_list_sandboxes(&self.harness, self.sandbox_scope()).await
+    }
+
     async fn create_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId> {
         http_create_sandbox(&self.harness, self.sandbox_scope(), request).await
+    }
+
+    async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {
+        http_terminate_sandbox(&self.harness, self.sandbox_scope(), id).await
     }
 
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {
@@ -1041,8 +1073,16 @@ impl SnapshotHandle for HttpConversationHandle {
 
 #[async_trait]
 impl SandboxHandle for HttpConversationHandle {
+    async fn list_sandboxes(&self) -> Result<Vec<SandboxRecord>> {
+        http_list_sandboxes(&self.harness, self.sandbox_scope()).await
+    }
+
     async fn create_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId> {
         http_create_sandbox(&self.harness, self.sandbox_scope(), request).await
+    }
+
+    async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {
+        http_terminate_sandbox(&self.harness, self.sandbox_scope(), id).await
     }
 
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {

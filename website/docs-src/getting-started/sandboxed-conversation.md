@@ -12,7 +12,7 @@ own a sandbox.
 ## Create an agent and conversation
 
 ```bash
-exo agent create --model gpt-5.5 "Sandbox Example"
+exo agent create --model gpt-5.5 --provider docker "Sandbox Example"
 exo conversation create sandbox-example "Local Dev"
 exo repl --agent sandbox-example --conversation local-dev
 ```
@@ -22,8 +22,7 @@ shell tool.
 
 ## Choosing a sandbox backend
 
-Local backends are selected with `--sandbox-backend` (or
-`EXO_SANDBOX_BACKEND`):
+Local providers are selected with `--provider`:
 
 | Backend | Isolation | Notes |
 |:--------|:----------|:------|

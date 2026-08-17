@@ -12,9 +12,9 @@ use exoharness::{
     GetEventsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
     ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId,
     SandboxProcess, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessRecord,
-    SandboxProcessStatus, Secret, SecretMetadata, SecretType, SessionId, SnapshotHandle,
-    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, ToolRequest, ToolResult,
-    TurnHandle, TurnId, TurnRecord, Uuid7, WriteArtifactRequest,
+    SandboxProcessStatus, SandboxRecord, Secret, SecretMetadata, SecretType, SessionId,
+    SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, ToolRequest,
+    ToolResult, TurnHandle, TurnId, TurnRecord, Uuid7, WriteArtifactRequest,
 };
 use futures::FutureExt;
 use futures::io::Cursor;
@@ -806,8 +806,16 @@ impl SnapshotHandle for FakeAgentHandle {
 
 #[async_trait]
 impl SandboxHandle for FakeAgentHandle {
+    async fn list_sandboxes(&self) -> Result<Vec<SandboxRecord>> {
+        Err(anyhow!("not implemented"))
+    }
+
     async fn create_sandbox(&self, _request: CreateSandboxRequest) -> Result<SandboxId> {
         Ok("agent-sandbox".to_string())
+    }
+
+    async fn terminate_sandbox(&self, _id: SandboxId) -> Result<()> {
+        Err(anyhow!("not implemented"))
     }
 
     async fn attach_sandbox(&self, _request: AttachSandboxRequest) -> Result<SandboxId> {
@@ -1086,7 +1094,15 @@ impl SnapshotHandle for FakeConversationHandle {
 
 #[async_trait]
 impl SandboxHandle for FakeConversationHandle {
+    async fn list_sandboxes(&self) -> Result<Vec<SandboxRecord>> {
+        Err(anyhow!("not implemented"))
+    }
+
     async fn create_sandbox(&self, _request: CreateSandboxRequest) -> Result<SandboxId> {
+        Err(anyhow!("not implemented"))
+    }
+
+    async fn terminate_sandbox(&self, _id: SandboxId) -> Result<()> {
         Err(anyhow!("not implemented"))
     }
 

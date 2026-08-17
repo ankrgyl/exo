@@ -8,9 +8,9 @@ use crate::{
     GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
     ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
     ReadArtifactRequest, SandboxAttachment, SandboxId, SandboxProcessEventQuery,
-    SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId, SecretMetadata, SessionId,
-    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, ThreadRecord, TurnId, TurnRecord,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    SandboxProcessRecord, SandboxProcessStatus, SandboxRecord, Secret, SecretId, SecretMetadata,
+    SessionId, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, ThreadRecord, TurnId,
+    TurnRecord, WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -127,9 +127,16 @@ pub enum Request {
         agent_id: AgentId,
         request: WriteArtifactRequest,
     },
+    ListSandboxes {
+        scope: SandboxScope,
+    },
     CreateSandbox {
         scope: SandboxScope,
         request: CreateSandboxRequest,
+    },
+    TerminateSandbox {
+        scope: SandboxScope,
+        sandbox_id: SandboxId,
     },
     AttachSandbox {
         scope: SandboxScope,
@@ -315,7 +322,9 @@ impl Request {
             Self::AgentListArtifacts { .. } => "agent_list_artifacts",
             Self::AgentReadArtifact { .. } => "agent_read_artifact",
             Self::AgentWriteArtifact { .. } => "agent_write_artifact",
+            Self::ListSandboxes { .. } => "list_sandboxes",
             Self::CreateSandbox { .. } => "create_sandbox",
+            Self::TerminateSandbox { .. } => "terminate_sandbox",
             Self::AttachSandbox { .. } => "attach_sandbox",
             Self::DetachSandbox { .. } => "detach_sandbox",
             Self::SnapshotSandbox { .. } => "snapshot_sandbox",
@@ -398,6 +407,9 @@ pub enum Response {
     SandboxId {
         sandbox_id: SandboxId,
     },
+    Sandboxes {
+        sandboxes: Vec<SandboxRecord>,
+    },
     SandboxAttachment {
         attachment: SandboxAttachment,
     },
@@ -456,6 +468,7 @@ impl Response {
             Self::Artifact { .. } => "artifact",
             Self::ArtifactVersion { .. } => "artifact_version",
             Self::SandboxId { .. } => "sandbox_id",
+            Self::Sandboxes { .. } => "sandboxes",
             Self::SandboxAttachment { .. } => "sandbox_attachment",
             Self::SnapshotId { .. } => "snapshot_id",
             Self::SandboxProcess { .. } => "sandbox_process",
