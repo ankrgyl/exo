@@ -1642,37 +1642,32 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         if sandbox.attachment.is_some() {
             bail!("attached sandboxes cannot be terminated");
         }
-
-        let handle = self
-            .harness
-            .inner
-            .running_sandboxes
-            .lock()
-            .await
-            .remove(&id);
-        if let Some(handle) = handle {
-            handle.stop().await?;
+        if sandbox.running {
+            let backend = self
+                .harness
+                .inner
+                .sandbox_backend_for_provider(sandbox.provider.clone())
+                .await?;
+            let state_key = sandbox_provider_state_key(self.owner, &id, &sandbox);
+            let provider_state = load_sandbox_provider_state(
+                self.harness,
+                &self.owner_dir,
+                self.owner,
+                &id,
+                sandbox.provider.clone(),
+                &state_key,
+            )
+            .await?;
+            backend
+                .terminate(sandbox_request(self.owner, &id, &sandbox, provider_state))
+                .await?;
+            self.harness
+                .inner
+                .running_sandboxes
+                .lock()
+                .await
+                .remove(&id);
         }
-
-        let backend = self
-            .harness
-            .inner
-            .sandbox_backend_for_provider(sandbox.provider.clone())
-            .await?;
-        let state_key = sandbox_provider_state_key(self.owner, &id, &sandbox);
-        let provider_state = load_sandbox_provider_state(
-            self.harness,
-            &self.owner_dir,
-            self.owner,
-            &id,
-            sandbox.provider.clone(),
-            &state_key,
-        )
-        .await?;
-        backend
-            .terminate(sandbox_request(self.owner, &id, &sandbox, provider_state))
-            .await?;
-
         self.harness
             .inner
             .storage
@@ -1684,6 +1679,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         }
         Ok(())
     }
+
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {
         self.ensure_full_sandbox_scope("attach_sandbox")?;
         let sandbox_id = format!("sandbox-{}", Uuid7::now());

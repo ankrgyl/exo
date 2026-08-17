@@ -193,10 +193,10 @@ pub trait ManagedSandboxBackend: Send + Sync {
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>>;
 
-    /// Permanently remove provider-owned state after the active handle stops.
-    /// Backends without retained state need no extra cleanup.
+    /// Permanently destroy the sandbox addressed by `request` and any retained
+    /// backend state. Unlike stopping a handle, termination must be idempotent.
     async fn terminate(&self, _request: SandboxRequest) -> Result<()> {
-        Ok(())
+        bail!("sandbox backend does not support explicit termination")
     }
 }
 
@@ -841,7 +841,7 @@ impl ManagedSandboxHandle for WarmSandboxHandle {
             // know to choose Docker for snapshot-using flows.
             ContainerCliFlavor::AppleContainer => bail!(
                 "snapshot is not yet implemented for the apple-container backend; \
-                 use --sandbox-provider docker for snapshot-using flows"
+                 use --provider docker for snapshot-using flows"
             ),
         }
     }
@@ -1851,11 +1851,11 @@ fn schedule_cleanup_named_container(container_bin: PathBuf, cli: ContainerCliFla
 fn missing_container_cli_message(cli: ContainerCliFlavor, container_bin: &Path) -> String {
     match cli {
         ContainerCliFlavor::AppleContainer => format!(
-            "apple-container sandbox backend requires the `{}` CLI; install Apple container CLI or use `--sandbox-backend local-process`",
+            "apple-container sandbox backend requires the `{}` CLI; install Apple container CLI or use `--provider local-process`",
             container_bin.display()
         ),
         ContainerCliFlavor::Docker => format!(
-            "docker sandbox backend requires the `{}` CLI; install Docker or use `--sandbox-backend local-process`",
+            "docker sandbox backend requires the `{}` CLI; install Docker or use `--provider local-process`",
             container_bin.display()
         ),
     }
@@ -2326,7 +2326,7 @@ esac
         let message = format!("{error:#}");
         assert!(message.contains("apple-container sandbox backend requires"));
         assert!(message.contains("install Apple container CLI"));
-        assert!(message.contains("--sandbox-backend local-process"));
+        assert!(message.contains("--provider local-process"));
     }
 
     #[cfg(unix)]

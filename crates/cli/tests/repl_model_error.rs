@@ -93,7 +93,7 @@ async fn repl_survives_model_call_failure() {
             "test-agent",
             "--model",
             "gpt-test",
-            "--sandbox-provider",
+            "--provider",
             &sandbox_provider_arg(),
             "Repl Error Test Agent",
         ],

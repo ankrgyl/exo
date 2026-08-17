@@ -43,9 +43,7 @@ pub trait SnapshotHandle: Send + Sync {
 pub trait SandboxHandle: SnapshotHandle {
     async fn list_sandboxes(&self) -> Result<Vec<SandboxRecord>>;
     async fn create_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId>;
-    async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {
-        self.stop_sandbox(id).await
-    }
+    async fn terminate_sandbox(&self, id: SandboxId) -> Result<()>;
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId>;
     async fn detach_sandbox(&self, id: SandboxId) -> Result<SandboxAttachment>;
     async fn stop_sandbox(&self, id: SandboxId) -> Result<()>;

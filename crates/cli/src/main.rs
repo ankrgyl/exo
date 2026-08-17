@@ -68,8 +68,6 @@ struct Cli {
     secret_backend: Option<SecretBackendArg>,
     #[arg(long, global = true, env = "EXO_MASTER_KEY_PATH")]
     master_key_path: Option<PathBuf>,
-    #[arg(long, global = true, value_enum, env = "EXO_SANDBOX_BACKEND")]
-    sandbox_backend: Option<SandboxBackendArg>,
     #[arg(long, global = true)]
     env_file: Option<PathBuf>,
     #[arg(long, global = true)]
@@ -249,25 +247,6 @@ impl From<SandboxProviderArg> for SandboxProvider {
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum SandboxBackendArg {
-    #[value(name = "apple-container")]
-    AppleContainer,
-    Docker,
-    #[value(name = "local-process")]
-    LocalProcess,
-}
-
-impl From<SandboxBackendArg> for SandboxBackendRegistration {
-    fn from(value: SandboxBackendArg) -> Self {
-        match value {
-            SandboxBackendArg::AppleContainer => Self::apple_container(),
-            SandboxBackendArg::Docker => Self::docker(),
-            SandboxBackendArg::LocalProcess => Self::local_process(),
-        }
-    }
-}
-
 fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
     let secret_backend = match cli.secret_backend.unwrap_or_else(default_secret_backend) {
         SecretBackendArg::AppleKeychain => SecretBackendChoice::AppleKeychain,
@@ -275,23 +254,11 @@ fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
             path: cli.master_key_path.clone(),
         },
     };
-    let sandbox_backend = cli
-        .sandbox_backend
-        .map(SandboxBackendRegistration::from)
-        .unwrap_or_else(default_sandbox_backend);
-    let sandbox_default = sandbox_backend.provider();
-    let mut sandbox_backends = default_sandbox_backends();
-    if !sandbox_backends
-        .iter()
-        .any(|backend| backend.provider() == sandbox_default)
-    {
-        sandbox_backends.push(sandbox_backend);
-    }
     Ok(BasicExoHarnessConfig {
         root: cli.root.join("exoharness"),
         secret_backend,
-        sandbox_default,
-        sandbox_backends,
+        sandbox_default: default_local_sandbox_provider(),
+        sandbox_backends: default_sandbox_backends(),
     })
 }
 
@@ -299,7 +266,8 @@ fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
 /// Daytona (offered even with no key set — credentials resolve lazily).
 fn default_sandbox_backends() -> Vec<SandboxBackendRegistration> {
     vec![
-        default_sandbox_backend(),
+        SandboxBackendRegistration::apple_container(),
+        SandboxBackendRegistration::docker(),
         SandboxBackendRegistration::local_process(),
         SandboxBackendRegistration::daytona(DaytonaBackendSpec::default()),
         SandboxBackendRegistration::e2b(E2bBackendSpec::default()),
@@ -329,16 +297,6 @@ fn default_secret_backend() -> SecretBackendArg {
 #[cfg(not(target_os = "macos"))]
 fn default_secret_backend() -> SecretBackendArg {
     SecretBackendArg::File
-}
-
-#[cfg(target_os = "macos")]
-fn default_sandbox_backend() -> SandboxBackendRegistration {
-    SandboxBackendRegistration::apple_container()
-}
-
-#[cfg(not(target_os = "macos"))]
-fn default_sandbox_backend() -> SandboxBackendRegistration {
-    SandboxBackendRegistration::docker()
 }
 
 #[cfg(target_os = "macos")]
@@ -460,7 +418,7 @@ enum AgentCommands {
         tool_creation: Option<EnabledDisabled>,
         #[arg(long)]
         sandbox_image: Option<String>,
-        #[arg(long, value_enum)]
+        #[arg(long = "provider", value_enum)]
         sandbox_provider: Option<SandboxProviderArg>,
         #[arg(long, value_enum)]
         sandbox_scope: Option<SandboxScopeArg>,
@@ -497,7 +455,7 @@ enum AgentCommands {
         sandbox_image: Option<String>,
         #[arg(long)]
         clear_sandbox_image: bool,
-        #[arg(long, value_enum)]
+        #[arg(long = "provider", value_enum)]
         sandbox_provider: Option<SandboxProviderArg>,
         #[arg(long, value_enum)]
         sandbox_scope: Option<SandboxScopeArg>,

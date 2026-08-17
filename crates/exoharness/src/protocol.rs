@@ -134,6 +134,10 @@ pub enum Request {
         scope: SandboxScope,
         request: CreateSandboxRequest,
     },
+    TerminateSandbox {
+        scope: SandboxScope,
+        sandbox_id: SandboxId,
+    },
     AttachSandbox {
         scope: SandboxScope,
         request: AttachSandboxRequest,
@@ -320,6 +324,7 @@ impl Request {
             Self::AgentWriteArtifact { .. } => "agent_write_artifact",
             Self::ListSandboxes { .. } => "list_sandboxes",
             Self::CreateSandbox { .. } => "create_sandbox",
+            Self::TerminateSandbox { .. } => "terminate_sandbox",
             Self::AttachSandbox { .. } => "attach_sandbox",
             Self::DetachSandbox { .. } => "detach_sandbox",
             Self::SnapshotSandbox { .. } => "snapshot_sandbox",
