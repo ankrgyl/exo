@@ -157,10 +157,10 @@ pub struct FirecrackerConfig {
     // and any cross-host blob redirects they return.
     pub allowed_registries: Vec<String>,
     pub network_bytes_per_second: u64,
-    /// Hard ceiling for VMs owned by this backend. Firecracker deliberately
-    /// leaves host CPU/memory oversubscription policy to its caller, and each
-    /// Firecracker process owns exactly one microVM, so callers should derive
-    /// this from scheduler capacity plus reserved fork-source VMs.
+    /// Hard physical ceiling for live and admitted-but-not-yet-live VMs owned
+    /// by this backend. Logical sandbox ownership and tenant quotas belong to
+    /// the caller and do not affect this host-level safety limit. Each
+    /// Firecracker process owns exactly one microVM.
     /// https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md#L23-L24
     /// https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md#L71-L72
     pub max_machines: Option<NonZeroUsize>,
@@ -698,12 +698,10 @@ impl FirecrackerSandboxBackend {
                 )
                 .await?;
             drop(snapshot_lease);
-            drop(_lifecycle_guard);
 
-            match self.acquire_resolved(request).await {
+            match self.acquire_resolved_locked(request).await {
                 Ok(handle) => Ok(handle),
                 Err(error) => {
-                    let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
                     if let Err(cleanup_error) = self.shared.cleanup_machine(&machine_id, true).await
                     {
                         tracing::warn!(
@@ -739,6 +737,17 @@ impl FirecrackerSandboxBackend {
         request: SandboxRequest,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
+        self.acquire_resolved_locked(request).await
+    }
+
+    // The caller holds lifecycle_lock until the admitted machine is either
+    // running or cleaned up. That makes the capacity check and launch one
+    // atomic operation: while one not-yet-live VMM occupies the remaining
+    // slot, no second launch can pass its capacity check.
+    async fn acquire_resolved_locked(
+        &self,
+        request: SandboxRequest,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let spec_hash = sandbox_spec_hash(&request.spec);
         let stable_machine_id = machine_id(&request.key, &spec_hash);
         let machine_key_prefix = format!("fc-{}-", stable_id(&request.key.to_string()));
@@ -898,12 +907,6 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
 
         let target_spec_hash = sandbox_spec_hash(&target.spec);
         let target_machine_id = machine_id(&target.key, &target_spec_hash);
-        {
-            let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
-            self.shared
-                .ensure_machine_capacity(&target_machine_id)
-                .await?;
-        }
         let template_key = fork_snapshot_template_key(&source_record, &target_machine_id);
         let captured = Self::capture_snapshot(
             &self.shared,
@@ -1112,16 +1115,41 @@ impl Shared {
         let Some(max_machines) = self.config.max_machines else {
             return Ok(());
         };
-        let state_root = self.config.state_root.clone();
-        let machine_id = machine_id.to_string();
-        let active_machine_ids =
-            tokio::task::spawn_blocking(move || manifest_machine_ids(&state_root))
+        let config = self.config.clone();
+        let capacity = tokio::task::spawn_blocking(move || {
+            machine_capacity_state(&config.state_root, |candidate| {
+                process_running(&jail_root(&config, candidate).join("firecracker.pid"))
+            })
+        })
+        .await
+        .context("joining Firecracker capacity scan")??;
+
+        let stale_machine_ids = capacity
+            .dead_machine_ids
+            .into_iter()
+            .filter(|candidate| candidate != machine_id)
+            .collect::<HashSet<_>>();
+        if !stale_machine_ids.is_empty() {
+            self.warm_machines
+                .lock()
                 .await
-                .context("joining Firecracker capacity scan")??;
+                .retain(|_, entry| !stale_machine_ids.contains(&entry.machine_id));
+            for stale_machine_id in stale_machine_ids {
+                self.cleanup_machine(&stale_machine_id, true).await?;
+                tracing::info!(
+                    machine_id = stale_machine_id,
+                    "reaped stale Firecracker machine record"
+                );
+            }
+        }
+
         ensure_machine_capacity(
             max_machines,
-            active_machine_ids.len(),
-            active_machine_ids.iter().any(|id| id == &machine_id),
+            capacity.live_machine_ids.len(),
+            capacity
+                .live_machine_ids
+                .iter()
+                .any(|candidate| candidate == machine_id),
         )
     }
 
@@ -1149,10 +1177,10 @@ impl Shared {
             }
         }
 
+        self.ensure_machine_capacity(machine_id).await?;
         let record = match existing {
             Some(record) if record.spec_hash == spec_hash => record,
             _ => {
-                self.ensure_machine_capacity(machine_id).await?;
                 self.new_machine_record(request, machine_id, spec_hash, None)
                     .await?
             }
@@ -1893,8 +1921,18 @@ fn expired_machine_ids(state_root: &Path, now: SystemTime) -> Result<Vec<String>
     Ok(expired)
 }
 
-fn manifest_machine_ids(state_root: &Path) -> Result<Vec<String>> {
-    let mut machine_ids = Vec::new();
+#[derive(Debug, PartialEq, Eq)]
+struct MachineCapacityState {
+    live_machine_ids: Vec<String>,
+    dead_machine_ids: Vec<String>,
+}
+
+fn machine_capacity_state(
+    state_root: &Path,
+    mut process_is_running: impl FnMut(&str) -> bool,
+) -> Result<MachineCapacityState> {
+    let mut live_machine_ids = Vec::new();
+    let mut dead_machine_ids = Vec::new();
     for entry in fs::read_dir(state_root.join("manifests"))? {
         let entry = entry?;
         let path = entry.path();
@@ -1914,21 +1952,28 @@ fn manifest_machine_ids(state_root: &Path) -> Result<Vec<String>> {
         {
             bail!("mismatched Firecracker manifest {}", path.display());
         }
-        machine_ids.push(record.machine_id);
+        if process_is_running(&record.machine_id) {
+            live_machine_ids.push(record.machine_id);
+        } else {
+            dead_machine_ids.push(record.machine_id);
+        }
     }
-    Ok(machine_ids)
+    Ok(MachineCapacityState {
+        live_machine_ids,
+        dead_machine_ids,
+    })
 }
 
 fn ensure_machine_capacity(
     max_machines: NonZeroUsize,
-    active_machines: usize,
+    live_machines: usize,
     target_already_exists: bool,
 ) -> Result<()> {
-    if target_already_exists || active_machines < max_machines.get() {
+    if target_already_exists || live_machines < max_machines.get() {
         return Ok(());
     }
     bail!(
-        "Firecracker host VM capacity exhausted: {active_machines} active, limit {}; reduce the caller's claimed-conversation capacity or terminate an idle sandbox",
+        "Firecracker host VM capacity exhausted: {live_machines} live, limit {}; stop a VM or raise the host limit",
         max_machines.get()
     )
 }

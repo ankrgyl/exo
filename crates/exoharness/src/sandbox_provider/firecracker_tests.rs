@@ -100,7 +100,38 @@ fn capacity_scan_fails_closed_on_invalid_manifest() {
     let manifests = directory.path().join("manifests");
     fs::create_dir(&manifests).unwrap();
     fs::write(manifests.join("fc-invalid.json"), b"not json").unwrap();
-    assert!(manifest_machine_ids(directory.path()).is_err());
+    assert!(machine_capacity_state(directory.path(), |_| false).is_err());
+}
+
+#[test]
+fn capacity_scan_counts_processes_instead_of_manifests() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("manifests")).unwrap();
+    let live = MachineRecord {
+        machine_id: "fc-live".to_string(),
+        spec_hash: "live".to_string(),
+        resolved_image: "/images/base.ext4".to_string(),
+        slot: 1,
+        network_enabled: false,
+        workspace_id: None,
+        idle_ttl_seconds: Some(60),
+        snapshot_template: None,
+        snapshot_network_slot: None,
+    };
+    let dead = MachineRecord {
+        machine_id: "fc-dead".to_string(),
+        spec_hash: "dead".to_string(),
+        slot: 2,
+        ..live.clone()
+    };
+    write_manifest(directory.path(), &live).unwrap();
+    write_manifest(directory.path(), &dead).unwrap();
+
+    let capacity =
+        machine_capacity_state(directory.path(), |machine_id| machine_id == live.machine_id)
+            .unwrap();
+    assert_eq!(capacity.live_machine_ids, vec![live.machine_id]);
+    assert_eq!(capacity.dead_machine_ids, vec![dead.machine_id]);
 }
 
 #[test]
