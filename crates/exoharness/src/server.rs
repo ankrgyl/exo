@@ -11,9 +11,9 @@ use crate::{
     CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, CreateSandboxRequest,
     ExoHarness, ForkSandboxRequest, GetSandboxProcessEventsResult, ListConversationsResult,
     RestoreSandboxRequest, Result, SandboxAttachment, SandboxId, SandboxProcessEventQuery,
-    SandboxProcessRecord, SandboxProcessStatus, SessionId, SnapshotId, StartSandboxProcessRequest,
-    StartSandboxRequest, TurnHandle, TurnId, TurnRecord, WaitSandboxProcessRequest,
-    WriteSandboxProcessInputRequest,
+    SandboxProcessRecord, SandboxProcessStatus, SandboxRecord, SessionId, SnapshotId,
+    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord,
+    WaitSandboxProcessRequest, WriteSandboxProcessInputRequest,
 };
 
 pub struct ExoHarnessServer {
@@ -504,6 +504,26 @@ impl ExoHarnessServer {
             }
             SandboxScope::Turn { .. } => {
                 Err(anyhow!("create_sandbox is not supported on a turn scope"))
+            }
+        }
+    }
+
+    async fn list_sandboxes(&self, scope: SandboxScope) -> Result<Vec<SandboxRecord>> {
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id).await?.list_sandboxes().await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .list_sandboxes()
+                    .await
+            }
+            SandboxScope::Turn { .. } => {
+                Err(anyhow!("list_sandboxes is not supported on a turn scope"))
             }
         }
     }

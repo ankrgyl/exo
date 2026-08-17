@@ -16,7 +16,7 @@ mod tui;
 mod tui_app;
 
 use std::collections::HashMap;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 #[cfg(feature = "firecracker")]
 use std::net::Ipv4Addr;
 use std::net::{SocketAddr, TcpListener};
@@ -37,14 +37,14 @@ use executor::{
     ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount, FileSystemMountMode,
     FirecrackerBackendSpec, ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART,
     HTTP_EXOHARNESS_TRACING_TARGET, Harness, HarnessAgent, HarnessConversation, HttpExoHarness,
-    LocalSandboxExoHarness, PutSecretRequest, RlmHarness, SANDBOX_MAIN_MOUNT_DIR,
-    SandboxAttachment, SandboxBackendRegistration, SandboxProvider, SandboxProviderConfig,
-    SandboxScope, Secret, SecretBackendChoice, SpritesBackendSpec, ToolRequest, ToolRuntime,
-    TypeScriptHarness, TypeScriptHarnessConfig, Uuid7, VercelBackendSpec,
-    default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
-    default_firecracker_image, default_vercel_image, effective_sandbox_scope,
-    finalize_rebuild_update_file, load_agent_config, record_host_event, send_conversation_wakeup,
-    serve_exoharness_http_listener_with_options,
+    LocalSandboxExoHarness, NewAgentRequest, PutSecretRequest, RlmHarness, RunInSandboxRequest,
+    SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment, SandboxBackendRegistration, SandboxProcess,
+    SandboxProvider, SandboxProviderConfig, SandboxScope, Secret, SecretBackendChoice,
+    SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness, TypeScriptHarnessConfig,
+    Uuid7, VercelBackendSpec, default_aws_agentcore_image, default_daytona_image,
+    default_docker_image, default_e2b_template, default_firecracker_image, default_vercel_image,
+    effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config, record_host_event,
+    send_conversation_wakeup, serve_exoharness_http_listener_with_options,
 };
 use serde::Deserialize;
 use tabwriter::TabWriter;
@@ -81,8 +81,6 @@ struct Cli {
     secret_backend: Option<SecretBackendArg>,
     #[arg(long, global = true, env = "EXO_MASTER_KEY_PATH")]
     master_key_path: Option<PathBuf>,
-    #[arg(long, global = true, value_enum, env = "EXO_SANDBOX_BACKEND")]
-    sandbox_backend: Option<SandboxBackendArg>,
     #[arg(long, global = true)]
     env_file: Option<PathBuf>,
     #[arg(long, global = true)]
@@ -451,27 +449,6 @@ impl From<SandboxProviderArg> for SandboxProvider {
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum SandboxBackendArg {
-    #[value(name = "apple-container")]
-    AppleContainer,
-    Docker,
-    Firecracker,
-    #[value(name = "local-process")]
-    LocalProcess,
-}
-
-impl SandboxBackendArg {
-    fn registration(self, firecracker: FirecrackerBackendSpec) -> SandboxBackendRegistration {
-        match self {
-            Self::AppleContainer => SandboxBackendRegistration::apple_container(),
-            Self::Docker => SandboxBackendRegistration::docker(),
-            Self::Firecracker => SandboxBackendRegistration::firecracker(firecracker),
-            Self::LocalProcess => SandboxBackendRegistration::local_process(),
-        }
-    }
-}
-
 fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
     let secret_backend = match cli.secret_backend.unwrap_or_else(default_secret_backend) {
         SecretBackendArg::AppleKeychain => SecretBackendChoice::AppleKeychain,
@@ -480,30 +457,32 @@ fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
         },
     };
     #[cfg(feature = "firecracker")]
-    let firecracker_spec = match &cli.command {
-        Commands::Serve { firecracker, .. } => firecracker.backend_spec()?,
-        _ => FirecrackerBackendSpec::default(),
-    };
+    let firecracker_spec = command_firecracker_args(&cli.command)
+        .map(FirecrackerArgs::backend_spec)
+        .transpose()?
+        .unwrap_or_default();
     #[cfg(not(feature = "firecracker"))]
     let firecracker_spec = FirecrackerBackendSpec::default();
-    let sandbox_backend = cli
-        .sandbox_backend
-        .map(|backend| backend.registration(firecracker_spec.clone()))
-        .unwrap_or_else(default_sandbox_backend);
-    let sandbox_default = sandbox_backend.provider();
-    let mut sandbox_backends = default_sandbox_backends(firecracker_spec);
-    if !sandbox_backends
-        .iter()
-        .any(|backend| backend.provider() == sandbox_default)
-    {
-        sandbox_backends.push(sandbox_backend);
-    }
     Ok(BasicExoHarnessConfig {
         root: cli.root.join("exoharness"),
         secret_backend,
         sandbox_default: default_local_sandbox_provider(),
-        sandbox_backends: default_sandbox_backends(),
+        sandbox_backends: default_sandbox_backends(firecracker_spec),
     })
+}
+
+#[cfg(feature = "firecracker")]
+fn command_firecracker_args(command: &Commands) -> Option<&FirecrackerArgs> {
+    match command {
+        Commands::Sandbox {
+            command: SandboxCommands::Start(args),
+        } => Some(&args.firecracker),
+        Commands::Sandbox {
+            command: SandboxCommands::Play(args),
+        } => Some(&args.firecracker),
+        Commands::Serve { firecracker, .. } => Some(firecracker),
+        _ => None,
+    }
 }
 
 /// Default providers: the OS-local container backend, local processes, and
@@ -512,7 +491,8 @@ fn default_sandbox_backends(
     firecracker: FirecrackerBackendSpec,
 ) -> Vec<SandboxBackendRegistration> {
     vec![
-        default_sandbox_backend(),
+        SandboxBackendRegistration::apple_container(),
+        SandboxBackendRegistration::docker(),
         SandboxBackendRegistration::firecracker(firecracker),
         SandboxBackendRegistration::local_process(),
         SandboxBackendRegistration::daytona(DaytonaBackendSpec::default()),
@@ -956,6 +936,9 @@ struct SandboxStartArgs {
     name: Option<String>,
     #[command(flatten)]
     sandbox: SandboxCreateArgs,
+    #[cfg(feature = "firecracker")]
+    #[command(flatten, next_help_heading = "Firecracker backend options")]
+    firecracker: FirecrackerArgs,
 }
 
 #[derive(Debug, Args)]
@@ -997,6 +980,9 @@ struct SandboxPlayArgs {
     shell: String,
     #[arg(long = "env", value_name = "NAME=VALUE")]
     env: Vec<String>,
+    #[cfg(feature = "firecracker")]
+    #[command(flatten, next_help_heading = "Firecracker backend options")]
+    firecracker: FirecrackerArgs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2946,6 +2932,7 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
         Commands::Repl { agent, .. } => Some(agent.as_deref().unwrap_or(DEFAULT_REPL_SLUG)),
         Commands::Secret { .. }
         | Commands::FirecrackerBridge
+        | Commands::Sandbox { .. }
         | Commands::Model { .. }
         | Commands::Provider { .. }
         | Commands::Adapters { .. }

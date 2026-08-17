@@ -126,13 +126,62 @@ Run Exo as root, select the backend, and configure the provider binding:
 ```bash
 sudo EXO_FIRECRACKER_KERNEL=/var/lib/exo/firecracker/vmlinux \
   EXO_FIRECRACKER_INITRAMFS=/var/lib/exo/firecracker/exo-firecracker-initramfs.cpio \
-  target/debug/exo --sandbox-backend firecracker provider configure \
+  target/debug/exo provider configure \
   --provider firecracker \
   --default-image 123456789012.dkr.ecr.us-east-1.amazonaws.com/exo-sandbox@sha256:...
 ```
 
-Agents can then select `--sandbox-provider firecracker`; the Exo CLI and data
+Agents can then select `--provider firecracker`; the Exo CLI and data
 model remain the same as for hosted sandbox providers.
+
+To start an unnamed sandbox and connect a shell in one command, use `sandbox
+play`. It destroys the sandbox when the shell exits:
+
+```bash
+sudo target/debug/exo sandbox play \
+  --provider firecracker \
+  --image 123456789012.dkr.ecr.us-east-1.amazonaws.com/exo-sandbox@sha256:... \
+  --networking enabled \
+  --firecracker-memory-mib 2048 \
+  --firecracker-vcpu-count 2
+```
+
+`sandbox start --help` and `sandbox play --help` list every sandbox-creation
+parameter, including the working directory, idle timeout, host mounts, durable
+filesystems, and networking. Their `--firecracker-*` options control the VMM
+and jailer paths, kernel, initramfs, state root, VM sizing, DNS, UID range,
+image/workspace sizes, and network rate limit. The same options live under
+`exo serve` for a persistent backend. The corresponding `EXO_FIRECRACKER_*`
+environment variables remain supported.
+
+For a sandbox that survives between CLI invocations, use the separate lifecycle
+commands. Each command adopts the running Firecracker VM from its persisted
+state:
+
+```bash
+sandbox_id=$(sudo target/debug/exo sandbox start --provider firecracker)
+sudo target/debug/exo sandbox ps
+sudo target/debug/exo sandbox exec "$sandbox_id" -- /bin/echo hello
+sudo target/debug/exo sandbox connect "$sandbox_id"
+sudo target/debug/exo sandbox terminate "$sandbox_id"
+```
+
+`connect` streams an interactive shell over stdin/stdout/stderr; the current
+sandbox process API does not provide a PTY. A long-running `exo serve` process
+is still useful when multiple clients need concurrent access to one backend.
+Every lifecycle command accepts `--agent <slug>` to use that agent's sandbox
+scope. Without it, commands share an internal singleton owner intended for
+direct CLI use.
+
+`sandbox ps` shows running sandboxes by default; `-a` includes stopped records,
+and `-q` prints only IDs.
+`stop` and `terminate` accept multiple IDs, so retained sandboxes can be cleaned
+up compositionally:
+
+```bash
+sudo target/debug/exo sandbox ps -aq \
+  | sudo target/debug/exo sandbox terminate
+```
 
 ## Security model
 
@@ -274,7 +323,14 @@ auto-create the instance: it must already exist, so a typo'd
 `EXO_FIRECRACKER_LIMA_INSTANCE` cannot silently provision a default VM that
 mounts your home directory. The Firecracker binaries, kernel, initramfs, and
 state directory remain inside that VM. Run the macOS Exo CLI normally with
-`--sandbox-backend firecracker`.
+`--provider firecracker`.
+
+Use `make restart-firecracker-lima` to restart the outer VM without removing
+Exo state. Use `make clean-firecracker-microvms` to restart it and remove all
+per-microVM state while retaining downloaded OCI images and the cached kernel
+and initramfs. Both commands honor `EXO_FIRECRACKER_LIMA_INSTANCE` and
+`EXO_FIRECRACKER_STATE_ROOT`; the clean command refuses state roots outside
+`/var/lib/exo/firecracker`.
 
 This path is for development only. Isolation _between_ microVMs inside the
 Lima VM is the same as on Linux, but the Lima VM itself belongs to your macOS

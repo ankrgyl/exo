@@ -26,9 +26,10 @@ use crate::{
     ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
     ReadArtifactRequest, RestoreSandboxRequest, Result, RunInSandboxRequest, SandboxAttachment,
     SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery, SandboxProcessParts,
-    SandboxProcessRecord, SandboxProcessStatus, Secret, SecretId, SecretMetadata, SessionId,
-    SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle,
-    TurnRecord, WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    SandboxProcessRecord, SandboxProcessStatus, SandboxRecord, Secret, SecretId, SecretMetadata,
+    SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest,
+    TurnHandle, TurnRecord, WaitSandboxProcessRequest, WriteArtifactRequest,
+    WriteSandboxProcessInputRequest,
 };
 
 #[derive(Clone)]
@@ -241,6 +242,16 @@ async fn http_restore_sandbox(
     {
         Response::SandboxId { sandbox_id } => Ok(sandbox_id),
         response => unexpected_response(response, "sandbox_id"),
+    }
+}
+
+async fn http_list_sandboxes(
+    harness: &HttpExoHarness,
+    scope: SandboxScope,
+) -> Result<Vec<SandboxRecord>> {
+    match harness.request(Request::ListSandboxes { scope }).await? {
+        Response::Sandboxes { sandboxes } => Ok(sandboxes),
+        response => unexpected_response(response, "sandboxes"),
     }
 }
 
@@ -722,7 +733,6 @@ impl SandboxHandle for HttpAgentHandle {
     async fn restore_sandbox(&self, request: RestoreSandboxRequest) -> Result<SandboxId> {
         http_restore_sandbox(&self.harness, self.sandbox_scope(), request).await
     }
-
     async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {
         http_terminate_sandbox(&self.harness, self.sandbox_scope(), id).await
     }
@@ -1114,7 +1124,6 @@ impl SandboxHandle for HttpConversationHandle {
     async fn restore_sandbox(&self, request: RestoreSandboxRequest) -> Result<SandboxId> {
         http_restore_sandbox(&self.harness, self.sandbox_scope(), request).await
     }
-
     async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {
         http_terminate_sandbox(&self.harness, self.sandbox_scope(), id).await
     }

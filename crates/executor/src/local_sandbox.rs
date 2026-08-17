@@ -12,9 +12,10 @@ use exoharness::{
     NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest,
     RestoreSandboxRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle,
     SandboxId, SandboxProcess, SandboxProcessEventQuery, SandboxProcessRecord,
-    SandboxProcessStatus, SandboxProvider, Secret, SecretId, SecretMetadata, SnapshotHandle,
-    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnRecord, Uuid7,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    SandboxProcessStatus, SandboxProvider, SandboxRecord, Secret, SecretId, SecretMetadata,
+    SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle,
+    TurnRecord, Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest,
+    WriteSandboxProcessInputRequest,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;

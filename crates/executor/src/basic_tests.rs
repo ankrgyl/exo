@@ -12,9 +12,9 @@ use exoharness::{
     ForkSandboxRequest, GetEventsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
     ReadArtifactRequest, RestoreSandboxRequest, Result, RunInSandboxRequest, SandboxAttachment,
     SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery, SandboxProcessParts,
-    SandboxProcessRecord, SandboxProcessStatus, Secret, SecretMetadata, SecretType, SessionId,
-    SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, ToolRequest,
-    ToolResult, TurnHandle, TurnId, TurnRecord, Uuid7, WriteArtifactRequest,
+    SandboxProcessRecord, SandboxProcessStatus, SandboxRecord, Secret, SecretMetadata, SecretType,
+    SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest,
+    ToolRequest, ToolResult, TurnHandle, TurnId, TurnRecord, Uuid7, WriteArtifactRequest,
 };
 use futures::FutureExt;
 use futures::io::Cursor;
