@@ -113,11 +113,8 @@ const JAILED_VSOCK: &str = "/run/exo.vsock";
 const FIRECRACKER_API_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 const FIRECRACKER_API_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRECRACKER_SNAPSHOT_CREATE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-// Explicit Firecracker snapshots are host-local cache entries, not durable
-// artifacts. Callers already recover from a missing template by rebuilding it,
-// so bound abandoned templates while leaving recently restored snapshots hot.
-const SNAPSHOT_CACHE_MAX_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 const SNAPSHOT_LEASE_FILE: &str = "lease";
+const SNAPSHOT_FORK_TEMPLATE_FILE: &str = "fork-template";
 // Firecracker forwards guest packets without filtering them. Keep special-use,
 // link-local, host-private, and cross-VM ranges closed unless explicitly admitted.
 // https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md#filtering-guest-egress-network-traffic
@@ -252,6 +249,11 @@ impl FirecrackerSnapshotManifest {
         }
         Ok(())
     }
+}
+
+struct CapturedSnapshot {
+    manifest: FirecrackerSnapshotManifest,
+    lease: File,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -523,7 +525,8 @@ impl FirecrackerSandboxBackend {
     pub(super) async fn reap_expired(&self) -> Result<()> {
         let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
         self.reap_expired_machines().await?;
-        self.shared.reap_expired_snapshot_templates().await
+        self.shared.reap_orphaned_fork_snapshot_templates().await;
+        Ok(())
     }
 
     async fn reap_expired_machines(&self) -> Result<()> {
@@ -586,7 +589,8 @@ impl FirecrackerSandboxBackend {
         source_machine_id: &str,
         source_spec_hash: &str,
         template_key: String,
-    ) -> Result<FirecrackerSnapshotManifest> {
+        lifecycle: SnapshotTemplateLifecycle,
+    ) -> Result<CapturedSnapshot> {
         if !request.spec.durable_file_systems.is_empty() {
             bail!("Firecracker snapshotting does not support durable filesystems")
         }
@@ -617,17 +621,20 @@ impl FirecrackerSandboxBackend {
         let config = shared.config.clone();
         let source_for_snapshot = source.clone();
         let key_for_snapshot = template_key.clone();
-        tokio::task::spawn_blocking(move || {
-            capture_snapshot_template(&config, &source_for_snapshot, &key_for_snapshot)
+        let lease = tokio::task::spawn_blocking(move || {
+            capture_snapshot_template(&config, &source_for_snapshot, &key_for_snapshot, lifecycle)
         })
         .await
         .context("joining Firecracker snapshot creation")??;
 
-        Ok(FirecrackerSnapshotManifest {
-            format_version: SNAPSHOT_FORMAT_VERSION,
-            template_key,
-            spec_hash: source.spec_hash,
-            source_network_slot: source.slot,
+        Ok(CapturedSnapshot {
+            manifest: FirecrackerSnapshotManifest {
+                format_version: SNAPSHOT_FORMAT_VERSION,
+                template_key,
+                spec_hash: source.spec_hash,
+                source_network_slot: source.slot,
+            },
+            lease,
         })
     }
 
@@ -636,6 +643,7 @@ impl FirecrackerSandboxBackend {
         request: SandboxRequest,
         manifest: FirecrackerSnapshotManifest,
         lifecycle: SnapshotTemplateLifecycle,
+        captured_lease: Option<File>,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let template_key = manifest.template_key.clone();
         let restore = async {
@@ -663,13 +671,18 @@ impl FirecrackerSandboxBackend {
             if !template_ready {
                 bail!("Firecracker snapshot {template_key} is not available on this host")
             }
-            let config = self.shared.config.clone();
-            let lease_key = template_key.clone();
-            let snapshot_lease = tokio::task::spawn_blocking(move || {
-                open_snapshot_template_lease(&config, &lease_key)
-            })
-            .await
-            .context("joining Firecracker snapshot lease acquisition")??;
+            let snapshot_lease = match captured_lease {
+                Some(lease) => lease,
+                None => {
+                    let config = self.shared.config.clone();
+                    let lease_key = template_key.clone();
+                    tokio::task::spawn_blocking(move || {
+                        open_snapshot_template_lease(&config, &lease_key)
+                    })
+                    .await
+                    .context("joining Firecracker snapshot lease acquisition")??
+                }
+            };
             self.shared
                 .new_machine_record(
                     &request,
@@ -810,7 +823,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         {
             let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
             self.reap_expired_machines().await?;
-            self.shared.reap_expired_snapshot_templates().await?;
+            self.shared.reap_orphaned_fork_snapshot_templates().await;
         }
         let request = self.resolve_request(request).await?;
         self.acquire_resolved(request).await
@@ -892,16 +905,22 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
                 .await?;
         }
         let template_key = fork_snapshot_template_key(&source_record, &target_machine_id);
-        let manifest = Self::capture_snapshot(
+        let captured = Self::capture_snapshot(
             &self.shared,
             &source,
             &source_record.machine_id,
             &source_record.spec_hash,
             template_key,
+            SnapshotTemplateLifecycle::Machine,
         )
         .await?;
-        self.restore_snapshot(target, manifest, SnapshotTemplateLifecycle::Machine)
-            .await
+        self.restore_snapshot(
+            target,
+            captured.manifest,
+            SnapshotTemplateLifecycle::Machine,
+            Some(captured.lease),
+        )
+        .await
     }
 
     async fn acquire_from_snapshot(
@@ -911,7 +930,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let manifest = FirecrackerSnapshotManifest::from_payload(payload)?;
         let request = self.resolve_request(request).await?;
-        self.restore_snapshot(request, manifest, SnapshotTemplateLifecycle::Snapshot)
+        self.restore_snapshot(request, manifest, SnapshotTemplateLifecycle::Snapshot, None)
             .await
     }
 }
@@ -1039,42 +1058,54 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
     }
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {
-        let manifest = FirecrackerSandboxBackend::capture_snapshot(
+        let captured = FirecrackerSandboxBackend::capture_snapshot(
             &self.shared,
             &self.request,
             &self.machine.record.machine_id,
             &self.spec_hash,
             explicit_snapshot_template_key(&self.machine.record, Uuid::new_v4()),
+            SnapshotTemplateLifecycle::Snapshot,
         )
         .await?;
+        drop(captured.lease);
 
         // The generic Exo payload stays small: copying multi-gigabyte RAM and
         // disk images through conversation storage would defeat local snapshot
         // restores. The reference is intentionally usable only by a backend
         // sharing this private Firecracker state root.
-        manifest.into_payload()
+        captured.manifest.into_payload()
     }
 }
 
 impl Shared {
-    async fn reap_expired_snapshot_templates(&self) -> Result<()> {
+    async fn reap_orphaned_fork_snapshot_templates(&self) {
         let config = self.config.clone();
-        let removed = tokio::task::spawn_blocking(move || {
-            reap_expired_snapshot_templates_blocking(
-                &config,
-                SystemTime::now(),
-                SNAPSHOT_CACHE_MAX_IDLE,
-            )
+        match tokio::task::spawn_blocking(move || {
+            reap_orphaned_fork_snapshot_templates_blocking(&config)
         })
         .await
-        .context("joining Firecracker snapshot cache scan")??;
-        for template_key in removed {
-            tracing::info!(
-                template_key,
-                "reaped expired Firecracker snapshot cache entry"
-            );
+        {
+            Ok(Ok(removed)) => {
+                for template_key in removed {
+                    tracing::info!(
+                        template_key,
+                        "reaped orphaned Firecracker fork snapshot template"
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "failed scanning Firecracker fork snapshot templates"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "failed joining Firecracker fork snapshot template scan"
+                );
+            }
         }
-        Ok(())
     }
 
     async fn ensure_machine_capacity(&self, machine_id: &str) -> Result<()> {
@@ -2774,8 +2805,6 @@ fn open_snapshot_template_lease(config: &FirecrackerConfig, key: &str) -> Result
     }
     flock(&file, FlockOperation::LockShared)
         .with_context(|| format!("locking Firecracker snapshot lease {}", path.display()))?;
-    file.set_modified(SystemTime::now())?;
-    file.sync_all()?;
     Ok(file)
 }
 
@@ -2807,26 +2836,13 @@ fn referenced_snapshot_template_keys(state_root: &Path) -> Result<HashSet<String
     Ok(referenced)
 }
 
-fn snapshot_template_lease_marker(directory: &Path) -> Result<Option<PathBuf>> {
-    for name in [SNAPSHOT_LEASE_FILE, "complete"] {
-        let path = directory.join(name);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_file() => return Ok(Some(path)),
-            Ok(_) => bail!(
-                "Firecracker snapshot lease marker is not a file: {}",
-                path.display()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(None)
+fn is_fork_snapshot_template(directory: &Path) -> bool {
+    fs::symlink_metadata(directory.join(SNAPSHOT_FORK_TEMPLATE_FILE))
+        .is_ok_and(|metadata| metadata.is_file())
 }
 
-fn reap_expired_snapshot_templates_blocking(
+fn reap_orphaned_fork_snapshot_templates_blocking(
     config: &FirecrackerConfig,
-    now: SystemTime,
-    max_idle: Duration,
 ) -> Result<Vec<String>> {
     let referenced = referenced_snapshot_template_keys(&config.state_root)?;
     let mut removed = Vec::new();
@@ -2838,40 +2854,38 @@ fn reap_expired_snapshot_templates_blocking(
         let Some(key) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if validate_snapshot_key(&key).is_err() || referenced.contains(&key) {
-            continue;
-        }
-        let Some(marker) = snapshot_template_lease_marker(&entry.path())? else {
-            continue;
-        };
-        let last_used = fs::metadata(&marker)?.modified()?;
-        if !last_used
-            .checked_add(max_idle)
-            .is_some_and(|deadline| deadline <= now)
+        if validate_snapshot_key(&key).is_err()
+            || referenced.contains(&key)
+            || !is_fork_snapshot_template(&entry.path())
         {
             continue;
         }
 
         // Restores hold a shared lock, while reclamation proceeds only after a
-        // non-blocking exclusive lock. Recheck the mtime after locking to close
-        // the scan/delete race with a restore that refreshed the lease.
-        let lease = File::open(&marker)
-            .with_context(|| format!("opening Firecracker snapshot lease {}", marker.display()))?;
+        // non-blocking exclusive lock. The lifecycle lock prevents new restores
+        // from starting between the reference scan and removal in this backend;
+        // the lease also protects against readers outside that critical section.
+        let lease_path = entry.path().join(SNAPSHOT_LEASE_FILE);
+        let lease = File::open(&lease_path).with_context(|| {
+            format!(
+                "opening Firecracker snapshot lease {}",
+                lease_path.display()
+            )
+        })?;
+        if !lease.metadata()?.is_file() {
+            continue;
+        }
         match flock(&lease, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => {}
             Err(error) if error == rustix::io::Errno::WOULDBLOCK => continue,
             Err(error) => {
                 return Err(error).with_context(|| {
-                    format!("locking Firecracker snapshot lease {}", marker.display())
+                    format!(
+                        "locking Firecracker snapshot lease {}",
+                        lease_path.display()
+                    )
                 });
             }
-        }
-        let last_used = lease.metadata()?.modified()?;
-        if !last_used
-            .checked_add(max_idle)
-            .is_some_and(|deadline| deadline <= now)
-        {
-            continue;
         }
         remove_directory_if_present(&entry.path())?;
         removed.push(key);
@@ -3110,7 +3124,8 @@ fn capture_snapshot_template(
     config: &FirecrackerConfig,
     source: &MachineRecord,
     template_key: &str,
-) -> Result<()> {
+    lifecycle: SnapshotTemplateLifecycle,
+) -> Result<File> {
     let destination = snapshot_template_dir(config, template_key)?;
     if destination.try_exists()? {
         remove_directory_if_present(&destination)?;
@@ -3203,6 +3218,11 @@ fn capture_snapshot_template(
             .open(&lease)?;
         fs::set_permissions(&lease, Permissions::from_mode(0o600))?;
         lease_file.sync_all()?;
+        if lifecycle == SnapshotTemplateLifecycle::Machine {
+            let marker = temporary.join(SNAPSHOT_FORK_TEMPLATE_FILE);
+            File::create(&marker)?.sync_all()?;
+            fs::set_permissions(&marker, Permissions::from_mode(0o444))?;
+        }
         let complete = temporary.join("complete");
         File::create(&complete)?.sync_all()?;
         fs::set_permissions(&complete, Permissions::from_mode(0o444))?;
@@ -3228,7 +3248,7 @@ fn capture_snapshot_template(
     fs::rename(&temporary, &destination)
         .with_context(|| format!("publishing Firecracker snapshot {}", destination.display()))?;
     validate_snapshot_template(config, &destination)?;
-    Ok(())
+    open_snapshot_template_lease(config, template_key)
 }
 
 fn prepare_snapshot_overlay(

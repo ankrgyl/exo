@@ -178,17 +178,23 @@ fn persisted_lease_expires_machine_after_idle_ttl() {
     );
 }
 
-fn create_snapshot_cache_entry(state_root: &Path, key: &str, last_used: SystemTime) -> PathBuf {
+fn create_snapshot_template(
+    state_root: &Path,
+    key: &str,
+    lifecycle: SnapshotTemplateLifecycle,
+) -> PathBuf {
     let directory = state_root.join("snapshots").join(key);
     fs::create_dir(&directory).unwrap();
     File::create(directory.join("complete")).unwrap();
-    let lease = File::create(directory.join(SNAPSHOT_LEASE_FILE)).unwrap();
-    lease.set_modified(last_used).unwrap();
+    File::create(directory.join(SNAPSHOT_LEASE_FILE)).unwrap();
+    if lifecycle == SnapshotTemplateLifecycle::Machine {
+        File::create(directory.join(SNAPSHOT_FORK_TEMPLATE_FILE)).unwrap();
+    }
     directory
 }
 
 #[test]
-fn snapshot_cache_reaps_only_unreferenced_expired_templates() {
+fn snapshot_gc_reaps_only_unreferenced_fork_templates() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("snapshots")).unwrap();
     fs::create_dir(directory.path().join("manifests")).unwrap();
@@ -196,14 +202,24 @@ fn snapshot_cache_reaps_only_unreferenced_expired_templates() {
         state_root: directory.path().to_path_buf(),
         ..FirecrackerConfig::default()
     };
-    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-    let stale_time = now - SNAPSHOT_CACHE_MAX_IDLE - Duration::from_secs(1);
-    let stale_key = "a".repeat(64);
-    let recent_key = "b".repeat(64);
+    let orphaned_fork_key = "a".repeat(64);
+    let explicit_key = "b".repeat(64);
     let referenced_key = "c".repeat(64);
-    let stale = create_snapshot_cache_entry(directory.path(), &stale_key, stale_time);
-    let recent = create_snapshot_cache_entry(directory.path(), &recent_key, now);
-    let referenced = create_snapshot_cache_entry(directory.path(), &referenced_key, stale_time);
+    let orphaned_fork = create_snapshot_template(
+        directory.path(),
+        &orphaned_fork_key,
+        SnapshotTemplateLifecycle::Machine,
+    );
+    let explicit = create_snapshot_template(
+        directory.path(),
+        &explicit_key,
+        SnapshotTemplateLifecycle::Snapshot,
+    );
+    let referenced = create_snapshot_template(
+        directory.path(),
+        &referenced_key,
+        SnapshotTemplateLifecycle::Machine,
+    );
     write_manifest(
         directory.path(),
         &MachineRecord {
@@ -216,7 +232,7 @@ fn snapshot_cache_reaps_only_unreferenced_expired_templates() {
             idle_ttl_seconds: Some(60),
             snapshot_template: Some(SnapshotTemplateReference {
                 key: referenced_key,
-                lifecycle: SnapshotTemplateLifecycle::Snapshot,
+                lifecycle: SnapshotTemplateLifecycle::Machine,
             }),
             snapshot_network_slot: Some(0),
         },
@@ -224,16 +240,16 @@ fn snapshot_cache_reaps_only_unreferenced_expired_templates() {
     .unwrap();
 
     assert_eq!(
-        reap_expired_snapshot_templates_blocking(&config, now, SNAPSHOT_CACHE_MAX_IDLE).unwrap(),
-        vec![stale_key]
+        reap_orphaned_fork_snapshot_templates_blocking(&config).unwrap(),
+        vec![orphaned_fork_key]
     );
-    assert!(!stale.exists());
-    assert!(recent.exists());
+    assert!(!orphaned_fork.exists());
+    assert!(explicit.exists());
     assert!(referenced.exists());
 }
 
 #[test]
-fn snapshot_cache_reaper_respects_shared_restore_lock() {
+fn snapshot_gc_does_not_delete_fork_between_capture_and_manifest_publish() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("snapshots")).unwrap();
     fs::create_dir(directory.path().join("manifests")).unwrap();
@@ -241,25 +257,60 @@ fn snapshot_cache_reaper_respects_shared_restore_lock() {
         state_root: directory.path().to_path_buf(),
         ..FirecrackerConfig::default()
     };
-    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-    let stale_time = now - SNAPSHOT_CACHE_MAX_IDLE - Duration::from_secs(1);
     let key = "d".repeat(64);
-    let snapshot = create_snapshot_cache_entry(directory.path(), &key, stale_time);
-    let lease = File::open(snapshot.join(SNAPSHOT_LEASE_FILE)).unwrap();
-    flock(&lease, FlockOperation::LockShared).unwrap();
+    let snapshot =
+        create_snapshot_template(directory.path(), &key, SnapshotTemplateLifecycle::Machine);
+    let lease = open_snapshot_template_lease(&config, &key).unwrap();
 
     assert!(
-        reap_expired_snapshot_templates_blocking(&config, now, SNAPSHOT_CACHE_MAX_IDLE)
+        reap_orphaned_fork_snapshot_templates_blocking(&config)
             .unwrap()
             .is_empty()
     );
     assert!(snapshot.exists());
+    write_manifest(
+        directory.path(),
+        &MachineRecord {
+            machine_id: "fc-0123456789abcdef-01234567".to_string(),
+            spec_hash: "spec".to_string(),
+            resolved_image: "/images/base.ext4".to_string(),
+            slot: 1,
+            network_enabled: false,
+            workspace_id: None,
+            idle_ttl_seconds: Some(60),
+            snapshot_template: Some(SnapshotTemplateReference {
+                key,
+                lifecycle: SnapshotTemplateLifecycle::Machine,
+            }),
+            snapshot_network_slot: Some(0),
+        },
+    )
+    .unwrap();
     drop(lease);
-    assert_eq!(
-        reap_expired_snapshot_templates_blocking(&config, now, SNAPSHOT_CACHE_MAX_IDLE).unwrap(),
-        vec![key]
+    assert!(
+        reap_orphaned_fork_snapshot_templates_blocking(&config)
+            .unwrap()
+            .is_empty()
     );
-    assert!(!snapshot.exists());
+    assert!(snapshot.exists());
+}
+
+#[test]
+fn snapshot_gc_preserves_templates_when_manifest_scan_fails() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("snapshots")).unwrap();
+    fs::create_dir(directory.path().join("manifests")).unwrap();
+    let config = FirecrackerConfig {
+        state_root: directory.path().to_path_buf(),
+        ..FirecrackerConfig::default()
+    };
+    let key = "e".repeat(64);
+    let snapshot =
+        create_snapshot_template(directory.path(), &key, SnapshotTemplateLifecycle::Machine);
+    fs::write(directory.path().join("manifests/corrupt.json"), b"{").unwrap();
+
+    assert!(reap_orphaned_fork_snapshot_templates_blocking(&config).is_err());
+    assert!(snapshot.exists());
 }
 
 #[test]
