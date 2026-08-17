@@ -1,6 +1,20 @@
 use super::*;
 use tokio::net::UnixListener;
 
+fn test_runtime() -> FirecrackerRuntimeFingerprint {
+    FirecrackerRuntimeFingerprint {
+        architecture: "x86_64".to_string(),
+        protocol_version: PROTOCOL_VERSION,
+        firecracker_version: "v1.16.1".to_string(),
+        firecracker_sha256: "firecracker".to_string(),
+        jailer_sha256: "jailer".to_string(),
+        kernel_sha256: "kernel".to_string(),
+        initramfs_sha256: "initramfs".to_string(),
+        vcpu_count: 2,
+        memory_mib: 4096,
+    }
+}
+
 #[test]
 fn resource_names_and_addresses_are_distinct() {
     let first = network_config(1);
@@ -110,6 +124,7 @@ fn capacity_scan_counts_processes_instead_of_manifests() {
     let live = MachineRecord {
         machine_id: "fc-live".to_string(),
         spec_hash: "live".to_string(),
+        runtime: test_runtime(),
         resolved_image: "/images/base.ext4".to_string(),
         slot: 1,
         network_enabled: false,
@@ -154,6 +169,7 @@ fn manifest_publish_does_not_replace_an_existing_machine() {
     let first = MachineRecord {
         machine_id: "fc-machine".to_string(),
         spec_hash: "first".to_string(),
+        runtime: test_runtime(),
         resolved_image: "/images/base.ext4".to_string(),
         slot: 1,
         network_enabled: false,
@@ -183,6 +199,7 @@ fn persisted_lease_expires_machine_after_idle_ttl() {
     let record = MachineRecord {
         machine_id: "fc-machine".to_string(),
         spec_hash: "spec".to_string(),
+        runtime: test_runtime(),
         resolved_image: "/images/base.ext4".to_string(),
         slot: 1,
         network_enabled: false,
@@ -256,6 +273,7 @@ fn snapshot_gc_reaps_only_unreferenced_fork_templates() {
         &MachineRecord {
             machine_id: "fc-0123456789abcdef-01234567".to_string(),
             spec_hash: "spec".to_string(),
+            runtime: test_runtime(),
             resolved_image: "/images/base.ext4".to_string(),
             slot: 1,
             network_enabled: false,
@@ -304,6 +322,7 @@ fn snapshot_gc_does_not_delete_fork_between_capture_and_manifest_publish() {
         &MachineRecord {
             machine_id: "fc-0123456789abcdef-01234567".to_string(),
             spec_hash: "spec".to_string(),
+            runtime: test_runtime(),
             resolved_image: "/images/base.ext4".to_string(),
             slot: 1,
             network_enabled: false,
@@ -349,6 +368,7 @@ fn fork_snapshots_are_unique_per_target() {
     let source = MachineRecord {
         machine_id: "fc-source".to_string(),
         spec_hash: "spec".to_string(),
+        runtime: test_runtime(),
         resolved_image: "/images/base.ext4".to_string(),
         slot: 1,
         network_enabled: false,
@@ -378,6 +398,7 @@ fn explicit_snapshots_are_unique_and_reusable() {
     let source = MachineRecord {
         machine_id: "fc-source".to_string(),
         spec_hash: "spec".to_string(),
+        runtime: test_runtime(),
         resolved_image: "/images/base.ext4".to_string(),
         slot: 7,
         network_enabled: true,
@@ -397,6 +418,7 @@ fn explicit_snapshots_are_unique_and_reusable() {
         template_key: first,
         spec_hash: source.spec_hash,
         source_network_slot: source.slot,
+        runtime: source.runtime,
     };
     let encoded = serde_json::to_vec(&manifest).unwrap();
     let decoded: FirecrackerSnapshotManifest = serde_json::from_slice(&encoded).unwrap();

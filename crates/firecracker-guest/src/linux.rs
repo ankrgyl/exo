@@ -16,14 +16,16 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use serde::{Deserialize, Serialize};
+use exo_firecracker_protocol::{
+    GuestIdentity, GuestProcessEvent as ProcessEvent, GuestProcessRequest as BridgeRequest,
+    GuestRequest, GuestResponse as Response, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, Message,
+    PROTOCOL_VERSION, decode_frame_length,
+};
 
 const AGENT_PORT: u32 = 10_052;
 const READY_HOST_PORT: u32 = 10_053;
 const GUEST_UID: u32 = 10_001;
 const GUEST_GID: u32 = 10_001;
-const MAX_REQUEST_BYTES: usize = 1024 * 1024;
-const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 32;
 const MAX_PROCESSES: usize = 128;
 const MAX_RECV_EVENTS: usize = 64;
@@ -32,104 +34,24 @@ const MAX_QUEUED_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(45);
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum Request {
-    Ping,
-    Exec {
-        argv: Vec<String>,
-        env: HashMap<String, String>,
-        cwd: String,
-        timeout_ms: Option<u64>,
-    },
-    StartProcess {
-        argv: Vec<String>,
-        env: HashMap<String, String>,
-        cwd: String,
-    },
-    ProcessBridge {
-        process_id: String,
-        request: BridgeRequest,
-    },
-    KillProcess {
-        process_id: String,
-    },
-    SyncFilesystem {
-        path: String,
-    },
-    ConfigureNetwork {
-        address: Ipv4Addr,
-        gateway: Ipv4Addr,
-        prefix: u8,
-    },
+type Request = GuestRequest<BridgeRequest>;
+
+trait ProcessEventExt {
+    fn payload_len(&self) -> usize;
+    fn is_exit(&self) -> bool;
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum BridgeRequest {
-    Ping,
-    Write { data: String },
-    CloseStdin,
-    Recv { timeout_seconds: Option<f64> },
-}
-
-#[derive(Debug, Default, Serialize)]
-struct Response {
-    ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    process_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    exit_code: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stdout: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stderr: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cwd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timeout: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    events: Option<Vec<ProcessEvent>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-impl Response {
-    fn ok() -> Self {
-        Self {
-            ok: true,
-            ..Self::default()
-        }
-    }
-
-    fn error(error: impl Into<String>) -> Self {
-        Self {
-            error: Some(error.into()),
-            ..Self::default()
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ProcessEvent {
-    Stdout { data: String },
-    Stderr { data: String },
-    Exit { exit_code: i32 },
-    Error { message: String },
-}
-
-impl ProcessEvent {
+impl ProcessEventExt for ProcessEvent {
     fn payload_len(&self) -> usize {
         match self {
-            Self::Stdout { data } | Self::Stderr { data } => data.len(),
-            Self::Error { message } => message.len(),
-            Self::Exit { .. } => 0,
+            ProcessEvent::Stdout { data } | ProcessEvent::Stderr { data } => data.len(),
+            ProcessEvent::Error { message } => message.len(),
+            ProcessEvent::Exit { .. } => 0,
         }
     }
 
     fn is_exit(&self) -> bool {
-        matches!(self, Self::Exit { .. })
+        matches!(self, ProcessEvent::Exit { .. })
     }
 }
 
@@ -404,7 +326,14 @@ impl Default for AgentState {
 impl AgentState {
     fn handle(&self, request: Request) -> Response {
         match request {
-            Request::Ping => Response::ok(),
+            Request::Ping => Response {
+                ok: true,
+                identity: Some(GuestIdentity {
+                    implementation_version: env!("CARGO_PKG_VERSION").to_string(),
+                    build_id: env!("EXO_FIRECRACKER_GUEST_BUILD_ID").to_string(),
+                }),
+                ..Response::default()
+            },
             Request::Exec {
                 argv,
                 env,
@@ -1205,29 +1134,40 @@ fn serve_connection(connection: OwnedFd, state: &AgentState) -> Result<(), Strin
     connection
         .read_exact(&mut length)
         .map_err(|error| error.to_string())?;
-    let length = u32::from_be_bytes(length) as usize;
-    if length > MAX_REQUEST_BYTES {
-        return write_response(
-            &mut connection,
-            &Response::error("request exceeds size limit"),
-        );
-    }
+    let length = match decode_frame_length(length, MAX_REQUEST_BYTES) {
+        Ok(length) => length,
+        Err(_) => {
+            return write_response(
+                &mut connection,
+                &Response::error("request exceeds size limit"),
+            );
+        }
+    };
     let mut payload = vec![0_u8; length];
     connection
         .read_exact(&mut payload)
         .map_err(|error| error.to_string())?;
-    let response = match serde_json::from_slice::<Request>(&payload) {
-        Ok(request) => state.handle(request),
+    let response = match serde_json::from_slice::<Message<Request>>(&payload) {
+        Ok(message) if message.protocol_version == PROTOCOL_VERSION => {
+            state.handle(message.payload)
+        }
+        Ok(message) => Response::error(format!(
+            "unsupported protocol version {}; expected {}",
+            message.protocol_version, PROTOCOL_VERSION
+        )),
         Err(error) => Response::error(format!("invalid request: {error}")),
     };
     write_response(&mut connection, &response)
 }
 
 fn write_response(connection: &mut File, response: &Response) -> Result<(), String> {
-    let mut payload = serde_json::to_vec(response).map_err(|error| error.to_string())?;
+    let mut payload =
+        serde_json::to_vec(&Message::new(response)).map_err(|error| error.to_string())?;
     if payload.len() > MAX_RESPONSE_BYTES {
-        payload = serde_json::to_vec(&Response::error("response exceeds size limit"))
-            .map_err(|error| error.to_string())?;
+        payload = serde_json::to_vec(&Message::new(Response::error(
+            "response exceeds size limit",
+        )))
+        .map_err(|error| error.to_string())?;
     }
     let length = u32::try_from(payload.len()).map_err(|error| error.to_string())?;
     connection
@@ -1283,11 +1223,11 @@ mod tests {
 
     #[test]
     fn parses_typed_requests() {
-        let request = serde_json::from_str::<Request>(
-            r#"{"type":"exec","argv":["/bin/echo","hi"],"env":{},"cwd":"/","timeout_ms":1000}"#,
+        let request = serde_json::from_str::<Message<Request>>(
+            r#"{"protocol_version":1,"payload":{"type":"exec","argv":["/bin/echo","hi"],"env":{},"cwd":"/","timeout_ms":1000}}"#,
         )
         .unwrap();
-        assert!(matches!(request, Request::Exec { .. }));
+        assert!(matches!(request.payload, Request::Exec { .. }));
     }
 
     #[test]

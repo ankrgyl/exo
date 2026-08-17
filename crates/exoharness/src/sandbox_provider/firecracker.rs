@@ -24,6 +24,10 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
+use exo_firecracker_protocol::{
+    GuestRequest as ProtocolGuestRequest, GuestResponse, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
+    Message, PROTOCOL_VERSION, decode_frame_length,
+};
 use ipnet::Ipv4Net;
 #[cfg(target_os = "linux")]
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
@@ -54,8 +58,7 @@ const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const PID_FILE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
-const MAX_GUEST_REQUEST_BYTES: usize = 1024 * 1024;
-const MAX_GUEST_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+type GuestRequest = ProtocolGuestRequest<process_bridge::Request>;
 const MAX_MACHINE_ID: &str = "fc-0000000000000000-00000000";
 // sockaddr_un.sun_path is 108 bytes including the trailing NUL on Linux.
 // The machine id length is budgeted against it: the jailed API socket lives at
@@ -91,7 +94,7 @@ pub const DEFAULT_VCPU_COUNT: u8 = 2;
 pub const DEFAULT_MEMORY_MIB: u32 = 4096;
 #[cfg(target_os = "macos")]
 pub const DEFAULT_MEMORY_MIB: u32 = 1024;
-const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 // Upstream warns that a compromised guest kernel can reactivate the serial
 // device even with 8250.nr_uarts=0, and unbounded console output written to a
 // host file is their named disk-fill DoS. VMM output therefore goes to
@@ -201,12 +204,26 @@ struct FirecrackerProviderState {
     guest_ip: Option<Ipv4Addr>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FirecrackerRuntimeFingerprint {
+    architecture: String,
+    protocol_version: u32,
+    firecracker_version: String,
+    firecracker_sha256: String,
+    jailer_sha256: String,
+    kernel_sha256: String,
+    initramfs_sha256: String,
+    vcpu_count: u8,
+    memory_mib: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FirecrackerSnapshotManifest {
     format_version: u32,
     template_key: String,
     spec_hash: String,
     source_network_slot: u32,
+    runtime: FirecrackerRuntimeFingerprint,
 }
 
 impl FirecrackerSnapshotManifest {
@@ -280,6 +297,7 @@ enum SnapshotTemplateLifecycle {
 struct MachineRecord {
     machine_id: String,
     spec_hash: String,
+    runtime: FirecrackerRuntimeFingerprint,
     resolved_image: String,
     slot: u32,
     network_enabled: bool,
@@ -419,6 +437,7 @@ struct WarmMachineEntry {
 
 struct Shared {
     config: FirecrackerConfig,
+    runtime: FirecrackerRuntimeFingerprint,
     // Serialize controllers for a state root. A later controller adopts live,
     // matching machines after the prior controller releases this lock; the
     // lock prevents concurrent controllers from racing that reconciliation.
@@ -439,7 +458,7 @@ impl FirecrackerSandboxBackend {
     }
 
     fn new_blocking(mut config: FirecrackerConfig) -> Result<Self> {
-        validate_host_blocking(&config)?;
+        let firecracker_version = validate_host_blocking(&config)?;
         fs::create_dir_all(&config.state_root).with_context(|| {
             format!(
                 "creating Firecracker state root {}",
@@ -508,11 +527,13 @@ impl FirecrackerSandboxBackend {
         config.kernel = cache_immutable_artifact(&config.state_root, "kernel", &config.kernel)?;
         config.initramfs =
             cache_immutable_artifact(&config.state_root, "initramfs", &config.initramfs)?;
+        let runtime = firecracker_runtime_fingerprint(&config, firecracker_version)?;
         validate_jailed_socket_paths(&config)?;
 
         Ok(Self {
             shared: Arc::new(Shared {
                 config,
+                runtime,
                 _state_lock: state_lock,
                 warm_machines: Mutex::new(HashMap::new()),
                 lifecycle_lock: Mutex::new(()),
@@ -606,6 +627,9 @@ impl FirecrackerSandboxBackend {
         {
             bail!("Firecracker snapshot source specification changed")
         }
+        if source.runtime != shared.runtime {
+            bail!("Firecracker snapshot source runtime does not match the configured runtime")
+        }
         if !process_running(&shared.pid_path(&source.machine_id)) {
             bail!("Firecracker snapshot source is not running")
         }
@@ -633,6 +657,7 @@ impl FirecrackerSandboxBackend {
                 template_key,
                 spec_hash: source.spec_hash,
                 source_network_slot: source.slot,
+                runtime: source.runtime,
             },
             lease,
         })
@@ -657,6 +682,9 @@ impl FirecrackerSandboxBackend {
             let spec_hash = sandbox_spec_hash(&request.spec);
             if spec_hash != manifest.spec_hash {
                 bail!("Firecracker snapshot specification does not match the requested sandbox")
+            }
+            if manifest.runtime != self.shared.runtime {
+                bail!("Firecracker snapshot runtime does not match the configured runtime")
             }
 
             let machine_id = machine_id(&request.key, &spec_hash);
@@ -1161,7 +1189,7 @@ impl Shared {
     ) -> Result<Machine> {
         let existing = self.load_machine_record(machine_id).await?;
         if let Some(record) = existing.as_ref() {
-            if record.spec_hash != spec_hash {
+            if record.spec_hash != spec_hash || record.runtime != self.runtime {
                 self.cleanup_machine(machine_id, true).await?;
             } else {
                 let machine = machine_from_record(&self.config, record.clone());
@@ -1179,7 +1207,9 @@ impl Shared {
 
         self.ensure_machine_capacity(machine_id).await?;
         let record = match existing {
-            Some(record) if record.spec_hash == spec_hash => record,
+            Some(record) if record.spec_hash == spec_hash && record.runtime == self.runtime => {
+                record
+            }
             _ => {
                 self.new_machine_record(request, machine_id, spec_hash, None)
                     .await?
@@ -1283,6 +1313,7 @@ impl Shared {
             None
         };
         let idle_ttl_seconds = request.lifecycle.idle_ttl.map(|ttl| ttl.as_secs());
+        let runtime = self.runtime.clone();
         tokio::task::spawn_blocking(move || {
             let (slot, snapshot_template, snapshot_network_slot) = match snapshot {
                 Some(snapshot) => {
@@ -1302,6 +1333,7 @@ impl Shared {
             let record = MachineRecord {
                 machine_id,
                 spec_hash,
+                runtime,
                 resolved_image,
                 slot,
                 network_enabled,
@@ -1513,7 +1545,7 @@ fn parse_provider_state(value: &Value) -> Result<FirecrackerProviderState> {
     serde_json::from_value(value.clone()).context("invalid Firecracker provider state")
 }
 
-fn validate_host_blocking(config: &FirecrackerConfig) -> Result<()> {
+fn validate_host_blocking(config: &FirecrackerConfig) -> Result<String> {
     if !cfg!(target_os = "linux") {
         bail!("Firecracker sandbox execution is only supported on Linux");
     }
@@ -1576,7 +1608,24 @@ fn validate_host_blocking(config: &FirecrackerConfig) -> Result<()> {
             "Firecracker and jailer versions must match: {firecracker_version} != {jailer_version}"
         );
     }
-    Ok(())
+    Ok(firecracker_version)
+}
+
+fn firecracker_runtime_fingerprint(
+    config: &FirecrackerConfig,
+    firecracker_version: String,
+) -> Result<FirecrackerRuntimeFingerprint> {
+    Ok(FirecrackerRuntimeFingerprint {
+        architecture: std::env::consts::ARCH.to_string(),
+        protocol_version: PROTOCOL_VERSION,
+        firecracker_version,
+        firecracker_sha256: super::firecracker_image::sha256_hex_of_file(&config.firecracker_bin)?,
+        jailer_sha256: super::firecracker_image::sha256_hex_of_file(&config.jailer_bin)?,
+        kernel_sha256: super::firecracker_image::sha256_hex_of_file(&config.kernel)?,
+        initramfs_sha256: super::firecracker_image::sha256_hex_of_file(&config.initramfs)?,
+        vcpu_count: config.vcpu_count,
+        memory_mib: config.memory_mib,
+    })
 }
 
 fn validate_file(label: &str, path: &Path) -> Result<()> {
@@ -1811,6 +1860,18 @@ fn stable_id(input: &str) -> String {
 fn hash_snapshot_string(hasher: &mut Sha256, value: &str) {
     hasher.update(value.len().to_le_bytes());
     hasher.update(value.as_bytes());
+}
+
+fn hash_runtime_fingerprint(hasher: &mut Sha256, runtime: &FirecrackerRuntimeFingerprint) {
+    hash_snapshot_string(hasher, &runtime.architecture);
+    hasher.update(runtime.protocol_version.to_le_bytes());
+    hash_snapshot_string(hasher, &runtime.firecracker_version);
+    hash_snapshot_string(hasher, &runtime.firecracker_sha256);
+    hash_snapshot_string(hasher, &runtime.jailer_sha256);
+    hash_snapshot_string(hasher, &runtime.kernel_sha256);
+    hash_snapshot_string(hasher, &runtime.initramfs_sha256);
+    hasher.update(runtime.vcpu_count.to_le_bytes());
+    hasher.update(runtime.memory_mib.to_le_bytes());
 }
 
 fn machine_from_record(config: &FirecrackerConfig, record: MachineRecord) -> Machine {
@@ -3144,6 +3205,7 @@ fn fork_snapshot_template_key(source: &MachineRecord, target_machine_id: &str) -
     hash_snapshot_string(&mut hasher, "point-in-time-fork");
     hash_snapshot_string(&mut hasher, &source.machine_id);
     hash_snapshot_string(&mut hasher, &source.spec_hash);
+    hash_runtime_fingerprint(&mut hasher, &source.runtime);
     hash_snapshot_string(&mut hasher, target_machine_id);
     format!("{:x}", hasher.finalize())
 }
@@ -3154,6 +3216,7 @@ fn explicit_snapshot_template_key(source: &MachineRecord, snapshot_id: Uuid) -> 
     hash_snapshot_string(&mut hasher, "explicit-snapshot");
     hash_snapshot_string(&mut hasher, &source.machine_id);
     hash_snapshot_string(&mut hasher, &source.spec_hash);
+    hash_runtime_fingerprint(&mut hasher, &source.runtime);
     hasher.update(snapshot_id.as_bytes());
     format!("{:x}", hasher.finalize())
 }
@@ -3505,10 +3568,26 @@ impl GuestClient {
         let response: GuestResponse = self
             .invoke_with_timeout(&GuestRequest::Ping, timeout)
             .await?;
-        response.into_result("Firecracker guest healthcheck failed")
+        guest_response_result(&response, "Firecracker guest healthcheck failed")?;
+        let identity = response
+            .identity
+            .context("Firecracker guest healthcheck did not include its implementation identity")?;
+        if identity.implementation_version.is_empty() {
+            bail!("Firecracker guest healthcheck returned an empty implementation version");
+        }
+        if identity.build_id.is_empty() {
+            bail!("Firecracker guest healthcheck returned an empty build id");
+        }
+        tracing::debug!(
+            guest_version = identity.implementation_version,
+            guest_build_id = identity.build_id,
+            protocol_version = PROTOCOL_VERSION,
+            "validated Firecracker guest protocol"
+        );
+        Ok(())
     }
 
-    async fn invoke<Response>(&self, request: &GuestRequest<'_>) -> Result<Response>
+    async fn invoke<Response>(&self, request: &GuestRequest) -> Result<Response>
     where
         Response: DeserializeOwned,
     {
@@ -3518,14 +3597,14 @@ impl GuestClient {
 
     async fn invoke_with_timeout<Response>(
         &self,
-        request: &GuestRequest<'_>,
+        request: &GuestRequest,
         timeout: Duration,
     ) -> Result<Response>
     where
         Response: DeserializeOwned,
     {
-        let payload = serde_json::to_vec(request)?;
-        if payload.len() > MAX_GUEST_REQUEST_BYTES {
+        let payload = serde_json::to_vec(&Message::new(request))?;
+        if payload.len() > MAX_REQUEST_BYTES {
             bail!(
                 "Firecracker guest request is too large: {} bytes",
                 payload.len()
@@ -3534,12 +3613,20 @@ impl GuestClient {
         let response = tokio::time::timeout(timeout, vsock_request(&self.vsock_path, &payload))
             .await
             .context("Firecracker guest request timed out")??;
-        serde_json::from_slice(&response).with_context(|| {
+        let message: Message<Response> = serde_json::from_slice(&response).with_context(|| {
             format!(
                 "decoding Firecracker guest response: {}",
                 String::from_utf8_lossy(&response)
             )
-        })
+        })?;
+        if message.protocol_version != PROTOCOL_VERSION {
+            bail!(
+                "unsupported Firecracker guest protocol version {}; expected {}",
+                message.protocol_version,
+                PROTOCOL_VERSION
+            );
+        }
+        Ok(message.payload)
     }
 
     async fn exec(
@@ -3561,9 +3648,9 @@ impl GuestClient {
         let response: GuestResponse = self
             .invoke_with_timeout(
                 &GuestRequest::Exec {
-                    argv: &command.argv,
-                    env: &command.env,
-                    cwd: &cwd,
+                    argv: command.argv.clone(),
+                    env: command.env.clone(),
+                    cwd: cwd.clone(),
                     timeout_ms: command
                         .timeout
                         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
@@ -3606,9 +3693,9 @@ impl GuestClient {
             .unwrap_or_else(|| spec.default_workdir.clone());
         let response: GuestResponse = self
             .invoke(&GuestRequest::StartProcess {
-                argv: &command.argv,
-                env: &command.env,
-                cwd: &cwd,
+                argv: command.argv.clone(),
+                env: command.env.clone(),
+                cwd: cwd.clone(),
             })
             .await?;
         if let Some(error) = response.error {
@@ -3645,19 +3732,23 @@ impl GuestClient {
 
     async fn kill_process(&self, process_id: &str) -> Result<()> {
         let response: GuestResponse = self
-            .invoke(&GuestRequest::KillProcess { process_id })
+            .invoke(&GuestRequest::KillProcess {
+                process_id: process_id.to_string(),
+            })
             .await?;
-        response.into_result("Firecracker kill_process failed")
+        guest_response_result(&response, "Firecracker kill_process failed")
     }
 
     async fn sync_filesystem(&self, path: &str) -> Result<()> {
         let response: GuestResponse = self
             .invoke_with_timeout(
-                &GuestRequest::SyncFilesystem { path },
+                &GuestRequest::SyncFilesystem {
+                    path: path.to_string(),
+                },
                 GUEST_REQUEST_TIMEOUT,
             )
             .await?;
-        response.into_result("Firecracker guest filesystem sync failed")
+        guest_response_result(&response, "Firecracker guest filesystem sync failed")
     }
 
     async fn configure_network(
@@ -3673,7 +3764,10 @@ impl GuestClient {
                 prefix,
             })
             .await?;
-        response.into_result("Firecracker fork clone network reconfiguration failed")
+        guest_response_result(
+            &response,
+            "Firecracker fork clone network reconfiguration failed",
+        )
     }
 }
 
@@ -3711,68 +3805,23 @@ async fn vsock_request(path: &Path, payload: &[u8]) -> Result<Vec<u8>> {
     stream.write_all(&request_length.to_be_bytes()).await?;
     stream.write_all(payload).await?;
     stream.flush().await?;
-    let response_length = stream.read_u32().await? as usize;
-    if response_length > MAX_GUEST_RESPONSE_BYTES {
-        bail!("Firecracker guest response is too large: {response_length} bytes");
-    }
+    let response_length =
+        decode_frame_length(stream.read_u32().await?.to_be_bytes(), MAX_RESPONSE_BYTES).map_err(
+            |length| anyhow!("Firecracker guest response is too large: {} bytes", length),
+        )?;
     let mut response = vec![0; response_length];
     stream.read_exact(&mut response).await?;
     Ok(response)
 }
 
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum GuestRequest<'a> {
-    Ping,
-    Exec {
-        argv: &'a [String],
-        env: &'a HashMap<String, String>,
-        cwd: &'a str,
-        timeout_ms: Option<u64>,
-    },
-    StartProcess {
-        argv: &'a [String],
-        env: &'a HashMap<String, String>,
-        cwd: &'a str,
-    },
-    ProcessBridge {
-        process_id: &'a str,
-        request: process_bridge::Request,
-    },
-    KillProcess {
-        process_id: &'a str,
-    },
-    SyncFilesystem {
-        path: &'a str,
-    },
-    ConfigureNetwork {
-        address: Ipv4Addr,
-        gateway: Ipv4Addr,
-        prefix: u8,
-    },
-}
-
-#[derive(Deserialize)]
-struct GuestResponse {
-    ok: bool,
-    process_id: Option<String>,
-    exit_code: Option<i32>,
-    stdout: Option<String>,
-    stderr: Option<String>,
-    cwd: Option<String>,
-    error: Option<String>,
-}
-
-impl GuestResponse {
-    fn into_result(self, context: &str) -> Result<()> {
-        if self.ok {
-            return Ok(());
-        }
-        bail!(
-            "{context}: {}",
-            self.error.unwrap_or_else(|| "unknown error".to_string())
-        )
+fn guest_response_result(response: &GuestResponse, context: &str) -> Result<()> {
+    if response.ok {
+        return Ok(());
     }
+    bail!(
+        "{context}: {}",
+        response.error.as_deref().unwrap_or("unknown error")
+    )
 }
 
 struct FirecrackerProcessBridgeClient {
@@ -3785,7 +3834,7 @@ impl process_bridge::Client for FirecrackerProcessBridgeClient {
     async fn request(&self, request: process_bridge::Request) -> Result<process_bridge::Response> {
         self.guest
             .invoke(&GuestRequest::ProcessBridge {
-                process_id: &self.process_id,
+                process_id: self.process_id.clone(),
                 request,
             })
             .await

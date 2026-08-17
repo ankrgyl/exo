@@ -1,0 +1,10 @@
+{
+  "protocol_version": 1,
+  "payload": {
+    "ok": true,
+    "identity": {
+      "implementation_version": "0.1.0",
+      "build_id": "0123456789abcdef"
+    }
+  }
+}

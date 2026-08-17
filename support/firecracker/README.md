@@ -6,6 +6,33 @@ a minimal initramfs. It launches Firecracker only through the matching `jailer` 
 communicates with a static Rust PID 1 over virtio-vsock, and adds a TAP device
 only when the sandbox requests networking.
 
+## Compatible host artifact bundle
+
+Install Firecracker, jailer, the guest kernel, and the Exo initramfs as one
+immutable, checksummed bundle. A deployment image can copy all four into a
+fixed directory; a standalone installation can distribute the same directory
+as a release archive. No registry service is required beyond wherever that
+immutable image or archive is already published.
+
+Build the initramfs from the exact Exo source revision used by the host's
+`exoharness` dependency. Pin the Firecracker release and kernel build for each
+architecture, verify downloaded files before installing them, and record the
+resulting initramfs checksum after building it. For example, this is a concrete
+bundle known to work:
+
+| Asset                                                  | Version or build                         | x86_64 SHA-256                                                     | aarch64 SHA-256                                                    |
+| ------------------------------------------------------ | ---------------------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| Firecracker release archive (includes matching jailer) | 1.16.1                                   | `382a02a869e4d6d5cb14c40577f9545e8458021ea8b0b2d3fc10ec14d9c242e6` | `8d0e69f6d6f9a1724551f607f18504052c16c1828ee3d4d7b6e6c73380871e0e` |
+| Firecracker CI kernel                                  | 6.18.39, build `20260812-48f1b9fb52e9-0` | `3fde810177aaf9d9a465d00e915924a7a6e2bdd34869d7fcd33c6af73b45e12d` | `92b6c36b3ea25328f32f7b09509989a0f653aa692afa745fde5274c349b6405e` |
+| Exo guest initramfs                                    | same Exo revision as the host            | record after building                                              | record after building                                              |
+
+The host verifies that Firecracker and jailer report the same version, and the
+versioned guest handshake rejects an incompatible host/guest protocol. It also
+fingerprints the exact binaries, kernel, initramfs, architecture, and VM shape;
+running machines are not adopted and snapshots are not restored under a
+different fingerprint. These checks prevent accidental mixing but do not
+replace checksum verification when the bundle is built or downloaded.
+
 Build the CLI with the backend and its OCI/filesystem dependencies enabled:
 
 ```bash

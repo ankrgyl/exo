@@ -3,11 +3,13 @@ members = [
   "crates/cli",
   "crates/cost",
   "crates/exoharness",
+  "crates/firecracker-protocol",
   "crates/firecracker-guest",
   "crates/executor",
   "exo/scheduler-runner",
 ]
 resolver = "2"
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2024"

@@ -2581,9 +2581,17 @@ name = "exo-firecracker-guest"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "exo-firecracker-protocol",
  "libc",
- "serde",
  "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "exo-firecracker-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -2612,6 +2620,7 @@ dependencies = [
  "bytes",
  "chrono",
  "docker_credential",
+ "exo-firecracker-protocol",
  "flate2",
  "futures",
  "ipnet",

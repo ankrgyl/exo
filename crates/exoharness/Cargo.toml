@@ -23,6 +23,7 @@ basic-backend = [
 firecracker = [
   "basic-backend",
   "dep:docker_credential",
+  "dep:exo-firecracker-protocol",
   "dep:flate2",
   "dep:ipnet",
   "dep:libc",
@@ -54,6 +55,7 @@ base64 = { version = "0.22.1", optional = true }
 bytes.workspace = true
 chrono.workspace = true
 docker_credential = { workspace = true, optional = true }
+exo-firecracker-protocol = { path = "../firecracker-protocol", optional = true }
 flate2 = { workspace = true, optional = true }
 futures.workspace = true
 ipnet = { workspace = true, optional = true }

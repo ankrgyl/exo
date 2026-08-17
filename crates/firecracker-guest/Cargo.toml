@@ -7,6 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 base64 = "0.22.1"
+exo-firecracker-protocol = { path = "../firecracker-protocol" }
 libc.workspace = true
-serde.workspace = true
 serde_json.workspace = true
+
+[build-dependencies]
+sha2.workspace = true
