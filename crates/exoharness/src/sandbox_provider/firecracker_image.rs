@@ -285,6 +285,10 @@ fn cache_local_image(
 ) -> Result<PathBuf> {
     let source = fs::canonicalize(source)
         .with_context(|| format!("resolving Firecracker root filesystem image {source}"))?;
+    if is_cached_local_image(state_root, &source) {
+        validate_ext4_image(&source)?;
+        return Ok(source);
+    }
     validate_allowed_local_image(state_root, &source, allowed_local_images)?;
     validate_ext4_image(&source)?;
     let metadata = fs::metadata(&source)?;
@@ -352,8 +356,7 @@ fn validate_allowed_local_image(
     source: &Path,
     allowed_local_images: &[PathBuf],
 ) -> Result<()> {
-    let cached_image = fs::canonicalize(state_root.join("images"))
-        .is_ok_and(|cache_root| source.starts_with(cache_root));
+    let cached_image = is_cached_local_image(state_root, source);
     let explicitly_allowed = allowed_local_images
         .iter()
         .any(|allowed| fs::canonicalize(allowed).is_ok_and(|allowed| source == allowed));
@@ -365,6 +368,11 @@ fn validate_allowed_local_image(
         source.display(),
         source.display()
     )
+}
+
+fn is_cached_local_image(state_root: &Path, source: &Path) -> bool {
+    fs::canonicalize(state_root.join("images"))
+        .is_ok_and(|cache_root| source.starts_with(cache_root))
 }
 
 fn registry_auth(reference: &Reference) -> Result<RegistryAuth> {
@@ -1572,6 +1580,22 @@ mod tests {
         assert!(validate_allowed_local_image(&state_root, &canonical(&cache), &[]).is_ok());
         assert!(validate_allowed_local_image(&state_root, &canonical(&denied), &[]).is_err());
         assert!(validate_allowed_local_image(&state_root, &canonical(&workspace), &[]).is_err());
+    }
+
+    #[test]
+    fn resolving_a_cached_local_image_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("state");
+        let cached = state_root.join("images/cache/rootfs.ext4");
+        fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        let mut image = vec![0_u8; EXT4_MAGIC_OFFSET as usize + EXT4_MAGIC.len()];
+        image[EXT4_MAGIC_OFFSET as usize..].copy_from_slice(&EXT4_MAGIC);
+        fs::write(&cached, image).unwrap();
+
+        assert_eq!(
+            cache_local_image(&state_root, cached.to_str().unwrap(), &[]).unwrap(),
+            fs::canonicalize(cached).unwrap()
+        );
     }
 
     #[test]
