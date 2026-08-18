@@ -1188,6 +1188,9 @@ impl Shared {
         spec_hash: &str,
     ) -> Result<Machine> {
         let existing = self.load_machine_record(machine_id).await?;
+        let reusing_existing_machine = existing
+            .as_ref()
+            .is_some_and(|record| record.spec_hash == spec_hash && record.runtime == self.runtime);
         if let Some(record) = existing.as_ref() {
             if record.spec_hash != spec_hash || record.runtime != self.runtime {
                 self.cleanup_machine(machine_id, true).await?;
@@ -1218,7 +1221,10 @@ impl Shared {
         let readiness = match self.prepare_and_launch(request, &record).await {
             Ok(readiness) => readiness,
             Err(error) => {
-                if let Err(cleanup_error) = self.cleanup_machine(machine_id, true).await {
+                if let Err(cleanup_error) = self
+                    .cleanup_machine(machine_id, !reusing_existing_machine)
+                    .await
+                {
                     tracing::warn!(%cleanup_error, machine_id, "failed cleaning up unsuccessful Firecracker launch");
                 }
                 return Err(error);
@@ -1230,7 +1236,10 @@ impl Shared {
             GuestReadiness::Probe => wait_for_restored_guest(self, &machine).await,
         };
         if let Err(error) = ready {
-            if let Err(cleanup_error) = self.cleanup_machine(machine_id, true).await {
+            if let Err(cleanup_error) = self
+                .cleanup_machine(machine_id, !reusing_existing_machine)
+                .await
+            {
                 tracing::warn!(%cleanup_error, machine_id, "failed cleaning up unsuccessful Firecracker guest boot");
             }
             return Err(error);
