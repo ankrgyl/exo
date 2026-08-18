@@ -39,6 +39,8 @@ const GUEST_GID: u32 = 10_001;
 // image whose content cannot fit in that filesystem could never materialize,
 // so rejecting it early costs no legitimate image anything.
 const MAX_IMAGE_LAYERS: usize = 512;
+const MAX_LAYER_WHITEOUTS: usize = 65_536;
+const MAX_WHITEOUT_PATH_BYTES: usize = 16 * 1024 * 1024;
 // A crashed materialization leaves image-build-*/local-image-*/.tmp* entries
 // behind; anything older than this is unreachable by any live build.
 const STALE_TEMPORARY_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -366,18 +368,6 @@ fn validate_allowed_local_image(
 }
 
 fn registry_auth(reference: &Reference) -> Result<RegistryAuth> {
-    let username = std::env::var("EXO_FIRECRACKER_REGISTRY_USERNAME").ok();
-    let password = std::env::var("EXO_FIRECRACKER_REGISTRY_PASSWORD").ok();
-    match (username, password) {
-        (Some(username), Some(password)) if !username.is_empty() && !password.is_empty() => {
-            return Ok(RegistryAuth::Basic(username, password));
-        }
-        (None, None) => {}
-        _ => bail!(
-            "EXO_FIRECRACKER_REGISTRY_USERNAME and EXO_FIRECRACKER_REGISTRY_PASSWORD must be set together"
-        ),
-    }
-
     let Some(config_path) = docker_config_path() else {
         return Ok(RegistryAuth::Anonymous);
     };
@@ -795,7 +785,7 @@ fn apply_layer(rootfs: &Path, layer: &CachedLayer, decompressed_budget: u64) -> 
     // The byte budget alone does not bound inodes: tar headers are 512 bytes,
     // so a budget-sized stream of empty files could still exhaust the host
     // filesystem's inode table. Real images stay far below this cap.
-    let entry_budget = (decompressed_budget / 8192).max(65_536);
+    let entry_budget = layer_entry_budget(decompressed_budget);
     let mut entries_extracted = 0_u64;
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -848,15 +838,44 @@ fn collect_whiteouts(layer: &CachedLayer, decompressed_budget: u64) -> Result<Ve
     let reader = layer_reader(&layer.path, &layer.media_type, decompressed_budget)?;
     let mut archive = tar::Archive::new(reader);
     let mut whiteouts = Vec::new();
+    let entry_budget = layer_entry_budget(decompressed_budget);
+    let mut entries_seen = 0_u64;
+    let mut whiteout_path_bytes = 0_usize;
     for entry in archive.entries()? {
         let entry = entry?;
+        entries_seen += 1;
+        if entries_seen > entry_budget {
+            bail!(
+                "OCI layer {} contains more than {entry_budget} entries",
+                layer.path.display()
+            );
+        }
         let path = entry.path()?.into_owned();
         validate_archive_path(&path)?;
         if let Some(whiteout) = whiteout_path(&path)? {
+            if whiteouts.len() >= MAX_LAYER_WHITEOUTS {
+                bail!(
+                    "OCI layer {} contains more than {MAX_LAYER_WHITEOUTS} whiteouts",
+                    layer.path.display()
+                );
+            }
+            whiteout_path_bytes = whiteout_path_bytes
+                .checked_add(path.as_os_str().as_bytes().len())
+                .context("OCI whiteout path byte count overflow")?;
+            if whiteout_path_bytes > MAX_WHITEOUT_PATH_BYTES {
+                bail!(
+                    "OCI layer {} contains more than {MAX_WHITEOUT_PATH_BYTES} bytes of whiteout paths",
+                    layer.path.display()
+                );
+            }
             whiteouts.push(whiteout);
         }
     }
     Ok(whiteouts)
+}
+
+fn layer_entry_budget(decompressed_budget: u64) -> u64 {
+    (decompressed_budget / 8192).max(65_536)
 }
 
 fn whiteout_path(path: &Path) -> Result<Option<Whiteout>> {

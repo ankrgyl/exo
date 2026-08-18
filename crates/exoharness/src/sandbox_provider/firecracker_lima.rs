@@ -45,6 +45,7 @@ use super::firecracker_bridge::{
 
 const BRIDGE_FRAME_QUEUE_DEPTH: usize = 16;
 const BRIDGE_STREAM_QUEUE_DEPTH: usize = 16;
+static LIMA_ONE_SHOT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 // The bridge runs as root inside Lima. Install the locally built executable to
 // a root-owned path before sudo executes it so the build user cannot swap it.
 const BRIDGE_INSTALL_PATH: &str = "/usr/local/libexec/exo-firecracker-bridge";
@@ -77,6 +78,26 @@ impl LimaFirecrackerSandboxBackend {
         self.bridge.request(request).await
     }
 
+    fn bound_handle(
+        &self,
+        mut request: SandboxRequest,
+        id: String,
+        provider_state: Option<serde_json::Value>,
+        effective_image: Option<String>,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        let effective_image = effective_image
+            .context("Firecracker Lima bridge did not return a resolved image for its handle")?;
+        request.spec.image.clone_from(&effective_image);
+        request.provider_state.clone_from(&provider_state);
+        Ok(Arc::new(LimaFirecrackerSandboxHandle {
+            id,
+            provider_state,
+            effective_image: Some(effective_image),
+            request,
+            backend: self.client(),
+        }))
+    }
+
     fn client(&self) -> Arc<Self> {
         Arc::new(self.clone())
     }
@@ -89,6 +110,19 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        // A one-shot Firecracker handle destroys its VM after the command. Do
+        // not eagerly acquire it here and then acquire a second VM when the
+        // command crosses the bridge.
+        if request.lifecycle.idle_ttl.is_none() {
+            let sequence = LIMA_ONE_SHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            return Ok(Arc::new(LimaFirecrackerSandboxHandle {
+                id: format!("firecracker-lima-oneshot:{sequence}"),
+                provider_state: None,
+                effective_image: None,
+                request,
+                backend: self.client(),
+            }));
+        }
         let response = self
             .request(FirecrackerBridgeRequest::Acquire {
                 config: self.config.clone(),
@@ -103,13 +137,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         else {
             bail!("Firecracker Lima bridge returned the wrong response to acquire");
         };
-        Ok(Arc::new(LimaFirecrackerSandboxHandle {
-            id,
-            provider_state,
-            effective_image,
-            request,
-            backend: self.client(),
-        }))
+        self.bound_handle(request, id, provider_state, effective_image)
     }
 
     async fn attach(
@@ -138,6 +166,9 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         source: SandboxRequest,
         target: SandboxRequest,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        if target.lifecycle.idle_ttl.is_none() {
+            bail!("Firecracker Lima forks require a managed sandbox lifecycle");
+        }
         let response = self
             .request(FirecrackerBridgeRequest::Fork {
                 config: self.config.clone(),
@@ -153,13 +184,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         else {
             bail!("Firecracker Lima bridge returned the wrong response to fork");
         };
-        Ok(Arc::new(LimaFirecrackerSandboxHandle {
-            id,
-            provider_state,
-            effective_image,
-            request: target,
-            backend: self.client(),
-        }))
+        self.bound_handle(target, id, provider_state, effective_image)
     }
 
     async fn acquire_from_snapshot(
@@ -167,6 +192,9 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         request: SandboxRequest,
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        if request.lifecycle.idle_ttl.is_none() {
+            bail!("Firecracker Lima snapshot restores require a managed sandbox lifecycle");
+        }
         let response = self
             .request(FirecrackerBridgeRequest::AcquireFromSnapshot {
                 config: self.config.clone(),
@@ -183,13 +211,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         else {
             bail!("Firecracker Lima bridge returned the wrong response to snapshot restore");
         };
-        Ok(Arc::new(LimaFirecrackerSandboxHandle {
-            id,
-            provider_state,
-            effective_image,
-            request,
-            backend: self.client(),
-        }))
+        self.bound_handle(request, id, provider_state, effective_image)
     }
 }
 
@@ -246,6 +268,9 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
     }
 
     async fn connect_tcp(&self, port: u16) -> Result<Option<BoxSandboxTcpStream>> {
+        if self.request.lifecycle.idle_ttl.is_none() {
+            bail!("one-shot Firecracker Lima sandboxes do not support TCP connections");
+        }
         let stream = self
             .backend
             .bridge
@@ -259,6 +284,9 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
     }
 
     async fn stop(&self) -> Result<()> {
+        if self.request.lifecycle.idle_ttl.is_none() {
+            bail!("one-shot Firecracker Lima sandboxes cannot be stopped independently");
+        }
         match self
             .backend
             .request(FirecrackerBridgeRequest::Stop {
@@ -277,6 +305,9 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
     }
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {
+        if self.request.lifecycle.idle_ttl.is_none() {
+            bail!("one-shot Firecracker Lima sandboxes cannot be snapshotted");
+        }
         let response = self
             .backend
             .request(FirecrackerBridgeRequest::Snapshot {
@@ -576,11 +607,12 @@ impl LimaBridgeConnection {
         });
 
         let reader_state = Arc::clone(&state);
+        let reader_outgoing = outgoing.clone();
         tokio::spawn(async move {
             loop {
                 match read_frame::<FirecrackerBridgeServerFrame>(&mut stdout).await {
                     Ok(frame) => {
-                        if let Err(error) = reader_state.handle_frame(frame).await {
+                        if let Err(error) = reader_state.handle_frame(frame, &reader_outgoing) {
                             reader_state
                                 .fail(format!("decoding Firecracker Lima bridge: {error:#}"));
                             return;
@@ -710,10 +742,10 @@ impl LimaBridgeConnection {
                 ..ClientStreamRoutes::default()
             },
         )?;
+        let cancel = BridgeStreamCancel::new(id, self.outgoing.clone(), Arc::clone(&self.state));
         self.open_stream(id, request, opened_receiver, "process")
             .await?;
 
-        let cancel = BridgeStreamCancel::new(id, self.outgoing.clone(), Arc::clone(&self.state));
         let wait = Box::pin(async move {
             let mut cancel = cancel;
             let result = exit_receiver
@@ -743,8 +775,11 @@ impl LimaBridgeConnection {
                 ..ClientStreamRoutes::default()
             },
         )?;
+        let mut cancel =
+            BridgeStreamCancel::new(id, self.outgoing.clone(), Arc::clone(&self.state));
         self.open_stream(id, request, opened_receiver, "TCP")
             .await?;
+        cancel.disarm();
         Ok(LimaTcpStream {
             id,
             reader: bridge_read_stream(tcp_receiver),
@@ -794,7 +829,11 @@ impl LimaBridgeClientState {
         }
     }
 
-    async fn handle_frame(&self, frame: FirecrackerBridgeServerFrame) -> Result<()> {
+    fn handle_frame(
+        &self,
+        frame: FirecrackerBridgeServerFrame,
+        outgoing: &mpsc::Sender<FirecrackerBridgeClientFrame>,
+    ) -> Result<()> {
         match frame {
             FirecrackerBridgeServerFrame::Response { id, result } => {
                 let sender = self
@@ -827,8 +866,7 @@ impl LimaBridgeClientState {
                 }
             }
             FirecrackerBridgeServerFrame::StreamData { id, channel, data } => {
-                self.send_stream_data(id, channel, Bytes::from(BASE64.decode(data)?))
-                    .await?;
+                self.send_stream_data(id, channel, Bytes::from(BASE64.decode(data)?), outgoing)?;
             }
             FirecrackerBridgeServerFrame::StreamClosed { id, channel } => {
                 self.close_stream_channel(id, channel)?;
@@ -856,11 +894,12 @@ impl LimaBridgeClientState {
         Ok(())
     }
 
-    async fn send_stream_data(
+    fn send_stream_data(
         &self,
         id: u64,
         channel: FirecrackerBridgeStreamChannel,
         data: Bytes,
+        outgoing: &mpsc::Sender<FirecrackerBridgeClientFrame>,
     ) -> Result<()> {
         let sender = {
             let streams = self
@@ -878,9 +917,23 @@ impl LimaBridgeClientState {
             .context("Firecracker bridge data used the wrong stream channel")?
             .clone()
         };
-        if sender.send(Ok(data)).await.is_err() {
-            tracing::debug!(id, ?channel, "Firecracker bridge stream reader was dropped");
+        match sender.try_send(Ok(data)) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    id,
+                    ?channel,
+                    "canceling Firecracker bridge stream whose reader stopped draining"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!(id, ?channel, "Firecracker bridge stream reader was dropped");
+            }
         }
+        if let Some(routes) = self.remove_stream(id) {
+            routes.fail("Firecracker bridge stream reader stopped draining".to_string());
+        }
+        send_bridge_frame_on_drop(outgoing, FirecrackerBridgeClientFrame::StreamCancel { id });
         Ok(())
     }
 

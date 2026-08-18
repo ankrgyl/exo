@@ -108,14 +108,15 @@ clears supplementary groups and irreversibly drops to UID/GID 10001 with
 not need Python, a shell, `ip`, `mount`, `setpriv`, or other boot-time
 utilities.
 
-Registry credentials come from
-`EXO_FIRECRACKER_REGISTRY_USERNAME`/`EXO_FIRECRACKER_REGISTRY_PASSWORD`, or the
-Docker credential configuration and helper for the user running Exo. For ECR,
-this supports `docker-credential-ecr-login` without requiring a Docker daemon.
-Because Exo and the Firecracker jailer run as root, set `DOCKER_CONFIG` to the
-intended root-owned credential configuration when necessary. Exo rejects a
-credential config, credential helper, or parent path writable by non-root
-users, and executes a configured helper only at its validated absolute path.
+Registry credentials come from the Docker credential configuration and helper
+for the user running Exo. Credentials are selected for the exact registry
+origin; Exo intentionally does not accept a global username/password pair that
+could be sent to a caller-selected registry. For ECR, this supports
+`docker-credential-ecr-login` without requiring a Docker daemon. Because Exo
+and the Firecracker jailer run as root, set `DOCKER_CONFIG` to the intended
+root-owned credential configuration when necessary. Exo rejects a credential
+config, credential helper, or parent path writable by non-root users, and
+executes a configured helper only at its validated absolute path.
 
 The generated filesystem is 8 GiB by default; set
 `EXO_FIRECRACKER_IMAGE_SIZE_GIB` to change it. That size also caps how much
@@ -264,6 +265,11 @@ Be aware of what this backend does _not_ do, and what stays on the operator:
   the guest kernel with the agent, `/proc` is not mounted with `hidepid`, and
   the agent's chroot is a convenience, not a containment boundary. Isolation
   between sandboxes comes from KVM, not from anything inside the guest.
+- **Command cancellation is process-group based.** Timeout and explicit
+  cancellation kill the command's original process group. A deliberately
+  evasive descendant can create a new session or process group and remain in
+  a persistent microVM. Stop or terminate the sandbox when every descendant
+  must be removed; full descendant cancellation requires per-command cgroups.
 - **Tag references are trust-on-first-use.** Only digest-pinned references
   anchor the full download chain to something you chose.
 - **Manifest and config responses are buffered in memory without a size
@@ -280,9 +286,12 @@ Be aware of what this backend does _not_ do, and what stays on the operator:
   `--firecracker-allowed-registry docker.io,123456789012.dkr.ecr.us-east-1.amazonaws.com`)
   to restrict registry entry points, and only materialize images from
   publishers you trust. Permitted registries may redirect blob downloads to
-  other object-storage hosts, so this is a publisher allowlist rather than a
-  host-network allowlist. The durable fix is a bounded response read in the
-  OCI client library.
+  other object-storage hosts and OCI descriptors can name alternate blob
+  URLs, so selecting an unrestricted registry grants that publisher outbound
+  network access from the privileged materializer. This is a publisher
+  allowlist rather than a host-network allowlist; do not give untrusted clients
+  full-scope image selection. The durable fix is a bounded response read and
+  destination policy in the OCI client library.
 - **The image cache grows without bound.** Every unique image digest and layer
   blob a full-scope client requests is retained under
   `EXO_FIRECRACKER_STATE_ROOT/images` — the standard behavior of a

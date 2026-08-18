@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::chown;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -133,6 +133,10 @@ impl EventQueue {
 // reparented to PID 1; stealing a tracked child's status would break exit-code
 // reporting for the host.
 static DIRECT_CHILDREN: Mutex<Vec<libc::pid_t>> = Mutex::new(Vec::new());
+// Serializes Command::spawn with the reaper's untracked-child decision. The
+// process may exit before spawn returns, so registration and classification
+// need an actual synchronization edge rather than a timing grace period.
+static DIRECT_CHILD_SPAWN: Mutex<()> = Mutex::new(());
 
 fn register_direct_child(pid: libc::pid_t) {
     DIRECT_CHILDREN
@@ -173,6 +177,18 @@ impl Drop for DirectChildRegistration {
     }
 }
 
+fn spawn_direct_child(
+    command: &mut Command,
+) -> Result<(Child, libc::pid_t, DirectChildRegistration), String> {
+    let _spawn_guard = DIRECT_CHILD_SPAWN
+        .lock()
+        .map_err(|_| "direct child spawn lock poisoned")?;
+    let child = command.spawn().map_err(|error| error.to_string())?;
+    let process_group = libc::pid_t::try_from(child.id()).map_err(|error| error.to_string())?;
+    let registration = DirectChildRegistration::new(process_group);
+    Ok((child, process_group, registration))
+}
+
 // This agent is PID 1, so every double-forked/daemonized workload descendant
 // reparents to it when its parent dies. Without an init-style reaper those
 // accumulate as zombies for the VM's lifetime, and enough of them exhaust the
@@ -198,17 +214,14 @@ fn reap_orphans() {
             thread::sleep(Duration::from_millis(10));
             continue;
         }
+        let _spawn_guard = DIRECT_CHILD_SPAWN
+            .lock()
+            .expect("direct child spawn lock poisoned");
         if is_direct_child(pid) {
             // A tracked child is momentarily waitable until its own wait
             // thread collects it; yield rather than stealing its status.
+            drop(_spawn_guard);
             thread::sleep(Duration::from_millis(10));
-            continue;
-        }
-        // Grace period closes the spawn-to-register window: a freshly spawned
-        // direct child that exited immediately gets a chance to appear in the
-        // registry before being treated as an orphan.
-        thread::sleep(Duration::from_millis(100));
-        if is_direct_child(pid) {
             continue;
         }
         let mut status = 0;
@@ -235,9 +248,7 @@ impl ManagedProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().map_err(|error| error.to_string())?;
-        let process_group = i32::try_from(child.id()).map_err(|error| error.to_string())?;
-        let registration = DirectChildRegistration::new(process_group);
+        let (mut child, process_group, registration) = spawn_direct_child(&mut command)?;
         let stdin = child.stdin.take().ok_or("missing child stdin")?;
         let stdout = child.stdout.take().ok_or("missing child stdout")?;
         let stderr = child.stderr.take().ok_or("missing child stderr")?;
@@ -457,15 +468,10 @@ fn exec(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = match command.spawn() {
+    let (mut child, process_group, _registration) = match spawn_direct_child(&mut command) {
         Ok(child) => child,
         Err(error) => return command_error(cwd, error.to_string()),
     };
-    let process_group = match i32::try_from(child.id()) {
-        Ok(process_group) => process_group,
-        Err(error) => return command_error(cwd, error.to_string()),
-    };
-    let _registration = DirectChildRegistration::new(process_group);
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => return command_error(cwd, "missing child stdout"),

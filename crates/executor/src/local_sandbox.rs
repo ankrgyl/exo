@@ -2,19 +2,20 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::Arc;
 
+use anyhow::anyhow;
 use async_trait::async_trait;
 use exoharness::{
     AddEventsRequest, AddEventsResult, AgentHandle, AgentId, Artifact, ArtifactVersion,
-    AttachSandboxRequest, Binding, BindingId, BindingRecord, CancelSandboxProcessRequest,
-    CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, CreateSandboxRequest,
-    Event, EventData, EventId, EventKind, EventStream, ExoHarness, ForkConversationRequest,
-    ForkSandboxRequest, GetEventsResult, ListConversationsRequest, ListConversationsResult,
-    NewAgentRequest, NewConversationRequest, PutSecretRequest, ReadArtifactRequest,
-    RestoreSandboxRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle,
-    SandboxId, SandboxProcess, SandboxProcessEventQuery, SandboxProcessRecord,
-    SandboxProcessStatus, SandboxProvider, SandboxRecord, Secret, SecretId, SecretMetadata,
-    SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle,
-    TurnRecord, Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest,
+    AttachSandboxRequest, Binding, BindingId, BindingRecord, BoxSandboxTcpStream,
+    CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, ConversationHandle,
+    ConversationId, CreateSandboxRequest, Event, EventData, EventId, EventKind, EventStream,
+    ExoHarness, ForkConversationRequest, ForkSandboxRequest, GetEventsResult,
+    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
+    PutSecretRequest, ReadArtifactRequest, RestoreSandboxRequest, Result, RunInSandboxRequest,
+    SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery,
+    SandboxProcessRecord, SandboxProcessStatus, SandboxProvider, SandboxRecord, Secret, SecretId,
+    SecretMetadata, SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest,
+    TurnHandle, TurnRecord, Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest,
     WriteSandboxProcessInputRequest,
 };
 use serde::{Deserialize, Serialize};
@@ -98,6 +99,72 @@ async fn forget_local_sandbox(state: &LocalSandboxState, id: &SandboxId) {
     let mut detached_sandboxes = state.detached_sandboxes.lock().await;
     sandboxes.remove(id);
     detached_sandboxes.remove(id);
+}
+
+struct UncommittedLocalSandbox {
+    state: Arc<LocalSandboxState>,
+    local: Arc<dyn ConversationHandle>,
+    ids: Option<(SandboxId, SandboxId)>,
+}
+
+impl UncommittedLocalSandbox {
+    fn new(
+        state: Arc<LocalSandboxState>,
+        local: Arc<dyn ConversationHandle>,
+        remote_id: SandboxId,
+        local_id: SandboxId,
+    ) -> Self {
+        Self {
+            state,
+            local,
+            ids: Some((remote_id, local_id)),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.ids = None;
+    }
+
+    async fn cleanup(&mut self) -> Result<()> {
+        let (remote_id, local_id) = self
+            .ids
+            .as_ref()
+            .expect("uncommitted sandbox guard is armed")
+            .clone();
+        forget_local_sandbox(&self.state, &remote_id).await;
+        let result = self.local.terminate_sandbox(local_id).await;
+        self.disarm();
+        result
+    }
+}
+
+impl Drop for UncommittedLocalSandbox {
+    fn drop(&mut self) {
+        let Some((remote_id, local_id)) = self.ids.take() else {
+            return;
+        };
+        let state = Arc::clone(&self.state);
+        let local = Arc::clone(&self.local);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                %remote_id,
+                %local_id,
+                "cannot clean up an uncommitted local sandbox outside a Tokio runtime"
+            );
+            return;
+        };
+        drop(runtime.spawn(async move {
+            forget_local_sandbox(&state, &remote_id).await;
+            if let Err(error) = local.terminate_sandbox(local_id.clone()).await {
+                tracing::error!(
+                    %remote_id,
+                    %local_id,
+                    %error,
+                    "failed to clean up a cancelled local sandbox creation"
+                );
+            }
+        }));
+    }
 }
 
 #[async_trait]
@@ -414,6 +481,30 @@ impl SandboxHandle for LocalSandboxAgent {
             return self.remote.stop_sandbox(id).await;
         };
         self.local_agent().await?.stop_sandbox(local_id).await
+    }
+
+    async fn sandbox_supports_tcp(&self, id: SandboxId) -> Result<bool> {
+        let Some(local_id) = self.local_sandbox_id(&id).await? else {
+            return self.remote.sandbox_supports_tcp(id).await;
+        };
+        self.local_agent()
+            .await?
+            .sandbox_supports_tcp(local_id)
+            .await
+    }
+
+    async fn connect_sandbox_tcp(
+        &self,
+        id: SandboxId,
+        port: u16,
+    ) -> Result<Option<BoxSandboxTcpStream>> {
+        let Some(local_id) = self.local_sandbox_id(&id).await? else {
+            return self.remote.connect_sandbox_tcp(id, port).await;
+        };
+        self.local_agent()
+            .await?
+            .connect_sandbox_tcp(local_id, port)
+            .await
     }
 
     async fn start_sandbox_process(
@@ -758,6 +849,38 @@ impl LocalSandboxConversation {
             .await?;
         Ok(())
     }
+
+    async fn commit_local_sandbox(
+        &self,
+        local: &Arc<dyn ConversationHandle>,
+        remote_id: SandboxId,
+        local_id: SandboxId,
+        events: Vec<EventData>,
+    ) -> Result<()> {
+        let mut uncommitted = UncommittedLocalSandbox::new(
+            Arc::clone(&self.state),
+            Arc::clone(local),
+            remote_id.clone(),
+            local_id.clone(),
+        );
+        let result = async {
+            self.map_local_sandbox(remote_id.clone(), local_id.clone())
+                .await?;
+            self.append_remote_sandbox_events(events).await
+        }
+        .await;
+        let Err(error) = result else {
+            uncommitted.disarm();
+            return Ok(());
+        };
+
+        match uncommitted.cleanup().await {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(anyhow!(
+                "{error:#}; cleaning up the uncommitted local sandbox also failed: {cleanup_error:#}"
+            )),
+        }
+    }
 }
 
 #[async_trait]
@@ -918,14 +1041,15 @@ impl SandboxHandle for LocalSandboxConversation {
         }
 
         let remote_id = format!("sandbox-{}", Uuid7::now());
-        let local_id = self
-            .local_conversation()
-            .await?
-            .create_sandbox(request.clone())
-            .await?;
-        self.map_local_sandbox(remote_id.clone(), local_id).await?;
-        self.append_remote_sandbox_events(sandbox_created_events(&remote_id, request))
-            .await?;
+        let local = self.local_conversation().await?;
+        let local_id = local.create_sandbox(request.clone()).await?;
+        self.commit_local_sandbox(
+            &local,
+            remote_id.clone(),
+            local_id,
+            sandbox_created_events(&remote_id, request),
+        )
+        .await?;
         Ok(remote_id)
     }
 
@@ -936,14 +1060,15 @@ impl SandboxHandle for LocalSandboxConversation {
         let sandbox = request.sandbox.clone();
         request.source_id = local_source_id;
         let remote_id = format!("sandbox-{}", Uuid7::now());
-        let local_id = self
-            .local_conversation()
-            .await?
-            .fork_sandbox(request)
-            .await?;
-        self.map_local_sandbox(remote_id.clone(), local_id).await?;
-        self.append_remote_sandbox_events(sandbox_created_events(&remote_id, sandbox))
-            .await?;
+        let local = self.local_conversation().await?;
+        let local_id = local.fork_sandbox(request).await?;
+        self.commit_local_sandbox(
+            &local,
+            remote_id.clone(),
+            local_id,
+            sandbox_created_events(&remote_id, sandbox),
+        )
+        .await?;
         Ok(remote_id)
     }
 
@@ -955,18 +1080,15 @@ impl SandboxHandle for LocalSandboxConversation {
         let snapshot_id = request.snapshot_id;
         let sandbox = request.sandbox.clone();
         let remote_id = format!("sandbox-{}", Uuid7::now());
-        let local_id = self
-            .local_conversation()
-            .await?
-            .restore_sandbox(request)
-            .await?;
-        self.map_local_sandbox(remote_id.clone(), local_id).await?;
+        let local = self.local_conversation().await?;
+        let local_id = local.restore_sandbox(request).await?;
         let mut events = sandbox_created_events(&remote_id, sandbox);
         events.push(EventData::SandboxStarted {
             sandbox_id: remote_id.clone(),
             snapshot_id: Some(snapshot_id),
         });
-        self.append_remote_sandbox_events(events).await?;
+        self.commit_local_sandbox(&local, remote_id.clone(), local_id, events)
+            .await?;
         Ok(remote_id)
     }
 
@@ -1021,6 +1143,30 @@ impl SandboxHandle for LocalSandboxConversation {
             .stop_sandbox(local_id)
             .await?;
         self.append_remote_sandbox_events(vec![EventData::SandboxStopped { sandbox_id: id }])
+            .await
+    }
+
+    async fn sandbox_supports_tcp(&self, id: SandboxId) -> Result<bool> {
+        let Some(local_id) = self.local_sandbox_id(&id).await? else {
+            return self.remote.sandbox_supports_tcp(id).await;
+        };
+        self.local_conversation()
+            .await?
+            .sandbox_supports_tcp(local_id)
+            .await
+    }
+
+    async fn connect_sandbox_tcp(
+        &self,
+        id: SandboxId,
+        port: u16,
+    ) -> Result<Option<BoxSandboxTcpStream>> {
+        let Some(local_id) = self.local_sandbox_id(&id).await? else {
+            return self.remote.connect_sandbox_tcp(id, port).await;
+        };
+        self.local_conversation()
+            .await?
+            .connect_sandbox_tcp(local_id, port)
             .await
     }
 
