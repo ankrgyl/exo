@@ -54,6 +54,32 @@ registry request. Tag references resolve through the registry over HTTPS and
 then cache by the returned digest; the first resolution of a tag trusts
 whatever the registry returns, so pin digests where that matters.
 
+### Compatible OCI images
+
+Most ordinary Linux container images work, subject to these constraints:
+
+- The image must include a Linux manifest for the Firecracker host
+  architecture (`linux/arm64` in an Apple Silicon Lima VM, for example). Exo
+  selects the matching platform from a multi-architecture image but does not
+  emulate another architecture.
+- Exo uses the image's filesystem, not its OCI runtime configuration.
+  `ENTRYPOINT`, `CMD`, `USER`, environment, and working-directory metadata are
+  not applied; commands and their environment are supplied through the sandbox
+  API instead.
+- Workload processes run as UID/GID 10001 with `no_new_privs`. Images whose
+  programs or data are only accessible to root, or which require privileged
+  container operations, must be adapted. Exo also strips setuid/setgid bits,
+  xattrs, and file capabilities while materializing the image.
+- `sandbox connect` requires the selected shell to exist in the image. It uses
+  `/bin/bash` by default; pass `--shell /bin/sh` for smaller images. Distroless
+  and `scratch` images can still be used with `sandbox exec` when you name an
+  executable they contain.
+- The extracted filesystem must fit within `--firecracker-image-size-gib`
+  (8 GiB by default).
+
+The image does not need an init system, kernel, Python, or networking tools;
+the Exo initramfs supplies the guest agent and performs VM boot and setup.
+
 The cached ext4 image is an immutable lower layer shared by hard link across
 VMs. Every VM gets a new sparse ext4 upper layer, and the initramfs mounts the
 pair with OverlayFS. VM startup therefore never copies the base filesystem.
