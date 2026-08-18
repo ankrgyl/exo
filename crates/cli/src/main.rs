@@ -2563,6 +2563,7 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
                 owner,
                 name,
                 sandbox,
+                ..
             } = *args;
             let (_, sandbox_id) = start_sandbox(harness, owner.agent, name, sandbox).await?;
             println!("{sandbox_id}");
@@ -2573,6 +2574,7 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
                 sandbox,
                 shell,
                 env,
+                ..
             } = *args;
             let env = parse_environment(env)?;
             let (agent, sandbox_id) = start_sandbox(harness, owner.agent, None, sandbox).await?;
