@@ -2609,21 +2609,9 @@ fn prepare_and_launch_blocking(
         )?;
     }
     let kernel = root.join("vmlinux");
-    fs::hard_link(&config.kernel, &kernel).with_context(|| {
-        format!(
-            "linking cached Firecracker kernel {} into {}",
-            config.kernel.display(),
-            kernel.display()
-        )
-    })?;
+    replace_hard_link(&config.kernel, &kernel)?;
     let initramfs = root.join("initramfs.cpio");
-    fs::hard_link(&config.initramfs, &initramfs).with_context(|| {
-        format!(
-            "linking cached Firecracker initramfs {} into {}",
-            config.initramfs.display(),
-            initramfs.display()
-        )
-    })?;
+    replace_hard_link(&config.initramfs, &initramfs)?;
     let host_uid = jailer_uid(config, record)?;
     prepare_api_run_dir(&root, host_uid)?;
     chown(&overlay, Some(host_uid), Some(host_uid))?;
