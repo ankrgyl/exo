@@ -2579,6 +2579,15 @@ fn prepare_and_launch_blocking(
     let root = jail_root(config, &record.machine_id);
     fs::create_dir_all(&root)?;
     fs::set_permissions(&root, Permissions::from_mode(0o700))?;
+    for directory in [root.join("dev"), root.join("sys")] {
+        remove_directory_if_present(&directory)?;
+    }
+    for file in [root.join("firecracker"), root.join("firecracker.pid")] {
+        if file.try_exists()? {
+            fs::remove_file(&file)
+                .with_context(|| format!("removing stale jailer file {}", file.display()))?;
+        }
+    }
     let ready_listener = prepare_ready_listener(&root)?;
     let rootfs = root.join("rootfs.ext4");
     if !rootfs.try_exists()? {
@@ -3041,6 +3050,13 @@ fn prepare_snapshot_jail_files(
 fn prepare_api_run_dir(root: &Path, uid: u32) -> Result<()> {
     let run = root.join("run");
     fs::create_dir_all(&run)?;
+    for socket in [JAILED_API_SOCKET, JAILED_VSOCK] {
+        let path = jailed_path_on_host(root, socket);
+        if path.try_exists()? {
+            fs::remove_file(&path)
+                .with_context(|| format!("removing stale Firecracker socket {}", path.display()))?;
+        }
+    }
     chown(&run, Some(uid), Some(uid))?;
     fs::set_permissions(run, Permissions::from_mode(0o700))
         .context("setting Firecracker API run directory permissions")
