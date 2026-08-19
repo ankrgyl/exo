@@ -384,6 +384,7 @@ impl LimaBridgeManager {
             "starting the Firecracker Lima VM",
         )
         .await?;
+        self.check_kvm_access().await?;
         if !self.build_bridge {
             return Ok(());
         }
@@ -445,6 +446,32 @@ impl LimaBridgeManager {
             "installing the Exo Firecracker bridge as root in Lima",
         )
         .await
+    }
+
+    async fn check_kvm_access(&self) -> Result<()> {
+        for mode in ["-r", "-w"] {
+            let mut command = Command::new(&self.limactl);
+            command
+                .arg("shell")
+                .arg(&self.instance)
+                .arg("--")
+                .arg("sudo")
+                .arg("-n")
+                .arg("test")
+                .arg(mode)
+                .arg("/dev/kvm");
+            self.run_checked(&mut command, "checking Lima /dev/kvm access")
+                .await
+                .with_context(|| {
+                    format!(
+                        "Lima instance {:?} does not provide read/write /dev/kvm access; \
+                         Firecracker on macOS requires Apple M3 or newer and a VZ Lima VM \
+                         created with --nested-virt",
+                        self.instance
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     async fn run_checked(&self, command: &mut Command, description: &str) -> Result<()> {
