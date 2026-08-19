@@ -824,7 +824,7 @@ struct ProviderConfigureArgs {
 struct ConversationSandboxRuntimeArgs {
     #[arg(long)]
     sandbox_image: Option<String>,
-    #[arg(long, value_enum)]
+    #[arg(long = "provider", value_enum)]
     sandbox_provider: Option<SandboxProviderArg>,
     #[arg(long)]
     shell_program: Option<String>,
