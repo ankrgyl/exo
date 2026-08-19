@@ -3011,8 +3011,9 @@ async fn load_stored_sandbox(
     harness
         .inner
         .storage
-        .get_json(owner_dir.join("sandboxes").join(format!("{id}.json")))
-        .await
+        .get_json_if_exists(owner_dir.join("sandboxes").join(format!("{id}.json")))
+        .await?
+        .ok_or_else(|| anyhow!("sandbox not found: {id}"))
 }
 
 async fn prepare_sandbox_request(
