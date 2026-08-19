@@ -215,29 +215,145 @@ fn parse_repl_input(line: &str) -> Result<ReplInput, clap::Error> {
 /// scrolls vertically.
 const MAX_INPUT_ROWS: u16 = 8;
 
+/// Editable input with a UTF-8 byte offset that always rests on a character
+/// boundary. Keeping editing here avoids letting individual key handlers
+/// desynchronize the text and cursor.
+#[derive(Debug, Default)]
+struct InputBuffer {
+    text: String,
+    cursor: usize,
+}
+
+impl InputBuffer {
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    fn replace(&mut self, text: String) {
+        self.text = text;
+        self.cursor = self.text.len();
+    }
+
+    fn take(&mut self) -> String {
+        self.cursor = 0;
+        std::mem::take(&mut self.text)
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        self.text.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        self.text.insert_str(self.cursor, text);
+        self.cursor += text.len();
+    }
+
+    fn move_start(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.text.len();
+    }
+
+    fn move_left(&mut self) {
+        if let Some((index, _)) = self.text[..self.cursor].char_indices().next_back() {
+            self.cursor = index;
+        }
+    }
+
+    fn move_right(&mut self) {
+        if let Some(ch) = self.text[self.cursor..].chars().next() {
+            self.cursor += ch.len_utf8();
+        }
+    }
+
+    fn delete_before(&mut self) {
+        let Some((previous, _)) = self.text[..self.cursor].char_indices().next_back() else {
+            return;
+        };
+        self.text.drain(previous..self.cursor);
+        self.cursor = previous;
+    }
+
+    fn delete_at(&mut self) {
+        let Some(ch) = self.text[self.cursor..].chars().next() else {
+            return;
+        };
+        self.text.drain(self.cursor..self.cursor + ch.len_utf8());
+    }
+
+    fn kill_to_start(&mut self) {
+        self.text.drain(..self.cursor);
+        self.cursor = 0;
+    }
+
+    fn kill_to_end(&mut self) {
+        self.text.truncate(self.cursor);
+    }
+}
+
+struct WrappedInput {
+    lines: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
 /// Wrap input at exact character boundaries so the cursor position stays a
 /// simple row/column computation (word-wrap would make it unpredictable).
-/// Embedded newlines (pasted or Alt+Enter) are hard breaks. The cursor sits
-/// at the end, so a line that exactly fills the width rolls over to a fresh
-/// empty line.
-fn wrap_input_chars(input: &str, width: usize) -> Vec<String> {
+/// Embedded newlines (pasted or Alt+Enter) are hard breaks. A cursor at an
+/// exact wrap boundary appears at the start of the following visual line.
+fn wrap_input_chars(input: &str, cursor: usize, width: usize) -> WrappedInput {
+    debug_assert!(input.is_char_boundary(cursor));
     let mut lines = vec![String::new()];
     let mut column = 0;
-    for ch in input.chars() {
-        if ch == '\n' || column == width {
+    let mut cursor_position = None;
+    for (index, ch) in input.char_indices() {
+        let wraps = column == width;
+        if ch == '\n' || wraps {
+            if index == cursor {
+                cursor_position = Some(if wraps {
+                    (lines.len(), 0)
+                } else {
+                    (lines.len() - 1, column)
+                });
+            }
             lines.push(String::new());
             column = 0;
             if ch == '\n' {
                 continue;
             }
         }
+        if index == cursor {
+            cursor_position = Some((lines.len() - 1, column));
+        }
         lines.last_mut().expect("lines never empty").push(ch);
         column += 1;
     }
     if column == width {
         lines.push(String::new());
+        column = 0;
     }
-    lines
+    let (cursor_row, cursor_col) = cursor_position.unwrap_or_else(|| (lines.len() - 1, column));
+    WrappedInput {
+        lines,
+        cursor_row,
+        cursor_col,
+    }
 }
 
 /// Everything the UI task can be woken by besides key presses.
@@ -279,7 +395,7 @@ struct TuiApp {
     conversation: Arc<dyn HarnessConversation>,
     verbosity: Verbosity,
     transcript: Vec<Line<'static>>,
-    input: String,
+    input: InputBuffer,
     input_history: Vec<String>,
     history_pos: Option<usize>,
     /// Lines scrolled up from the bottom; 0 means follow new output.
@@ -323,7 +439,7 @@ impl TuiApp {
             conversation,
             verbosity,
             transcript: Vec::new(),
-            input: String::new(),
+            input: InputBuffer::default(),
             input_history: Vec::new(),
             history_pos: None,
             scrollback: 0,
@@ -435,7 +551,8 @@ impl TuiApp {
         }
         if let Event::Paste(text) = event {
             // Terminals report pasted line breaks as `\r`.
-            self.input.push_str(&text.replace('\r', "\n"));
+            self.input.insert_str(&text.replace('\r', "\n"));
+            self.history_pos = None;
             return Ok(false);
         }
         let Event::Key(key) = event else {
@@ -454,8 +571,27 @@ impl TuiApp {
                 self.input.clear();
                 self.history_pos = None;
             }
-            (KeyModifiers::CONTROL, KeyCode::Char('d')) => return Ok(true),
-            (KeyModifiers::CONTROL, KeyCode::Char('u')) => self.input.clear(),
+            (KeyModifiers::CONTROL, KeyCode::Char('a')) => self.input.move_start(),
+            (KeyModifiers::CONTROL, KeyCode::Char('e')) => self.input.move_end(),
+            (KeyModifiers::CONTROL, KeyCode::Char('b')) => self.input.move_left(),
+            (KeyModifiers::CONTROL, KeyCode::Char('f')) => self.input.move_right(),
+            (KeyModifiers::CONTROL, KeyCode::Char('k')) => {
+                self.input.kill_to_end();
+                self.history_pos = None;
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
+                self.input.kill_to_start();
+                self.history_pos = None;
+            }
+            // Readline treats Ctrl+D as delete-at-cursor, or EOF on an empty
+            // input. Preserve the existing quit behavior for the empty case.
+            (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
+                if self.input.is_empty() {
+                    return Ok(true);
+                }
+                self.input.delete_at();
+                self.history_pos = None;
+            }
             // Release the mouse so the terminal's native text selection works,
             // at the cost of wheel scrolling; toggle back when done.
             (KeyModifiers::CONTROL, KeyCode::Char('t')) => {
@@ -466,11 +602,23 @@ impl TuiApp {
                     crossterm::execute!(std::io::stdout(), DisableMouseCapture)
                 };
             }
-            (KeyModifiers::ALT, KeyCode::Enter) => self.input.push('\n'),
+            (KeyModifiers::ALT, KeyCode::Enter) => {
+                self.input.insert_char('\n');
+                self.history_pos = None;
+            }
             (_, KeyCode::Enter) => return self.submit_input(tx).await,
             (_, KeyCode::Backspace) => {
-                self.input.pop();
+                self.input.delete_before();
+                self.history_pos = None;
             }
+            (_, KeyCode::Delete) => {
+                self.input.delete_at();
+                self.history_pos = None;
+            }
+            (_, KeyCode::Left) => self.input.move_left(),
+            (_, KeyCode::Right) => self.input.move_right(),
+            (_, KeyCode::Home) => self.input.move_start(),
+            (_, KeyCode::End) => self.input.move_end(),
             (_, KeyCode::Up) => self.history_step(-1),
             (_, KeyCode::Down) => self.history_step(1),
             (_, KeyCode::PageUp) => {
@@ -480,7 +628,10 @@ impl TuiApp {
                 self.scrollback = self.scrollback.saturating_sub(10);
             }
             (_, KeyCode::Esc) => self.scrollback = 0,
-            (_, KeyCode::Char(ch)) => self.input.push(ch),
+            (_, KeyCode::Char(ch)) => {
+                self.input.insert_char(ch);
+                self.history_pos = None;
+            }
             _ => {}
         }
         Ok(false)
@@ -488,7 +639,7 @@ impl TuiApp {
 
     /// Returns true when the app should exit.
     async fn submit_input(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) -> Result<bool> {
-        let line = std::mem::take(&mut self.input);
+        let line = self.input.take();
         self.history_pos = None;
         // The bare help listing is ours, not clap's CLI-shaped help screen.
         if matches!(line.trim(), "/" | "/help") {
@@ -502,7 +653,7 @@ impl TuiApp {
             Ok(ReplInput::Chat(text)) => {
                 if self.is_busy() {
                     self.push_notice("still waiting on the previous turn");
-                    self.input = line;
+                    self.input.replace(line);
                     return Ok(false);
                 }
                 self.input_history.push(line);
@@ -818,7 +969,7 @@ impl TuiApp {
         };
         if let Some(pos) = next {
             self.history_pos = Some(pos);
-            self.input = self.input_history[pos].clone();
+            self.input.replace(self.input_history[pos].clone());
         }
     }
 
@@ -870,8 +1021,8 @@ impl TuiApp {
         // The input box wraps and grows with its content (bounded), so its
         // height must be known before the layout is split.
         let input_width = usize::from(frame.area().width.saturating_sub(2)).max(1);
-        let input_lines = wrap_input_chars(&self.input, input_width);
-        let input_height = (input_lines.len() as u16).min(MAX_INPUT_ROWS) + 2;
+        let wrapped = wrap_input_chars(self.input.as_str(), self.input.cursor(), input_width);
+        let input_height = (wrapped.lines.len() as u16).min(MAX_INPUT_ROWS) + 2;
 
         let [transcript_area, input_area, status_area] = Layout::vertical([
             Constraint::Min(1),
@@ -903,13 +1054,22 @@ impl TuiApp {
             transcript_area,
         );
 
-        // Once the input outgrows its bounded height, scroll vertically so
-        // the cursor row (always the last line) stays visible.
-        let cursor_col = input_lines.last().map_or(0, |line| line.chars().count()) as u16;
-        let total_rows = input_lines.len() as u16;
-        let input_scroll = total_rows.saturating_sub(MAX_INPUT_ROWS);
+        // Once the input outgrows its bounded height, scroll vertically so the
+        // current cursor row stays visible even when editing earlier text.
+        let cursor_col = wrapped.cursor_col as u16;
+        let cursor_row = wrapped.cursor_row as u16;
+        let total_rows = wrapped.lines.len() as u16;
+        let max_scroll = total_rows.saturating_sub(MAX_INPUT_ROWS);
+        let input_scroll = cursor_row
+            .saturating_add(1)
+            .saturating_sub(MAX_INPUT_ROWS)
+            .min(max_scroll);
         let input = Paragraph::new(Text::from(
-            input_lines.into_iter().map(Line::from).collect::<Vec<_>>(),
+            wrapped
+                .lines
+                .into_iter()
+                .map(Line::from)
+                .collect::<Vec<_>>(),
         ))
         .scroll((input_scroll, 0))
         .block(
@@ -920,7 +1080,7 @@ impl TuiApp {
         frame.render_widget(input, input_area);
         frame.set_cursor_position(Position::new(
             input_area.x + 1 + cursor_col,
-            input_area.y + 1 + (total_rows - 1 - input_scroll),
+            input_area.y + 1 + (cursor_row - input_scroll),
         ));
 
         let state = if self.is_busy() {
@@ -1106,8 +1266,74 @@ fn status_style(status: &str) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReplCommand, ReplInput, parse_repl_input};
+    use super::{InputBuffer, ReplCommand, ReplInput, parse_repl_input, wrap_input_chars};
     use crate::render::Verbosity;
+
+    fn input_buffer(text: &str) -> InputBuffer {
+        let mut input = InputBuffer::default();
+        input.replace(text.to_string());
+        input
+    }
+
+    #[test]
+    fn input_buffer_edits_at_the_cursor() {
+        let mut input = input_buffer("helo");
+        input.move_left();
+        input.insert_char('l');
+        assert_eq!(input.as_str(), "hello");
+
+        input.move_left();
+        input.delete_at();
+        assert_eq!(input.as_str(), "helo");
+
+        input.delete_before();
+        assert_eq!(input.as_str(), "heo");
+    }
+
+    #[test]
+    fn input_buffer_kills_before_and_after_the_cursor() {
+        let mut input = input_buffer("hello world");
+        input.move_start();
+        for _ in 0..5 {
+            input.move_right();
+        }
+        input.kill_to_end();
+        assert_eq!(input.as_str(), "hello");
+
+        input.replace("hello world".to_string());
+        input.move_start();
+        for _ in 0..6 {
+            input.move_right();
+        }
+        input.kill_to_start();
+        assert_eq!(input.as_str(), "world");
+        assert_eq!(input.cursor(), 0);
+    }
+
+    #[test]
+    fn input_buffer_keeps_utf8_boundaries_and_inserts_paste_at_cursor() {
+        let mut input = input_buffer("a🦀é");
+        input.move_left();
+        input.delete_before();
+        input.insert_str("中\n");
+        assert_eq!(input.as_str(), "a中\né");
+        assert!(input.as_str().is_char_boundary(input.cursor()));
+        input.delete_at();
+        assert_eq!(input.as_str(), "a中\n");
+    }
+
+    #[test]
+    fn wrapped_input_tracks_a_cursor_away_from_the_end() {
+        let middle = wrap_input_chars("abcd", 2, 2);
+        assert_eq!(middle.lines, ["ab", "cd", ""]);
+        assert_eq!((middle.cursor_row, middle.cursor_col), (1, 0));
+
+        let end = wrap_input_chars("abcd", 4, 2);
+        assert_eq!((end.cursor_row, end.cursor_col), (2, 0));
+
+        let newline = wrap_input_chars("ab\ncd", 2, 4);
+        assert_eq!((newline.cursor_row, newline.cursor_col), (0, 2));
+    }
 
     #[test]
     fn parses_blank_and_chat_input() {
