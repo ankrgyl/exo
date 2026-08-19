@@ -17,12 +17,14 @@ import type {
   ToolResult,
 } from "@exo/harness";
 
-const GUARDIAN_SCRIPT = new URL(
+// Both scripts live in exo/scripts/, one level up from this file. Exported so
+// tests can assert they are still spawnable from here.
+export const GUARDIAN_SCRIPT = new URL(
   "../scripts/exo-service-guardian",
   import.meta.url,
 ).pathname;
-const DEFERRED_SCRIPT = new URL(
-  "./scripts/deferred-rebuild-and-restart",
+export const DEFERRED_SCRIPT = new URL(
+  "../scripts/deferred-rebuild-and-restart",
   import.meta.url,
 ).pathname;
 const ROOT_DIR = new URL("../..", import.meta.url).pathname;

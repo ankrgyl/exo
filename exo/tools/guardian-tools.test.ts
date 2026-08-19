@@ -1,7 +1,11 @@
+import { accessSync, constants } from "node:fs";
+
 import { HarnessToolRegistry, type TurnContext } from "@exo/harness";
 import { describe, expect, it } from "vitest";
 
 import {
+  DEFERRED_SCRIPT,
+  GUARDIAN_SCRIPT,
   parseRebuildReason,
   rebuildAndRestartExoTool,
   registerGuardianTools,
@@ -35,6 +39,14 @@ describe("guardian tools", () => {
       },
       required: ["reason"],
     });
+  });
+
+  it("resolves host scripts that exist and are executable", () => {
+    // A wrong relative path here is invisible until a self-update is queued:
+    // the spawn fails with ENOENT and the update record stays "queued".
+    for (const script of [GUARDIAN_SCRIPT, DEFERRED_SCRIPT]) {
+      expect(() => accessSync(script, constants.X_OK)).not.toThrow();
+    }
   });
 
   it("parses rebuild reasons for the durable update record", () => {
