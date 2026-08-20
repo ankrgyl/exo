@@ -1,10 +1,13 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use exoharness::Uuid7;
-use serde::{Serialize, de::DeserializeOwned};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+
+use crate::json_store::{
+    is_record_entry, read_json_file_if_exists, remove_dir_if_exists, remove_file_if_exists,
+    write_json_file,
+};
 
 use super::types::{
     AdapterAttachment, AdapterDeliveryStatus, AdapterEventRecord, AdapterEventType,
@@ -50,10 +53,10 @@ impl AdapterStore {
             .with_context(|| format!("failed to read adapter directory {adapter_dir:?}"))?;
         let mut adapters = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            if !is_record_entry(&entry).await {
                 continue;
             }
+            let path = entry.path();
             let bytes = fs::read(&path)
                 .await
                 .with_context(|| format!("failed to read adapter {}", path.display()))?;
@@ -209,10 +212,10 @@ impl AdapterStore {
             .with_context(|| format!("failed to read adapter events directory {events_dir:?}"))?;
         let mut events = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            if !is_record_entry(&entry).await {
                 continue;
             }
+            let path = entry.path();
             let bytes = fs::read(&path)
                 .await
                 .with_context(|| format!("failed to read adapter event {}", path.display()))?;
@@ -296,10 +299,10 @@ impl AdapterStore {
         while messages.len() < MAX_MESSAGES_PER_CLAIM
             && let Some(entry) = entries.next_entry().await?
         {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            if !is_record_entry(&entry).await {
                 continue;
             }
+            let path = entry.path();
             let bytes = fs::read(&path).await.with_context(|| {
                 format!("failed to read adapter outbound message {}", path.display())
             })?;
@@ -402,10 +405,10 @@ impl AdapterStore {
             format!("failed to read adapter inflight directory {inflight_dir:?}")
         })?;
         while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            if !is_record_entry(&entry).await {
                 continue;
             }
+            let path = entry.path();
             let Some(message_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
                 continue;
             };
@@ -450,10 +453,10 @@ impl AdapterStore {
         let mut records = Vec::new();
         let mut entries = fs::read_dir(&dir).await?;
         while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            if !is_record_entry(&entry).await {
                 continue;
             }
+            let path = entry.path();
             let bytes = fs::read(&path).await.with_context(|| {
                 format!("failed to read target conversation {}", path.display())
             })?;
@@ -610,48 +613,6 @@ impl AdapterStore {
     }
 }
 
-async fn remove_file_if_exists(path: PathBuf) -> Result<()> {
-    match fs::remove_file(&path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to delete file {}", path.display()))
-        }
-    }
-}
-
-async fn read_json_file_if_exists<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    match fs::read(path).await {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
-    }
-}
-
-async fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let temp_path = path.with_extension(format!("json.{}.tmp", Uuid7::now()));
-    fs::write(&temp_path, serde_json::to_vec_pretty(value)?)
-        .await
-        .with_context(|| format!("failed to write temp file {}", temp_path.display()))?;
-    fs::rename(&temp_path, path).await.with_context(|| {
-        format!(
-            "failed to replace {} with temp file {}",
-            path.display(),
-            temp_path.display()
-        )
-    })
-}
-
-async fn remove_dir_if_exists(path: PathBuf) -> Result<()> {
-    match fs::remove_dir_all(&path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to delete directory {}", path.display()))
-        }
-    }
-}
-
 async fn count_json_files(path: &Path) -> Result<usize> {
     let mut entries = match fs::read_dir(path).await {
         Ok(entries) => entries,
@@ -660,7 +621,7 @@ async fn count_json_files(path: &Path) -> Result<usize> {
     };
     let mut count = 0;
     while let Some(entry) = entries.next_entry().await? {
-        if entry.path().extension().and_then(|ext| ext.to_str()) == Some("json") {
+        if is_record_entry(&entry).await {
             count += 1;
         }
     }
@@ -696,6 +657,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::test_support::backdate_file;
 
     #[tokio::test]
     async fn creates_lists_disables_and_deletes_adapters() {
@@ -988,6 +950,45 @@ mod tests {
                 .await
                 .is_err(),
             "recovery should retire the stale in-flight copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn claiming_sweeps_staging_files_a_crashed_writer_left_behind() {
+        let tempdir = TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        fs::create_dir_all(store.outbox_dir("adapter"))
+            .await
+            .unwrap();
+        let outbox = store.outbox_dir("adapter");
+        let stale = outbox.join(format!("message.json.{}.tmp", exoharness::Uuid7::now()));
+        let fresh = outbox.join(format!("message.json.{}.tmp", exoharness::Uuid7::now()));
+        let foreign = outbox.join("message.json.backup.tmp");
+        fs::write(&stale, b"{").await.unwrap();
+        fs::write(&fresh, b"{").await.unwrap();
+        fs::write(&foreign, b"{").await.unwrap();
+        // A writer that died an hour ago between its temp write and rename.
+        backdate_file(&stale, std::time::Duration::from_secs(3600));
+        backdate_file(&foreign, std::time::Duration::from_secs(3600));
+
+        assert!(
+            store
+                .claim_outbound_messages("adapter")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            fs::metadata(&stale).await.is_err(),
+            "a stale staging file should be swept"
+        );
+        assert!(
+            fs::metadata(&fresh).await.is_ok(),
+            "a staging file that may still be mid-write must be left alone"
+        );
+        assert!(
+            fs::metadata(&foreign).await.is_ok(),
+            "a file that is not the writer's staging shape must be left alone"
         );
     }
 

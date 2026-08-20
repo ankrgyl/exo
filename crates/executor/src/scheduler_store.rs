@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use exoharness::Uuid7;
-use serde::Serialize;
 use tokio::fs;
 
+use crate::json_store::{
+    is_record_entry, remove_dir_if_exists, remove_file_if_exists, write_json_file,
+};
 use crate::scheduler_types::{
     NewScheduledTask, ScheduledFireRecord, ScheduledTaskRecord, ScheduledTaskRunRecord,
     migrate_scheduled_task, now_ms,
@@ -44,10 +45,10 @@ impl SchedulerStore {
             .with_context(|| format!("failed to read scheduled task directory {task_dir:?}"))?;
         let mut tasks = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            if !is_record_entry(&entry).await {
                 continue;
             }
+            let path = entry.path();
             let bytes = fs::read(&path)
                 .await
                 .with_context(|| format!("failed to read scheduled task {}", path.display()))?;
@@ -170,10 +171,10 @@ impl SchedulerStore {
             .with_context(|| format!("failed to read scheduled fire directory {dir:?}"))?;
         let mut fires = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            if !is_record_entry(&entry).await {
                 continue;
             }
+            let path = entry.path();
             let bytes = fs::read(&path).await.with_context(|| {
                 format!("failed to read scheduled task fire {}", path.display())
             })?;
@@ -260,49 +261,13 @@ fn decode_task(bytes: &[u8]) -> Result<ScheduledTaskRecord> {
     migrate_scheduled_task(serde_json::from_slice::<ScheduledTaskRecord>(bytes)?)
 }
 
-/// Writes JSON through a temp file so a crash mid-write leaves the previous
-/// record intact instead of a half-written one. Same shape as the adapter
-/// store's writer.
-async fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let temp_path = path.with_extension(format!("json.{}.tmp", Uuid7::now()));
-    fs::write(&temp_path, serde_json::to_vec_pretty(value)?)
-        .await
-        .with_context(|| format!("failed to write temp file {}", temp_path.display()))?;
-    fs::rename(&temp_path, path).await.with_context(|| {
-        format!(
-            "failed to replace {} with temp file {}",
-            path.display(),
-            temp_path.display()
-        )
-    })
-}
-
-async fn remove_file_if_exists(path: PathBuf) -> Result<()> {
-    match fs::remove_file(&path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to delete file {}", path.display()))
-        }
-    }
-}
-
-async fn remove_dir_if_exists(path: PathBuf) -> Result<()> {
-    match fs::remove_dir_all(&path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to delete directory {}", path.display()))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
 
     use super::*;
     use crate::scheduler_types::SCHEDULED_TASK_SCHEMA_VERSION;
+    use crate::test_support::backdate_file;
 
     #[tokio::test]
     async fn creates_and_lists_tasks() {
@@ -465,6 +430,33 @@ mod tests {
         }
         assert_eq!(names, vec![format!("{}.json", task.id)]);
         assert_eq!(store.get_task(&task.id).await.unwrap().unwrap(), task);
+    }
+
+    #[tokio::test]
+    async fn listing_sweeps_staging_files_a_crashed_writer_left_behind() {
+        let tempdir = TempDir::new().unwrap();
+        let store = SchedulerStore::new(tempdir.path());
+        tokio::fs::create_dir_all(store.tasks_dir()).await.unwrap();
+        let stale = store
+            .tasks_dir()
+            .join(format!("task.json.{}.tmp", exoharness::Uuid7::now()));
+        let fresh = store
+            .tasks_dir()
+            .join(format!("task.json.{}.tmp", exoharness::Uuid7::now()));
+        tokio::fs::write(&stale, b"{").await.unwrap();
+        tokio::fs::write(&fresh, b"{").await.unwrap();
+        // A writer that died an hour ago between its temp write and rename.
+        backdate_file(&stale, std::time::Duration::from_secs(3600));
+
+        assert!(store.list_tasks().await.unwrap().is_empty());
+        assert!(
+            tokio::fs::metadata(&stale).await.is_err(),
+            "a stale staging file should be swept"
+        );
+        assert!(
+            tokio::fs::metadata(&fresh).await.is_ok(),
+            "a staging file that may still be mid-write must be left alone"
+        );
     }
 
     #[tokio::test]
