@@ -1,3 +1,5 @@
+#[cfg(feature = "firecracker")]
+use std::collections::HashMap;
 use std::env;
 use std::future::Future;
 use std::pin::Pin;
@@ -23,13 +25,13 @@ use crate::{
     BoxAsyncWrite, CloseSandboxProcessInputRequest, CreateSandboxRequest, DurableFileSystem,
     EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness, FileSystemMountMode,
     ForkConversationRequest, ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest,
-    NewConversationRequest, PutSecretRequest, RunInSandboxRequest, SandboxAttachment,
-    SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput, SandboxKey,
-    SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent, SandboxProcessEventQuery,
-    SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin, SandboxProvider,
-    SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotKind, SnapshotPayload,
-    StartSandboxProcessRequest, StartSandboxRequest, Uuid7, WaitSandboxProcessRequest,
-    WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    NewConversationRequest, PutSecretRequest, RestoreSandboxRequest, RunInSandboxRequest,
+    SandboxAttachment, SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput,
+    SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent,
+    SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin,
+    SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotKind,
+    SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
+    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const DEFAULT_DURABLE_CONTRACT_MOUNT_PATH: &str = "/home/exo/workspace";
@@ -40,6 +42,13 @@ const DEFAULT_AGENTCORE_DURABLE_CONTRACT_MOUNT_PATH: &str = "/mnt/workspace";
 fn sandbox_backend_registration_uses_backend_locality() {
     assert!(SandboxBackendRegistration::apple_container().is_local());
     assert!(SandboxBackendRegistration::docker().is_local());
+    assert_eq!(
+        SandboxBackendRegistration::firecracker(Default::default()).is_local(),
+        cfg!(all(
+            any(target_os = "linux", target_os = "macos"),
+            feature = "firecracker"
+        ))
+    );
     assert!(SandboxBackendRegistration::local_process().is_local());
     assert!(!SandboxBackendRegistration::daytona(crate::DaytonaBackendSpec::default()).is_local());
 }
@@ -52,6 +61,7 @@ fn sandbox_backend_registration_resolves_builtin_providers() {
         SandboxProvider::Daytona,
         SandboxProvider::Docker,
         SandboxProvider::E2b,
+        SandboxProvider::Firecracker,
         SandboxProvider::LocalProcess,
         SandboxProvider::Sprites,
         SandboxProvider::Vercel,
@@ -65,6 +75,20 @@ fn sandbox_backend_registration_resolves_builtin_providers() {
         SandboxBackendRegistration::from_builtin_provider(SandboxProvider::from_static("custom"))
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn unsupported_backend_fork_is_an_error() {
+    let backend = TestProviderStateBackend::new(Value::Null);
+    let source = provider_contract_request("test", "fork-source", "test-image".to_string(), "/");
+    let target = provider_contract_request("test", "fork-target", "test-image".to_string(), "/");
+
+    let error = match backend.fork_sandbox(source, target).await {
+        Ok(_) => panic!("unsupported fork unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("does not support forking"));
+    assert!(backend.requests.lock().await.is_empty());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -154,6 +178,348 @@ async fn local_process_sandbox_contract_start_process_long_running_protocol() {
     )
     .await
     .expect("sandbox long-running protocol contract");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "firecracker")]
+#[ignore = "uses a real Firecracker sandbox; requires Linux KVM or nested virtualization through Lima on macOS"]
+async fn firecracker_sandbox_contract_start_process_stdio_and_env() {
+    let handle = firecracker_contract_handle("stdio-and-env").await;
+    crate::contract_tests::sandbox_handle_start_process_supports_interactive_stdio_and_env(
+        Arc::clone(&handle),
+    )
+    .await
+    .expect("Firecracker sandbox start_process contract");
+    assert!(handle.supports_tcp());
+    let mut server = handle
+        .start_process(&SandboxCommand {
+            argv: vec![
+                "/usr/bin/python3".to_string(),
+                "-u".to_string(),
+                "-c".to_string(),
+                "import socket; server = socket.create_server(('0.0.0.0', 18080)); print('ready', flush=True); client, _ = server.accept(); client.sendall(client.recv(4))".to_string(),
+            ],
+            env: HashMap::new(),
+            display_argv: None,
+            cwd: Some("/".to_string()),
+            timeout: Some(Duration::from_secs(10)),
+        })
+        .await
+        .expect("start Firecracker TCP echo server");
+    let mut ready = [0; 6];
+    server
+        .stdout
+        .read_exact(&mut ready)
+        .await
+        .expect("wait for Firecracker TCP echo server");
+    assert_eq!(&ready, b"ready\n");
+    let mut stream = handle
+        .connect_tcp(18080)
+        .await
+        .expect("connect to Firecracker TCP echo server")
+        .expect("Firecracker TCP support disappeared");
+    tokio::io::AsyncWriteExt::write_all(&mut stream, b"ping")
+        .await
+        .expect("write Firecracker TCP payload");
+    let mut echoed = [0; 4];
+    tokio::io::AsyncReadExt::read_exact(&mut stream, &mut echoed)
+        .await
+        .expect("read Firecracker TCP payload");
+    assert_eq!(&echoed, b"ping");
+    assert_eq!(server.wait.await.expect("wait for TCP echo server"), 0);
+    let status = handle
+        .exec(&SandboxCommand {
+            argv: vec!["/bin/cat".to_string(), "/proc/self/status".to_string()],
+            env: HashMap::new(),
+            display_argv: None,
+            cwd: Some("/".to_string()),
+            timeout: Some(Duration::from_secs(10)),
+        })
+        .await
+        .expect("read Firecracker workload process status");
+    assert!(status.ok, "{}{}", status.stdout, status.stderr);
+    assert!(status.stdout.contains("Uid:\t10001\t10001\t10001\t10001"));
+    assert!(status.stdout.contains("Gid:\t10001\t10001\t10001\t10001"));
+    assert!(status.stdout.contains("NoNewPrivs:\t1"));
+    handle
+        .stop()
+        .await
+        .expect("stop Firecracker sandbox after status checks");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "firecracker")]
+#[ignore = "uses a real Firecracker sandbox; requires Linux KVM or nested virtualization through Lima on macOS"]
+async fn firecracker_sandbox_contract_start_process_long_running_protocol() {
+    let handle = firecracker_contract_handle("long-running-protocol").await;
+    crate::contract_tests::sandbox_handle_start_process_supports_long_running_request_response_protocol(
+        handle,
+    )
+    .await
+    .expect("Firecracker sandbox long-running protocol contract");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "firecracker")]
+#[ignore = "uses a real Firecracker sandbox; requires Linux KVM or nested virtualization through Lima on macOS"]
+async fn firecracker_fork_captures_current_source_state() {
+    let config = firecracker_test_config();
+    let backend = crate::sandbox_provider::firecracker_backend_for_test(config)
+        .await
+        .expect("Firecracker backend");
+    let image = env_or("FIRECRACKER_IMAGE", &crate::default_firecracker_image());
+    let source_request =
+        provider_contract_request("firecracker", "point-in-time-source", image.clone(), "/tmp");
+    let source = backend
+        .acquire(source_request.clone())
+        .await
+        .expect("acquire fork source");
+
+    for (sample, expected) in ["first", "second"].into_iter().enumerate() {
+        let write = source
+            .exec(&SandboxCommand {
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    format!("printf %s {expected} > /tmp/exo-fork-state"),
+                ],
+                env: HashMap::new(),
+                display_argv: None,
+                cwd: Some("/".to_string()),
+                timeout: Some(Duration::from_secs(10)),
+            })
+            .await
+            .expect("mutate fork source");
+        assert!(write.ok, "{}{}", write.stdout, write.stderr);
+
+        let target_request = provider_contract_request(
+            "firecracker",
+            &format!("point-in-time-target-{sample}"),
+            image.clone(),
+            "/tmp",
+        );
+        let target = backend
+            .fork_sandbox(source_request.clone(), target_request.clone())
+            .await
+            .expect("fork current source state");
+        let read = target
+            .exec(&SandboxCommand {
+                argv: vec!["/bin/cat".to_string(), "/tmp/exo-fork-state".to_string()],
+                env: HashMap::new(),
+                display_argv: None,
+                cwd: Some("/".to_string()),
+                timeout: Some(Duration::from_secs(10)),
+            })
+            .await
+            .expect("read forked state");
+        assert!(read.ok, "{}{}", read.stdout, read.stderr);
+        assert_eq!(read.stdout, expected);
+        backend
+            .terminate(target_request)
+            .await
+            .expect("terminate fork target");
+    }
+
+    backend
+        .terminate(source_request)
+        .await
+        .expect("terminate fork source");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "firecracker")]
+#[ignore = "uses a real Firecracker sandbox; requires Linux KVM or nested virtualization through Lima on macOS"]
+async fn firecracker_snapshot_restores_multiple_independent_targets() {
+    let config = firecracker_test_config();
+    let backend = crate::sandbox_provider::firecracker_backend_for_test(config)
+        .await
+        .expect("Firecracker backend");
+    let image = env_or("FIRECRACKER_IMAGE", &crate::default_firecracker_image());
+    let source_request =
+        provider_contract_request("firecracker", "snapshot-source", image.clone(), "/tmp");
+    let source = backend
+        .acquire(source_request.clone())
+        .await
+        .expect("acquire snapshot source");
+    let write = source
+        .exec(&SandboxCommand {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf %s captured > /tmp/exo-snapshot-state".to_string(),
+            ],
+            env: HashMap::new(),
+            display_argv: None,
+            cwd: Some("/".to_string()),
+            timeout: Some(Duration::from_secs(10)),
+        })
+        .await
+        .expect("write snapshot source state");
+    assert!(write.ok, "{}{}", write.stdout, write.stderr);
+    let snapshot = source.snapshot().await.expect("snapshot source");
+
+    let mutate = source
+        .exec(&SandboxCommand {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf %s mutated > /tmp/exo-snapshot-state".to_string(),
+            ],
+            env: HashMap::new(),
+            display_argv: None,
+            cwd: Some("/".to_string()),
+            timeout: Some(Duration::from_secs(10)),
+        })
+        .await
+        .expect("mutate source after snapshot");
+    assert!(mutate.ok, "{}{}", mutate.stdout, mutate.stderr);
+
+    for target in ["snapshot-target-1", "snapshot-target-2"] {
+        let target_request =
+            provider_contract_request("firecracker", target, image.clone(), "/tmp");
+        let restored = backend
+            .acquire_from_snapshot(target_request.clone(), snapshot.clone())
+            .await
+            .expect("restore snapshot target");
+        let read = restored
+            .exec(&SandboxCommand {
+                argv: vec![
+                    "/bin/cat".to_string(),
+                    "/tmp/exo-snapshot-state".to_string(),
+                ],
+                env: HashMap::new(),
+                display_argv: None,
+                cwd: Some("/".to_string()),
+                timeout: Some(Duration::from_secs(10)),
+            })
+            .await
+            .expect("read restored snapshot state");
+        assert!(read.ok, "{}{}", read.stdout, read.stderr);
+        assert_eq!(read.stdout, "captured");
+        backend
+            .terminate(target_request)
+            .await
+            .expect("terminate restored target");
+    }
+
+    backend
+        .terminate(source_request)
+        .await
+        .expect("terminate snapshot source");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "firecracker")]
+#[ignore = "uses a real Firecracker sandbox; requires Linux KVM or nested virtualization through Lima on macOS"]
+async fn firecracker_adopts_running_machine_after_backend_restart() {
+    let config = firecracker_test_config();
+    let mut request = provider_contract_request(
+        "firecracker",
+        "backend-restart",
+        env_or("FIRECRACKER_IMAGE", &crate::default_firecracker_image()),
+        "/tmp",
+    );
+    let token = format!("exo-reattach-{}", Uuid7::now());
+
+    let backend = crate::sandbox_provider::firecracker_backend_for_test(config.clone())
+        .await
+        .expect("first Firecracker backend");
+    let machine = backend
+        .acquire(request.clone())
+        .await
+        .expect("acquire Firecracker machine");
+    let launch = machine
+        .exec(&SandboxCommand {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "/usr/bin/python3 -c 'import time; time.sleep(300)' {token} >/dev/null 2>&1 & echo $!"
+                ),
+            ],
+            env: HashMap::new(),
+            display_argv: None,
+            cwd: Some("/".to_string()),
+            timeout: Some(Duration::from_secs(10)),
+        })
+        .await
+        .expect("start process that must survive controller restart");
+    assert!(launch.ok, "{}{}", launch.stdout, launch.stderr);
+    let pid = launch
+        .stdout
+        .trim()
+        .parse::<u32>()
+        .expect("guest process pid");
+    request.provider_state = machine.provider_state();
+    drop(machine);
+    drop(backend);
+
+    // On macOS the first Lima bridge exits asynchronously after its final
+    // client is dropped. A new CLI process naturally incurs this delay too.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let backend = crate::sandbox_provider::firecracker_backend_for_test(config)
+        .await
+        .expect("replacement Firecracker backend");
+    let machine = backend
+        .acquire(request.clone())
+        .await
+        .expect("adopt running Firecracker machine");
+    let probe = machine
+        .exec(&SandboxCommand {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("tr '\\0' '\\n' </proc/{pid}/cmdline | grep -Fx -- {token}"),
+            ],
+            env: HashMap::new(),
+            display_argv: None,
+            cwd: Some("/".to_string()),
+            timeout: Some(Duration::from_secs(10)),
+        })
+        .await
+        .expect("probe process after controller restart");
+    assert!(probe.ok, "{}{}", probe.stdout, probe.stderr);
+    backend
+        .terminate(request)
+        .await
+        .expect("terminate adopted Firecracker machine");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "firecracker")]
+#[ignore = "uses a real Firecracker sandbox; requires Linux KVM or nested virtualization through Lima on macOS"]
+async fn firecracker_sandbox_contract_durable_file_system_survives_stop_and_reacquire() {
+    crate::contract_tests::sandbox_backend_durable_file_system_survives_stop_and_reacquire(
+        firecracker_contract_backend().await,
+        firecracker_durable_contract_request("durable-file-system"),
+    )
+    .await
+    .expect("Firecracker sandbox durable filesystem contract");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "firecracker")]
+#[ignore = "uses a real Firecracker sandbox; requires Linux KVM or nested virtualization through Lima on macOS"]
+async fn firecracker_sandbox_contract_workdir_survives_stop_and_reacquire() {
+    crate::contract_tests::sandbox_backend_workdir_survives_stop_and_reacquire(
+        firecracker_contract_backend().await,
+        firecracker_durable_contract_request("workdir"),
+    )
+    .await
+    .expect("Firecracker sandbox workdir contract");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "firecracker")]
+#[ignore = "uses a real Firecracker sandbox; requires Linux KVM or nested virtualization through Lima on macOS"]
+async fn firecracker_sandbox_contract_long_running_process_and_workdir_survive_stop_and_reacquire()
+{
+    crate::contract_tests::sandbox_backend_long_running_process_and_workdir_survive_stop_and_reacquire(
+        firecracker_contract_backend().await,
+        firecracker_durable_contract_request("long-running-process-and-workdir"),
+    )
+    .await
+    .expect("Firecracker sandbox long-running process and workdir contract");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -319,6 +685,53 @@ async fn local_process_contract_handle(
         })
         .await
         .expect("acquire sandbox")
+}
+
+#[cfg(feature = "firecracker")]
+async fn firecracker_contract_backend() -> Arc<dyn ManagedSandboxBackend> {
+    drop(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .try_init(),
+    );
+    crate::sandbox_provider::firecracker_backend_for_test(firecracker_test_config())
+        .await
+        .expect("Firecracker backend from environment")
+}
+
+#[cfg(feature = "firecracker")]
+fn firecracker_test_config() -> crate::FirecrackerConfig {
+    let mut config = crate::FirecrackerConfig::default();
+    if let Some(image) = nonempty_env("FIRECRACKER_IMAGE") {
+        config.allowed_local_images.push(image.into());
+    }
+    config
+}
+
+#[cfg(feature = "firecracker")]
+async fn firecracker_contract_handle(contract: &str) -> Arc<dyn ManagedSandboxHandle> {
+    firecracker_contract_backend()
+        .await
+        .acquire(provider_contract_request(
+            "firecracker",
+            contract,
+            env_or("FIRECRACKER_IMAGE", &crate::default_firecracker_image()),
+            "/",
+        ))
+        .await
+        .expect("acquire Firecracker sandbox")
+}
+
+#[cfg(feature = "firecracker")]
+fn firecracker_durable_contract_request(contract: &str) -> SandboxRequest {
+    let mount_path = durable_contract_mount_path();
+    durable_provider_contract_request(
+        "firecracker",
+        contract,
+        env_or("FIRECRACKER_IMAGE", &crate::default_firecracker_image()),
+        &mount_path,
+    )
 }
 
 async fn daytona_contract_handle(contract: &str) -> Option<Arc<dyn ManagedSandboxHandle>> {
@@ -1830,6 +2243,64 @@ async fn sandbox_provider_state_persists_through_events_after_harness_reload() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn deleting_conversation_terminates_persisted_sandbox_after_harness_reload() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let state = serde_json::json!({
+        "microvm_id": "microvm-test"
+    });
+    let first_backend = Arc::new(TestProviderStateBackend::new(state.clone()));
+    let harness =
+        BasicExoHarness::new_with_sandbox_backend(local_test_config(tempdir.path()), first_backend)
+            .await
+            .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let agent_id = agent.record().id;
+    let conversation = agent
+        .new_conversation(NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    let conversation_id = conversation.record().id;
+    conversation
+        .create_sandbox(provider_state_test_create_request())
+        .await
+        .expect("sandbox should be created");
+    drop(conversation);
+    drop(agent);
+    drop(harness);
+
+    let second_backend = Arc::new(TestProviderStateBackend::new(state.clone()));
+    let reloaded = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        second_backend.clone(),
+    )
+    .await
+    .expect("reloaded harness should initialize");
+    let reloaded_agent = reloaded
+        .get_agent(&agent_id)
+        .await
+        .expect("agent lookup should succeed")
+        .expect("agent should exist");
+
+    assert!(
+        reloaded_agent
+            .delete_conversation(&conversation_id)
+            .await
+            .expect("conversation deletion should succeed")
+    );
+    assert_eq!(
+        second_backend.requests.lock().await.as_slice(),
+        &[Some(state)]
+    );
+    assert_eq!(*second_backend.cleanup_count.lock().await, 1);
+}
+
 fn provider_state_test_create_request() -> CreateSandboxRequest {
     CreateSandboxRequest {
         name: Some("stateful".to_string()),
@@ -1846,6 +2317,7 @@ fn provider_state_test_create_request() -> CreateSandboxRequest {
 struct TestProviderStateBackend {
     state: Value,
     requests: Arc<AsyncMutex<Vec<Option<Value>>>>,
+    cleanup_count: Arc<AsyncMutex<usize>>,
 }
 
 impl TestProviderStateBackend {
@@ -1853,6 +2325,7 @@ impl TestProviderStateBackend {
         Self {
             state,
             requests: Arc::new(AsyncMutex::new(Vec::new())),
+            cleanup_count: Arc::new(AsyncMutex::new(0)),
         }
     }
 }
@@ -1870,6 +2343,7 @@ impl ManagedSandboxBackend for TestProviderStateBackend {
         self.requests.lock().await.push(request.provider_state);
         Ok(Arc::new(TestProviderStateHandle {
             state: self.state.clone(),
+            cleanup_count: Arc::clone(&self.cleanup_count),
         }))
     }
 
@@ -1879,6 +2353,12 @@ impl ManagedSandboxBackend for TestProviderStateBackend {
         _attachment: SandboxAttachment,
     ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
         bail!("test provider-state backend does not support attachment")
+    }
+
+    async fn terminate(&self, request: SandboxRequest) -> crate::Result<()> {
+        self.requests.lock().await.push(request.provider_state);
+        *self.cleanup_count.lock().await += 1;
+        Ok(())
     }
 
     async fn acquire_from_snapshot(
@@ -1892,6 +2372,7 @@ impl ManagedSandboxBackend for TestProviderStateBackend {
 
 struct TestProviderStateHandle {
     state: Value,
+    cleanup_count: Arc<AsyncMutex<usize>>,
 }
 
 #[async_trait]
@@ -1913,6 +2394,7 @@ impl ManagedSandboxHandle for TestProviderStateHandle {
     }
 
     async fn stop(&self) -> crate::Result<()> {
+        *self.cleanup_count.lock().await += 1;
         Ok(())
     }
 
@@ -2136,6 +2618,87 @@ async fn restored_sandbox_image_persists_for_cross_process_reattach() {
     // The reattach must target the restored image, not the originally
     // requested one; otherwise a real backend would boot a second container
     // with pre-restore state.
+    assert_eq!(
+        second_backend.acquired_images.lock().await.as_slice(),
+        &["restored-image".to_string()]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let first_backend = Arc::new(RestoreImageTestBackend::default());
+    let harness = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        first_backend.clone(),
+    )
+    .await
+    .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let agent_id = agent.record().id;
+
+    let source_id = agent
+        .create_sandbox(CreateSandboxRequest {
+            name: Some("source".to_string()),
+            provider: SandboxProvider::LocalProcess,
+            image: "original-image".to_string(),
+            default_workdir: Some("/".to_string()),
+            file_system_mounts: None,
+            durable_file_systems: None,
+            enable_networking: Some(true),
+            idle_seconds: Some(60),
+        })
+        .await
+        .expect("source sandbox should be created");
+    let snapshot_id = agent
+        .snapshot_sandbox(source_id.clone())
+        .await
+        .expect("snapshot should succeed");
+    first_backend.acquired_images.lock().await.clear();
+
+    let target_request = CreateSandboxRequest {
+        name: Some("target".to_string()),
+        provider: SandboxProvider::LocalProcess,
+        image: "original-image".to_string(),
+        default_workdir: Some("/".to_string()),
+        file_system_mounts: None,
+        durable_file_systems: None,
+        enable_networking: Some(true),
+        idle_seconds: Some(60),
+    };
+    let target_id = agent
+        .restore_sandbox(RestoreSandboxRequest {
+            snapshot_id,
+            sandbox: target_request.clone(),
+        })
+        .await
+        .expect("snapshot should restore into a new sandbox");
+    assert_ne!(target_id, source_id);
+    assert!(first_backend.acquired_images.lock().await.is_empty());
+
+    let second_backend = Arc::new(RestoreImageTestBackend::default());
+    let reloaded = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        second_backend.clone(),
+    )
+    .await
+    .expect("reloaded harness should initialize");
+    let reloaded_agent = reloaded
+        .get_agent(&agent_id)
+        .await
+        .expect("agent lookup should succeed")
+        .expect("agent should exist");
+    let reused_target_id = reloaded_agent
+        .create_sandbox(target_request)
+        .await
+        .expect("named target should be reused");
+    assert_eq!(reused_target_id, target_id);
     assert_eq!(
         second_backend.acquired_images.lock().await.as_slice(),
         &["restored-image".to_string()]

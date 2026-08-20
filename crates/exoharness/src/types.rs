@@ -43,10 +43,26 @@ pub trait SnapshotHandle: Send + Sync {
 pub trait SandboxHandle: SnapshotHandle {
     async fn list_sandboxes(&self) -> Result<Vec<SandboxRecord>>;
     async fn create_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId>;
+    async fn fork_sandbox(&self, request: ForkSandboxRequest) -> Result<SandboxId>;
+    /// Create a new sandbox directly from an immutable snapshot. Unlike
+    /// `start_sandbox`, the target need not already exist.
+    async fn restore_sandbox(&self, request: RestoreSandboxRequest) -> Result<SandboxId>;
     async fn terminate_sandbox(&self, id: SandboxId) -> Result<()>;
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId>;
     async fn detach_sandbox(&self, id: SandboxId) -> Result<SandboxAttachment>;
     async fn stop_sandbox(&self, id: SandboxId) -> Result<()>;
+    #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+    async fn sandbox_supports_tcp(&self, _id: SandboxId) -> Result<bool> {
+        Ok(false)
+    }
+    #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+    async fn connect_sandbox_tcp(
+        &self,
+        _id: SandboxId,
+        _port: u16,
+    ) -> Result<Option<crate::BoxSandboxTcpStream>> {
+        Ok(None)
+    }
     async fn start_sandbox_process(
         &self,
         request: StartSandboxProcessRequest,
@@ -639,6 +655,18 @@ pub struct CreateSandboxRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForkSandboxRequest {
+    pub source_id: SandboxId,
+    pub sandbox: CreateSandboxRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestoreSandboxRequest {
+    pub snapshot_id: SnapshotId,
+    pub sandbox: CreateSandboxRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttachSandboxRequest {
     pub attachment: SandboxAttachment,
     pub default_workdir: Option<String>,
@@ -671,6 +699,7 @@ impl SandboxProvider {
     pub const AwsAgentCore: Self = Self::from_static("aws_agentcore");
     pub const AppleContainer: Self = Self::from_static("apple_container");
     pub const Docker: Self = Self::from_static("docker");
+    pub const Firecracker: Self = Self::from_static("firecracker");
     pub const LocalProcess: Self = Self::from_static("local_process");
 
     pub const fn from_static(provider: &'static str) -> Self {
@@ -940,6 +969,10 @@ pub enum SandboxProviderConfig {
         #[serde(default = "crate::sandbox_provider::default_docker_image")]
         default_image: String,
     },
+    Firecracker {
+        #[serde(default = "crate::sandbox_provider::default_firecracker_image")]
+        default_image: String,
+    },
     Daytona {
         /// Secret-store id of the API key.
         api_key_secret_id: SecretId,
@@ -1011,6 +1044,7 @@ impl SandboxProviderConfig {
             Self::Sprites { .. } => SandboxProvider::Sprites,
             Self::Vercel { .. } => SandboxProvider::Vercel,
             Self::Docker { .. } => SandboxProvider::Docker,
+            Self::Firecracker { .. } => SandboxProvider::Firecracker,
             Self::AwsAgentCore { .. } => SandboxProvider::AwsAgentCore,
         }
     }
@@ -1021,6 +1055,7 @@ impl SandboxProviderConfig {
             Self::Daytona { default_image, .. }
             | Self::Vercel { default_image, .. }
             | Self::Docker { default_image, .. }
+            | Self::Firecracker { default_image, .. }
             | Self::E2b { default_image, .. }
             | Self::AwsAgentCore { default_image, .. } => Some(default_image),
             Self::Sprites { .. } => None,
@@ -1247,6 +1282,7 @@ mod tests {
         );
         assert_eq!(SandboxProvider::Vercel.to_string(), "vercel");
         assert_eq!(SandboxProvider::AwsAgentCore.to_string(), "aws_agentcore");
+        assert_eq!(SandboxProvider::Firecracker.to_string(), "firecracker");
         assert_eq!(SandboxProvider::LocalProcess.to_string(), "local_process");
         assert_eq!(
             serde_json::to_value(SandboxProvider::AppleContainer).unwrap(),

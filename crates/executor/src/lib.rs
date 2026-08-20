@@ -58,14 +58,23 @@ pub use exoharness::{
     BindingRecord, ConversationHandle, CreateSandboxRequest, DEFAULT_SANDBOX_IMAGE,
     DaytonaBackendSpec, DurableFileSystem, E2bBackendSpec, EventData, EventId, EventKind,
     EventQuery, EventQueryDirection, ExoHarness, ExoHarnessHttpServeOptions, FileSystemMount,
-    FileSystemMountMode, ForkConversationRequest, HTTP_EXOHARNESS_TRACING_TARGET, HttpExoHarness,
-    NewAgentRequest, PutSecretRequest, RunInSandboxRequest, SANDBOX_MAIN_MOUNT_DIR,
-    SandboxAttachment, SandboxBackendRegistration, SandboxId, SandboxProcess, SandboxProvider,
-    SandboxProviderConfig, SandboxRecord, Secret, SecretBackendChoice, SecretMetadata, SessionId,
-    SnapshotId, SpritesBackendSpec, StartSandboxRequest, ToolRequest, Uuid7, VercelBackendSpec,
-    default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
+    FileSystemMountMode, FirecrackerBackendSpec, ForkConversationRequest,
+    HTTP_EXOHARNESS_TRACING_TARGET, HttpExoHarness, NewAgentRequest, PutSecretRequest,
+    RunInSandboxRequest, SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment, SandboxBackendRegistration,
+    SandboxId, SandboxProcess, SandboxProvider, SandboxProviderConfig, SandboxRecord, Secret,
+    SecretBackendChoice, SecretMetadata, SessionId, SnapshotId, SpritesBackendSpec,
+    StartSandboxRequest, ToolRequest, Uuid7, VercelBackendSpec, default_aws_agentcore_image,
+    default_daytona_image, default_docker_image, default_e2b_template, default_firecracker_image,
     default_vercel_image, serve_exoharness_http_listener,
     serve_exoharness_http_listener_with_options,
+};
+#[cfg(feature = "firecracker")]
+pub use exoharness::{
+    DEFAULT_FIRECRACKER_BINARY, DEFAULT_FIRECRACKER_INITRAMFS, DEFAULT_FIRECRACKER_JAILER,
+    DEFAULT_FIRECRACKER_KERNEL, DEFAULT_FIRECRACKER_STATE_ROOT, DEFAULT_IMAGE_SIZE_GIB,
+    DEFAULT_JAILER_UID_BASE, DEFAULT_MEMORY_MIB, DEFAULT_NETWORK_BYTES_PER_SECOND,
+    DEFAULT_VCPU_COUNT, DEFAULT_WORKSPACE_SIZE_GIB, FirecrackerConfig, FirecrackerLimaConfig,
+    run_firecracker_bridge,
 };
 pub use harness_basic::BasicHarness;
 pub use harness_config::load_agent_config;

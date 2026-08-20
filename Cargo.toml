@@ -3,10 +3,13 @@ members = [
   "crates/cli",
   "crates/cost",
   "crates/exoharness",
+  "crates/firecracker-protocol",
+  "crates/firecracker-guest",
   "crates/executor",
   "exo/scheduler-runner",
 ]
 resolver = "2"
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2024"
@@ -25,7 +28,11 @@ braintrust-sdk-rust = { git = "https://github.com/braintrustdata/braintrust-sdk-
 bytes = "1.10.1"
 chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.48", features = ["derive", "env"] }
+docker_credential = "1.3.2"
+flate2 = "1.1.2"
 futures = "0.3.31"
+ipnet = { version = "2.12.0", features = ["serde"] }
+libc = "0.2.177"
 object_store = { version = "0.12.5", features = [
   "fs",
   "aws",
@@ -33,15 +40,20 @@ object_store = { version = "0.12.5", features = [
   "azure",
   "http",
 ] }
+oci-client = { version = "0.17.0", default-features = false, features = [
+  "rustls-tls",
+] }
 reqwest = { version = "0.12.23", default-features = false, features = [
   "json",
   "rustls-tls",
   "stream",
 ] }
+rustix = { version = "1.1.4", features = ["event", "process"] }
 crossterm = { version = "0.28", features = ["bracketed-paste", "event-stream"] }
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+sha2 = "0.10.9"
 shlex = "1.3.0"
 sqlx = { version = "0.8.6", default-features = false, features = [
   "runtime-tokio-rustls",
@@ -52,6 +64,8 @@ sqlx = { version = "0.8.6", default-features = false, features = [
 ] }
 tabwriter = "1.4.1"
 thiserror = "2.0.17"
+tar = "0.4.46"
+tempfile = "3.23.0"
 tokio = { version = "1.52.1", features = [
   "io-std",
   "io-util",
@@ -68,6 +82,7 @@ tracing = "0.1.44"
 tracing-subscriber = "0.3.20"
 url = "2.5.7"
 uuid = { version = "1.18.1", features = ["serde", "v4", "v7"] }
+zstd = "0.13.3"
 
 lingua = { git = "https://github.com/braintrustdata/lingua.git", rev = "3ab9bcc9b58688be37216e9ab0b3d8362d185cfb" }
 braintrust-llm-router = { git = "https://github.com/braintrustdata/lingua.git", package = "braintrust-llm-router", rev = "3ab9bcc9b58688be37216e9ab0b3d8362d185cfb", default-features = false, features = [

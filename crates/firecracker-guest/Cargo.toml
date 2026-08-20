@@ -1,0 +1,15 @@
+[package]
+name = "exo-firecracker-guest"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64 = "0.22.1"
+exo-firecracker-protocol = { path = "../firecracker-protocol" }
+libc.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+sha2.workspace = true

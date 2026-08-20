@@ -11,10 +11,10 @@ use crate::test_support::local_test_config;
 use crate::{
     BasicExoHarness, BeginTurnRequest, CreateSandboxRequest, EventData, EventKind, EventQuery,
     EventQueryDirection, ExoHarness, HttpExoHarness, ManagedSandboxBackend, ManagedSandboxHandle,
-    RunInSandboxRequest, SandboxAttachment, SandboxCommand, SandboxCommandOutput,
-    SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
-    SandboxProcessStdin, SandboxProvider, SandboxRequest, SnapshotKind, SnapshotPayload,
-    StartSandboxProcessRequest, StartSandboxRequest, WaitSandboxProcessRequest,
+    RestoreSandboxRequest, RunInSandboxRequest, SandboxAttachment, SandboxCommand,
+    SandboxCommandOutput, SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts,
+    SandboxProcessStatus, SandboxProcessStdin, SandboxProvider, SandboxRequest, SnapshotKind,
+    SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, WaitSandboxProcessRequest,
     WriteSandboxProcessInputRequest, serve_exoharness_http_listener,
 };
 
@@ -424,6 +424,79 @@ async fn http_exoharness_supports_turn_scoped_sandbox_snapshot_and_start() {
         Some(turn.record().session_id)
     );
     assert_eq!(restored_start_event.turn_id, Some(turn.record().id));
+}
+
+#[actix_web::test]
+async fn http_exoharness_restores_a_snapshot_into_a_new_sandbox() {
+    let fixture = http_harness_with_sandbox_backend(Arc::new(SnapshotTestSandboxBackend)).await;
+    let agent = fixture
+        .harness
+        .new_agent(crate::NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let conversation = agent
+        .new_conversation(crate::NewConversationRequest::default())
+        .await
+        .expect("conversation");
+    let source_id = conversation
+        .create_sandbox(CreateSandboxRequest {
+            name: Some("source".to_string()),
+            provider: SandboxProvider::LocalProcess,
+            image: "local".to_string(),
+            default_workdir: Some("/".to_string()),
+            file_system_mounts: None,
+            durable_file_systems: None,
+            enable_networking: Some(true),
+            idle_seconds: Some(60),
+        })
+        .await
+        .expect("source sandbox");
+    let snapshot_id = conversation
+        .snapshot_sandbox(source_id.clone())
+        .await
+        .expect("snapshot");
+    let target_id = conversation
+        .restore_sandbox(RestoreSandboxRequest {
+            snapshot_id,
+            sandbox: CreateSandboxRequest {
+                name: Some("target".to_string()),
+                provider: SandboxProvider::LocalProcess,
+                image: "local".to_string(),
+                default_workdir: Some("/".to_string()),
+                file_system_mounts: None,
+                durable_file_systems: None,
+                enable_networking: Some(true),
+                idle_seconds: Some(60),
+            },
+        })
+        .await
+        .expect("restore snapshot into target");
+    assert_ne!(target_id, source_id);
+
+    let events = conversation
+        .get_events(Some(EventQuery {
+            cursor: None,
+            direction: Some(EventQueryDirection::Asc),
+            limit: None,
+            session_id: None,
+            turn_id: None,
+            types: Some(vec![EventKind::SANDBOX_STARTED]),
+        }))
+        .await
+        .expect("events")
+        .events;
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.data,
+            EventData::SandboxStarted {
+                sandbox_id,
+                snapshot_id: Some(event_snapshot_id),
+            } if sandbox_id == &target_id && event_snapshot_id == &snapshot_id
+        )
+    }));
 }
 
 struct SnapshotTestSandboxBackend;
