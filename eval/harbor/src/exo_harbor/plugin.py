@@ -89,7 +89,7 @@ class ExoSessionPlugin(BaseJobPlugin):
             raise RuntimeError("Exo feedback hook ran before job setup")
 
         trial_dir = event.config.trials_dir / event.trial_name
-        sandbox_id = await self._client.create_sandbox_from_snapshot(
+        sandbox_id = await self._client.restore_sandbox(
             conversation, snapshot_id
         )
         logger.info(

@@ -35,7 +35,7 @@ class ExoClient:
             model,
             "--module",
             str(self.repo_root / conventions.HARNESS_MODULE),
-            "--sandbox-provider",
+            "--provider",
             "docker",
             "--sandbox-scope",
             "agent",
@@ -122,21 +122,28 @@ class ExoClient:
             command="conversation sandbox snapshot",
         )
 
-    async def create_sandbox_from_snapshot(
-        self, conversation: str, snapshot_id: str
-    ) -> str:
+    async def restore_sandbox(self, conversation: str, snapshot_id: str) -> str:
+        """Start a new Exo-owned sandbox from a snapshot; return its id.
+
+        The source sandbox is untouched. The new sandbox becomes the
+        conversation's explicitly selected sandbox, so the agent's shell lands
+        inside it on the next turn rather than in the container the trial
+        borrowed, which by now has been torn down.
+        """
         return _parse_trailing_id(
             await self._run(
                 "conversation",
                 "sandbox",
-                "create-from-snapshot",
+                "restore",
                 conventions.AGENT_SLUG,
                 conversation,
                 "--snapshot-id",
                 snapshot_id,
+                "--provider",
+                "docker",
             ),
-            pattern=r"created sandbox (\S+) from snapshot ",
-            command="conversation sandbox create-from-snapshot",
+            pattern=r"restored sandbox (\S+) from snapshot ",
+            command="conversation sandbox restore",
         )
 
     async def read_conversation_events(

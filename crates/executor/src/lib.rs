@@ -46,6 +46,7 @@ pub use conversation_events::{
     HOST_EVENT_REBUILD_AND_RESTART, RebuildUpdateRecord, complete_rebuild_and_restart_update,
     finalize_rebuild_update_file, record_host_event,
 };
+pub use conversation_sandbox::attached_conversation_sandbox;
 pub use conversation_wakeup::send_conversation_wakeup;
 pub use executor_types::{
     AgentConfig, AgentHarnessKind, AgentSandboxConfig, ConversationConfig, ConversationModelConfig,
@@ -60,12 +61,12 @@ pub use exoharness::{
     EventQuery, EventQueryDirection, ExoHarness, ExoHarnessHttpServeOptions, FileSystemMount,
     FileSystemMountMode, FirecrackerBackendSpec, ForkConversationRequest,
     HTTP_EXOHARNESS_TRACING_TARGET, HttpExoHarness, NewAgentRequest, PutSecretRequest,
-    RunInSandboxRequest, SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment, SandboxBackendRegistration,
-    SandboxId, SandboxProcess, SandboxProvider, SandboxProviderConfig, SandboxRecord, Secret,
-    SecretBackendChoice, SecretMetadata, SessionId, SnapshotId, SpritesBackendSpec,
-    StartSandboxRequest, ToolRequest, Uuid7, VercelBackendSpec, default_aws_agentcore_image,
-    default_daytona_image, default_docker_image, default_e2b_template, default_firecracker_image,
-    default_vercel_image, serve_exoharness_http_listener,
+    RestoreSandboxRequest, RunInSandboxRequest, SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment,
+    SandboxBackendRegistration, SandboxId, SandboxProcess, SandboxProvider, SandboxProviderConfig,
+    SandboxRecord, Secret, SecretBackendChoice, SecretMetadata, SessionId, SnapshotId,
+    SpritesBackendSpec, StartSandboxRequest, ToolRequest, Uuid7, VercelBackendSpec,
+    default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
+    default_firecracker_image, default_vercel_image, serve_exoharness_http_listener,
     serve_exoharness_http_listener_with_options,
 };
 #[cfg(feature = "firecracker")]

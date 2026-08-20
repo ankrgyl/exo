@@ -37,14 +37,15 @@ use executor::{
     ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount, FileSystemMountMode,
     FirecrackerBackendSpec, ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART,
     HTTP_EXOHARNESS_TRACING_TARGET, Harness, HarnessAgent, HarnessConversation, HttpExoHarness,
-    LocalSandboxExoHarness, NewAgentRequest, PutSecretRequest, RlmHarness, RunInSandboxRequest,
-    SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment, SandboxBackendRegistration, SandboxProcess,
-    SandboxProvider, SandboxProviderConfig, SandboxScope, Secret, SecretBackendChoice,
-    SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness, TypeScriptHarnessConfig,
-    Uuid7, VercelBackendSpec, default_aws_agentcore_image, default_daytona_image,
-    default_docker_image, default_e2b_template, default_firecracker_image, default_vercel_image,
-    effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config, record_host_event,
-    send_conversation_wakeup, serve_exoharness_http_listener_with_options,
+    LocalSandboxExoHarness, NewAgentRequest, PutSecretRequest, RestoreSandboxRequest, RlmHarness,
+    RunInSandboxRequest, SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment, SandboxBackendRegistration,
+    SandboxProcess, SandboxProvider, SandboxProviderConfig, SandboxScope, Secret,
+    SecretBackendChoice, SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness,
+    TypeScriptHarnessConfig, Uuid7, VercelBackendSpec, attached_conversation_sandbox,
+    default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
+    default_firecracker_image, default_vercel_image, effective_sandbox_scope,
+    finalize_rebuild_update_file, load_agent_config, record_host_event, send_conversation_wakeup,
+    serve_exoharness_http_listener_with_options,
 };
 use serde::Deserialize;
 use tabwriter::TabWriter;
@@ -858,6 +859,25 @@ enum ConversationSandboxCommands {
         agent: String,
         conversation: String,
         sandbox_id: String,
+    },
+    /// Capture a filesystem snapshot of a conversation sandbox and print its id.
+    Snapshot {
+        agent: String,
+        conversation: String,
+        /// Sandbox to snapshot. Defaults to the conversation's attached sandbox.
+        #[arg(long)]
+        sandbox_id: Option<String>,
+    },
+    /// Start a new sandbox from a snapshot, leaving the source untouched.
+    Restore {
+        agent: String,
+        conversation: String,
+        #[arg(long)]
+        snapshot_id: String,
+        #[arg(long, value_enum)]
+        provider: SandboxProviderArg,
+        #[arg(long)]
+        idle_seconds: Option<u64>,
     },
     Run {
         agent: String,
@@ -2120,6 +2140,65 @@ async fn main() -> Result<()> {
                         serde_json::to_string(&attachment)?
                     );
                 }
+                ConversationSandboxCommands::Snapshot {
+                    agent,
+                    conversation,
+                    sandbox_id,
+                } => {
+                    let conversation =
+                        must_get_conversation(harness.as_ref(), &agent, &conversation).await?;
+                    let handle = conversation.exoharness_handle();
+                    let sandbox_id = match sandbox_id {
+                        Some(sandbox_id) => sandbox_id,
+                        None => attached_conversation_sandbox(handle.as_ref())
+                            .await?
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "conversation {} has no attached sandbox; pass --sandbox-id",
+                                    conversation.record().slug
+                                )
+                            })?,
+                    };
+                    let snapshot_id = handle.snapshot_sandbox(sandbox_id.clone()).await?;
+                    println!("snapshotted sandbox {sandbox_id} as {snapshot_id}");
+                }
+                ConversationSandboxCommands::Restore {
+                    agent,
+                    conversation,
+                    snapshot_id,
+                    provider,
+                    idle_seconds,
+                } => {
+                    let snapshot_id = snapshot_id
+                        .parse()
+                        .map_err(|error| anyhow!("invalid snapshot id {snapshot_id}: {error}"))?;
+                    let conversation =
+                        must_get_conversation(harness.as_ref(), &agent, &conversation).await?;
+                    let sandbox_id = conversation
+                        .exoharness_handle()
+                        .restore_sandbox(RestoreSandboxRequest {
+                            snapshot_id,
+                            sandbox: CreateSandboxRequest {
+                                name: None,
+                                provider: SandboxProvider::from(provider),
+                                // The snapshot carries the filesystem; the
+                                // provider binding supplies a base image.
+                                image: String::new(),
+                                default_workdir: None,
+                                file_system_mounts: None,
+                                durable_file_systems: None,
+                                enable_networking: None,
+                                idle_seconds,
+                            },
+                        })
+                        .await?;
+                    println!(
+                        "restored sandbox {} from snapshot {} for {}",
+                        sandbox_id,
+                        snapshot_id,
+                        conversation.record().slug
+                    );
+                }
                 ConversationSandboxCommands::Run {
                     agent,
                     conversation,
@@ -2927,6 +3006,8 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
             ConversationCommands::Sandbox { command } => match command {
                 ConversationSandboxCommands::Attach { agent, .. }
                 | ConversationSandboxCommands::Detach { agent, .. }
+                | ConversationSandboxCommands::Snapshot { agent, .. }
+                | ConversationSandboxCommands::Restore { agent, .. }
                 | ConversationSandboxCommands::Run { agent, .. } => Some(agent.as_str()),
             },
             ConversationCommands::CompleteRebuildUpdate { .. } => None,

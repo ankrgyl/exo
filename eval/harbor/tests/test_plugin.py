@@ -53,7 +53,7 @@ class ExoSessionPluginTest(unittest.IsolatedAsyncioTestCase):
     async def test_reflection_restores_the_submitted_snapshot(self) -> None:
         plugin = ExoSessionPlugin()
         client = AsyncMock()
-        client.create_sandbox_from_snapshot.return_value = "sandbox-new"
+        client.restore_sandbox.return_value = "sandbox-new"
         plugin._client = client
         plugin._model = "gpt-5.5"
         event = trial_event(
@@ -68,7 +68,7 @@ class ExoSessionPluginTest(unittest.IsolatedAsyncioTestCase):
         with patch("exo_harbor.plugin.export_trial_trajectory", AsyncMock()):
             await plugin._reflect_on_trial(event)
 
-        client.create_sandbox_from_snapshot.assert_awaited_once_with(
+        client.restore_sandbox.assert_awaited_once_with(
             "trial-abc", "snapshot-1"
         )
         # Reflection must land in the same conversation as the trial, or the
@@ -82,7 +82,7 @@ class ExoSessionPluginTest(unittest.IsolatedAsyncioTestCase):
         # score -- but raising here forfeits every remaining trial.
         plugin = ExoSessionPlugin()
         client = AsyncMock()
-        client.create_sandbox_from_snapshot.side_effect = OSError(
+        client.restore_sandbox.side_effect = OSError(
             7, "Argument list too long"
         )
         plugin._client = client

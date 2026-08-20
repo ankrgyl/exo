@@ -61,10 +61,17 @@ pub(crate) async fn ensure_conversation_sandbox(
     {
         match candidate {
             ConversationSandboxCandidate::Attached { id } => return Ok(id),
-            ConversationSandboxCandidate::Created(sandbox) if sandbox.matches_spec(&spec) => {
+            ConversationSandboxCandidate::Created {
+                sandbox,
+                explicitly_started: true,
+            } => return Ok(sandbox.id),
+            ConversationSandboxCandidate::Created {
+                sandbox,
+                explicitly_started: false,
+            } if sandbox.matches_spec(&spec) => {
                 return Ok(sandbox.id);
             }
-            ConversationSandboxCandidate::Created(_) => {}
+            ConversationSandboxCandidate::Created { .. } => {}
         }
     }
 
@@ -81,21 +88,57 @@ pub async fn attached_conversation_sandbox(
             .next_back()
         {
             Some(ConversationSandboxCandidate::Attached { id }) => Some(id),
-            Some(ConversationSandboxCandidate::Created(_)) | None => None,
+            Some(ConversationSandboxCandidate::Created { .. }) | None => None,
+        },
+    )
+}
+
+/// The sandbox this conversation was last pointed at on purpose.
+///
+/// `attached_conversation_sandbox` only reports an attachment, so once a
+/// snapshot has been restored into a new sandbox it returns None and callers
+/// fall back to creating one from configuration -- losing the restored state.
+pub(crate) async fn explicitly_selected_conversation_sandbox(
+    conversation: &dyn ConversationHandle,
+) -> Result<Option<String>> {
+    Ok(
+        match conversation_sandbox_candidates(conversation)
+            .await?
+            .into_iter()
+            .next_back()
+        {
+            Some(ConversationSandboxCandidate::Attached { id })
+            | Some(ConversationSandboxCandidate::Created {
+                sandbox: ConversationSandboxInfo { id, .. },
+                explicitly_started: true,
+            }) => Some(id),
+            Some(ConversationSandboxCandidate::Created {
+                explicitly_started: false,
+                ..
+            })
+            | None => None,
         },
     )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ConversationSandboxCandidate {
-    Created(ConversationSandboxInfo),
-    Attached { id: String },
+    Created {
+        sandbox: ConversationSandboxInfo,
+        /// Started from a snapshot rather than merely matching configuration.
+        /// Such a sandbox was asked for by name, so it wins over an attached
+        /// one even though its image no longer matches the conversation spec.
+        explicitly_started: bool,
+    },
+    Attached {
+        id: String,
+    },
 }
 
 impl ConversationSandboxCandidate {
     fn id(&self) -> &str {
         match self {
-            Self::Created(sandbox) => &sandbox.id,
+            Self::Created { sandbox, .. } => &sandbox.id,
             Self::Attached { id } => id,
         }
     }
@@ -138,8 +181,8 @@ async fn conversation_sandbox_candidates(
                 idle_seconds,
                 ..
             } => {
-                candidates.push(ConversationSandboxCandidate::Created(
-                    ConversationSandboxInfo {
+                candidates.push(ConversationSandboxCandidate::Created {
+                    sandbox: ConversationSandboxInfo {
                         id: sandbox_id,
                         provider,
                         image,
@@ -149,13 +192,34 @@ async fn conversation_sandbox_candidates(
                         enable_networking,
                         idle_seconds,
                     },
-                ));
+                    explicitly_started: false,
+                });
             }
             EventData::SandboxAttached { sandbox_id, .. } => {
                 candidates.push(ConversationSandboxCandidate::Attached { id: sandbox_id });
             }
-            EventData::SandboxStarted { sandbox_id, .. } => {
+            EventData::SandboxStarted {
+                sandbox_id,
+                snapshot_id,
+            } => {
                 inactive.remove(&sandbox_id);
+                // A start that names a snapshot was asked for explicitly, so
+                // promote it: its image is the snapshot's and no longer matches
+                // the conversation spec, yet it is the sandbox the caller means.
+                if snapshot_id.is_some()
+                    && let Some(index) = candidates
+                        .iter()
+                        .position(|candidate| candidate.id() == sandbox_id)
+                {
+                    let mut candidate = candidates.remove(index);
+                    if let ConversationSandboxCandidate::Created {
+                        explicitly_started, ..
+                    } = &mut candidate
+                    {
+                        *explicitly_started = true;
+                    }
+                    candidates.push(candidate);
+                }
             }
             EventData::SandboxStopped { sandbox_id }
             | EventData::SandboxDetached { sandbox_id, .. } => {
@@ -195,7 +259,7 @@ pub(crate) async fn conversation_sandboxes(
         .await?
         .into_iter()
         .filter_map(|candidate| match candidate {
-            ConversationSandboxCandidate::Created(sandbox) => Some(sandbox),
+            ConversationSandboxCandidate::Created { sandbox, .. } => Some(sandbox),
             ConversationSandboxCandidate::Attached { .. } => None,
         })
         .collect())
