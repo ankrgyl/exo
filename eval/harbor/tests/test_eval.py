@@ -27,9 +27,28 @@ class EvalScriptTest(unittest.TestCase):
 
         self.assertEqual(args.dataset, "terminal-bench")
         self.assertEqual(args.model, "gpt-5.5")
+        self.assertEqual(args.provider, "openai")
         self.assertIsNone(args.n_tasks)
         self.assertEqual(args.n_attempts, 1)
         self.assertEqual(args.include_task_names, [])
+        self.assertEqual(args.reflection_strategy, "router")
+        self.assertFalse(args.skip_build)
+        self.assertIsNone(args.workspace_root)
+        self.assertIsNone(args.exo_bin)
+        self.assertIsNone(args.output_root)
+
+    def test_skip_build_reuses_existing_binary(self) -> None:
+        args = self.parse(
+            "--skip-build",
+            "--workspace-root=/tmp/workspace",
+            "--exo-bin=/tmp/exo",
+            "--output-root=/tmp/results",
+        )
+
+        self.assertTrue(args.skip_build)
+        self.assertEqual(args.workspace_root, Path("/tmp/workspace"))
+        self.assertEqual(args.exo_bin, Path("/tmp/exo"))
+        self.assertEqual(args.output_root, Path("/tmp/results"))
 
     def test_all_tasks_omits_harbor_limit(self) -> None:
         args = self.parse()
@@ -44,6 +63,7 @@ class EvalScriptTest(unittest.TestCase):
         )
 
         self.assertNotIn("--n-tasks", command)
+        self.assertIn("reflection_strategy=router", command)
 
     def test_flags_override_config_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -51,7 +71,9 @@ class EvalScriptTest(unittest.TestCase):
             config.write_text(
                 'dataset = "terminal-bench-sample"\n'
                 'model = "configured-model"\n'
+                'provider = "openrouter"\n'
                 "n_tasks = 4\n"
+                'reflection_strategy = "memory"\n'
             )
 
             args = self.parse(
@@ -61,6 +83,8 @@ class EvalScriptTest(unittest.TestCase):
         self.assertEqual(args.dataset, "terminal-bench-sample")
         self.assertEqual(args.model, "flag-model")
         self.assertEqual(args.n_tasks, 2)
+        self.assertEqual(args.provider, "openrouter")
+        self.assertEqual(args.reflection_strategy, "memory")
 
     def test_local_dataset_path_can_come_from_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -75,7 +99,8 @@ class EvalScriptTest(unittest.TestCase):
             args = self.parse(f"--config={config}")
 
             self.assertEqual(
-                eval_script.dataset_arguments(args), ["--path", str(dataset)]
+                eval_script.dataset_arguments(args),
+                ["--path", str(dataset.resolve())],
             )
 
     def test_smoke_test_uses_the_bundled_task(self) -> None:
@@ -105,6 +130,19 @@ class EvalScriptTest(unittest.TestCase):
                 "03-restart-policy",
                 "04-timeout-trajectory",
             ],
+        )
+
+    def test_learning_router_transfer_test_uses_bundled_pair(self) -> None:
+        args = self.parse("--dataset=learning-router-transfer-test")
+        dataset = SCRIPT.parent / "datasets/learning-router-transfer-test"
+
+        self.assertEqual(
+            eval_script.dataset_arguments(args),
+            ["--path", str(dataset)],
+        )
+        self.assertEqual(
+            sorted(path.name for path in dataset.iterdir()),
+            ["01-learn-normalization", "02-transfer-normalization"],
         )
 
     def test_terminal_bench_easy_selects_three_tasks(self) -> None:
@@ -166,6 +204,10 @@ class EvalScriptTest(unittest.TestCase):
 
         self.assertIn(
             "Harbor results: /runs/one/jobs/terminal-bench-3/result.json",
+            output.getvalue(),
+        )
+        self.assertIn(
+            "Learning summary: /runs/one/jobs/terminal-bench-3/learning-summary.json",
             output.getvalue(),
         )
         self.assertIn(

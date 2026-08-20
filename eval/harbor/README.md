@@ -79,6 +79,63 @@ limit or override those defaults:
 ./eval.sh --dataset=terminal-bench --model=gpt-5.5 --n-tasks=10 --n-attempts=2
 ```
 
+OpenRouter is supported with an exact model id. Set `OPENROUTER_API_KEY` and
+pass both flags; do not use `openrouter/free` for controlled comparisons because
+the underlying model can change between requests:
+
+```bash
+./eval.sh --dataset=smoke-test --provider=openrouter \
+  --model=z-ai/glm-5.2
+```
+
+The learning-router prototype defaults to `router`. Run the memory-first PR
+#202 prompt as a baseline with the same fixed model and task selection:
+
+```bash
+./eval.sh --dataset=terminal-bench-easy --model=gpt-5.5 \
+  --reflection-strategy=memory
+./eval.sh --dataset=terminal-bench-easy --model=gpt-5.5 \
+  --reflection-strategy=router
+```
+
+For a paired comparison, `compare.sh` snapshots the current source into two
+identical isolated workspaces, gives each arm a fresh Exo root, runs the same
+task sequence with one exact model id, and writes `comparison.json` containing
+router-minus-memory reward and reuse deltas:
+
+```bash
+./compare.sh --dataset=learning-router-transfer-test \
+  --provider=openrouter \
+  --model=z-ai/glm-5.2:free
+```
+
+Do not pass `openrouter/free`: that router can select a different underlying
+model between requests, invalidating the comparison. The isolated workspaces
+are retained under `.local/harbor-comparisons` so agent-created tools or source
+changes can be inspected after the run.
+
+A single paired run is a diagnostic probe, not a stable performance estimate.
+Repeat independent runs with both `--arm-order=memory-first` and
+`--arm-order=router-first`; otherwise provider variance, stochastic tool use,
+or shared rate-limit timing can be mistaken for a router effect.
+
+When running the arms manually instead of through `compare.sh`, use separate
+clean worktrees at the same commit. Separate Exo roots are not sufficient: a
+self-edit or workspace-local tool source from the first arm could contaminate
+the second.
+
+Each run gets a fresh Exo root. After feedback, every completed trial contains
+`agent/learning.json`, which records observable memory, skill, tool, and policy
+mutations made during reflection, plus skill loads and agent-created tool calls
+during task execution. Each route separates attempted, successful, failed, and
+unresolved actions; unresolved means the request had no matching result event.
+The job directory also gets `learning-summary.json`, which aggregates reward,
+routed actions, later skill/tool reuse, and final memory growth without copying
+memory text. `compare.sh` rejects an arm if any trial is missing its reflection
+report, so measurement failures cannot silently appear as zero learning.
+Compare these reports alongside Harbor reward; artifact count alone is not a
+success metric.
+
 Select particular tasks by repeating `--include-task-name`:
 
 ```bash
@@ -96,15 +153,34 @@ For a quick end-to-end check using the bundled tiny task:
 ./eval.sh --dataset=smoke-test --n-tasks=1
 ```
 
-To test self-evolution across trials, run the bundled three-task dataset. Its
+To test self-evolution across trials, run the bundled four-task dataset. Its
 first trial asks Exo to install and use a custom tool; its second trial uses
 the installed tool again from a fresh conversation and container; its third
 trial changes durable agent policy state, rebuilds and restarts Exo, then
-finishes the trial after the adapter reconnects.
+finishes the trial after the adapter reconnects; and its fourth intentionally
+times out to verify that the partial trajectory is still exported.
 
 ```bash
 ./eval.sh --dataset=self-evolution-smoke-test
 ```
+
+That dataset explicitly requests tool installation, so it tests mechanics, not
+the router's judgment. The bundled transfer pair presents the same
+deterministic normalization problem with different data in two fresh
+conversations and never mentions a learning route. Use it to check whether
+reflection independently creates a narrow artifact and whether the second task
+reuses prior learning. The comparison runner verifies that Harbor actually ran
+the learn task before the transfer task; a reversed sequence is invalid rather
+than a transfer test:
+
+```bash
+./eval.sh --dataset=learning-router-transfer-test \
+  --reflection-strategy=router
+```
+
+When `target/debug/exo` is already built from the current checkout, pass
+`--skip-build` to reuse it. This is useful for repeated comparison runs and
+avoids growing Rust build artifacts between experimental arms.
 
 For a short real benchmark run, `terminal-bench-easy` selects three Terminal
 Bench 2 tasks marked easy: `fix-git`, `prove-plus-comm`, and

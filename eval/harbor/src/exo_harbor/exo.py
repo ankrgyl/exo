@@ -23,6 +23,7 @@ class ExoClient:
     exo_bin: Path
     exo_root: Path
     repo_root: Path
+    sandbox_backend: str = "docker"
 
     async def ensure_agent(self, model: str) -> None:
         """Create the persistent evaluation agent if it does not exist."""
@@ -191,6 +192,8 @@ class ExoClient:
             str(self.exo_root),
             "--harness",
             "exo",
+            "--sandbox-backend",
+            self.sandbox_backend,
             *args,
         ]
 

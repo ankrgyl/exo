@@ -40,6 +40,18 @@ Using the same conversation preserves the reasoning and trajectory for that
 trial. Using the same filesystem state lets Exo inspect its submitted work.
 Agent-scoped state remains the mechanism by which lessons affect later trials.
 
+## Task boundary
+
+For this evaluation, a task is one externally specified Harbor trial: an
+instruction, a starting container, a resource budget, and a verifier that
+produces the reward and logs. Each task receives a fresh conversation and
+filesystem environment. The Exo agent identity and its agent-scoped memory,
+skills, tools, and source changes persist across tasks.
+
+This boundary matters to the experiment. Repeating a task measures recovery
+from prior feedback; performance on a new task measures whether the learning
+transfers. Neither should be inferred only from the amount of state Exo writes.
+
 ## Protocol
 
 The successful `trial_complete` response gains `snapshot_id`:
@@ -89,9 +101,81 @@ phase, starting from the snapshot recorded at trial completion.
 
 The reflection prompt should tell Exo to inspect its prior work and the restored
 filesystem, understand what succeeded or failed, and extract general lessons
-that will help on similar future tasks. It should explicitly consider durable
-memories, reusable tools, and changes to its own policy or implementation. The
-goal is learning, not repairing the already-graded submission.
+that will help on similar future tasks. It should route each lesson to the
+narrowest durable form that fits: memory for concise cross-task facts and
+heuristics, skills for reusable procedures, tools for repeated mechanical work,
+and policy or implementation for broad agent behavior. Task-specific details
+and unsupported guesses should be discarded. The prompt must not require every
+lesson to become a memory, and it should ask Exo to avoid duplicate or
+superseded memories. The goal is learning, not repairing the already-graded
+submission.
+
+## Learning-router prototype
+
+The Harbor plugin accepts two reflection strategies:
+
+- `memory` preserves the original PR #202 prompt, which asks Exo to put every
+  useful general lesson in durable memory and optionally create tools or change
+  its implementation.
+- `router` asks Exo to choose the narrowest useful destination: memory for a
+  stable fact or heuristic, skill for a reusable procedure, tool for a repeated
+  deterministic operation, policy or implementation for a broad behavior
+  change, and discard for task-specific or unsupported conclusions.
+
+After reflection, Harbor writes `agent/learning.json` beside the trajectory.
+The report counts actual successful calls to `remember`, `install_skill`,
+`install_agent_tool`, `manage_tool`, and the corresponding removal or restart
+tools. It does not treat the reflection summary as proof that learning was
+persisted. Discard decisions are intentionally not counted because they have no
+observable durable mutation. The report also records successful `use_skill`
+calls and calls whose tool-result source is `agent` during the task phase. This
+makes later skill and self-created-tool reuse observable. Installs performed in
+the same task are tracked and excluded from the prior-task reuse metric; memory
+reuse remains implicit because all durable memories are currently injected
+into every turn.
+
+At job end, Harbor writes `learning-summary.json` in the job directory. It
+aggregates reward; attempted, successful, failed, and unresolved actions by
+route; later skill/tool reuse; and the final durable-memory count, with the
+fixed model and task name recorded for comparison. An unresolved action was
+requested but has no matching result event. Because every comparison run
+starts with a fresh Exo root, that final count is also the run's memory growth.
+The summary counts memory entries without copying their text. A comparison is
+invalid if any completed trial is missing its reflection report; the comparison
+runner rejects that arm instead of treating missing instrumentation as zero
+learning.
+
+The first controlled comparison should run both strategies from separate fresh
+Exo roots **and separate clean source checkouts created from the same commit**,
+with the same fixed model, selected tasks, task order, attempt count, and
+resource limits. A fresh Exo root alone is insufficient because a genuine
+self-edit or workspace-local tool source can otherwise contaminate the next
+experimental arm. Compare Harbor reward with memory, skill, tool, and policy
+actions from `learning.json`. Same-task reruns measure recovery; a held-out task
+set is still required to measure transfer.
+
+One paired run is only a diagnostic probe. Repeat independent comparisons with
+both arm orders so stochastic tool behavior, provider variance, and shared
+rate-limit timing are not mistaken for effects of the reflection strategy.
+
+The current Harbor attached task sandbox and restored feedback sandbox do not
+mount the Exo source checkout. Memory, skills, and legacy generated tools are
+actionable, but source-level policy changes are not yet a complete experimental
+route. `rebuild_and_restart_exo` without an actual source change must not count
+as improvement. Testing policy/code routing requires an isolated writable
+checkout integration; it must not share a checkout between the baseline and
+router arms.
+
+The bundled `self-evolution-smoke-test` forces tool creation and reuse, so it is
+only an integration test. The `learning-router-transfer-test` is the first
+router-behavior probe: two fresh task environments apply the same deterministic
+record-normalization rule to different inputs, without naming memory, skills,
+or tools. Harbor still verifies output externally. The first reflection has an
+opportunity to create a reusable artifact; the second task's report shows
+whether prior learning was actually reused. This is a targeted transfer probe,
+not evidence of broad benchmark improvement. The comparison must reject a run
+unless the recorded task sequence places the learn task before the transfer
+task; local dataset discovery order is not itself experimental evidence.
 
 ## Exoharness changes
 

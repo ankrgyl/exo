@@ -2,11 +2,10 @@
 dataset = "terminal-bench"
 # For a shorter run of three easy tasks, use "terminal-bench-easy".
 model = "gpt-5.5"
+provider = "openai"
 n_tasks = 10
 n_attempts = 1
-
-# "shared" measures learning across tasks. "per_task" isolates task context
-# while retaining agent-level state such as tools, memory, and source changes.
+reflection_strategy = "router"
 
 # Endless Terminals is currently a local dataset rather than a Harbor registry
 # entry. To run it, replace dataset above and set its local path.

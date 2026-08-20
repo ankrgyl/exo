@@ -28,7 +28,8 @@ from harbor.trial.hooks import TrialHookEvent
 
 from exo_harbor import conventions
 from exo_harbor.exo import ExoClient
-from exo_harbor.feedback import REFLECTION_INSTRUCTIONS, build_feedback
+from exo_harbor.feedback import build_feedback, reflection_instructions
+from exo_harbor.learning import export_job_learning_summary, export_learning_report
 from exo_harbor.protocol import TrialFeedback, send_trial_feedback
 from exo_harbor.trajectory import export_trial_trajectory
 
@@ -45,13 +46,17 @@ class ExoSessionPlugin(BaseJobPlugin):
         # kwargs in on_job_start so it stays a single source of truth.
         adapter_start_timeout_sec: float | str = 90,
         feedback_timeout_sec: float | str = 600,
+        reflection_strategy: str = "router",
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self._adapter_start_timeout_sec = float(adapter_start_timeout_sec)
         self._feedback_timeout_sec = float(feedback_timeout_sec)
+        self._reflection_strategy = reflection_strategy
+        self._reflection_instructions = reflection_instructions(reflection_strategy)
         self._client: ExoClient | None = None
         self._model: str | None = None
+        self._job_dir: Path | None = None
 
     async def on_job_start(self, job: Job) -> None:
         """Bring Exo up before the first container is built."""
@@ -89,6 +94,7 @@ class ExoSessionPlugin(BaseJobPlugin):
         )
         self._client = client
         self._model = model
+        self._job_dir = job.job_dir
         job.on_trial_ended(self._reflect_on_trial)
         logger.info("Exo ready for job %s on %s", job.id, socket_path)
 
@@ -112,7 +118,7 @@ class ExoSessionPlugin(BaseJobPlugin):
             TrialFeedback(
                 request_id=str(uuid4()),
                 target=str(result.id),
-                instructions=REFLECTION_INSTRUCTIONS,
+                instructions=self._reflection_instructions,
                 feedback=build_feedback(result, trial_dir / "verifier"),
             ),
             timeout_sec=self._feedback_timeout_sec,
@@ -127,17 +133,42 @@ class ExoSessionPlugin(BaseJobPlugin):
             self._model,
             trial_dir / "agent" / "trajectory.json",
         )
+        await _export_learning_report(
+            self._client,
+            conversation_id,
+            str(result.id),
+            self._reflection_strategy,
+            response.summary,
+            trial_dir / "agent" / "learning.json",
+        )
         logger.info("trial %s feedback complete", result.id)
 
-    async def on_job_end(self, _job_result: JobResult) -> None:
+    async def on_job_end(self, job_result: JobResult) -> None:
         """Discard temporary snapshots while retaining the run's other artifacts."""
         if self._client is None:
             return
+        if self._job_dir is not None and self._model is not None:
+            trial_metadata = {
+                trial.trial_name: {
+                    "task_name": trial.task_name,
+                    "rewards": (
+                        trial.verifier_result.rewards
+                        if trial.verifier_result is not None
+                        and trial.verifier_result.rewards is not None
+                        else {}
+                    ),
+                }
+                for trial in job_result.trial_results
+            }
+            _export_job_learning_summary(
+                job_dir=self._job_dir,
+                exo_root=self._client.exo_root,
+                strategy=self._reflection_strategy,
+                model=self._model,
+                trial_metadata=trial_metadata,
+            )
         count = await self._client.delete_snapshots()
         logger.info("deleted %d Exo snapshot directories", count)
-
-# TODO: add on_job_end to produce a report on the learnings obtained during
-# the trial.
 
 
 async def _export_trajectory(
@@ -159,3 +190,44 @@ async def _export_trajectory(
         )
     except Exception:
         logger.exception("failed to export Harbor trajectory for %s", trial_id)
+
+
+async def _export_learning_report(
+    client: ExoClient,
+    conversation_id: str,
+    trial_id: str,
+    strategy: str,
+    reflection_summary: str | None,
+    destination: Path,
+) -> None:
+    try:
+        await export_learning_report(
+            client,
+            conversation_id,
+            trial_id,
+            strategy,
+            reflection_summary,
+            destination,
+        )
+    except Exception:
+        logger.exception("failed to export learning report for %s", trial_id)
+
+
+def _export_job_learning_summary(
+    *,
+    job_dir: Path,
+    exo_root: Path,
+    strategy: str,
+    model: str,
+    trial_metadata: dict[str, dict[str, Any]],
+) -> None:
+    try:
+        export_job_learning_summary(
+            job_dir=job_dir,
+            exo_root=exo_root,
+            strategy=strategy,
+            model=model,
+            trial_metadata=trial_metadata,
+        )
+    except Exception:
+        logger.exception("failed to export job learning summary")
