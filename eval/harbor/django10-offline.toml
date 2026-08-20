@@ -1,0 +1,15 @@
+dataset = "swe-bench/swe-bench-verified@latest"
+model = "gpt-5.6-sol"
+n_attempts = 1
+include_task_names = [
+  "swe-bench/django__django-16938",
+  "swe-bench/django__django-10554",
+  "swe-bench/django__django-16950",
+  "swe-bench/django__django-16032",
+  "swe-bench/django__django-14311",
+  "swe-bench/django__django-16901",
+  "swe-bench/django__django-15973",
+  "swe-bench/django__django-13121",
+  "swe-bench/django__django-14631",
+  "swe-bench/django__django-15022",
+]

@@ -1,0 +1,4 @@
+dataset = "swe-bench/swe-bench-verified@latest"
+model = "gpt-5.5"
+n_attempts = 1
+include_task_names = ["swe-bench/django__django-16938", "swe-bench/django__django-10554"]

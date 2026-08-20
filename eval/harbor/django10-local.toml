@@ -1,0 +1,17 @@
+# Runs against the local clone of harbor-datasets, so the agent-phase
+# network policy is written into files we own rather than a download cache.
+dataset_path = "/home/fuzz/harbor/datasets/datasets/swebench-verified"
+model = "gpt-5.6-sol"
+n_attempts = 1
+include_task_names = [
+  "django__django-16938",
+  "django__django-10554",
+  "django__django-16950",
+  "django__django-16032",
+  "django__django-14311",
+  "django__django-16901",
+  "django__django-15973",
+  "django__django-13121",
+  "django__django-14631",
+  "django__django-15022",
+]
