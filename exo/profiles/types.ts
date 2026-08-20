@@ -4,7 +4,7 @@ import type {
   TurnContext,
 } from "@exo/harness";
 
-export type ExoProfileName = "bootstrap" | "practical";
+export type ExoProfileName = "bootstrap" | "practical" | "offline";
 
 export interface ExoProfile {
   name: ExoProfileName;

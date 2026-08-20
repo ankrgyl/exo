@@ -4,6 +4,32 @@ import { describe, expect, it } from "vitest";
 import { resolveExoProfile } from "./index";
 
 describe("Exo profiles", () => {
+  it("offline is practical minus web reach", () => {
+    const context = {
+      agentConfig: { enableAgentToolCreation: true },
+    } as TurnContext;
+    const names = (profile: string) => {
+      const tools = new HarnessToolRegistry(context);
+      resolveExoProfile(profile).registerTools(tools, context);
+      return tools.definitions().map(({ name }) => name);
+    };
+
+    const practical = names("practical");
+    const offline = names("offline");
+
+    // The web tools run host-side, so only withholding them removes the
+    // ability to fetch a benchmark's reference solution.
+    expect(practical).toContain("web_fetch");
+    expect(practical).toContain("web_search");
+    expect(offline).not.toContain("web_fetch");
+    expect(offline).not.toContain("web_search");
+    // Everything that makes self-improvement measurable stays.
+    expect(offline).toContain("remember");
+    expect(
+      practical.filter((n) => n !== "web_fetch" && n !== "web_search"),
+    ).toEqual(offline);
+  });
+
   it("defaults to the practical profile", () => {
     expect(resolveExoProfile(undefined).name).toBe("practical");
   });
@@ -77,7 +103,7 @@ describe("Exo profiles", () => {
 
   it("rejects unknown profiles", () => {
     expect(() => resolveExoProfile("unknown")).toThrow(
-      "expected bootstrap or practical",
+      "expected bootstrap, practical, offline",
     );
   });
 });

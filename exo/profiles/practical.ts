@@ -3,6 +3,7 @@ import {
   registerAdapterTools,
   registerSkillTools,
   type BuiltInToolName,
+  type TurnContext,
 } from "@exo/harness";
 
 import { registerGuardianTools } from "../tools/guardian-tools";
@@ -24,21 +25,32 @@ export const practicalProfile: ExoProfile = {
     return names;
   },
   registerTools(tools, context) {
-    const libraryTools = new HarnessToolRegistry(context);
-    registerSchedulerTools(libraryTools);
-    registerAdapterTools(libraryTools);
-    registerIntrospectionTools(libraryTools);
-    registerSandboxTools(libraryTools);
-    registerMemoryTools(libraryTools);
-    registerTodoTools(libraryTools);
-    registerSkillTools(libraryTools);
-    registerWebTools(libraryTools);
-    for (const tool of libraryTools.instances()) {
-      tools.register({ ...tool, source: "library" });
-    }
-    registerGuardianTools(tools);
+    registerPracticalTools(tools, context, { web: true });
   },
 };
+
+/** Shared by `practical` and `offline`, which differ only in web access. */
+export function registerPracticalTools(
+  tools: HarnessToolRegistry,
+  context: TurnContext,
+  { web }: { web: boolean },
+): void {
+  const libraryTools = new HarnessToolRegistry(context);
+  registerSchedulerTools(libraryTools);
+  registerAdapterTools(libraryTools);
+  registerIntrospectionTools(libraryTools);
+  registerSandboxTools(libraryTools);
+  registerMemoryTools(libraryTools);
+  registerTodoTools(libraryTools);
+  registerSkillTools(libraryTools);
+  if (web) {
+    registerWebTools(libraryTools);
+  }
+  for (const tool of libraryTools.instances()) {
+    tools.register({ ...tool, source: "library" });
+  }
+  registerGuardianTools(tools);
+}
 
 function bootstrapBuiltInToolNames(): BuiltInToolName[] {
   return ["shell", "inspect_tools", "manage_tool"];
