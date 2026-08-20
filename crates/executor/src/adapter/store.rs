@@ -342,8 +342,7 @@ impl AdapterStore {
         message.last_error = None;
         fs::create_dir_all(self.delivered_dir(adapter_id)).await?;
         write_json_file(&self.delivered_path(adapter_id, message_id), &message).await?;
-        remove_file_if_exists(self.inflight_path(adapter_id, message_id)).await?;
-        remove_file_if_exists(self.outbox_path(adapter_id, message_id)).await?;
+        self.remove_pending_copies(adapter_id, message_id).await?;
         Ok(Some(message))
     }
 
@@ -361,18 +360,21 @@ impl AdapterStore {
         };
         message.last_error = Some(error.into());
         message.updated_at_ms = now_ms();
-        remove_file_if_exists(self.inflight_path(adapter_id, message_id)).await?;
-        remove_file_if_exists(self.outbox_path(adapter_id, message_id)).await?;
+        // Write the message's next home before retiring its current one. The
+        // other order has an instant where the message exists nowhere, and a
+        // failed write (or a crash) in that instant loses it for good.
         if message.attempt >= MAX_DELIVERY_ATTEMPTS {
             message.status = AdapterDeliveryStatus::Failed;
             message.completed_at_ms = Some(message.updated_at_ms);
             fs::create_dir_all(self.failed_dir(adapter_id)).await?;
             write_json_file(&self.failed_path(adapter_id, message_id), &message).await?;
+            remove_file_if_exists(self.outbox_path(adapter_id, message_id)).await?;
         } else {
             message.status = AdapterDeliveryStatus::Queued;
             fs::create_dir_all(self.outbox_dir(adapter_id)).await?;
             write_json_file(&self.outbox_path(adapter_id, message_id), &message).await?;
         }
+        remove_file_if_exists(self.inflight_path(adapter_id, message_id)).await?;
         Ok(Some(message))
     }
 
@@ -582,6 +584,12 @@ impl AdapterStore {
             }
         }
         Ok(None)
+    }
+
+    /// Retires every copy of a message that is still queued or in flight.
+    async fn remove_pending_copies(&self, adapter_id: &str, message_id: &str) -> Result<()> {
+        remove_file_if_exists(self.inflight_path(adapter_id, message_id)).await?;
+        remove_file_if_exists(self.outbox_path(adapter_id, message_id)).await
     }
 
     fn target_conversations_dir(&self, adapter_id: &str) -> PathBuf {
@@ -894,6 +902,38 @@ mod tests {
         assert_eq!(claimed_again.len(), 1);
         assert_eq!(claimed_again[0].id, message.id);
         assert_eq!(claimed_again[0].attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn nack_that_cannot_write_the_replacement_keeps_the_message() {
+        let tempdir = TempDir::new().unwrap();
+        let store = AdapterStore::new(tempdir.path());
+        let message = store
+            .enqueue_outbound_message("adapter".to_string(), "hello".to_string(), None, Vec::new())
+            .await
+            .unwrap();
+        store.claim_outbound_messages("adapter").await.unwrap();
+
+        // Make the requeue destination unwritable: a plain file where the
+        // outbox directory has to be. The nack fails either way; what matters
+        // is that the only remaining copy of the message survives it.
+        let outbox_dir = store.outbox_dir("adapter");
+        fs::remove_dir_all(&outbox_dir).await.unwrap();
+        fs::write(&outbox_dir, b"not a directory").await.unwrap();
+        store
+            .nack_outbound_message("adapter", &message.id, "worker failed")
+            .await
+            .unwrap_err();
+
+        fs::remove_file(&outbox_dir).await.unwrap();
+        store.requeue_inflight_messages("adapter").await.unwrap();
+        let claimed = store.claim_outbound_messages("adapter").await.unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "a failed nack must leave the message recoverable, not destroy it"
+        );
+        assert_eq!(claimed[0].id, message.id);
     }
 
     #[tokio::test]
