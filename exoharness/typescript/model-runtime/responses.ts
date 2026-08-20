@@ -440,7 +440,17 @@ export class ChatCompletionsRuntime implements ResponsesRuntimeLike {
   private async completeRaw(
     body: ChatCompletionCreateParamsNonStreaming,
   ): Promise<ChatCompletion> {
-    return this.client.chat.completions.create(body);
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const completion = await this.client.chat.completions.create(body);
+      const envelopeError = chatCompletionEnvelopeError(completion);
+      if (envelopeError === null) return completion;
+      if (!envelopeError.retryable || attempt === maxAttempts) {
+        throw envelopeError;
+      }
+      await delay(250 * 2 ** (attempt - 1));
+    }
+    throw new Error("chat completion retry loop ended unexpectedly");
   }
 
   private async completeStreamRaw(
@@ -918,6 +928,67 @@ function chatCompletionToResponse(completion: ChatCompletion): Response {
     output,
     usage: chatUsageToResponseUsage(completion.usage),
   } as unknown as Response;
+}
+
+interface ChatCompletionErrorEnvelope {
+  error?: {
+    code?: number | string;
+    message?: string;
+    metadata?: {
+      error_type?: string;
+    };
+  };
+}
+
+class ChatCompletionEnvelopeError extends Error {
+  constructor(
+    message: string,
+    readonly retryable: boolean,
+  ) {
+    super(message);
+    this.name = "ChatCompletionEnvelopeError";
+  }
+}
+
+function chatCompletionEnvelopeError(
+  completion: ChatCompletion,
+): ChatCompletionEnvelopeError | null {
+  if (Array.isArray(completion.choices) && completion.choices.length > 0) {
+    return null;
+  }
+
+  const envelope = completion as ChatCompletion & ChatCompletionErrorEnvelope;
+  const code = envelope.error?.code;
+  const errorType = envelope.error?.metadata?.error_type;
+  const message =
+    envelope.error?.message ??
+    "response did not contain any completion choices";
+  const retryableCodes = new Set(["408", "429", "500", "502", "503", "504"]);
+  const retryableTypes = new Set([
+    "provider_overloaded",
+    "provider_unavailable",
+    "rate_limit_exceeded",
+    "server",
+    "timeout",
+    "unmapped",
+  ]);
+  const retryable =
+    code === undefined ||
+    retryableCodes.has(String(code)) ||
+    (errorType !== undefined && retryableTypes.has(errorType));
+  const details = [
+    code === undefined ? null : `code=${code}`,
+    errorType === undefined ? null : `type=${errorType}`,
+  ].filter((value): value is string => value !== null);
+  const suffix = details.length === 0 ? "" : ` (${details.join(", ")})`;
+  return new ChatCompletionEnvelopeError(
+    `chat completion provider error${suffix}: ${message}`,
+    retryable,
+  );
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 class ChatCompletionAccumulator {
