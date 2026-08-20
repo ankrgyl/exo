@@ -1,6 +1,6 @@
 // Feishu (Lark) adapter worker.
 //
-// Mirrors the IRC / Slack worker pattern for Feishu and Lark:
+// Built on the official Lark SDK:
 //   - Lark.Client for outbound messages (im.message.create)
 //   - Lark.WSClient for inbound messages over the open platform's
 //     long-connection mode, so no public callback URL is required. The

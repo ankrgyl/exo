@@ -39,8 +39,7 @@ export function parseInboundEvent(
   const chatType =
     typeof message.chat_type === "string" ? message.chat_type : null;
   const mentionedBot = isMentionedBot(message);
-  // DMs always wake the agent; mentions_only only filters group chatter,
-  // matching the Slack adapter's wake semantics.
+  // DMs always wake the agent; mentions_only only filters group chatter.
   if (trigger === "mentions_only" && chatType !== "p2p" && !mentionedBot) {
     return null;
   }
