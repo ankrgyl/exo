@@ -304,7 +304,8 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
             }
             SnapshotKind::E2bSnapshot
             | SnapshotKind::SpritesSnapshot
-            | SnapshotKind::SmolMachinePack => bail!(
+            | SnapshotKind::SmolMachinePack
+            | SnapshotKind::FirecrackerSnapshot => bail!(
                 "the Daytona backend cannot restore a {:?} payload; \
                  select the provider that produced the snapshot",
                 payload.kind

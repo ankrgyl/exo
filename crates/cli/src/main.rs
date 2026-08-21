@@ -16,37 +16,54 @@ mod tui;
 mod tui_app;
 
 use std::collections::HashMap;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
+#[cfg(feature = "firecracker")]
+use std::net::Ipv4Addr;
 use std::net::{SocketAddr, TcpListener};
+#[cfg(feature = "firecracker")]
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use executor::{
-    AgentHarnessKind, AttachSandboxRequest, BasicExoHarness, BasicExoHarnessConfig, BasicHarness,
-    BasicToolRuntime, Binding, BraintrustProject, BraintrustRuntimeConfig, BraintrustTracingConfig,
-    ConversationModelConfig, CreateAgentRequest, CreateConversationRequest, DaytonaBackendSpec,
+    AgentHandle, AgentHarnessKind, AttachSandboxRequest, BasicExoHarness, BasicExoHarnessConfig,
+    BasicHarness, BasicToolRuntime, Binding, BraintrustProject, BraintrustRuntimeConfig,
+    BraintrustTracingConfig, ConversationModelConfig, CreateAgentRequest,
+    CreateConversationRequest, CreateSandboxRequest, DaytonaBackendSpec, DurableFileSystem,
     E2bBackendSpec, EventKind, EventQuery, EventQueryDirection, ExoHarness,
     ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount, FileSystemMountMode,
-    ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART, HTTP_EXOHARNESS_TRACING_TARGET,
-    Harness, HarnessAgent, HarnessConversation, HttpExoHarness, LocalSandboxExoHarness,
-    PutSecretRequest, RlmHarness, SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment,
-    SandboxBackendRegistration, SandboxProvider, SandboxProviderConfig, SandboxScope, Secret,
-    SecretBackendChoice, SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness,
-    TypeScriptHarnessConfig, Uuid7, VercelBackendSpec, default_aws_agentcore_image,
-    default_daytona_image, default_docker_image, default_e2b_template, default_vercel_image,
+    FirecrackerBackendSpec, ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART,
+    HTTP_EXOHARNESS_TRACING_TARGET, Harness, HarnessAgent, HarnessConversation, HttpExoHarness,
+    LocalSandboxExoHarness, NewAgentRequest, PutSecretRequest, RlmHarness, RunInSandboxRequest,
+    SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment, SandboxBackendRegistration, SandboxProcess,
+    SandboxProvider, SandboxProviderConfig, SandboxScope, Secret, SecretBackendChoice,
+    SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness, TypeScriptHarnessConfig,
+    Uuid7, VercelBackendSpec, default_aws_agentcore_image, default_daytona_image,
+    default_docker_image, default_e2b_template, default_firecracker_image, default_vercel_image,
     effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config, record_host_event,
     send_conversation_wakeup, serve_exoharness_http_listener_with_options,
 };
 use serde::Deserialize;
 use tabwriter::TabWriter;
+use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+
+#[cfg(feature = "firecracker")]
+use executor::{
+    DEFAULT_FIRECRACKER_BINARY, DEFAULT_FIRECRACKER_INITRAMFS, DEFAULT_FIRECRACKER_JAILER,
+    DEFAULT_FIRECRACKER_KERNEL, DEFAULT_FIRECRACKER_STATE_ROOT, DEFAULT_IMAGE_SIZE_GIB,
+    DEFAULT_JAILER_UID_BASE, DEFAULT_MEMORY_MIB, DEFAULT_NETWORK_BYTES_PER_SECOND,
+    DEFAULT_VCPU_COUNT, DEFAULT_WORKSPACE_SIZE_GIB, FirecrackerConfig, FirecrackerLimaConfig,
+};
 
 use crate::env::CliEnvironment;
 use crate::render::{Verbosity, print_message};
 use tui::run_chat_repl;
+
+const SANDBOX_CLI_AGENT_SLUG: &str = "__exo_sandbox_cli";
 
 #[derive(Debug, Parser)]
 #[command(name = "exo")]
@@ -64,8 +81,6 @@ struct Cli {
     secret_backend: Option<SecretBackendArg>,
     #[arg(long, global = true, env = "EXO_MASTER_KEY_PATH")]
     master_key_path: Option<PathBuf>,
-    #[arg(long, global = true, value_enum, env = "EXO_SANDBOX_BACKEND")]
-    sandbox_backend: Option<SandboxBackendArg>,
     #[arg(long, global = true)]
     env_file: Option<PathBuf>,
     #[arg(long, global = true)]
@@ -101,6 +116,193 @@ struct Cli {
     pricing_url: Option<String>,
     #[command(subcommand)]
     command: Commands,
+}
+
+#[cfg(feature = "firecracker")]
+#[derive(Debug, Args)]
+struct FirecrackerArgs {
+    /// Restrict the materializer to these OCI registry entry points. Repeat or
+    /// comma-separate values; unset means unrestricted.
+    #[arg(
+        long = "firecracker-allowed-registry",
+        value_name = "REGISTRY",
+        value_delimiter = ','
+    )]
+    allowed_registries: Vec<String>,
+    /// Permit these exact local ext4 images as Firecracker roots (repeatable).
+    #[arg(long = "firecracker-allowed-local-image", value_name = "PATH")]
+    allowed_local_images: Vec<PathBuf>,
+    /// Admit these private or special-use IPv4 ranges for guest egress. Repeat
+    /// or comma-separate values.
+    #[arg(
+        long = "firecracker-allowed-egress-cidr",
+        value_name = "CIDR",
+        value_delimiter = ','
+    )]
+    allowed_egress_cidrs: Vec<String>,
+    /// Maximum number of Firecracker VMs this Exo process may own.
+    #[arg(long = "firecracker-max-machines", value_name = "COUNT")]
+    max_machines: Option<NonZeroUsize>,
+    /// Firecracker VMM executable.
+    #[arg(
+        long = "firecracker-binary",
+        env = "EXO_FIRECRACKER_BINARY",
+        default_value = DEFAULT_FIRECRACKER_BINARY
+    )]
+    firecracker_bin: PathBuf,
+    /// Jailer executable matching the Firecracker VMM version.
+    #[arg(
+        long = "firecracker-jailer",
+        env = "EXO_FIRECRACKER_JAILER",
+        default_value = DEFAULT_FIRECRACKER_JAILER
+    )]
+    jailer_bin: PathBuf,
+    /// Uncompressed guest kernel image.
+    #[arg(
+        long = "firecracker-kernel",
+        env = "EXO_FIRECRACKER_KERNEL",
+        default_value = DEFAULT_FIRECRACKER_KERNEL
+    )]
+    kernel: PathBuf,
+    /// Guest initramfs containing the Exo guest agent.
+    #[arg(
+        long = "firecracker-initramfs",
+        env = "EXO_FIRECRACKER_INITRAMFS",
+        default_value = DEFAULT_FIRECRACKER_INITRAMFS
+    )]
+    initramfs: PathBuf,
+    /// Root-owned directory for Firecracker state and jails.
+    #[arg(
+        long = "firecracker-state-root",
+        env = "EXO_FIRECRACKER_STATE_ROOT",
+        default_value = DEFAULT_FIRECRACKER_STATE_ROOT
+    )]
+    state_root: PathBuf,
+    /// Virtual CPUs assigned to each microVM.
+    #[arg(
+        long = "firecracker-vcpu-count",
+        env = "EXO_FIRECRACKER_VCPU_COUNT",
+        default_value_t = DEFAULT_VCPU_COUNT
+    )]
+    vcpu_count: u8,
+    /// Memory assigned to each microVM, in MiB.
+    #[arg(
+        long = "firecracker-memory-mib",
+        env = "EXO_FIRECRACKER_MEMORY_MIB",
+        default_value_t = DEFAULT_MEMORY_MIB
+    )]
+    memory_mib: u32,
+    /// Maximum materialized OCI root filesystem size, in GiB.
+    #[arg(
+        long = "firecracker-image-size-gib",
+        env = "EXO_FIRECRACKER_IMAGE_SIZE_GIB",
+        default_value_t = DEFAULT_IMAGE_SIZE_GIB
+    )]
+    image_size_gib: u64,
+    /// Sparse writable workspace size, in GiB.
+    #[arg(
+        long = "firecracker-workspace-size-gib",
+        env = "EXO_FIRECRACKER_WORKSPACE_SIZE_GIB",
+        default_value_t = DEFAULT_WORKSPACE_SIZE_GIB
+    )]
+    workspace_size_gib: u64,
+    /// First host UID/GID in the reserved per-VM jailer range.
+    #[arg(
+        long = "firecracker-jailer-uid-base",
+        env = "EXO_FIRECRACKER_JAILER_UID_BASE",
+        default_value_t = DEFAULT_JAILER_UID_BASE
+    )]
+    jailer_uid_base: u32,
+    /// DNS resolver supplied to networking-enabled guests.
+    #[arg(
+        long = "firecracker-dns-server",
+        env = "EXO_FIRECRACKER_DNS_SERVER",
+        default_value = "1.1.1.1"
+    )]
+    dns_server: Ipv4Addr,
+    /// Per-VM network rate limit, in bytes per second.
+    #[arg(
+        long = "firecracker-network-bytes-per-second",
+        env = "EXO_FIRECRACKER_NETWORK_BYTES_PER_SECOND",
+        default_value_t = DEFAULT_NETWORK_BYTES_PER_SECOND
+    )]
+    network_bytes_per_second: u64,
+    #[cfg(target_os = "macos")]
+    /// Lima executable used to manage the outer Firecracker development VM.
+    #[arg(
+        long = "firecracker-limactl",
+        env = "EXO_FIRECRACKER_LIMACTL",
+        default_value = "limactl"
+    )]
+    limactl: PathBuf,
+    #[cfg(target_os = "macos")]
+    /// Dedicated Lima instance that hosts Firecracker.
+    #[arg(
+        long = "firecracker-lima-instance",
+        env = "EXO_FIRECRACKER_LIMA_INSTANCE",
+        default_value = "exo-firecracker"
+    )]
+    lima_instance: String,
+    #[cfg(target_os = "macos")]
+    /// Build output directory inside the Lima VM.
+    #[arg(
+        long = "firecracker-lima-target-dir",
+        env = "EXO_FIRECRACKER_LIMA_TARGET_DIR",
+        default_value = "/var/tmp/exo-firecracker-bridge-target"
+    )]
+    lima_target_dir: PathBuf,
+    #[cfg(target_os = "macos")]
+    /// Prebuilt bridge executable inside Lima; otherwise Exo builds its own.
+    #[arg(
+        long = "firecracker-lima-exo-binary",
+        env = "EXO_FIRECRACKER_LIMA_EXO_BINARY"
+    )]
+    lima_bridge_binary: Option<PathBuf>,
+}
+
+#[cfg(feature = "firecracker")]
+impl FirecrackerArgs {
+    fn backend_spec(&self) -> Result<FirecrackerBackendSpec> {
+        let allowed_egress_cidrs = self
+            .allowed_egress_cidrs
+            .iter()
+            .map(|cidr| {
+                cidr.parse()
+                    .map_err(|error| anyhow!("invalid Firecracker egress CIDR {cidr}: {error}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let allowed_local_images = std::iter::once(PathBuf::from(default_firecracker_image()))
+            .chain(self.allowed_local_images.iter().cloned())
+            .collect();
+        let config = FirecrackerConfig {
+            firecracker_bin: self.firecracker_bin.clone(),
+            jailer_bin: self.jailer_bin.clone(),
+            kernel: self.kernel.clone(),
+            initramfs: self.initramfs.clone(),
+            state_root: self.state_root.clone(),
+            vcpu_count: self.vcpu_count,
+            memory_mib: self.memory_mib,
+            image_size_gib: self.image_size_gib,
+            workspace_size_gib: self.workspace_size_gib,
+            jailer_uid_base: self.jailer_uid_base,
+            dns_server: self.dns_server,
+            allowed_egress_cidrs,
+            allowed_local_images,
+            allowed_registries: self.allowed_registries.clone(),
+            network_bytes_per_second: self.network_bytes_per_second,
+            max_machines: self.max_machines,
+        };
+        #[cfg(target_os = "macos")]
+        let lima = FirecrackerLimaConfig {
+            limactl: self.limactl.clone(),
+            instance: self.lima_instance.clone(),
+            target_dir: self.lima_target_dir.clone(),
+            bridge_binary: self.lima_bridge_binary.clone(),
+        };
+        #[cfg(not(target_os = "macos"))]
+        let lima = FirecrackerLimaConfig::default();
+        Ok(FirecrackerBackendSpec { config, lima })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -227,6 +429,7 @@ enum SandboxProviderArg {
     AppleContainer,
     Docker,
     Smolvm,
+    Firecracker,
     #[value(name = "local-process")]
     LocalProcess,
 }
@@ -242,28 +445,8 @@ impl From<SandboxProviderArg> for SandboxProvider {
             SandboxProviderArg::AppleContainer => Self::AppleContainer,
             SandboxProviderArg::Docker => Self::Docker,
             SandboxProviderArg::Smolvm => Self::Smolvm,
+            SandboxProviderArg::Firecracker => Self::Firecracker,
             SandboxProviderArg::LocalProcess => Self::LocalProcess,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum SandboxBackendArg {
-    #[value(name = "apple-container")]
-    AppleContainer,
-    Docker,
-    Smolvm,
-    #[value(name = "local-process")]
-    LocalProcess,
-}
-
-impl From<SandboxBackendArg> for SandboxBackendRegistration {
-    fn from(value: SandboxBackendArg) -> Self {
-        match value {
-            SandboxBackendArg::AppleContainer => Self::apple_container(),
-            SandboxBackendArg::Docker => Self::docker(),
-            SandboxBackendArg::Smolvm => Self::smolvm(),
-            SandboxBackendArg::LocalProcess => Self::local_process(),
         }
     }
 }
@@ -275,33 +458,46 @@ fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
             path: cli.master_key_path.clone(),
         },
     };
-    let sandbox_backend = cli
-        .sandbox_backend
-        .map(SandboxBackendRegistration::from)
-        .unwrap_or_else(default_sandbox_backend);
-    let sandbox_default = sandbox_backend.provider();
-    let mut sandbox_backends = default_sandbox_backends();
-    if !sandbox_backends
-        .iter()
-        .any(|backend| backend.provider() == sandbox_default)
-    {
-        sandbox_backends.push(sandbox_backend);
-    }
+    #[cfg(feature = "firecracker")]
+    let firecracker_spec = command_firecracker_args(&cli.command)
+        .map(FirecrackerArgs::backend_spec)
+        .transpose()?
+        .unwrap_or_default();
+    #[cfg(not(feature = "firecracker"))]
+    let firecracker_spec = FirecrackerBackendSpec::default();
     Ok(BasicExoHarnessConfig {
         root: cli.root.join("exoharness"),
         secret_backend,
-        sandbox_default,
-        sandbox_backends,
+        sandbox_default: default_local_sandbox_provider(),
+        sandbox_backends: default_sandbox_backends(firecracker_spec),
     })
+}
+
+#[cfg(feature = "firecracker")]
+fn command_firecracker_args(command: &Commands) -> Option<&FirecrackerArgs> {
+    match command {
+        Commands::Sandbox {
+            command: SandboxCommands::Start(args),
+        } => Some(&args.firecracker),
+        Commands::Sandbox {
+            command: SandboxCommands::Play(args),
+        } => Some(&args.firecracker),
+        Commands::Serve { firecracker, .. } => Some(firecracker),
+        _ => None,
+    }
 }
 
 /// Default providers: the OS-local container backend, local processes, and
 /// Daytona (offered even with no key set — credentials resolve lazily).
-fn default_sandbox_backends() -> Vec<SandboxBackendRegistration> {
+fn default_sandbox_backends(
+    firecracker: FirecrackerBackendSpec,
+) -> Vec<SandboxBackendRegistration> {
     vec![
-        default_sandbox_backend(),
-        SandboxBackendRegistration::local_process(),
+        SandboxBackendRegistration::apple_container(),
+        SandboxBackendRegistration::docker(),
         SandboxBackendRegistration::smolvm(),
+        SandboxBackendRegistration::firecracker(firecracker),
+        SandboxBackendRegistration::local_process(),
         SandboxBackendRegistration::daytona(DaytonaBackendSpec::default()),
         SandboxBackendRegistration::e2b(E2bBackendSpec::default()),
         SandboxBackendRegistration::sprites(SpritesBackendSpec::default()),
@@ -330,16 +526,6 @@ fn default_secret_backend() -> SecretBackendArg {
 #[cfg(not(target_os = "macos"))]
 fn default_secret_backend() -> SecretBackendArg {
     SecretBackendArg::File
-}
-
-#[cfg(target_os = "macos")]
-fn default_sandbox_backend() -> SandboxBackendRegistration {
-    SandboxBackendRegistration::apple_container()
-}
-
-#[cfg(not(target_os = "macos"))]
-fn default_sandbox_backend() -> SandboxBackendRegistration {
-    SandboxBackendRegistration::docker()
 }
 
 #[cfg(target_os = "macos")]
@@ -381,6 +567,8 @@ impl From<SandboxScopeArg> for SandboxScope {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    #[command(hide = true)]
+    FirecrackerBridge,
     /// Manage agents and their executor configuration.
     Agent {
         #[command(subcommand)]
@@ -400,6 +588,11 @@ enum Commands {
     Provider {
         #[command(subcommand)]
         command: ProviderCommands,
+    },
+    /// Manage sandboxes directly. Each command accepts --agent; omitted uses a shared owner.
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommands,
     },
     /// Manage local stored secrets.
     Secret {
@@ -438,6 +631,9 @@ enum Commands {
         bind: SocketAddr,
         #[arg(short, long, action = ArgAction::Count)]
         verbose: u8,
+        #[cfg(feature = "firecracker")]
+        #[command(flatten, next_help_heading = "Firecracker backend options")]
+        firecracker: FirecrackerArgs,
     },
 }
 
@@ -456,7 +652,7 @@ enum AgentCommands {
         tool_creation: Option<EnabledDisabled>,
         #[arg(long)]
         sandbox_image: Option<String>,
-        #[arg(long, value_enum)]
+        #[arg(long = "provider", value_enum)]
         sandbox_provider: Option<SandboxProviderArg>,
         #[arg(long, value_enum)]
         sandbox_scope: Option<SandboxScopeArg>,
@@ -493,7 +689,7 @@ enum AgentCommands {
         sandbox_image: Option<String>,
         #[arg(long)]
         clear_sandbox_image: bool,
-        #[arg(long, value_enum)]
+        #[arg(long = "provider", value_enum)]
         sandbox_provider: Option<SandboxProviderArg>,
         #[arg(long, value_enum)]
         sandbox_scope: Option<SandboxScopeArg>,
@@ -674,6 +870,125 @@ enum ConversationSandboxCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum SandboxCommands {
+    /// Create and start a sandbox.
+    Start(Box<SandboxStartArgs>),
+    /// Start a sandbox, enter a shell, and destroy it when the shell exits.
+    Play(Box<SandboxPlayArgs>),
+    /// List sandboxes. Running only unless --all is passed.
+    Ps {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
+        /// Include stopped sandboxes.
+        #[arg(short, long)]
+        all: bool,
+        /// Print only sandbox IDs.
+        #[arg(short, long)]
+        quiet: bool,
+    },
+    /// Run a command and stream its output.
+    Exec {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
+        sandbox_id: String,
+        #[arg(long = "env", value_name = "NAME=VALUE")]
+        env: Vec<String>,
+        #[arg(required = true, trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+    /// Connect stdin/stdout/stderr to an interactive shell (without a PTY).
+    Connect {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
+        sandbox_id: String,
+        #[arg(long, default_value = "/bin/bash")]
+        shell: String,
+        #[arg(long = "env", value_name = "NAME=VALUE")]
+        env: Vec<String>,
+    },
+    /// Stop a sandbox while retaining its stored record.
+    Stop {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
+        /// Sandbox IDs; when omitted, read whitespace-delimited IDs from stdin.
+        #[arg(value_name = "SANDBOX_ID")]
+        sandbox_ids: Vec<String>,
+    },
+    /// Destroy sandboxes and remove their retained records.
+    Terminate {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
+        /// Sandbox IDs; when omitted, read whitespace-delimited IDs from stdin.
+        #[arg(value_name = "SANDBOX_ID")]
+        sandbox_ids: Vec<String>,
+    },
+}
+
+#[derive(Debug, Args)]
+struct SandboxOwnerArgs {
+    /// Agent that owns the sandbox; omitted uses the shared CLI owner.
+    #[arg(long, value_name = "AGENT")]
+    agent: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct SandboxStartArgs {
+    #[command(flatten)]
+    owner: SandboxOwnerArgs,
+    #[arg(long)]
+    name: Option<String>,
+    #[command(flatten)]
+    sandbox: SandboxCreateArgs,
+    #[cfg(feature = "firecracker")]
+    #[command(flatten, next_help_heading = "Firecracker backend options")]
+    firecracker: FirecrackerArgs,
+}
+
+#[derive(Debug, Args)]
+struct SandboxCreateArgs {
+    #[arg(long, value_enum)]
+    provider: SandboxProviderArg,
+    /// Image, template, or root filesystem understood by the provider.
+    /// Omitting it uses the provider binding's default.
+    #[arg(long, default_value = "")]
+    image: String,
+    #[arg(long)]
+    workdir: Option<String>,
+    #[arg(long, value_enum)]
+    networking: Option<EnabledDisabled>,
+    #[arg(long)]
+    idle_seconds: Option<u64>,
+    /// Host directory mount: HOST_PATH:GUEST_PATH[:ro|rw].
+    #[arg(long = "mount", value_name = "MOUNT", value_parser = parse_sandbox_mount)]
+    mounts: Vec<FileSystemMount>,
+    /// Internal host directory mount: HOST_PATH:GUEST_PATH[:ro|rw].
+    #[arg(
+        long = "internal-mount",
+        value_name = "MOUNT",
+        value_parser = parse_sandbox_mount
+    )]
+    internal_mounts: Vec<FileSystemMount>,
+    /// Durable filesystem: NAME:GUEST_PATH[:ro|rw].
+    #[arg(long = "durable", value_name = "MOUNT", value_parser = parse_durable_mount)]
+    durable_file_systems: Vec<DurableFileSystem>,
+}
+
+#[derive(Debug, Args)]
+struct SandboxPlayArgs {
+    #[command(flatten)]
+    owner: SandboxOwnerArgs,
+    #[command(flatten)]
+    sandbox: SandboxCreateArgs,
+    #[arg(long, default_value = "/bin/bash")]
+    shell: String,
+    #[arg(long = "env", value_name = "NAME=VALUE")]
+    env: Vec<String>,
+    #[cfg(feature = "firecracker")]
+    #[command(flatten, next_help_heading = "Firecracker backend options")]
+    firecracker: FirecrackerArgs,
+}
+
+#[derive(Debug, Subcommand)]
 enum SecretCommands {
     List,
     Set {
@@ -749,7 +1064,7 @@ struct ProviderConfigureArgs {
 struct ConversationSandboxRuntimeArgs {
     #[arg(long)]
     sandbox_image: Option<String>,
-    #[arg(long, value_enum)]
+    #[arg(long = "provider", value_enum)]
     sandbox_provider: Option<SandboxProviderArg>,
     #[arg(long)]
     shell_program: Option<String>,
@@ -783,7 +1098,7 @@ struct ConversationSandboxRuntimeUpdateArgs {
     clear_shell_program: bool,
     #[arg(long)]
     clear_sandbox_image: bool,
-    #[arg(long)]
+    #[arg(long = "clear-provider")]
     clear_sandbox_provider: bool,
 }
 
@@ -796,7 +1111,7 @@ impl ConversationSandboxRuntimeUpdateArgs {
             bail!("provide either --clear-sandbox-image or --sandbox-image, not both");
         }
         if self.clear_sandbox_provider && self.runtime.sandbox_provider.is_some() {
-            bail!("provide either --clear-sandbox-provider or --sandbox-provider, not both");
+            bail!("provide either --clear-provider or --provider, not both");
         }
         self.runtime.validate()?;
 
@@ -855,6 +1170,18 @@ enum ConversationMountCommands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Commands::FirecrackerBridge) {
+        #[cfg(feature = "firecracker")]
+        {
+            init_firecracker_bridge_tracing();
+            if let Some(exit_code) = executor::run_firecracker_bridge().await? {
+                std::process::exit(exit_code);
+            }
+            return Ok(());
+        }
+        #[cfg(not(feature = "firecracker"))]
+        bail!("Firecracker bridge support requires building Exo with --features firecracker");
+    }
     let exo_config = build_exo_config(&cli)?;
     let env = CliEnvironment::load(cli.env_file_if_exists.as_deref(), cli.env_file.as_deref())?;
     let runtime_config = env.braintrust_runtime_config(
@@ -879,8 +1206,14 @@ async fn main() -> Result<()> {
         .map(|env| env_value_from_arg("--bearer-env", env, &env_vars))
         .transpose()?;
     let default_sandbox_provider = default_local_sandbox_provider();
-    let exoharness =
-        instantiate_exoharness(&exo_config, cli.exoharness_url.as_deref(), bearer_token).await?;
+    let route_local_sandboxes = !matches!(&cli.command, Commands::Sandbox { .. });
+    let exoharness = instantiate_exoharness(
+        &exo_config,
+        cli.exoharness_url.as_deref(),
+        bearer_token,
+        route_local_sandboxes,
+    )
+    .await?;
     let harness_kind = determine_harness_kind(
         exoharness.as_ref(),
         harness_selection.as_ref(),
@@ -898,8 +1231,10 @@ async fn main() -> Result<()> {
         pricing,
     )
     .await?;
-
     match cli.command {
+        Commands::FirecrackerBridge => {
+            unreachable!("Firecracker bridge returns before harness startup")
+        }
         Commands::Tools { .. } => unreachable!("tools commands return before harness startup"),
         Commands::Adapters { command } => {
             adapters::handle_adapter_command(&cli.root, Arc::clone(&harness), command).await?;
@@ -999,6 +1334,7 @@ async fn main() -> Result<()> {
                     &["AGENT", "ID", "NAME"],
                     agents
                         .into_iter()
+                        .filter(|agent| agent.slug != SANDBOX_CLI_AGENT_SLUG)
                         .map(|agent| vec![agent.slug, agent.id.to_string(), agent.name])
                         .collect(),
                 )?;
@@ -2001,6 +2337,9 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Commands::Sandbox { command } => {
+            handle_sandbox_command(harness.as_ref(), command).await?;
+        }
         Commands::Secret { command } => match command {
             SecretCommands::List => {
                 let secrets = harness.exoharness_handle().list_secrets().await?;
@@ -2168,6 +2507,12 @@ async fn main() -> Result<()> {
                     SandboxProviderArg::Docker => SandboxProviderConfig::Docker {
                         default_image: default_image.unwrap_or_else(default_docker_image),
                     },
+                    SandboxProviderArg::Smolvm => SandboxProviderConfig::Smolvm {
+                        default_image: default_image.unwrap_or_else(default_docker_image),
+                    },
+                    SandboxProviderArg::Firecracker => SandboxProviderConfig::Firecracker {
+                        default_image: default_image.unwrap_or_else(default_firecracker_image),
+                    },
                     SandboxProviderArg::E2b => {
                         let secret =
                             secret.ok_or_else(|| anyhow!("--secret is required for e2b"))?;
@@ -2215,6 +2560,330 @@ async fn main() -> Result<()> {
 
     harness.flush_tracing().await?;
     Ok(())
+}
+
+async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands) -> Result<()> {
+    match command {
+        SandboxCommands::Start(args) => {
+            let SandboxStartArgs {
+                owner,
+                name,
+                sandbox,
+                ..
+            } = *args;
+            let (_, sandbox_id) = start_sandbox(harness, owner.agent, name, sandbox).await?;
+            println!("{sandbox_id}");
+        }
+        SandboxCommands::Play(args) => {
+            let SandboxPlayArgs {
+                owner,
+                sandbox,
+                shell,
+                env,
+                ..
+            } = *args;
+            let env = parse_environment(env)?;
+            let (agent, sandbox_id) = start_sandbox(harness, owner.agent, None, sandbox).await?;
+            println!("started {sandbox_id}");
+            let shell_result = tokio::select! {
+                result = run_sandbox_process(
+                    agent.as_ref(),
+                    sandbox_id.clone(),
+                    vec![shell, "-i".to_string()],
+                    env,
+                    true,
+                ) => result,
+                result = tokio::signal::ctrl_c() => {
+                    result?;
+                    Ok(130)
+                }
+            };
+            let cleanup_result = agent.terminate_sandbox(sandbox_id).await;
+            match (shell_result, cleanup_result) {
+                (Ok(0), Ok(())) => {}
+                (Ok(exit_code), Ok(())) => {
+                    bail!("sandbox shell exited with status {exit_code}");
+                }
+                (Err(error), Ok(())) => return Err(error),
+                (Ok(_), Err(cleanup_error)) => return Err(cleanup_error),
+                (Err(error), Err(cleanup_error)) => {
+                    return Err(error).context(format!(
+                        "also failed to terminate the sandbox: {cleanup_error:#}"
+                    ));
+                }
+            }
+        }
+        SandboxCommands::Ps { owner, all, quiet } => {
+            let mut sandboxes = sandbox_owner(harness, owner.agent.as_deref())
+                .await?
+                .list_sandboxes()
+                .await?;
+            if !all {
+                sandboxes.retain(|sandbox| sandbox.running);
+            }
+            if quiet {
+                write_sandbox_ids(sandboxes.into_iter().map(|sandbox| sandbox.id))?;
+            } else {
+                print_table(
+                    &["ID", "NAME", "PROVIDER", "STATE", "IMAGE"],
+                    sandboxes
+                        .into_iter()
+                        .map(|sandbox| {
+                            vec![
+                                sandbox.id,
+                                sandbox
+                                    .name
+                                    .filter(|name| !name.trim().is_empty())
+                                    .unwrap_or_else(|| "<none>".to_string()),
+                                sandbox.provider.to_string(),
+                                if sandbox.running {
+                                    "running"
+                                } else {
+                                    "stopped"
+                                }
+                                .to_string(),
+                                sandbox.image,
+                            ]
+                        })
+                        .collect(),
+                )?;
+            }
+        }
+        SandboxCommands::Exec {
+            owner,
+            sandbox_id,
+            env,
+            command,
+        } => {
+            let agent = sandbox_owner(harness, owner.agent.as_deref()).await?;
+            let exit_code = run_sandbox_process(
+                agent.as_ref(),
+                sandbox_id,
+                command,
+                parse_environment(env)?,
+                false,
+            )
+            .await?;
+            if exit_code != 0 {
+                bail!("sandbox command exited with status {exit_code}");
+            }
+        }
+        SandboxCommands::Connect {
+            owner,
+            sandbox_id,
+            shell,
+            env,
+        } => {
+            let agent = sandbox_owner(harness, owner.agent.as_deref()).await?;
+            let exit_code = run_sandbox_process(
+                agent.as_ref(),
+                sandbox_id,
+                vec![shell, "-i".to_string()],
+                parse_environment(env)?,
+                true,
+            )
+            .await?;
+            if exit_code != 0 {
+                bail!("sandbox shell exited with status {exit_code}");
+            }
+        }
+        SandboxCommands::Stop { owner, sandbox_ids } => {
+            let sandbox_ids = sandbox_ids_or_stdin(sandbox_ids)?;
+            if sandbox_ids.is_empty() {
+                return Ok(());
+            }
+            let agent = sandbox_owner(harness, owner.agent.as_deref()).await?;
+            for sandbox_id in sandbox_ids {
+                agent
+                    .stop_sandbox(sandbox_id.clone())
+                    .await
+                    .with_context(|| format!("stopping sandbox {sandbox_id}"))?;
+            }
+        }
+        SandboxCommands::Terminate { owner, sandbox_ids } => {
+            let sandbox_ids = sandbox_ids_or_stdin(sandbox_ids)?;
+            if sandbox_ids.is_empty() {
+                return Ok(());
+            }
+            let agent = sandbox_owner(harness, owner.agent.as_deref()).await?;
+            for sandbox_id in sandbox_ids {
+                agent
+                    .terminate_sandbox(sandbox_id.clone())
+                    .await
+                    .with_context(|| format!("terminating sandbox {sandbox_id}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sandbox_ids_or_stdin(sandbox_ids: Vec<String>) -> Result<Vec<String>> {
+    if !sandbox_ids.is_empty() {
+        return Ok(sandbox_ids);
+    }
+    if io::stdin().is_terminal() {
+        bail!("provide at least one sandbox ID or pipe IDs on stdin");
+    }
+
+    let mut input = String::new();
+    io::stdin().lock().read_to_string(&mut input)?;
+    let sandbox_ids = input
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    Ok(sandbox_ids)
+}
+
+fn write_sandbox_ids(ids: impl IntoIterator<Item = String>) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    for id in ids {
+        if let Err(error) = writeln!(stdout, "{id}") {
+            if error.kind() == io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+async fn sandbox_owner(
+    harness: &dyn Harness,
+    agent_ref: Option<&str>,
+) -> Result<Arc<dyn AgentHandle>> {
+    let exoharness = harness.exoharness_handle();
+    if let Some(agent_ref) = agent_ref {
+        return exoharness
+            .list_agents()
+            .await?
+            .into_iter()
+            .find(|agent| {
+                agent.record().slug == agent_ref || agent.record().id.to_string() == agent_ref
+            })
+            .ok_or_else(|| anyhow!("agent not found: {agent_ref}"));
+    }
+
+    if let Some(agent) = exoharness
+        .list_agents()
+        .await?
+        .into_iter()
+        .find(|agent| agent.record().slug == SANDBOX_CLI_AGENT_SLUG)
+    {
+        return Ok(agent);
+    }
+
+    exoharness
+        .new_agent(NewAgentRequest {
+            slug: SANDBOX_CLI_AGENT_SLUG.to_string(),
+            name: "Sandbox CLI".to_string(),
+        })
+        .await
+}
+
+async fn start_sandbox(
+    harness: &dyn Harness,
+    agent: Option<String>,
+    name: Option<String>,
+    args: SandboxCreateArgs,
+) -> Result<(Arc<dyn AgentHandle>, String)> {
+    let SandboxCreateArgs {
+        provider,
+        image,
+        workdir,
+        networking,
+        idle_seconds,
+        mut mounts,
+        mut internal_mounts,
+        durable_file_systems,
+    } = args;
+    if name.as_ref().is_some_and(|name| name.trim().is_empty()) {
+        bail!("sandbox name must not be empty");
+    }
+    for mount in &mut internal_mounts {
+        mount.internal = Some(true);
+    }
+    mounts.extend(internal_mounts);
+
+    let agent = sandbox_owner(harness, agent.as_deref()).await?;
+    let sandbox_id = agent
+        .create_sandbox(CreateSandboxRequest {
+            name,
+            provider: provider.into(),
+            image,
+            default_workdir: workdir,
+            file_system_mounts: (!mounts.is_empty()).then_some(mounts),
+            durable_file_systems: (!durable_file_systems.is_empty())
+                .then_some(durable_file_systems),
+            enable_networking: networking.map(EnabledDisabled::enabled),
+            idle_seconds,
+        })
+        .await?;
+    Ok((agent, sandbox_id))
+}
+
+async fn run_sandbox_process(
+    agent: &dyn AgentHandle,
+    sandbox_id: String,
+    command: Vec<String>,
+    env: HashMap<String, String>,
+    connect_stdin: bool,
+) -> Result<i32> {
+    let process = agent
+        .run_in_sandbox(RunInSandboxRequest {
+            id: sandbox_id,
+            command,
+            env,
+        })
+        .await?;
+    stream_sandbox_process(process, connect_stdin).await
+}
+
+async fn stream_sandbox_process(
+    process: Box<dyn SandboxProcess>,
+    connect_stdin: bool,
+) -> Result<i32> {
+    let parts = process.into_parts();
+    let mut stdout_reader = parts.stdout.compat();
+    let mut stderr_reader = parts.stderr.compat();
+    let stdout = async move {
+        let mut stdout = tokio::io::stdout();
+        tokio::io::copy(&mut stdout_reader, &mut stdout).await?;
+        tokio::io::AsyncWriteExt::flush(&mut stdout).await?;
+        Result::<()>::Ok(())
+    };
+    let stderr = async move {
+        let mut stderr = tokio::io::stderr();
+        tokio::io::copy(&mut stderr_reader, &mut stderr).await?;
+        tokio::io::AsyncWriteExt::flush(&mut stderr).await?;
+        Result::<()>::Ok(())
+    };
+
+    let mut wait = parts.wait;
+    let lifecycle = async move {
+        let exit_code = if connect_stdin {
+            let mut stdin_writer = parts.stdin.compat_write();
+            let stdin = async move {
+                let mut stdin = tokio::io::stdin();
+                tokio::io::copy(&mut stdin, &mut stdin_writer).await?;
+                Result::<()>::Ok(())
+            };
+            tokio::pin!(stdin);
+            tokio::select! {
+                result = &mut wait => result?,
+                result = &mut stdin => {
+                    result?;
+                    wait.await?
+                }
+            }
+        } else {
+            drop(parts.stdin);
+            wait.await?
+        };
+        Result::<i32>::Ok(exit_code)
+    };
+
+    let (exit_code, (), ()) = tokio::try_join!(lifecycle, stdout, stderr)?;
+    Ok(exit_code)
 }
 
 async fn determine_harness_kind(
@@ -2270,11 +2939,25 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
         },
         Commands::Repl { agent, .. } => Some(agent.as_deref().unwrap_or(DEFAULT_REPL_SLUG)),
         Commands::Secret { .. }
+        | Commands::FirecrackerBridge
+        | Commands::Sandbox { .. }
         | Commands::Model { .. }
         | Commands::Provider { .. }
         | Commands::Adapters { .. }
         | Commands::Tools { .. }
         | Commands::Serve { .. } => None,
+    }
+}
+
+#[cfg(feature = "firecracker")]
+fn init_firecracker_bridge_tracing() {
+    let layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .with_filter(tracing_subscriber::filter::LevelFilter::INFO);
+    match tracing_subscriber::registry().with(layer).try_init() {
+        Ok(()) | Err(_) => {}
     }
 }
 
@@ -2286,7 +2969,7 @@ struct ServeConfig {
 
 fn serve_config(command: &Commands) -> Option<ServeConfig> {
     match command {
-        Commands::Serve { bind, verbose } => Some(ServeConfig {
+        Commands::Serve { bind, verbose, .. } => Some(ServeConfig {
             bind: *bind,
             verbosity: *verbose,
         }),
@@ -2370,19 +3053,23 @@ async fn instantiate_exoharness(
     exo_config: &BasicExoHarnessConfig,
     http_url: Option<&str>,
     bearer_token: Option<String>,
+    route_local_sandboxes: bool,
 ) -> Result<Arc<dyn ExoHarness>> {
     if let Some(http_url) = http_url {
+        let mut harness = HttpExoHarness::new(http_url)?;
+        if let Some(bearer_token) = bearer_token {
+            harness = harness.with_bearer_token(bearer_token);
+        }
+        let remote: Arc<dyn ExoHarness> = Arc::new(harness);
+        if !route_local_sandboxes {
+            return Ok(remote);
+        }
         let local_sandbox_providers = exo_config
             .sandbox_backends
             .iter()
             .filter(|backend| backend.is_local())
             .map(SandboxBackendRegistration::provider)
             .collect::<Vec<_>>();
-        let mut harness = HttpExoHarness::new(http_url)?;
-        if let Some(bearer_token) = bearer_token {
-            harness = harness.with_bearer_token(bearer_token);
-        }
-        let remote: Arc<dyn ExoHarness> = Arc::new(harness);
         let local: Arc<dyn ExoHarness> = Arc::new(BasicExoHarness::new(exo_config.clone()).await?);
         return Ok(Arc::new(LocalSandboxExoHarness::new_with_local_providers(
             remote,
@@ -2798,6 +3485,57 @@ fn parse_optional_uuid7(value: Option<&str>, field: &str) -> Result<Option<Uuid7
         )),
         None => Ok(None),
     }
+}
+
+fn parse_sandbox_mount(value: &str) -> std::result::Result<FileSystemMount, String> {
+    let (host_path, mount_path, mode) = parse_mount_spec(value, "host path")?;
+    Ok(FileSystemMount {
+        host_path: host_path.to_string(),
+        mount_path: mount_path.to_string(),
+        mode,
+        internal: Some(false),
+    })
+}
+
+fn parse_durable_mount(value: &str) -> std::result::Result<DurableFileSystem, String> {
+    let (name, mount_path, mode) = parse_mount_spec(value, "filesystem name")?;
+    Ok(DurableFileSystem {
+        name: name.to_string(),
+        mount_path: mount_path.to_string(),
+        mode,
+    })
+}
+
+fn parse_mount_spec<'a>(
+    value: &'a str,
+    source_label: &str,
+) -> std::result::Result<(&'a str, &'a str, FileSystemMountMode), String> {
+    let (source, target) = value
+        .split_once(':')
+        .ok_or_else(|| format!("expected {source_label}:GUEST_PATH[:ro|rw]"))?;
+    if source.is_empty() {
+        return Err(format!("{source_label} must not be empty"));
+    }
+    let (mount_path, mode) = match target.rsplit_once(':') {
+        Some((mount_path, "ro")) => (mount_path, FileSystemMountMode::ReadOnly),
+        Some((mount_path, "rw")) => (mount_path, FileSystemMountMode::ReadWrite),
+        _ => (target, FileSystemMountMode::ReadOnly),
+    };
+    validate_mount_path(mount_path).map_err(|error| error.to_string())?;
+    Ok((source, mount_path, mode))
+}
+
+fn parse_environment(values: Vec<String>) -> Result<HashMap<String, String>> {
+    values
+        .into_iter()
+        .map(|value| {
+            let (name, value) = value
+                .split_once('=')
+                .ok_or_else(|| anyhow!("environment value must be NAME=VALUE"))?;
+            let name = parse_env_var_name(name).map_err(|error| anyhow!(error))?;
+            Ok((name, value.to_string()))
+        })
+        .collect()
 }
 
 fn canonicalize_directory(path: &PathBuf) -> Result<PathBuf> {
@@ -3277,7 +4015,7 @@ mod create_tests {
             "agent",
             "create",
             "test",
-            "--sandbox-provider",
+            "--provider",
             "local-process",
             "--model",
             "test-model",

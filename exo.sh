@@ -25,8 +25,7 @@ MODULE="${EXO_MODULE:-exo/harness.ts}"
 HARNESS="exo"
 LOCAL_PROMPT_FILE="${EXO_LOCAL_PROMPT_FILE:-$ROOT_DIR/.exo/exo-profile.md}"
 SANDBOX_IMAGE="${EXO_SANDBOX_IMAGE:-ubuntu:24.04}"
-SANDBOX_PROVIDER="${EXO_SANDBOX_PROVIDER:-}"
-SANDBOX_BACKEND="${EXO_SANDBOX_BACKEND:-}"
+PROVIDER="${EXO_PROVIDER:-}"
 SELF_REPO_MOUNT_PATH="${EXO_REPO:-/workspace/exo}"
 SELF_MAP_PATH="$SELF_REPO_MOUNT_PATH/exo/SELF.md"
 AGENT_CLI_MOUNT_ROOT="${EXO_AGENT_CLI_ROOT:-}"
@@ -46,8 +45,7 @@ SETUP_PROFILE=false
 SKIP_BUILD="${EXO_SKIP_BUILD:-false}"
 TEMPLATE="${EXO_TEMPLATE:-canonical}"
 PROFILE="${EXO_PROFILE:-practical}"
-SANDBOX_PROVIDER_EXPLICIT=false
-SANDBOX_BACKEND_EXPLICIT=false
+PROVIDER_EXPLICIT=false
 declare -a CONTROL_PIDS=()
 SETUP_ADAPTER="${EXO_SETUP_ADAPTER:-}"
 declare -a SETUP_ADAPTERS=()
@@ -120,12 +118,7 @@ Options:
                                             control console, or guardian config
   --profile <name>             Checked-in tool profile: practical (default) or bootstrap
   --sandbox-image <image>      Sandbox image (default: ubuntu:24.04)
-  --sandbox-provider <provider>
-                                Sandbox provider: daytona, apple-container, docker, smolvm, or
-                                local-process
-  --sandbox-backend <backend>   Local sandbox backend: apple-container, docker, smolvm, or
-                                local-process.
-                                Defaults to --sandbox-provider when that provider is local.
+  --provider <provider>         Sandbox provider: daytona, apple-container, docker, smolvm, or local-process
   --self-repo-mount <path>      Sandbox path for this repo (default: /workspace/exo)
   --agent-cli-mount <host-dir>  Bind-mount this host directory read-write into the
                                 sandbox for the agent-cli adapter (default: none)
@@ -161,7 +154,7 @@ Options:
 Environment overrides:
   EXO_MODEL, EXO_AGENT, EXO_CONVERSATION, EXO_AGENT_NAME,
   EXO_CONVERSATION_NAME, EXO_MODULE, EXO_SANDBOX_IMAGE,
-  EXO_SANDBOX_PROVIDER, EXO_SANDBOX_BACKEND, EXO_NETWORKING,
+  EXO_PROVIDER, EXO_NETWORKING,
   EXO_SHELL_PROGRAM, EXO_SANDBOX_SCOPE, EXO_ENV_FILE, EXO_LOCAL_PROMPT_FILE,
   EXO_BIN, EXO_START_SCHEDULER, EXO_START_ADAPTERS, EXO_REPO,
   EXO_AGENT_CLI_ROOT, EXO_AGENT_CLI_MOUNT,
@@ -272,11 +265,8 @@ apply_template_defaults() {
   START_SCHEDULER=true
   START_ADAPTERS=true
   CONTROL=true
-  if [[ "$SANDBOX_PROVIDER_EXPLICIT" != true ]]; then
-    SANDBOX_PROVIDER="docker"
-  fi
-  if [[ "$SANDBOX_BACKEND_EXPLICIT" != true ]]; then
-    SANDBOX_BACKEND="docker"
+  if [[ "$PROVIDER_EXPLICIT" != true ]]; then
+    PROVIDER="docker"
   fi
   case "$TEMPLATE" in
     canonical)
@@ -301,7 +291,6 @@ configure_guardian_for_current_launch() {
     --env-file "$ENV_FILE" \
     --exo-bin "$EXO_BIN" \
     --scheduler-bin "$SCHEDULER_BIN" \
-    --sandbox-backend "$SANDBOX_BACKEND" \
     --scheduler-interval "$SCHEDULER_INTERVAL_SECONDS" \
     --adapter-limit "$ADAPTER_LIMIT" >/dev/null
   echo "Configured guardian for Docker-backed Exo services."
@@ -369,25 +358,8 @@ scheduler_source_newer_than() {
   return 1
 }
 
-effective_sandbox_backend() {
-  if [[ -n "$SANDBOX_BACKEND" ]]; then
-    printf '%s\n' "$SANDBOX_BACKEND"
-    return
-  fi
-  case "$SANDBOX_PROVIDER" in
-    apple-container|docker|smolvm|local-process)
-      printf '%s\n' "$SANDBOX_PROVIDER"
-      ;;
-  esac
-}
-
 append_exo_global_args() {
-  local backend
   EXO_GLOBAL_ARGS=(--env-file-if-exists "$ENV_FILE")
-  backend="$(effective_sandbox_backend)"
-  if [[ -n "$backend" ]]; then
-    EXO_GLOBAL_ARGS+=(--sandbox-backend "$backend")
-  fi
 }
 
 exo() {
@@ -498,11 +470,6 @@ ensure_scheduler() {
   echo "Starting scheduler loop..."
   rm -f "$(scheduler_lock_file)"
   local scheduler_args=(--env-file-if-exists "$ENV_FILE")
-  local backend
-  backend="$(effective_sandbox_backend)"
-  if [[ -n "$backend" ]]; then
-    scheduler_args+=(--sandbox-backend "$backend")
-  fi
   nohup "$SCHEDULER_BIN" "${scheduler_args[@]}" run --watch \
     --interval-seconds "$SCHEDULER_INTERVAL_SECONDS" >>"$log_file" 2>&1 &
   echo "$!" >"$pid_file"
@@ -560,11 +527,6 @@ container_pull_image() {
 }
 
 ensure_sandbox_image() {
-  # smolvm pulls its own images inside the VM, so there is nothing for docker or
-  # podman to pre-pull — and requiring either would put a daemon back in the path.
-  if [[ "$(effective_sandbox_backend)" == "smolvm" ]]; then
-    return
-  fi
   local status=0
   container_image_exists || status=$?
   case "$status" in
@@ -624,8 +586,8 @@ ensure_agent() {
   )
   if [[ "$USE_SANDBOX" == true ]]; then
     args+=(--sandbox-image "$SANDBOX_IMAGE" --networking "$NETWORKING")
-    if [[ -n "$SANDBOX_PROVIDER" ]]; then
-      args+=(--sandbox-provider "$SANDBOX_PROVIDER")
+    if [[ -n "$PROVIDER" ]]; then
+      args+=(--provider "$PROVIDER")
     fi
     # The exo agent shares one sandbox across all of its conversations.
     args+=(--sandbox-scope "${SANDBOX_SCOPE:-agent}")
@@ -635,13 +597,13 @@ ensure_agent() {
 
 ensure_conversation() {
   if conversation_exists; then
-    if [[ "$USE_SANDBOX" == true && ( -n "$SANDBOX_SCOPE" || -n "$SANDBOX_PROVIDER" ) ]]; then
+    if [[ "$USE_SANDBOX" == true && ( -n "$SANDBOX_SCOPE" || -n "$PROVIDER" ) ]]; then
       local update_args=(conversation update "$AGENT" "$CONVERSATION")
       if [[ -n "$SANDBOX_SCOPE" ]]; then
         update_args+=(--sandbox-scope "$SANDBOX_SCOPE")
       fi
-      if [[ -n "$SANDBOX_PROVIDER" ]]; then
-        update_args+=(--sandbox-provider "$SANDBOX_PROVIDER")
+      if [[ -n "$PROVIDER" ]]; then
+        update_args+=(--provider "$PROVIDER")
       fi
       exo "${update_args[@]}" >/dev/null
     fi
@@ -653,8 +615,8 @@ ensure_conversation() {
   if [[ -n "$SANDBOX_SCOPE" ]]; then
     args+=(--sandbox-scope "$SANDBOX_SCOPE")
   fi
-  if [[ -n "$SANDBOX_PROVIDER" ]]; then
-    args+=(--sandbox-provider "$SANDBOX_PROVIDER")
+  if [[ -n "$PROVIDER" ]]; then
+    args+=(--provider "$PROVIDER")
   fi
   exo "${args[@]}"
   if [[ "$USE_SANDBOX" == true ]]; then
@@ -662,8 +624,8 @@ ensure_conversation() {
     if [[ -n "$SANDBOX_SCOPE" ]]; then
       update_args+=(--sandbox-scope "$SANDBOX_SCOPE")
     fi
-    if [[ -n "$SANDBOX_PROVIDER" ]]; then
-      update_args+=(--sandbox-provider "$SANDBOX_PROVIDER")
+    if [[ -n "$PROVIDER" ]]; then
+      update_args+=(--provider "$PROVIDER")
     fi
     exo "${update_args[@]}" >/dev/null
   fi
@@ -872,40 +834,6 @@ cleanup_stale_sandbox_containers() {
   fi
 }
 
-# The smolvm equivalent. Machines carry the same exo.sandbox.* labels, but only
-# `machine ls --json` reports them, so this needs a JSON reader and skips when
-# either tool is absent — the same stance as the docker sweep above. There is no
-# mounts-this-checkout check: `machine ls` reports a mount count, not paths, so a
-# machine whose owner is still alive is always left alone.
-cleanup_stale_sandbox_machines() {
-  command -v smolvm >/dev/null 2>&1 || return
-  command -v python3 >/dev/null 2>&1 || return
-  local name owner removed=0
-  while IFS=$'\t' read -r name owner; do
-    [[ -n "$name" ]] || continue
-    if [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null; then
-      continue
-    fi
-    echo "Removing stale sandbox machine $name..."
-    smolvm machine delete --name "$name" --force >/dev/null 2>&1 || true
-    removed=$((removed + 1))
-  done < <(smolvm machine ls --json 2>/dev/null | python3 -c '
-import json, sys
-try:
-    machines = json.load(sys.stdin)
-except ValueError:
-    sys.exit(0)
-for machine in machines if isinstance(machines, list) else []:
-    labels = machine.get("labels") or {}
-    if "exo.sandbox.key" not in labels:
-        continue
-    print("%s\t%s" % (machine.get("name", ""), labels.get("exo.sandbox.owner-pid", "")))
-')
-  if [[ "$removed" -gt 0 ]]; then
-    echo "Removed $removed stale sandbox machine(s)."
-  fi
-}
-
 container_mounts_current_checkout() {
   local container="$1"
   local source
@@ -925,7 +853,6 @@ fresh_start() {
   fi
   delete_all_agents_and_conversations
   cleanup_stale_sandbox_containers
-  cleanup_stale_sandbox_machines
   if [[ "$USE_SANDBOX" == true ]]; then
     PULL_SANDBOX=true
   fi
@@ -1411,22 +1338,13 @@ while [[ $# -gt 0 ]]; do
       [[ -n "$SANDBOX_IMAGE" ]] || die "--sandbox-image requires a value"
       shift 2
       ;;
-    --sandbox-provider)
-      SANDBOX_PROVIDER="${2:-}"
-      case "$SANDBOX_PROVIDER" in
+    --provider)
+      PROVIDER="${2:-}"
+      case "$PROVIDER" in
         daytona|apple-container|docker|smolvm|local-process) ;;
-        *) die "--sandbox-provider must be daytona, apple-container, docker, smolvm, or local-process" ;;
+        *) die "--provider must be daytona, apple-container, docker, smolvm, or local-process" ;;
       esac
-      SANDBOX_PROVIDER_EXPLICIT=true
-      shift 2
-      ;;
-    --sandbox-backend)
-      SANDBOX_BACKEND="${2:-}"
-      case "$SANDBOX_BACKEND" in
-        apple-container|docker|smolvm|local-process) ;;
-        *) die "--sandbox-backend must be apple-container, docker, smolvm, or local-process" ;;
-      esac
-      SANDBOX_BACKEND_EXPLICIT=true
+      PROVIDER_EXPLICIT=true
       shift 2
       ;;
     --template)

@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,7 +23,7 @@ use uuid::Uuid;
 
 use crate::{DurableFileSystem, SandboxAttachment};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SandboxKey {
     AgentSandbox {
         agent_id: String,
@@ -49,18 +50,18 @@ impl fmt::Display for SandboxKey {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxLifecycleConfig {
     pub idle_ttl: Option<Duration>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SandboxMountAccess {
     ReadOnly,
     ReadWrite,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SandboxMount {
     pub host_path: PathBuf,
     pub guest_path: String,
@@ -68,13 +69,13 @@ pub struct SandboxMount {
     pub internal: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SandboxNetworkPolicy {
     Enabled,
     Disabled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SandboxSpec {
     pub image: String,
     pub mounts: Vec<SandboxMount>,
@@ -83,7 +84,7 @@ pub struct SandboxSpec {
     pub default_workdir: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxRequest {
     pub key: SandboxKey,
     pub spec: SandboxSpec,
@@ -91,7 +92,7 @@ pub struct SandboxRequest {
     pub provider_state: Option<Value>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxCommand {
     pub argv: Vec<String>,
     pub env: HashMap<String, String>,
@@ -100,7 +101,7 @@ pub struct SandboxCommand {
     pub timeout: Option<Duration>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxCommandOutput {
     pub ok: bool,
     pub exit_code: Option<i32>,
@@ -142,6 +143,10 @@ pub enum SnapshotKind {
     /// small JSON manifest; restoring is `smolvm machine create --from <path>`.
     /// A pack captures a whole stateful VM, so it is far too large to inline.
     SmolMachinePack,
+    /// Reference to an immutable Firecracker state/RAM/disk bundle in the
+    /// backend's private state root. Payload bytes are a small JSON manifest;
+    /// the multi-gigabyte snapshot remains local to that Firecracker host.
+    FirecrackerSnapshot,
 }
 
 #[async_trait]
@@ -164,6 +169,14 @@ pub trait ManagedSandboxHandle: Send + Sync {
 
     async fn start_process(&self, command: &SandboxCommand) -> Result<crate::SandboxProcessParts>;
 
+    fn supports_tcp(&self) -> bool {
+        false
+    }
+
+    async fn connect_tcp(&self, _port: u16) -> Result<Option<BoxSandboxTcpStream>> {
+        Ok(None)
+    }
+
     async fn stop(&self) -> Result<()>;
 
     /// Relinquish lifecycle ownership without stopping the sandbox and return
@@ -174,6 +187,12 @@ pub trait ManagedSandboxHandle: Send + Sync {
     /// error if this backend doesn't (yet) support snapshotting.
     async fn snapshot(&self) -> Result<SnapshotPayload>;
 }
+
+pub trait SandboxTcpStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+
+impl<T> SandboxTcpStream for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+
+pub type BoxSandboxTcpStream = Pin<Box<dyn SandboxTcpStream>>;
 
 #[async_trait]
 pub trait ManagedSandboxBackend: Send + Sync {
@@ -196,6 +215,21 @@ pub trait ManagedSandboxBackend: Send + Sync {
         request: SandboxRequest,
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>>;
+
+    /// Permanently destroy the sandbox addressed by `request` and any retained
+    /// backend state. Unlike stopping a handle, termination must be idempotent.
+    async fn terminate(&self, _request: SandboxRequest) -> Result<()> {
+        bail!("sandbox backend does not support explicit termination")
+    }
+
+    /// Copy the current state of `source` to `target`.
+    async fn fork_sandbox(
+        &self,
+        _source: SandboxRequest,
+        _target: SandboxRequest,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        bail!("sandbox backend does not support forking")
+    }
 }
 
 pub const DEFAULT_SANDBOX_IMAGE: &str = crate::sandbox_provider::DEFAULT_DOCKER_IMAGE;
@@ -612,6 +646,10 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
                 "SmolMachinePack payloads can only be restored by the smolvm sandbox provider; \
                  select provider smolvm to rewind this snapshot"
             ),
+            (_, SnapshotKind::FirecrackerSnapshot) => bail!(
+                "FirecrackerSnapshot payloads can only be restored by the Firecracker sandbox provider; \
+                 select provider firecracker to rewind this snapshot"
+            ),
         }
 
         let image_tag = docker_load_image(&self.container_bin, &payload.bytes).await?;
@@ -843,7 +881,7 @@ impl ManagedSandboxHandle for WarmSandboxHandle {
             // know to choose Docker for snapshot-using flows.
             ContainerCliFlavor::AppleContainer => bail!(
                 "snapshot is not yet implemented for the apple-container backend; \
-                 use --sandbox-provider docker for snapshot-using flows"
+                 use --provider docker for snapshot-using flows"
             ),
         }
     }
@@ -1853,11 +1891,11 @@ fn schedule_cleanup_named_container(container_bin: PathBuf, cli: ContainerCliFla
 fn missing_container_cli_message(cli: ContainerCliFlavor, container_bin: &Path) -> String {
     match cli {
         ContainerCliFlavor::AppleContainer => format!(
-            "apple-container sandbox backend requires the `{}` CLI; install Apple container CLI or use `--sandbox-backend local-process`",
+            "apple-container sandbox backend requires the `{}` CLI; install Apple container CLI or use `--provider local-process`",
             container_bin.display()
         ),
         ContainerCliFlavor::Docker => format!(
-            "docker sandbox backend requires the `{}` CLI; install Docker or use `--sandbox-backend local-process`",
+            "docker sandbox backend requires the `{}` CLI; install Docker or use `--provider local-process`",
             container_bin.display()
         ),
     }
@@ -2328,7 +2366,7 @@ esac
         let message = format!("{error:#}");
         assert!(message.contains("apple-container sandbox backend requires"));
         assert!(message.contains("install Apple container CLI"));
-        assert!(message.contains("--sandbox-backend local-process"));
+        assert!(message.contains("--provider local-process"));
     }
 
     #[cfg(unix)]

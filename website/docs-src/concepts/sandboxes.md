@@ -23,8 +23,11 @@ plus arbitrary command execution inside them.
 | `vercel` | Remote | [Vercel Sandbox](https://vercel.com/docs/vercel-sandbox) |
 | `aws-agentcore` | Remote | [Amazon Bedrock AgentCore](https://aws.amazon.com/bedrock/agentcore/) |
 
-**Local** backends are selected with `--sandbox-backend` (or the
-`EXO_SANDBOX_BACKEND` env var) and need no credentials.
+Select a provider with `--provider`; local providers need no credentials:
+
+```bash
+exo agent create --model <model> --provider docker "My Agent"
+```
 
 **Remote** backends are configured as bindings and need an API key:
 

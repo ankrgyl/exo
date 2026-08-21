@@ -1,5 +1,16 @@
 //! Per-provider [`crate::sandbox::ManagedSandboxBackend`] implementations,
 //! selected via the harness's provider registry.
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+use std::{path::PathBuf, sync::Arc};
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+type FirecrackerBackend = Arc<dyn crate::ManagedSandboxBackend>;
+
+const DEFAULT_FIRECRACKER_IMAGE: &str = "/var/lib/exo/firecracker/rootfs.ext4";
+
+pub fn default_firecracker_image() -> String {
+    DEFAULT_FIRECRACKER_IMAGE.to_string()
+}
+
 mod docker;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
@@ -28,6 +39,18 @@ mod aws_agentcore {
 }
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 mod e2b;
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+mod firecracker;
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+mod firecracker_bridge;
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+mod firecracker_image;
+#[cfg(all(
+    target_os = "macos",
+    not(target_arch = "wasm32"),
+    feature = "firecracker"
+))]
+mod firecracker_lima;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub mod process_bridge;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
@@ -60,6 +83,69 @@ pub(crate) use docker::DEFAULT_DOCKER_IMAGE;
 pub use docker::default_docker_image;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use e2b::{DEFAULT_E2B_API_URL, DEFAULT_E2B_ENVD_PORT, E2bConfig, E2bSandboxBackend};
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+pub use firecracker::{
+    DEFAULT_FIRECRACKER_BINARY, DEFAULT_FIRECRACKER_INITRAMFS, DEFAULT_FIRECRACKER_JAILER,
+    DEFAULT_FIRECRACKER_KERNEL, DEFAULT_FIRECRACKER_STATE_ROOT, DEFAULT_IMAGE_SIZE_GIB,
+    DEFAULT_JAILER_UID_BASE, DEFAULT_MEMORY_MIB, DEFAULT_NETWORK_BYTES_PER_SECOND,
+    DEFAULT_VCPU_COUNT, DEFAULT_WORKSPACE_SIZE_GIB, FirecrackerConfig, FirecrackerSandboxBackend,
+};
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+pub use firecracker_bridge::run_firecracker_bridge;
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+#[derive(Debug, Clone)]
+pub struct FirecrackerLimaConfig {
+    pub limactl: PathBuf,
+    pub instance: String,
+    pub target_dir: PathBuf,
+    /// Prebuilt bridge binary inside the Lima VM. When absent, Exo builds and
+    /// installs the bridge from the current checkout.
+    pub bridge_binary: Option<PathBuf>,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+impl Default for FirecrackerLimaConfig {
+    fn default() -> Self {
+        Self {
+            limactl: PathBuf::from("limactl"),
+            instance: "exo-firecracker".to_string(),
+            target_dir: PathBuf::from("/var/tmp/exo-firecracker-bridge-target"),
+            bridge_binary: None,
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+pub async fn firecracker_backend(
+    config: FirecrackerConfig,
+    lima: FirecrackerLimaConfig,
+) -> anyhow::Result<FirecrackerBackend> {
+    #[cfg(target_os = "linux")]
+    {
+        drop(lima);
+        Ok(Arc::new(FirecrackerSandboxBackend::new(config).await?))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Arc::new(
+            firecracker_lima::LimaFirecrackerSandboxBackend::new(config, lima).await?,
+        ))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        drop(config);
+        drop(lima);
+        anyhow::bail!("Firecracker sandbox execution is only supported on Linux or macOS with Lima")
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32"), feature = "firecracker"))]
+pub(crate) async fn firecracker_backend_for_test(
+    config: FirecrackerConfig,
+) -> anyhow::Result<std::sync::Arc<dyn crate::ManagedSandboxBackend>> {
+    firecracker_backend(config, FirecrackerLimaConfig::default()).await
+}
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use smolvm::{SmolvmExecutionMode, SmolvmSandboxBackend, default_smolvm_image};
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]

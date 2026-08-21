@@ -163,7 +163,7 @@ exo/scripts/exo-service-guardian restart-all --build
 Save local launch settings for later restarts with:
 
 ```bash
-exo/scripts/exo-service-guardian configure --sandbox-backend docker
+exo/scripts/exo-service-guardian configure
 ```
 
 The service guardian manages only the scheduler and adapter runners. Start or

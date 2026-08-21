@@ -164,7 +164,7 @@ async fn conversation_send_round_trips_through_real_sandbox_and_mocked_openai() 
             "test-agent",
             "--model",
             "gpt-test",
-            "--sandbox-provider",
+            "--provider",
             provider.cli_arg(),
             "Integration Test Agent",
         ],
