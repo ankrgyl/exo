@@ -76,6 +76,18 @@ def copy_source_snapshot(source: Path, destination: Path) -> str:
     return workspace_digest(destination)
 
 
+def link_runtime_dependencies(source: Path, destination: Path) -> None:
+    """Expose installed dependencies without copying them into each arm."""
+    dependencies = source / "node_modules"
+    if not dependencies.is_dir():
+        raise ValueError(
+            f"runtime dependencies not found: {dependencies}; run pnpm install first"
+        )
+    (destination / "node_modules").symlink_to(
+        dependencies.resolve(), target_is_directory=True
+    )
+
+
 def workspace_digest(workspace: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(workspace.rglob("*")):
@@ -304,6 +316,8 @@ def main() -> int:
         shutil.copytree(memory_workspace, router_workspace, symlinks=True)
         if workspace_digest(router_workspace) != source_digest:
             raise ValueError("isolated workspaces differ before evaluation")
+        link_runtime_dependencies(repo, memory_workspace)
+        link_runtime_dependencies(repo, router_workspace)
 
         short_id = dt.datetime.now(dt.UTC).strftime("%H%M%S") + f"-{os.getpid()}"
         short_runs = repo / ".local/hr" / short_id

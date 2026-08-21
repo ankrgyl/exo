@@ -248,6 +248,32 @@ class ComparisonTest(unittest.TestCase):
             for ignored in (".git", ".local", ".exo", "target", "node_modules"):
                 self.assertFalse((destination / ignored).exists())
 
+    def test_runtime_dependencies_are_linked_after_snapshotting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            dependencies = source / "node_modules"
+            dependencies.mkdir(parents=True)
+            destination.mkdir()
+
+            compare_script.link_runtime_dependencies(source, destination)
+
+            link = destination / "node_modules"
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(link.resolve(), dependencies.resolve())
+
+    def test_runtime_dependencies_must_be_installed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            destination.mkdir()
+
+            with self.assertRaisesRegex(ValueError, "run pnpm install first"):
+                compare_script.link_runtime_dependencies(source, destination)
+
 
 if __name__ == "__main__":
     unittest.main()

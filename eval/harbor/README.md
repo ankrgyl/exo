@@ -109,6 +109,11 @@ router-minus-memory reward and reuse deltas:
   --model=z-ai/glm-5.2:free
 ```
 
+Run `pnpm install` in the source checkout first. Generated state, including
+`node_modules`, is excluded from each source snapshot; both arms link to the
+checkout's installed dependency tree so their TypeScript harnesses can start
+without duplicating hundreds of megabytes of immutable packages.
+
 Do not pass `openrouter/free`: that router can select a different underlying
 model between requests, invalidating the comparison. The isolated workspaces
 are retained under `.local/harbor-comparisons` so agent-created tools or source
