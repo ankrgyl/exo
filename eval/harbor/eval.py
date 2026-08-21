@@ -122,17 +122,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--agent-network",
-        choices=("no-network", "public"),
-        default="no-network",
-        help=(
-            "network policy for the agent phase, written into each task.toml. "
-            "Harbor defaults to public, which on SWE-bench lets the agent "
-            "fetch the upstream patch for its own task id. The verifier phase "
-            "is left alone so it can still install its toolchain."
-        ),
-    )
-    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="print the resolved command without running it",
@@ -149,85 +138,6 @@ def local_dataset_path(args: argparse.Namespace) -> Path | None:
     if local_dataset := LOCAL_DATASETS.get(args.dataset):
         return Path(__file__).resolve().parent / local_dataset
     return None
-
-
-TASK_CACHE_DIR = Path.home() / ".cache/harbor/tasks/packages"
-AGENT_NETWORK_MARKER = "network_mode"
-
-
-def task_config_paths(args: argparse.Namespace, dataset_path: Path | None) -> list[Path]:
-    """Every task.toml this run could use.
-
-    Local datasets own their task files. Registry datasets are unpacked into
-    Harbor's cache, keyed by the task owner, which is the part of the dataset
-    id before the slash.
-    """
-    if dataset_path is not None:
-        return sorted(dataset_path.rglob("task.toml"))
-    dataset = DATASETS.get(args.dataset, args.dataset)
-    owner = dataset.split("/", 1)[0]
-    return sorted((TASK_CACHE_DIR / owner).rglob("task.toml"))
-
-
-def set_agent_network_mode(text: str, mode: str | None) -> str:
-    """Add, replace, or drop `network_mode` in a task.toml's [agent] section.
-
-    Harbor's default network policy is `public`, and these task files say
-    nothing about networking, so the agent phase reaches the internet. On a
-    benchmark whose task ids are upstream pull request numbers, that lets an
-    agent fetch the reference patch instead of solving the task.
-
-    `mode=None` removes the override so the file returns to whatever it
-    shipped with, which is what makes the two arms of a comparison honest:
-    the same cached file cannot silently keep a previous run's policy.
-    """
-    lines = text.splitlines()
-    output: list[str] = []
-    in_agent = False
-    wrote = False
-
-    def close_agent_section() -> None:
-        """Append the setting after the section's last real line.
-
-        Appending at the raw section end would put it after the blank line
-        that separates sections, leaving it visually orphaned against the
-        next header even though TOML still reads it as part of [agent].
-        """
-        nonlocal wrote
-        blanks: list[str] = []
-        while output and not output[-1].strip():
-            blanks.append(output.pop())
-        output.append(f'{AGENT_NETWORK_MARKER} = "{mode}"')
-        output.extend(reversed(blanks))
-        wrote = True
-
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("["):
-            if in_agent and mode is not None and not wrote:
-                close_agent_section()
-            in_agent = stripped == "[agent]"
-        if in_agent and stripped.startswith(AGENT_NETWORK_MARKER):
-            # Drop the old value; a replacement is appended below if wanted.
-            continue
-        output.append(line)
-    if in_agent and mode is not None and not wrote:
-        close_agent_section()
-    if mode is not None and not wrote:
-        output.extend(["", "[agent]", f'{AGENT_NETWORK_MARKER} = "{mode}"'])
-    return "\n".join(output) + "\n"
-
-
-def apply_agent_network_mode(paths: list[Path], mode: str | None) -> int:
-    """Rewrite only the task files whose policy actually changes."""
-    changed = 0
-    for path in paths:
-        text = path.read_text()
-        updated = set_agent_network_mode(text, mode)
-        if updated != text:
-            path.write_text(updated)
-            changed += 1
-    return changed
 
 
 def is_ordered_dataset(dataset_path: Path | None) -> bool:
@@ -482,27 +392,6 @@ def main() -> int:
             check=True,
         )
         print(f"Run directory: {run_dir}")
-
-        # Applied every run so a re-downloaded task package cannot quietly
-        # revert to Harbor's public default, and so switching arms takes
-        # effect rather than inheriting the previous run's policy.
-        network_mode = None if args.agent_network == "public" else args.agent_network
-        dataset_path = local_dataset_path(args)
-        task_configs = task_config_paths(args, dataset_path)
-        changed = apply_agent_network_mode(task_configs, network_mode)
-        print(
-            f"Agent network: {args.agent_network} "
-            f"({changed} of {len(task_configs)} task files updated)"
-        )
-        if not task_configs and dataset_path is None:
-            # Registry packages are unpacked during the job, so a cold cache
-            # means these tasks run before anything could be rewritten.
-            print(
-                "warning: no cached task packages found, so the agent network "
-                "policy could not be applied. Re-run once the dataset has been "
-                "downloaded to enforce it.",
-                file=sys.stderr,
-            )
 
         print("\n===Trials===", flush=True)
         # Let Harbor own the terminal so its built-in live progress UI works.

@@ -1,4 +1,7 @@
-"""ExoAgent — per-task driver, killed after completion of task and reinstantiated."""
+"""ExoAgent — per-task driver, killed after completion of task and reinstantiated.
+
+See https://www.harborframework.com/docs/agents#external-agents for more details
+on the lifecycle."""
 
 from __future__ import annotations
 
@@ -96,6 +99,7 @@ class ExoAgent(BaseAgent):
         finally:
             # Snapshot the sandbox so we have a record of the final state.
             # Useful b/c Harbor injects verifier code and tears down after completion.
+            # TODO: add a flag to enable/disable reflection, and only snapshot if reflection is enabled.
             try:
                 snapshot_id = await self._client.snapshot_sandbox(self._conversation)
             except Exception:

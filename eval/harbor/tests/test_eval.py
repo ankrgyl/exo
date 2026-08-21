@@ -154,32 +154,5 @@ class EvalScriptTest(unittest.TestCase):
                 ],
             )
 
-    def test_agent_network_mode_is_added_to_the_agent_section(self) -> None:
-        original = (
-            '[verifier]\ntimeout_sec = 3000\n\n[agent]\ntimeout_sec = 3000\n'
-        )
-
-        patched = eval_script.set_agent_network_mode(original, "no-network")
-
-        self.assertIn('network_mode = "no-network"', patched)
-        # It must land in [agent]; in [verifier] it would break grading, which
-        # needs the network to install its toolchain.
-        agent_section = patched.split("[agent]", 1)[1]
-        self.assertIn('network_mode = "no-network"', agent_section)
-        self.assertNotIn("network_mode", patched.split("[agent]", 1)[0])
-
-    def test_public_removes_a_previously_written_override(self) -> None:
-        # Otherwise a cached task file keeps the last run's policy and the
-        # two arms of a comparison are not actually different.
-        restricted = eval_script.set_agent_network_mode(
-            '[agent]\ntimeout_sec = 3000\n', "no-network"
-        )
-
-        released = eval_script.set_agent_network_mode(restricted, None)
-
-        self.assertNotIn("network_mode", released)
-        self.assertIn("timeout_sec = 3000", released)
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,4 @@
 """Tests for the Harbor trajectory export functionality.
-
-Note: tests entierly AI generated but reviewed by human.
 """
 
 

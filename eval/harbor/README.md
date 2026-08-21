@@ -91,6 +91,25 @@ and run:
 ./eval.sh --config=my-eval.toml
 ```
 
+## Network policy on SWE-bench
+
+For some reason, Harbor's store of SWE-bench does not disable internet access
+in the sandboxes. Exo ends up being smart enough to learn to pull the upstream
+patches that actually fixed the issues.
+
+So, to run SWE-bench (and other similar coding tasks) correctly, one needs
+to ensure that the following is set for each task in the Harbor .toml file:
+
+```toml
+[agent]
+network_mode = "no-network"
+```
+
+`[verifier]` is left alone, since it installs its own toolchain and needs the
+network. Disabling the sandbox's networking is not sufficient on its own:
+`web_search` and `web_fetch` run in the harness runner process on the host, and
+a shell inside the task container can reach the network by itself.
+
 ## Notes
 
 The package is pinned to `harbor>=0.20,<0.21` because the `JobPlugin` protocol

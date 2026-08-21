@@ -1,4 +1,7 @@
-"""Convert an Exo trial conversation into Harbor's native ATIF trajectory."""
+"""Convert an Exo trial conversation into Harbor's native ATIF trajectory.
+
+See https://www.harborframework.com/docs/agents/trajectory-format for more details
+on the AITF trajectory format."""
 
 from __future__ import annotations
 

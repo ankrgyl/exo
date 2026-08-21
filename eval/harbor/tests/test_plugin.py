@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, patch
 
 from exo_harbor import conventions
 from exo_harbor.plugin import (
-    REFLECTION_INSTRUCTIONS,
     ExoSessionPlugin,
     _export_trajectory,
     build_feedback,
@@ -167,6 +166,8 @@ class FeedbackSizeTest(unittest.TestCase):
 
 
 class StripSetupNoiseTest(unittest.TestCase):
+    # Note: this is important because some of the trials have huge amounts of setup,
+    # can crowd out the actual feedback.
     def test_drops_everything_before_the_pytest_banner(self) -> None:
         text = (
             "Get:1 http://archive.ubuntu.com/ubuntu noble InRelease [126 kB]\n"
