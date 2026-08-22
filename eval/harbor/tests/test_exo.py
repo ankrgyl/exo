@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from exo_harbor import conventions
-from exo_harbor.exo import ExoClient, ExoCommandError, _parse_trailing_id
+from exo_harbor.exo import ExoClient
 
 
 CLIENT = ExoClient(
@@ -32,26 +32,40 @@ class ArgvTest(unittest.TestCase):
         )
 
 
-class ParseTrailingIdTest(unittest.TestCase):
-    def test_reads_the_sandbox_id_from_an_attach(self) -> None:
-        self.assertEqual(
-            _parse_trailing_id(
-                "attached Docker container as sandbox sandbox-019ff873-1ebb for trial",
-                pattern=r"attached Docker container as sandbox (\S+) for ",
-                command="conversation sandbox attach",
-            ),
-            "sandbox-019ff873-1ebb",
-        )
+class SandboxOwnerTest(unittest.IsolatedAsyncioTestCase):
+    """Every sandbox command must name the conversation as the owner.
 
-    def test_unrecognized_output_fails_loudly(self) -> None:
-        # The CLI prints prose, so a reworded confirmation must break here
-        # rather than hand a wrong id to the verifier.
-        with self.assertRaises(ExoCommandError):
-            _parse_trailing_id(
-                "sandbox attached.",
-                pattern=r"attached Docker container as sandbox (\S+) for ",
-                command="conversation sandbox attach",
-            )
+    A sandbox id resolves only against its owner. Dropping --conversation is
+    silent: the sandbox gets created under the agent, and the trial
+    conversation then cannot address it.
+    """
+
+    async def capture_argv(self, call) -> tuple[str, ...]:
+        calls: list[tuple[str, ...]] = []
+
+        async def fake_run(_self, *args: str, **_kwargs: object) -> str:
+            calls.append(args)
+            return "sandbox-1"
+
+        with patch.object(ExoClient, "_run", fake_run):
+            await call()
+        return calls[0]
+
+    async def test_sandbox_commands_are_scoped_to_the_conversation(self) -> None:
+        cases = {
+            "attach": lambda: CLIENT.attach_container("trial-1", "abc123"),
+            "snapshot": lambda: CLIENT.snapshot_sandbox("trial-1", "sandbox-1"),
+            "restore": lambda: CLIENT.restore_sandbox("trial-1", "snapshot-1"),
+        }
+        for command, call in cases.items():
+            with self.subTest(command=command):
+                argv = await self.capture_argv(call)
+                self.assertEqual(argv[0], "sandbox")
+                self.assertEqual(argv[1], command)
+                self.assertEqual(
+                    argv[argv.index("--agent") + 1], conventions.AGENT_SLUG
+                )
+                self.assertEqual(argv[argv.index("--conversation") + 1], "trial-1")
 
 
 if __name__ == "__main__":

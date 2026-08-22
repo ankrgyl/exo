@@ -53,6 +53,9 @@ class SetupTest(unittest.IsolatedAsyncioTestCase):
 
         lookup.assert_called_once_with("session-1")
         self.assertEqual(agent._container_id, "abc123")
+        # Kept for the end-of-trial snapshot, which names the sandbox rather
+        # than re-deriving it.
+        self.assertEqual(agent._sandbox_id, "sandbox-1")
         # The conversation must exist before anything is attached to it.
         agent._client.ensure_conversation.assert_awaited_once_with(
             f"trial-{agent.context_id}"
@@ -83,6 +86,7 @@ class RunTest(unittest.IsolatedAsyncioTestCase):
         agent = build_agent()
         agent.context_id = uuid4()
         agent._container_id = "abc123"
+        agent._sandbox_id = "sandbox-1"
         agent._client = AsyncMock()
         agent._client.snapshot_sandbox.return_value = "snapshot-1"
         return agent
@@ -119,7 +123,9 @@ class RunTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(TimeoutError):
                 await agent.run("do the thing", SimpleNamespace(), context)
 
-        agent._client.snapshot_sandbox.assert_awaited_once()
+        agent._client.snapshot_sandbox.assert_awaited_once_with(
+            f"trial-{agent.context_id}", "sandbox-1"
+        )
         self.assertEqual(context.metadata["exo_snapshot_id"], "snapshot-1")
         export.assert_awaited_once()
 

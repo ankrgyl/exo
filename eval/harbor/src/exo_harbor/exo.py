@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +58,15 @@ class ExoClient:
             "conversation",
         )
 
+    def _owner(self, conversation: str) -> list[str]:
+        """Address the conversation as the sandbox owner.
+
+        A sandbox id resolves only against its owner, so every `exo sandbox`
+        call has to name the conversation; without it the sandbox would belong
+        to the agent and the conversation could not use it.
+        """
+        return ["--agent", conventions.AGENT_SLUG, "--conversation", conversation]
+
     async def attach_container(
         self,
         conversation: str,
@@ -68,11 +76,9 @@ class ExoClient:
     ) -> str:
         """Attach Harbor's task container and return the Exo sandbox id."""
         arguments = [
-            "conversation",
             "sandbox",
             "attach",
-            conventions.AGENT_SLUG,
-            conversation,
+            *self._owner(conversation),
             "--provider",
             "docker",
             "--external-id",
@@ -80,11 +86,7 @@ class ExoClient:
         ]
         if default_workdir is not None:
             arguments.extend(("--default-workdir", default_workdir))
-        return _parse_trailing_id(
-            await self._run(*arguments),
-            pattern=r"attached Docker container as sandbox (\S+) for ",
-            command="conversation sandbox attach",
-        )
+        return (await self._run(*arguments)).strip()
 
     async def send(
         self, conversation: str, prompt: str, *, timeout_sec: float | None
@@ -104,47 +106,50 @@ class ExoClient:
             timeout_sec=timeout_sec,
         )
 
-    async def snapshot_sandbox(
-        self, conversation: str, *, sandbox_id: str | None = None
-    ) -> str:
-        arguments = [
-            "conversation",
-            "sandbox",
-            "snapshot",
-            conventions.AGENT_SLUG,
-            conversation,
-        ]
-        if sandbox_id is not None:
-            arguments.extend(("--sandbox-id", sandbox_id))
-        return _parse_trailing_id(
-            await self._run(*arguments),
-            pattern=r"snapshotted sandbox \S+ as (\S+)$",
-            command="conversation sandbox snapshot",
-        )
+    async def snapshot_sandbox(self, conversation: str, sandbox_id: str) -> str:
+        """Snapshot the given sandbox and return the snapshot id.
+
+        Pass the id attach returned rather than letting anything re-derive it:
+        for a trial conversation that sandbox is Harbor's task container, and
+        this has to run before Harbor tears it down or the submitted state is
+        gone and reflection has nothing to inspect.
+        """
+        return (
+            await self._run(
+                "sandbox",
+                "snapshot",
+                *self._owner(conversation),
+                sandbox_id,
+            )
+        ).strip()
 
     async def restore_sandbox(self, conversation: str, snapshot_id: str) -> str:
-        """Start a new Exo-owned sandbox from a snapshot; return its id.
+        """Restore a snapshot into a new sandbox and make the conversation use it.
 
-        The source sandbox is untouched. The new sandbox becomes the
-        conversation's explicitly selected sandbox, so the agent's shell lands
-        inside it on the next turn rather than in the container the trial
-        borrowed, which by now has been torn down.
+        Restoring only creates the sandbox. Nothing infers that the caller
+        wants it, so the binding is recorded explicitly; the shell would
+        otherwise fall back to configuration and build a fresh container,
+        discarding the state just restored.
         """
-        return _parse_trailing_id(
+        sandbox_id = (
             await self._run(
-                "conversation",
                 "sandbox",
                 "restore",
-                conventions.AGENT_SLUG,
-                conversation,
-                "--snapshot-id",
+                *self._owner(conversation),
                 snapshot_id,
                 "--provider",
                 "docker",
-            ),
-            pattern=r"restored sandbox (\S+) from snapshot ",
-            command="conversation sandbox restore",
+            )
+        ).strip()
+        await self._run(
+            "conversation",
+            "update",
+            conventions.AGENT_SLUG,
+            conversation,
+            "--sandbox-id",
+            sandbox_id,
         )
+        return sandbox_id
 
     async def read_conversation_events(
         self,
@@ -238,13 +243,3 @@ class ExoClient:
             "exo",
             *args,
         ]
-
-
-def _parse_trailing_id(output: str, *, pattern: str, command: str) -> str:
-    """Pull an id out of the CLI's human-readable confirmation line."""
-    for line in output.splitlines():
-        if match := re.search(pattern, line.strip()):
-            return match.group(1)
-    raise ExoCommandError(
-        f"could not read the id from `exo {command}` output: {output!r}"
-    )

@@ -115,7 +115,8 @@ a shell inside the task container can reach the network by itself.
 The package is pinned to `harbor>=0.20,<0.21` because the `JobPlugin` protocol
 and the `TrialEvent.END` payload may move between Harbor minor releases.
 
-`exo.py` parses ids out of the CLI's human-readable confirmation lines. That
-parsing is confined to one function and covered by tests, so a reworded CLI
-message fails loudly rather than yielding a wrong id. If that proves annoying,
-the fix is a `--json` output mode on the relevant `exo` subcommands.
+Sandbox commands go through `exo sandbox <verb> --agent <agent> --conversation
+<trial>`, which prints a bare id, so `exo.py` no longer parses prose. Naming
+the conversation as the owner is what makes the sandbox usable by the trial:
+sandbox records live under their owner, and a conversation cannot address one
+its agent owns.

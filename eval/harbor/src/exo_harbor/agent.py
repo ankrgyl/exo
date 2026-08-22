@@ -47,6 +47,7 @@ class ExoAgent(BaseAgent):
             repo_root=Path(exo_repo_root),
         )
         self._container_id: str | None = None
+        self._sandbox_id: str | None = None
 
     @property
     def _conversation(self) -> str:
@@ -71,13 +72,16 @@ class ExoAgent(BaseAgent):
 
         # setup dedicated conversation for the trial
         await self._client.ensure_conversation(self._conversation)
-        sandbox_id = await self._client.attach_container(self._conversation, self._container_id)
+        self._sandbox_id = await self._client.attach_container(
+            self._conversation, self._container_id
+        )
+
         
         logger.info(
             "trial %s attached Harbor container %s as sandbox %s in conversation %s",
             self.context_id,
             self._container_id[:12],
-            sandbox_id,
+            self._sandbox_id,
             self._conversation,
         )
 
@@ -89,7 +93,7 @@ class ExoAgent(BaseAgent):
         context: AgentContext,
     ) -> None:
         """Hand Exo the task, wait for the turn, and snapshot what it built (to enable reflection)."""
-        assert self._container_id is not None, "ExoAgent.run called before setup"
+        assert self._sandbox_id is not None, "ExoAgent.run called before setup"
 
         snapshot_id: str | None = None
         try:
@@ -101,7 +105,9 @@ class ExoAgent(BaseAgent):
             # Useful b/c Harbor injects verifier code and tears down after completion.
             # TODO: add a flag to enable/disable reflection, and only snapshot if reflection is enabled.
             try:
-                snapshot_id = await self._client.snapshot_sandbox(self._conversation)
+                snapshot_id = await self._client.snapshot_sandbox(
+                    self._conversation, self._sandbox_id
+                )
             except Exception:
                 logger.exception("trial %s failed to snapshot at end", self.context_id)
 
