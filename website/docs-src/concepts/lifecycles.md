@@ -249,15 +249,20 @@ by any external process (Harbor and similar flows). Exo does not build that
 container; it binds an existing one into the conversation and routes
 execution there.
 
+Every `exo sandbox` verb names its owner. `--agent` alone makes the agent the
+owner; adding `--conversation` makes that conversation the owner instead.
+Ownership is not cosmetic: sandbox records live under the owner, so a
+conversation cannot address a sandbox its agent owns.
+
 ```bash
 # Attach an existing Docker container to a conversation
-exo conversation sandbox attach <agent> <conversation> \
+exo sandbox attach --agent <agent> --conversation <conversation> \
   --provider docker \
   --external-id <container-id> \
   --default-workdir /workspace
 
 # Later, hand it back
-exo conversation sandbox detach <agent> <conversation> <exo-sandbox-id>
+exo sandbox detach --agent <agent> --conversation <conversation> <exo-sandbox-id>
 ```
 
 ### Which sandbox does a turn use?
@@ -276,6 +281,24 @@ Executor selection (simplified):
 
 An attached sandbox wins over a normal created one so external workflows
 can temporarily own execution without fighting auto-provisioning.
+
+**Creating a conversation-owned sandbox is not enough to make a turn use
+it.** The spec match in step 3 compares image, workdir, mounts, durable
+filesystems, networking, and an idle timeout of exactly 300s, and
+`exo sandbox start` does not produce those defaults — it leaves the workdir
+unset, networking on, and its own idle timeout. So a sandbox you started by
+hand loses the match and the next turn builds a second one beside it. Bind it
+explicitly when you want it used:
+
+```bash
+exo sandbox start --agent <agent> --conversation <conversation> \
+  --provider docker --image ubuntu:24.04
+exo conversation update <agent> <conversation> --sandbox-id <sandbox-id>
+```
+
+The binding is recorded as a `sandbox_selected` event and takes priority over
+both attachment and spec matching, which is also what makes a sandbox restored
+from a snapshot usable when its image no longer matches the configured spec.
 
 **Config changes do not migrate an existing conversation sandbox.** If you
 change the sandbox spec mid-flight (image, mounts, networking, provider,
