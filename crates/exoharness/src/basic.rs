@@ -3488,6 +3488,17 @@ async fn active_sandbox_handle(
     }
     let mut running = harness.inner.running_sandboxes.lock().await;
     if let Some(existing) = running.get(sandbox_id) {
+        // Another concurrent caller already acquired this sandbox while we
+        // were provisioning (check-then-act race): stop the handle we just
+        // created so the remote sandbox isn't leaked untracked, then return
+        // the winner's handle.
+        tracing::warn!(
+            sandbox_id,
+            "sandbox already active; stopping the handle provisioned by this caller"
+        );
+        if let Err(stop_error) = handle.stop().await {
+            tracing::warn!(%stop_error, sandbox_id, "failed to stop the losing sandbox handle");
+        }
         return Ok((Arc::clone(existing), None));
     }
     running.insert(sandbox_id.clone(), Arc::clone(&handle));
