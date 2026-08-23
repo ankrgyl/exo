@@ -1,8 +1,12 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use exoharness::{
     AgentHandle, Artifact, ArtifactVersion, CreateSandboxRequest, ReadArtifactRequest, Result,
     SandboxProvider, Uuid7, WriteArtifactRequest,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::AgentConfig;
 use crate::conversation_sandbox::{ConversationSandboxSpec, agent_sandbox_spec};
@@ -72,6 +76,8 @@ pub(crate) async fn ensure_agent_sandbox(
     agent: &dyn AgentHandle,
     agent_config: &AgentConfig,
 ) -> Result<AgentSandboxHandle> {
+    let sandbox_lock = agent_sandbox_lock(&agent.record().id.to_string());
+    let _guard = sandbox_lock.lock().await;
     if let Some(record) = load_agent_sandbox_record(agent).await? {
         let recorded_spec = record.spec();
         if recorded_spec != agent_sandbox_spec(agent_config) {
@@ -165,6 +171,19 @@ fn latest_artifact_version(artifacts: Vec<ArtifactVersion>, path: &str) -> Optio
 
 fn new_agent_sandbox_name() -> String {
     format!("{AGENT_SANDBOX_NAME_PREFIX}-{}", Uuid7::now())
+}
+
+// Different conversations can prepare the shared agent sandbox concurrently.
+// Serialize the read-create-record sequence so first use creates exactly one.
+fn agent_sandbox_lock(agent_id: &str) -> Arc<AsyncMutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().expect("agent sandbox lock registry poisoned");
+    Arc::clone(
+        locks
+            .entry(agent_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+    )
 }
 
 #[cfg(test)]
