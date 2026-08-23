@@ -2050,6 +2050,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn snapshot_sandbox(&self, id: SandboxId) -> Result<SnapshotId> {
+        self.ensure_active_turn()?;
         let (snapshot_id, event) =
             snapshot_sandbox_side_effect(self.harness, &self.owner_dir, id).await?;
         self.append_events(vec![event]).await?;
@@ -2057,6 +2058,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn start_sandbox(&self, request: StartSandboxRequest) -> Result<()> {
+        self.ensure_active_turn()?;
         let event =
             start_sandbox_side_effect(self.harness, &self.owner_dir, self.owner, request).await?;
         self.append_events(vec![event]).await?;
@@ -2583,7 +2585,11 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 turn_id,
                 state,
             } => {
-                let expected_head = state.lock().expect("turn state poisoned").latest_event_id;
+                let expected_head = {
+                    let state = state.lock().expect("turn state poisoned");
+                    state.ensure_active(turn_id)?;
+                    state.latest_event_id
+                };
                 let mut record = self
                     .harness
                     .inner
@@ -2611,6 +2617,16 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 Ok(())
             }
         }
+    }
+
+    fn ensure_active_turn(&self) -> Result<()> {
+        if let BasicSandboxEventSink::Turn { turn_id, state, .. } = self.event_sink {
+            state
+                .lock()
+                .expect("turn state poisoned")
+                .ensure_active(turn_id)?;
+        }
+        Ok(())
     }
 }
 
@@ -2692,7 +2708,7 @@ impl ConversationHandle for BasicConversationHandle {
             record: turn_record,
             state: Mutex::new(BasicTurnState {
                 latest_event_id: Some(add_result.latest_event_id),
-                finished: false,
+                finish_event_id: None,
             }),
         }))
     }
@@ -2700,14 +2716,16 @@ impl ConversationHandle for BasicConversationHandle {
     async fn turn_handle(&self, record: TurnRecord) -> Result<Arc<dyn TurnHandle>> {
         let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
         let mut latest_event_id = None;
-        let mut finished = false;
+        let mut finish_event_id = None;
         for event in events
             .into_iter()
             .filter(|event| event.session_id == Some(record.session_id))
             .filter(|event| event.turn_id == Some(record.id))
         {
             latest_event_id = Some(event.id);
-            finished = matches!(event.data, EventData::TurnEnded);
+            if finish_event_id.is_none() && matches!(event.data, EventData::TurnEnded) {
+                finish_event_id = Some(event.id);
+            }
         }
         if latest_event_id.is_none() {
             bail!(
@@ -2723,7 +2741,7 @@ impl ConversationHandle for BasicConversationHandle {
             record,
             state: Mutex::new(BasicTurnState {
                 latest_event_id,
-                finished,
+                finish_event_id,
             }),
         }))
     }
@@ -3664,7 +3682,18 @@ struct BasicTurnHandle {
 
 struct BasicTurnState {
     latest_event_id: Option<EventId>,
-    finished: bool,
+    // Keep the completion boundary itself so rehydration cannot reopen a turn
+    // merely because older data contains a later turn-scoped event.
+    finish_event_id: Option<EventId>,
+}
+
+impl BasicTurnState {
+    fn ensure_active(&self, turn_id: TurnId) -> Result<()> {
+        if self.finish_event_id.is_some() {
+            bail!("turn {turn_id} is already finished");
+        }
+        Ok(())
+    }
 }
 
 impl BasicSandboxScope for BasicTurnHandle {
@@ -3680,6 +3709,15 @@ impl BasicSandboxScope for BasicTurnHandle {
     }
 }
 
+impl BasicTurnHandle {
+    fn ensure_active(&self) -> Result<()> {
+        self.state
+            .lock()
+            .expect("turn state poisoned")
+            .ensure_active(self.record.id)
+    }
+}
+
 #[async_trait]
 impl TurnHandle for BasicTurnHandle {
     fn record(&self) -> &TurnRecord {
@@ -3688,6 +3726,7 @@ impl TurnHandle for BasicTurnHandle {
 
     async fn add_events(&self, data: Vec<EventData>) -> Result<AddEventsResult> {
         let _guard = self.harness.inner.write_lock.lock().await;
+        self.ensure_active()?;
         let mut record = self
             .harness
             .inner
@@ -3720,6 +3759,7 @@ impl TurnHandle for BasicTurnHandle {
 
     async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion> {
         let _guard = self.harness.inner.write_lock.lock().await;
+        self.ensure_active()?;
         let mut record = self
             .harness
             .inner
@@ -3764,10 +3804,8 @@ impl TurnHandle for BasicTurnHandle {
         let _guard = self.harness.inner.write_lock.lock().await;
         {
             let state = self.state.lock().expect("turn state poisoned");
-            if state.finished {
-                return state
-                    .latest_event_id
-                    .ok_or_else(|| anyhow!("turn has no latest event id"));
+            if let Some(finish_event_id) = state.finish_event_id {
+                return Ok(finish_event_id);
             }
         }
         let mut record = self
@@ -3796,7 +3834,7 @@ impl TurnHandle for BasicTurnHandle {
         let latest = add_result.latest_event_id;
         let mut state = self.state.lock().expect("turn state poisoned");
         state.latest_event_id = Some(latest);
-        state.finished = true;
+        state.finish_event_id = Some(latest);
         Ok(latest)
     }
 }

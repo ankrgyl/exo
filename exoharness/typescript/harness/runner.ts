@@ -189,7 +189,9 @@ interface RawAddEventsResult {
 
 interface RawEvent {
   id: string;
-  conversation_id: string;
+  thread_id?: string;
+  // Read events persisted before the thread terminology migration.
+  conversation_id?: string;
   session_id?: string | null;
   turn_id?: string | null;
   created_at: string;
@@ -1002,9 +1004,13 @@ function decodeArtifactJson<T>(artifact: Artifact | null): T | null {
 }
 
 function toEvent(raw: RawEvent): Event {
+  const conversationId = raw.thread_id ?? raw.conversation_id;
+  if (!conversationId) {
+    throw new Error(`event ${raw.id} is missing thread_id`);
+  }
   return {
     id: raw.id,
-    conversationId: raw.conversation_id,
+    conversationId,
     sessionId: raw.session_id ?? null,
     turnId: raw.turn_id ?? null,
     createdAt: raw.created_at,
