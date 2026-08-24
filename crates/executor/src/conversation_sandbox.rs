@@ -87,6 +87,7 @@ pub async fn attached_conversation_sandbox(
 }
 
 /// Return the most recent sandbox selection event, if any, for the conversation.
+/// Note: deselection is recorded as selection of 'None', which is caught here.
 pub(crate) async fn selected_conversation_sandbox(
     conversation: &dyn ConversationHandle,
 ) -> Result<Option<String>> {

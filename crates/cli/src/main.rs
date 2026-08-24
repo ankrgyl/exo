@@ -896,9 +896,8 @@ enum SandboxCommands {
         env: Vec<String>,
     },
     /// Adopt an externally managed container as a sandbox and print its id.
-    ///
-    /// Exo can run in and snapshot it, but never takes over its lifecycle: it
-    /// cannot stop, terminate, or delete a container it did not create.
+    /// Note: can run or snapshot, but cannot stop/terminate/delete as this
+    /// sandbox is not managed by the CLI.
     Attach {
         #[command(flatten)]
         owner: SandboxOwnerArgs,
@@ -909,7 +908,7 @@ enum SandboxCommands {
         #[arg(long)]
         default_workdir: Option<String>,
     },
-    /// Release an adopted container, leaving it running.
+    /// Release an adopted container.
     Detach {
         #[command(flatten)]
         owner: SandboxOwnerArgs,
@@ -921,7 +920,7 @@ enum SandboxCommands {
         owner: SandboxOwnerArgs,
         sandbox_id: String,
     },
-    /// Start a new sandbox from a snapshot, leaving the source untouched.
+    /// Start a new sandbox from a snapshot.
     Restore {
         #[command(flatten)]
         owner: SandboxOwnerArgs,
@@ -954,8 +953,7 @@ struct SandboxOwnerArgs {
     /// Agent that owns the sandbox; omitted uses the shared CLI owner.
     #[arg(long, value_name = "AGENT")]
     agent: Option<String>,
-    /// Conversation that owns the sandbox, resolved within --agent by slug or
-    /// id; omitted leaves the agent itself as the owner.
+    /// Conversation that owns the sandbox; omitted uses the agent itself as the owner.
     #[arg(long, value_name = "CONVERSATION", requires = "agent")]
     conversation: Option<String>,
 }
@@ -1976,9 +1974,8 @@ async fn main() -> Result<()> {
                 let mut config = conversation.config().await?;
                 let mut changed = sandbox_runtime.apply(&mut config)?;
 
-                // Recorded as an event rather than stored as configuration, so
-                // history says which sandbox each turn ran in. Selection reads
-                // the most recent binding, so clearing is also an append.
+                // Sandbox selection is treated as an event, so from the event history
+                // we can tell which sandvox was selected for a given turn.
                 if let Some(sandbox_id) = sandbox_id {
                     // The binding is a recorded event, not part of config, so
                     // it counts as a change on its own.
@@ -2831,16 +2828,13 @@ fn write_sandbox_ids(ids: impl IntoIterator<Item = String>) -> Result<()> {
     Ok(())
 }
 
-// A sandbox id is only meaningful next to its owner: records live under
-// `<owner_dir>/sandboxes/`, so an agent-owned id is unresolvable from a
-// conversation and vice versa. Every `exo sandbox` verb therefore picks its
-// owner here, and both handles satisfy SandboxHandle.
+// A sandbox owner is either a conversation or an agent. If a conversation is
+// specified, it takes precedence over the agent.
 async fn sandbox_owner(
     harness: &dyn Harness,
     owner: &SandboxOwnerArgs,
 ) -> Result<Arc<dyn SandboxHandle>> {
     if let Some(conversation_ref) = owner.conversation.as_deref() {
-        // clap's `requires` makes the agent present whenever this is.
         let agent_ref = owner
             .agent
             .as_deref()
@@ -4071,8 +4065,7 @@ mod create_tests {
     #[test]
     fn sandbox_conversation_owner_requires_an_agent() {
         use clap::Parser;
-        // A conversation slug is unique only within its agent, so naming one
-        // without an agent would be ambiguous and must not parse.
+        // A convo without an agent doesn't make sense.
         assert!(
             super::Cli::try_parse_from(["exo", "sandbox", "ps", "--conversation", "conv"]).is_err()
         );
