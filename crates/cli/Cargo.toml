@@ -15,6 +15,7 @@ name = "exo"
 path = "src/main.rs"
 
 [dependencies]
+libc.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 cost = { path = "../cost" }

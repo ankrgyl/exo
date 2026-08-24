@@ -1164,8 +1164,27 @@ enum ConversationMountCommands {
     },
 }
 
+/// Restore the default disposition for SIGPIPE.
+///
+/// Rust ignores SIGPIPE at startup, so writing to a closed pipe returns EPIPE
+/// and `println!` panics on it. That makes ordinary shell usage fail loudly:
+/// `exo sandbox ps | head -1` prints a panic and exits non-zero once `head`
+/// goes away. Every other Unix tool just dies quietly on the signal instead.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: this only restores a signal's default disposition. It installs no
+    // handler, so there is no Rust code to run in a signal context.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    restore_default_sigpipe();
     let cli = Cli::parse();
     if matches!(cli.command, Commands::FirecrackerBridge) {
         #[cfg(feature = "firecracker")]

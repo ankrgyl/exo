@@ -2560,6 +2560,7 @@ dependencies = [
  "executor",
  "exoharness",
  "futures",
+ "libc",
  "lingua",
  "ratatui",
  "rustyline",
