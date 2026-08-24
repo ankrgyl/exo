@@ -1351,3 +1351,69 @@ fn default_agent_config() -> AgentConfig {
         braintrust: None,
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn clearing_a_binding_unpins_instead_of_restoring_the_previous_one() {
+    // Unpinning has no branch of its own: selection reads the newest
+    // sandbox_selected event and hands back its payload, so a None payload has
+    // to fall through to ordinary selection. Two pins before the clear is the
+    // case that matters -- filtering null payloads out of the query, or
+    // mapping instead of and_then-ing the Option, would silently resurrect the
+    // earlier pin rather than unpin.
+    let agent_id = Uuid7::now();
+    let conversation_id = Uuid7::now();
+    let exoharness = Arc::new(FakeExoHarness::new(agent_id, conversation_id));
+    let agent = exoharness
+        .get_agent(&agent_id)
+        .await
+        .expect("get agent should succeed")
+        .expect("agent should exist");
+    let conversation = agent
+        .get_conversation(&conversation_id)
+        .await
+        .expect("get conversation should succeed")
+        .expect("conversation should exist");
+
+    let select = |sandbox_id: Option<&str>| AddEventsRequest {
+        session_id: None,
+        turn_id: None,
+        data: vec![EventData::SandboxSelected {
+            sandbox_id: sandbox_id.map(str::to_string),
+        }],
+    };
+
+    conversation
+        .add_events(select(Some("sandbox-one")))
+        .await
+        .expect("first binding should be recorded");
+    assert_eq!(
+        crate::conversation_sandbox::selected_conversation_sandbox(conversation.as_ref())
+            .await
+            .expect("selection should resolve"),
+        Some("sandbox-one".to_string())
+    );
+
+    conversation
+        .add_events(select(Some("sandbox-two")))
+        .await
+        .expect("rebinding should append");
+    assert_eq!(
+        crate::conversation_sandbox::selected_conversation_sandbox(conversation.as_ref())
+            .await
+            .expect("selection should resolve"),
+        Some("sandbox-two".to_string()),
+        "the newest binding wins"
+    );
+
+    conversation
+        .add_events(select(None))
+        .await
+        .expect("clearing should append");
+    assert_eq!(
+        crate::conversation_sandbox::selected_conversation_sandbox(conversation.as_ref())
+            .await
+            .expect("selection should resolve"),
+        None,
+        "clearing unpins entirely rather than falling back to sandbox-one"
+    );
+}
