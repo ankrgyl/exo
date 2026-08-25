@@ -147,7 +147,9 @@ pub(crate) async fn firecracker_backend_for_test(
     firecracker_backend(config, FirecrackerLimaConfig::default()).await
 }
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
-pub use smolvm::{SmolvmExecutionMode, SmolvmSandboxBackend, default_smolvm_image};
+pub use smolvm::{
+    SmolvmBackendConfig, SmolvmExecutionMode, SmolvmSandboxBackend, default_smolvm_image,
+};
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use sprites::{DEFAULT_SPRITES_API_URL, SpritesConfig, SpritesSandboxBackend};
 pub use vercel::default_vercel_image;

@@ -37,6 +37,9 @@ use crate::sandbox::{
 /// Default binary name; overridable with `SMOLVM_BIN` for a non-PATH install.
 const SMOLVM_BIN_ENV: &str = "SMOLVM_BIN";
 const DEFAULT_SMOLVM_BIN: &str = "smolvm";
+/// Also the variable smolvm itself reads, which is why the name is not ours to
+/// choose; `--smolvm-boot-binary` is the discoverable way to set it.
+const SMOLVM_BOOT_BIN_ENV: &str = "SMOLVM_BOOT_BINARY";
 
 pub fn default_smolvm_image() -> String {
     DEFAULT_SANDBOX_IMAGE.to_string()
@@ -73,11 +76,31 @@ pub enum SmolvmExecutionMode {
     Warm,
 }
 
+/// Everything the backend can be tuned with, so a caller configures it by
+/// building a struct rather than by setting variables the type never mentions.
+/// The clap args that fill this (`--smolvm-binary`, `--smolvm-boot-binary`)
+/// carry `env` attributes, which keeps the historical `SMOLVM_*` variables
+/// working while still listing them in `--help`.
+#[derive(Debug, Clone, Default)]
+pub struct SmolvmBackendConfig {
+    pub mode: SmolvmExecutionMode,
+    /// `smolvm` itself. `None` falls back to `SMOLVM_BIN`, then bare `smolvm`
+    /// resolved through `PATH`.
+    pub binary: Option<PathBuf>,
+    /// The binary handed to smolvm as `SMOLVM_BOOT_BINARY`. `None` derives one
+    /// from `binary` on first use; see [`resolve_boot_binary`].
+    pub boot_binary: Option<PathBuf>,
+}
+
 /// Backend driving the `smolvm` CLI.
 pub struct SmolvmSandboxBackend {
     binary: PathBuf,
+    /// Configured boot binary, if the caller pinned one.
+    boot_binary_override: Option<PathBuf>,
     /// Serves `_boot-vm`; arms the parent-death watchdog for ephemeral VMs.
-    boot_binary: Option<PathBuf>,
+    /// Derived on first use rather than in the constructor: deriving it walks
+    /// `PATH` and stats candidates, and a constructor cannot await.
+    boot_binary: OnceCell<Option<PathBuf>>,
     mode: SmolvmExecutionMode,
     /// Probed once: re-asking per `acquire` would spawn a process per sandbox.
     capabilities: OnceCell<Capabilities>,
@@ -91,26 +114,43 @@ impl SmolvmSandboxBackend {
     }
 
     pub fn with_mode(mode: SmolvmExecutionMode) -> Self {
-        Self::with_mode_and_binary(mode, None)
+        Self::from_config(SmolvmBackendConfig {
+            mode,
+            ..Default::default()
+        })
     }
 
-    /// `binary` comes from the provider config (`--smolvm-binary`, which clap
-    /// also fills from `SMOLVM_BIN`). The env lookup is kept only as the
-    /// fallback for callers that build a backend without a config — clap's
-    /// `env` attribute is what makes the setting discoverable in `--help`
-    /// instead of a hidden tuning parameter.
-    pub fn with_mode_and_binary(mode: SmolvmExecutionMode, binary: Option<PathBuf>) -> Self {
-        let binary = binary
+    /// The env lookups below are the fallback for callers that build a backend
+    /// without a config; anything routed through the CLI arrives on the struct.
+    pub fn from_config(config: SmolvmBackendConfig) -> Self {
+        let binary = config
+            .binary
             .or_else(|| std::env::var_os(SMOLVM_BIN_ENV).map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from(DEFAULT_SMOLVM_BIN));
-        let boot_binary = resolve_boot_binary(&binary);
+        let boot_binary_override = config
+            .boot_binary
+            .or_else(|| std::env::var_os(SMOLVM_BOOT_BIN_ENV).map(PathBuf::from));
         Self {
             binary,
-            boot_binary,
-            mode,
+            boot_binary_override,
+            boot_binary: OnceCell::new(),
+            mode: config.mode,
             capabilities: OnceCell::new(),
             warm_seen: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Resolved once and cached: every ephemeral `acquire` needs it, and the
+    /// resolution touches the filesystem.
+    async fn boot_binary(&self) -> &Option<PathBuf> {
+        self.boot_binary
+            .get_or_init(|| async {
+                match &self.boot_binary_override {
+                    Some(explicit) => Some(explicit.clone()),
+                    None => resolve_boot_binary(&self.binary).await,
+                }
+            })
+            .await
     }
 
     /// The configured mode, which may still be `Auto` until a request resolves it.
@@ -399,7 +439,7 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
             _ => Ok(Arc::new(SmolvmOneShotHandle {
                 id: format!("smolvm-oneshot:{}", request.key),
                 binary: self.binary.clone(),
-                boot_binary: self.boot_binary.clone(),
+                boot_binary: self.boot_binary().await.clone(),
                 request,
             })),
         }
@@ -738,28 +778,40 @@ fn with_backstop_timeout(command: &SandboxCommand) -> SandboxCommand {
 ///
 /// Prefers the sibling `smolvm-bin`, since a packaged `smolvm` may be a wrapper
 /// script that cannot be exec'd as the boot binary.
-fn resolve_boot_binary(binary: &Path) -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os("SMOLVM_BOOT_BINARY") {
-        return Some(PathBuf::from(explicit));
-    }
-    let resolved = which_binary(binary)?;
+///
+/// An explicitly configured path short-circuits this in [`SmolvmSandboxBackend::boot_binary`].
+async fn resolve_boot_binary(binary: &Path) -> Option<PathBuf> {
+    let resolved = which_binary(binary).await?;
     let sibling = resolved.with_file_name("smolvm-bin");
-    if sibling.is_file() {
+    if is_file(&sibling).await {
         return Some(sibling);
     }
     Some(resolved)
 }
 
 /// Absolute path for a command that may be a bare name resolved through `PATH`.
-fn which_binary(binary: &Path) -> Option<PathBuf> {
+async fn which_binary(binary: &Path) -> Option<PathBuf> {
     if binary.components().count() > 1 {
-        return std::fs::canonicalize(binary).ok();
+        return tokio::fs::canonicalize(binary).await.ok();
     }
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(binary))
-        .find(|candidate| candidate.is_file())
-        .and_then(|candidate| std::fs::canonicalize(candidate).ok())
+    // Sequential rather than concurrent: `PATH` order *is* the precedence rule,
+    // and the first hit almost always wins on the first entry or two.
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(binary);
+        if is_file(&candidate).await
+            && let Ok(canonical) = tokio::fs::canonicalize(&candidate).await
+        {
+            return Some(canonical);
+        }
+    }
+    None
+}
+
+async fn is_file(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|meta| meta.is_file())
 }
 
 /// smolvm has no named durable filesystem; refuse rather than hand back a sandbox
@@ -883,6 +935,49 @@ async fn run_checked(mut process: Command, what: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::sandbox::SandboxLifecycleConfig;
+
+    /// A configured boot binary is used as given. The point is what does *not*
+    /// happen: no `PATH` walk, no `stat`, so a path that exists only on the host
+    /// this config was written for still round-trips instead of being silently
+    /// replaced by whatever resolution finds.
+    #[tokio::test]
+    async fn a_configured_boot_binary_is_used_verbatim() {
+        let backend = SmolvmSandboxBackend::from_config(SmolvmBackendConfig {
+            mode: SmolvmExecutionMode::OneShot,
+            binary: Some(PathBuf::from("/nowhere/smolvm")),
+            boot_binary: Some(PathBuf::from("/nowhere/smolvm-bin")),
+        });
+        assert_eq!(
+            backend.boot_binary().await.as_deref(),
+            Some(Path::new("/nowhere/smolvm-bin"))
+        );
+    }
+
+    /// Resolution is memoized, which is what keeps it off the per-sandbox path:
+    /// `acquire` asks for this every ephemeral run, and the answer costs a `PATH`
+    /// walk plus a `canonicalize`.
+    #[tokio::test]
+    async fn boot_binary_resolution_is_cached_after_the_first_ask() {
+        let backend = SmolvmSandboxBackend::from_config(SmolvmBackendConfig {
+            mode: SmolvmExecutionMode::OneShot,
+            binary: Some(PathBuf::from("/nowhere/smolvm")),
+            boot_binary: None,
+        });
+        assert!(
+            !backend.boot_binary.initialized(),
+            "construction must not resolve; that is the work being deferred"
+        );
+        // Not asserted against a fixed value: an inherited `SMOLVM_BOOT_BINARY`
+        // legitimately changes the answer, and what is under test is that the
+        // answer is computed once, not what it is.
+        let first = backend.boot_binary().await.clone();
+        assert!(backend.boot_binary.initialized());
+        assert_eq!(
+            backend.boot_binary().await,
+            &first,
+            "the second ask must read the cell, not the filesystem"
+        );
+    }
 
     #[test]
     fn parses_the_version_line_smolvm_actually_prints() {

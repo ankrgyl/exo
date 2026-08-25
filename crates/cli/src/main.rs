@@ -1058,6 +1058,11 @@ struct ProviderConfigureArgs {
     /// fallback keeps existing `SMOLVM_BIN` setups working.
     #[arg(long = "smolvm-binary", env = "SMOLVM_BIN")]
     smolvm_binary: Option<PathBuf>,
+    /// smolvm: binary to exec when booting a VM, for installs where the entry
+    /// point is a wrapper script. Defaults to the `smolvm-bin` beside
+    /// `--smolvm-binary`, else that binary itself.
+    #[arg(long = "smolvm-boot-binary", env = "SMOLVM_BOOT_BINARY")]
+    smolvm_boot_binary: Option<PathBuf>,
     /// Sprites sprite HTTP URL auth: sprite | public.
     #[arg(long)]
     url_auth: Option<String>,
@@ -2444,6 +2449,7 @@ async fn main() -> Result<()> {
                     session_storage_mount_path,
                     default_image,
                     smolvm_binary,
+                    smolvm_boot_binary,
                     url_auth,
                     labels,
                 } = *args;
@@ -2517,6 +2523,7 @@ async fn main() -> Result<()> {
                     SandboxProviderArg::Smolvm => SandboxProviderConfig::Smolvm {
                         default_image: default_image.unwrap_or_else(default_docker_image),
                         binary: smolvm_binary,
+                        boot_binary: smolvm_boot_binary,
                     },
                     SandboxProviderArg::Firecracker => SandboxProviderConfig::Firecracker {
                         default_image: default_image.unwrap_or_else(default_firecracker_image),

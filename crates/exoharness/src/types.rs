@@ -979,6 +979,10 @@ pub enum SandboxProviderConfig {
         /// setting is visible, persisted with the agent, and reproducible.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         binary: Option<PathBuf>,
+        /// Binary smolvm should exec to boot a VM, for installs where `binary`
+        /// is a wrapper script. Omitted derives it from `binary`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        boot_binary: Option<PathBuf>,
     },
     Firecracker {
         #[serde(default = "crate::sandbox_provider::default_firecracker_image")]
