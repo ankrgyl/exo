@@ -165,10 +165,19 @@ impl SandboxBackendRegistration {
     /// hypervisor boundary around the workload, and unlike `apple_container` it
     /// is not macOS-only.
     pub fn smolvm() -> Self {
-        Self::from_backend(
-            SandboxProvider::Smolvm,
-            Arc::new(crate::SmolvmSandboxBackend::new()),
-        )
+        // A factory, not a fixed backend: the binary path is configured per
+        // binding (`exo provider configure --provider smolvm --smolvm-binary`),
+        // so it has to be read when a request arrives rather than at startup —
+        // the same shape daytona/e2b use for their credentials.
+        Self::from_factory(SandboxProvider::Smolvm, false, |inner| {
+            Box::pin(async move {
+                let binary = inner.smolvm_binary_from_binding().await?;
+                Ok(Arc::new(crate::SmolvmSandboxBackend::with_mode_and_binary(
+                    crate::SmolvmExecutionMode::default(),
+                    binary,
+                )) as Arc<dyn ManagedSandboxBackend>)
+            })
+        })
     }
 
     pub fn daytona(spec: DaytonaBackendSpec) -> Self {
@@ -662,6 +671,23 @@ impl BasicExoHarnessInner {
 
     /// `DaytonaConfig` from a root-scoped `Binding::Sandbox` (newest wins), or
     /// `None` if none is set so callers fall back to the secret-name spec.
+    /// The `binary` recorded on the most recent smolvm binding, if any. `None`
+    /// leaves the backend on its `SMOLVM_BIN`-or-PATH default, so an unconfigured
+    /// install keeps working exactly as before.
+    async fn smolvm_binary_from_binding(&self) -> Result<Option<std::path::PathBuf>> {
+        let bindings = list_binding_records(&self.storage, Path::new("bindings")).await?;
+        Ok(bindings
+            .into_iter()
+            .rev()
+            .find_map(|record| match record.binding {
+                Binding::Sandbox {
+                    config: SandboxProviderConfig::Smolvm { binary, .. },
+                    ..
+                } => binary,
+                _ => None,
+            }))
+    }
+
     async fn daytona_config_from_binding(&self) -> Result<Option<crate::DaytonaConfig>> {
         let bindings = list_binding_records(&self.storage, Path::new("bindings")).await?;
         let Some((api_key_secret_id, region, organization_id, api_url)) = bindings

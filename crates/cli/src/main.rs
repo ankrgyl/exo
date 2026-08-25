@@ -1052,6 +1052,12 @@ struct ProviderConfigureArgs {
     /// Default base image for sandboxes that don't request one.
     #[arg(long)]
     default_image: Option<String>,
+    /// smolvm: path to the `smolvm` binary, for an install that is not on PATH.
+    /// Declared here rather than read from the environment inside the backend so
+    /// it appears in `--help` and is persisted with the binding; the `env`
+    /// fallback keeps existing `SMOLVM_BIN` setups working.
+    #[arg(long = "smolvm-binary", env = "SMOLVM_BIN")]
+    smolvm_binary: Option<PathBuf>,
     /// Sprites sprite HTTP URL auth: sprite | public.
     #[arg(long)]
     url_auth: Option<String>,
@@ -2437,6 +2443,7 @@ async fn main() -> Result<()> {
                     qualifier,
                     session_storage_mount_path,
                     default_image,
+                    smolvm_binary,
                     url_auth,
                     labels,
                 } = *args;
@@ -2509,6 +2516,7 @@ async fn main() -> Result<()> {
                     },
                     SandboxProviderArg::Smolvm => SandboxProviderConfig::Smolvm {
                         default_image: default_image.unwrap_or_else(default_docker_image),
+                        binary: smolvm_binary,
                     },
                     SandboxProviderArg::Firecracker => SandboxProviderConfig::Firecracker {
                         default_image: default_image.unwrap_or_else(default_firecracker_image),

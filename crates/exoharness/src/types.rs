@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::ops::Bound;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -973,6 +974,11 @@ pub enum SandboxProviderConfig {
     Smolvm {
         #[serde(default = "default_smolvm_image")]
         default_image: String,
+        /// Path to the `smolvm` binary for a non-PATH install. Carried on the
+        /// config rather than read from the environment at construction, so the
+        /// setting is visible, persisted with the agent, and reproducible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binary: Option<PathBuf>,
     },
     Firecracker {
         #[serde(default = "crate::sandbox_provider::default_firecracker_image")]

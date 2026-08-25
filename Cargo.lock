@@ -2632,6 +2632,7 @@ dependencies = [
  "oci-client",
  "reqwest 0.12.28",
  "rustix 1.1.4",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",

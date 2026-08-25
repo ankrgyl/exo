@@ -67,6 +67,7 @@ object_store = { workspace = true, optional = true }
 oci-client = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 rustix = { workspace = true, optional = true, features = ["fs"] }
+semver = "1"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = { workspace = true, optional = true }

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::process::Command;
@@ -43,7 +44,7 @@ pub fn default_smolvm_image() -> String {
 
 /// First smolvm release whose client drains the agent's `Progress` frames during
 /// a detached start, which is what warm mode needs; see [`SmolvmExecutionMode::Warm`].
-const MIN_WARM_VERSION: (u32, u32, u32) = (1, 7, 2);
+const MIN_WARM_VERSION: Version = Version::new(1, 7, 2);
 
 /// Probed from `--help`, not the version: a build carrying `--label` still
 /// reported 1.7.5, so a version gate would refuse a flag that is right there.
@@ -90,8 +91,17 @@ impl SmolvmSandboxBackend {
     }
 
     pub fn with_mode(mode: SmolvmExecutionMode) -> Self {
-        let binary = std::env::var_os(SMOLVM_BIN_ENV)
-            .map(PathBuf::from)
+        Self::with_mode_and_binary(mode, None)
+    }
+
+    /// `binary` comes from the provider config (`--smolvm-binary`, which clap
+    /// also fills from `SMOLVM_BIN`). The env lookup is kept only as the
+    /// fallback for callers that build a backend without a config — clap's
+    /// `env` attribute is what makes the setting discoverable in `--help`
+    /// instead of a hidden tuning parameter.
+    pub fn with_mode_and_binary(mode: SmolvmExecutionMode, binary: Option<PathBuf>) -> Self {
+        let binary = binary
+            .or_else(|| std::env::var_os(SMOLVM_BIN_ENV).map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from(DEFAULT_SMOLVM_BIN));
         let boot_binary = resolve_boot_binary(&binary);
         Self {
@@ -166,7 +176,7 @@ impl SmolvmSandboxBackend {
         }
     }
 
-    async fn probe_version(&self) -> Option<(u32, u32, u32)> {
+    async fn probe_version(&self) -> Option<Version> {
         let output = Command::new(&self.binary)
             .arg("--version")
             .output()
@@ -419,10 +429,7 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
         if self.resolve_mode(&request).await != SmolvmExecutionMode::Warm {
             bail!(
                 "smolvm snapshots require warm mode (one-shot VMs hold no state to restore); \
-                 warm needs smolvm >= {}.{}.{}",
-                MIN_WARM_VERSION.0,
-                MIN_WARM_VERSION.1,
-                MIN_WARM_VERSION.2
+                 warm needs smolvm >= {MIN_WARM_VERSION}"
             );
         }
 
@@ -805,24 +812,33 @@ mod cli_says {
     }
 }
 
-/// `(major, minor, patch)` from `smolvm --version`; `None` means "assume old".
-fn parse_version(output: &str) -> Option<(u32, u32, u32)> {
-    // Strip `v` before the digit test, or "v1.10.0" is skipped entirely.
+/// The version reported by `smolvm --version`; `None` means "assume old".
+///
+/// Comparison is delegated to `semver` rather than hand-rolled, so precedence
+/// follows the spec — notably that a prerelease sorts BELOW its release, which a
+/// tuple comparison silently got wrong (`1.7.2-rc.1` used to satisfy a `>= 1.7.2`
+/// gate even though it predates the fix that gate exists to require).
+///
+/// The input still needs a little normalizing before `semver` will take it:
+/// `--version` prints `smolvm 1.7.5`, sometimes with a `v` prefix, and a
+/// two-component `1.7` is not valid semver but is worth accepting as `1.7.0`.
+fn parse_version(output: &str) -> Option<Version> {
     let token = output
         .split_whitespace()
         .map(|word| word.trim_start_matches('v'))
         .find(|word| word.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
-    // Tolerate a "1.7.5-rc.1" suffix.
-    let core = token.split(['-', '+']).next().unwrap_or(token);
-    let mut parts = core.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    // "1.7" is valid, with patch 0.
-    let patch = match parts.next() {
-        Some(value) => value.parse().ok()?,
-        None => 0,
-    };
-    Some((major, minor, patch))
+    Version::parse(token)
+        .ok()
+        // `1.7` / `1` are not semver; retry with the missing components as zero
+        // rather than reporting an unreadable version and disabling warm mode.
+        .or_else(|| {
+            let core = token.split(['-', '+']).next().unwrap_or(token);
+            let mut parts = core.split('.').map(|p| p.parse::<u64>());
+            let major = parts.next()?.ok()?;
+            let minor = parts.next().transpose().ok()?.unwrap_or(0);
+            let patch = parts.next().transpose().ok()?.unwrap_or(0);
+            Some(Version::new(major, minor, patch))
+        })
 }
 
 /// Whether an image reference names local disk rather than a registry: a tar, an
@@ -870,10 +886,16 @@ mod tests {
 
     #[test]
     fn parses_the_version_line_smolvm_actually_prints() {
-        assert_eq!(parse_version("smolvm 1.7.5\n"), Some((1, 7, 5)));
-        assert_eq!(parse_version("smolvm 1.7.5-rc.1"), Some((1, 7, 5)));
-        assert_eq!(parse_version("smolvm v1.10.0"), Some((1, 10, 0)));
-        assert_eq!(parse_version("smolvm 1.7"), Some((1, 7, 0)));
+        assert_eq!(parse_version("smolvm 1.7.5\n"), Some(Version::new(1, 7, 5)));
+        assert_eq!(
+            parse_version("smolvm 1.7.5-rc.1"),
+            Some(Version::parse("1.7.5-rc.1").unwrap())
+        );
+        assert_eq!(
+            parse_version("smolvm v1.10.0"),
+            Some(Version::new(1, 10, 0))
+        );
+        assert_eq!(parse_version("smolvm 1.7"), Some(Version::new(1, 7, 0)));
         assert_eq!(parse_version("not a version"), None);
         assert_eq!(parse_version(""), None);
     }
@@ -887,6 +909,11 @@ mod tests {
         assert!(supports("smolvm 1.7.5"));
         assert!(supports("smolvm 2.0.0"));
         assert!(!supports("smolvm 1.6.13"));
+        // Semver precedence, which the previous tuple comparison got wrong: a
+        // prerelease sorts BELOW its release, so 1.7.2-rc.1 predates the fix the
+        // gate requires and must not enable warm mode.
+        assert!(!supports("smolvm 1.7.2-rc.1"));
+        assert!(supports("smolvm 1.7.3-rc.1"));
     }
 
     fn test_request(idle_ttl: Option<Duration>) -> SandboxRequest {
