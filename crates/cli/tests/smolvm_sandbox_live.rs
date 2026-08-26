@@ -289,10 +289,28 @@ async fn timed_out_exec_leaves_no_orphaned_vm() {
     cmd.timeout = Some(Duration::from_secs(5));
     let started = std::time::Instant::now();
     let outcome = handle.exec(&cmd).await;
+    let elapsed = started.elapsed();
     println!(
-        "timed-out exec returned after {:?}: ok={:?}",
-        started.elapsed(),
+        "timed-out exec returned after {elapsed:?}: ok={:?}",
         outcome.as_ref().map(|o| o.ok)
+    );
+
+    // The VM-count check below is satisfied by a VM that was reaped correctly AND
+    // by one that never booted, so it cannot stand alone: a total regression of
+    // the boot path (a bad `SMOLVM_BOOT_BINARY` is enough) creates nothing to
+    // strand and sails through.
+    //
+    // `ok` alone does not separate those either — a VM that fails to start also
+    // reports `Ok(ok: false)`, just immediately. Elapsed time is the honest
+    // discriminator: a real timeout cannot return before the timeout.
+    let outcome = outcome.expect("exec `sleep 120`");
+    assert!(
+        !outcome.ok,
+        "`sleep 120` under a 5s timeout must not report success: {outcome:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(4),
+        "returned in {elapsed:?} — that is a failure to start, not a timeout"
     );
 
     // Give a stranded VM time to show up before counting.
@@ -557,6 +575,18 @@ async fn smolvm_network_is_denied_unless_requested() {
         ))
         .await
         .expect("acquire smolvm sandbox");
+
+    // Without this, the denial below passes for the wrong reason on any guest
+    // that simply has no `wget`: the command fails, `ok` is false, and the test
+    // reports an egress policy it never exercised.
+    let probe = handle
+        .exec(&command(&["sh", "-c", "command -v wget"]))
+        .await
+        .expect("exec wget probe");
+    assert!(
+        probe.ok,
+        "guest image has no wget, so a failed fetch would prove nothing"
+    );
 
     let output = handle
         .exec(&command(&[
