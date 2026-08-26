@@ -18,6 +18,7 @@ def build_agent(logs_dir: Path = Path("/tmp/logs")) -> ExoAgent:
         exo_bin="/repo/target/debug/exo",
         exo_repo_root="/repo",
         exo_model="gpt-5.5",
+        reflection=True,
     )
 
 
@@ -84,6 +85,46 @@ class SetupTest(unittest.IsolatedAsyncioTestCase):
                 await agent.setup(SimpleNamespace(session_id="session-1"))
 
         agent._client.ensure_conversation.assert_not_awaited()
+
+
+class ReflectionFlagTest(unittest.IsolatedAsyncioTestCase):
+    """Without reflection nothing ever reads the snapshot, so do not take one.
+
+    Harbor passes agent kwargs as strings, so the flag has to survive "false"
+    rather than being read as a truthy value.
+    """
+
+    async def build(self, reflection: object) -> ExoAgent:
+        agent = ExoAgent(
+            logs_dir=Path("/tmp/logs"),
+            exo_root="/runs/one/exo",
+            exo_bin="/repo/target/debug/exo",
+            exo_repo_root="/repo",
+            exo_model="gpt-5.5",
+            reflection=reflection,
+        )
+        agent.context_id = uuid4()
+        agent._container_id = "abc123"
+        agent._sandbox_id = "sandbox-1"
+        agent._client = AsyncMock()
+        agent._client.snapshot_sandbox.return_value = "snapshot-1"
+        return agent
+
+    async def test_the_string_false_does_not_enable_reflection(self) -> None:
+        agent = await self.build("false")
+        context = SimpleNamespace(metadata=None)
+        with patch("exo_harbor.agent.export_trial_trajectory", AsyncMock()):
+            await agent.run("do the thing", SimpleNamespace(), context)
+        agent._client.snapshot_sandbox.assert_not_awaited()
+        self.assertIsNone(context.metadata["exo_snapshot_id"])
+
+    async def test_reflection_still_snapshots(self) -> None:
+        agent = await self.build("true")
+        context = SimpleNamespace(metadata=None)
+        with patch("exo_harbor.agent.export_trial_trajectory", AsyncMock()):
+            await agent.run("do the thing", SimpleNamespace(), context)
+        agent._client.snapshot_sandbox.assert_awaited_once()
+        self.assertEqual(context.metadata["exo_snapshot_id"], "snapshot-1")
 
 
 class RunTest(unittest.IsolatedAsyncioTestCase):

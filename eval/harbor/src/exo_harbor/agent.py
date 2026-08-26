@@ -33,11 +33,14 @@ class ExoAgent(BaseAgent):
         exo_bin: str | Path,
         exo_repo_root: str | Path,
         exo_model: str,
+        harness: str = "exo",
+        reflection: bool | str = False,
         task_timeout_sec: float | str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self._model = exo_model
+        self._reflection = conventions.parse_flag(reflection)
         self._task_timeout_sec = (
             float(task_timeout_sec) if task_timeout_sec is not None else None
         )
@@ -45,6 +48,7 @@ class ExoAgent(BaseAgent):
             exo_bin=Path(exo_bin),
             exo_root=Path(exo_root),
             repo_root=Path(exo_repo_root),
+            harness=harness,
         )
         self._container_id: str | None = None
         self._sandbox_id: str | None = None
@@ -104,14 +108,16 @@ class ExoAgent(BaseAgent):
             )
         finally:
             # Snapshot the sandbox so we have a record of the final state.
-            # Useful b/c Harbor injects verifier code and tears down after completion.
-            # TODO: add a flag to enable/disable reflection, and only snapshot if reflection is enabled.
-            try:
-                snapshot_id = await self._client.snapshot_sandbox(
-                    self._conversation, self._sandbox_id
-                )
-            except Exception:
-                logger.exception("trial %s failed to snapshot at end", self.context_id)
+            # Harbor injects verifier code and tears the container down once the
+            # trial ends, so this is the last chance to capture what was
+            # submitted. Only reflection reads it, so skip the cost otherwise.
+            if self._reflection:
+                try:
+                    snapshot_id = await self._client.snapshot_sandbox(
+                        self._conversation, self._sandbox_id
+                    )
+                except Exception:
+                    logger.exception("trial %s failed to snapshot at end", self.context_id)
 
             context.metadata = {
                 **(context.metadata or {}),

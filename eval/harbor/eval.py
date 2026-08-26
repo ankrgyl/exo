@@ -41,6 +41,8 @@ CONFIG_FIELDS = {
     "n_tasks",
     "n_attempts",
     "include_task_names",
+    "reflection",
+    "harness",
 }
 
 
@@ -119,6 +121,23 @@ def parse_args() -> argparse.Namespace:
             "reuse the existing exo binary instead of running cargo build; "
             "for example when another eval is mid-run, since each of its "
             "turns re-invokes the binary a rebuild would replace"
+        ),
+    )
+    parser.add_argument(
+        "--harness",
+        choices=("exo", "basic"),
+        help=(
+            "which executor to evaluate; `basic` is a control arm with only a "
+            "shell -- no memory, no skills, no self-editing"
+        ),
+    )
+    parser.add_argument(
+        "--reflection",
+        action="store_true",
+        help=(
+            "after each trial, restore its final sandbox and let Exo review "
+            "the grade so it can carry lessons into later trials; off by "
+            "default, which makes each trial independent"
         ),
     )
     parser.add_argument(
@@ -278,6 +297,11 @@ def harbor_command(
         f"exo_bin={exo}",
         "--ak",
         f"exo_model={args.model}",
+        # Read by the agent, and by the plugin through the agent's kwargs.
+        "--ak",
+        f"harness={args.harness or 'exo'}",
+        "--ak",
+        f"reflection={str(bool(args.reflection)).lower()}",
         "--jobs-dir",
         str(jobs_dir),
         *task_limit,

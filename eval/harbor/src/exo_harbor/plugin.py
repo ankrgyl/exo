@@ -48,6 +48,7 @@ class ExoSessionPlugin(BaseJobPlugin):
                 exo_bin=Path(kwargs["exo_bin"]),
                 exo_root=Path(kwargs["exo_root"]),
                 repo_root=Path(kwargs["exo_repo_root"]),
+                harness=kwargs.get("harness", "exo"),
             )
         except KeyError as error:
             raise ValueError(f"ExoAgent is missing required --ak {error.args[0]}") from error
@@ -55,7 +56,10 @@ class ExoSessionPlugin(BaseJobPlugin):
         await client.ensure_agent(model)
         self._client = client
         self._model = model
-        job.on_trial_ended(self._reflect_on_trial)
+        if conventions.parse_flag(kwargs.get("reflection")):
+            job.on_trial_ended(self._reflect_on_trial)
+        else:
+            logger.info("reflection is off; trials will not learn from each other")
         logger.info("Exo ready for job %s under %s", job.id, client.exo_root)
 
     async def _reflect_on_trial(self, event: TrialHookEvent) -> None:
@@ -99,22 +103,36 @@ class ExoSessionPlugin(BaseJobPlugin):
             snapshot_id,
         )
 
-        feedback = build_feedback(result, trial_dir / "verifier")
-        await self._client.send(
-            conversation,
-            f"{REFLECTION_INSTRUCTIONS}\n\nGrader feedback:\n{feedback}",
-            timeout_sec=self._feedback_timeout_sec,
-        )
-        # add reflection trajectory to harbor's logs
-        await _export_trajectory(
-            self._client,
-            conversation,
-            str(result.id),
-            instruction,
-            self._model,
-            trial_dir / "agent" / "trajectory.json",
-        )
-        logger.info("trial %s feedback complete", result.id)
+        try:
+            feedback = build_feedback(result, trial_dir / "verifier")
+            await self._client.send(
+                conversation,
+                f"{REFLECTION_INSTRUCTIONS}\n\nGrader feedback:\n{feedback}",
+                timeout_sec=self._feedback_timeout_sec,
+            )
+            # add reflection trajectory to harbor's logs
+            await _export_trajectory(
+                self._client,
+                conversation,
+                str(result.id),
+                instruction,
+                self._model,
+                trial_dir / "agent" / "trajectory.json",
+            )
+            logger.info("trial %s feedback complete", result.id)
+        finally:
+            # Reflection restored this sandbox, so reflection destroys it.
+            # Nothing else will: the trial conversation is finished, and one
+            # container per trial adds up over a long run. In a finally because
+            # a failed or timed-out reflection leaks just as readily.
+            try:
+                await self._client.terminate_sandbox(conversation, sandbox_id)
+            except Exception:
+                logger.exception(
+                    "trial %s could not terminate reflection sandbox %s",
+                    result.id,
+                    sandbox_id,
+                )
 
     async def on_job_end(self, _job_result: JobResult) -> None:
         if self._client is None:
