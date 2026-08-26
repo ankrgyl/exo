@@ -1354,12 +1354,6 @@ fn default_agent_config() -> AgentConfig {
 
 #[tokio::test(flavor = "current_thread")]
 async fn clearing_a_binding_unpins_instead_of_restoring_the_previous_one() {
-    // Unpinning has no branch of its own: selection reads the newest
-    // sandbox_selected event and hands back its payload, so a None payload has
-    // to fall through to ordinary selection. Two pins before the clear is the
-    // case that matters -- filtering null payloads out of the query, or
-    // mapping instead of and_then-ing the Option, would silently resurrect the
-    // earlier pin rather than unpin.
     let agent_id = Uuid7::now();
     let conversation_id = Uuid7::now();
     let exoharness = Arc::new(FakeExoHarness::new(agent_id, conversation_id));
@@ -1419,10 +1413,6 @@ async fn clearing_a_binding_unpins_instead_of_restoring_the_previous_one() {
 }
 #[tokio::test(flavor = "current_thread")]
 async fn a_binding_to_a_detached_sandbox_is_an_error() {
-    // Detach leaves the selection event behind, so the binding outlives what it
-    // points at. Running somewhere else instead would make the log a liar: it
-    // would say this conversation selected one sandbox while every turn ran in
-    // another. Fail loudly; `--clear-sandbox-id` is the way back.
     let agent_id = Uuid7::now();
     let conversation_id = Uuid7::now();
     let exoharness = Arc::new(FakeExoHarness::new(agent_id, conversation_id));
