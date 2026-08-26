@@ -685,6 +685,18 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
             warm_sandboxes: Arc::clone(&self.warm_sandboxes),
         }))
     }
+
+    async fn terminate(&self, request: SandboxRequest) -> Result<()> {
+        if let Some(entry) = self.warm_sandboxes.lock().await.remove(&request.key) {
+            cleanup_named_container(&self.container_bin, self.cli, &entry.name).await?;
+        }
+        for container in
+            find_sandbox_containers_for_key(&self.container_bin, self.cli, &request.key).await?
+        {
+            cleanup_named_container(&self.container_bin, self.cli, &container).await?;
+        }
+        Ok(())
+    }
 }
 
 struct BorrowedDockerSandboxHandle {
@@ -918,6 +930,11 @@ impl ManagedSandboxBackend for LocalProcessSandboxBackend {
         _payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         bail!("restore-from-snapshot is not supported by the local-process sandbox backend")
+    }
+
+    async fn terminate(&self, _request: SandboxRequest) -> Result<()> {
+        // Nothing to destroy, as this is local.
+        Ok(())
     }
 }
 
@@ -1220,6 +1237,64 @@ async fn find_running_warm_sandbox(
         }
         ContainerCliFlavor::Docker => {
             find_running_docker_warm_sandbox(container_bin, request).await
+        }
+    }
+}
+
+/// Every container labelled for `key`, running or not, so termination also
+/// clears records left behind by an earlier process.
+async fn find_sandbox_containers_for_key(
+    container_bin: &Path,
+    cli: ContainerCliFlavor,
+    key: &SandboxKey,
+) -> Result<Vec<String>> {
+    match cli {
+        ContainerCliFlavor::AppleContainer => {
+            let output = run_container_admin_command(
+                container_bin,
+                WARM_SANDBOX_CLEANUP_TIMEOUT,
+                ["list", "--format", "json"],
+            )
+            .await?;
+            if !output.status.success() {
+                return Err(anyhow!(
+                    "failed to list sandboxes: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            let containers: Vec<ContainerListItem> = serde_json::from_slice(&output.stdout)?;
+            Ok(containers
+                .into_iter()
+                .filter(|container| {
+                    container
+                        .configuration
+                        .labels
+                        .get(WARM_SANDBOX_KEY_LABEL)
+                        .is_some_and(|value| value == &key.to_string())
+                })
+                .map(|container| container.configuration.id)
+                .collect())
+        }
+        ContainerCliFlavor::Docker => {
+            let key_filter = format!("label={WARM_SANDBOX_KEY_LABEL}={key}");
+            let output = run_container_admin_command(
+                container_bin,
+                WARM_SANDBOX_CLEANUP_TIMEOUT,
+                ["ps", "-aq", "--no-trunc", "--filter", key_filter.as_str()],
+            )
+            .await?;
+            if !output.status.success() {
+                return Err(anyhow!(
+                    "failed to list sandboxes: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(ToOwned::to_owned)
+                .collect())
         }
     }
 }
