@@ -12,6 +12,7 @@ from exo_harbor.trajectory import (
     AssistantMessage,
     ConversationEvent,
     ConversationEvents,
+    LearningActivatedData,
     MessagesData,
     ToolCallContent,
     ToolResultData,
@@ -33,6 +34,13 @@ TOOL_ROUTES: dict[str, LearningRoute] = {
     "rebuild_and_restart_exo": "policy",
 }
 
+PROPOSAL_ROUTES = {
+    "propose_memory_learning": "memory",
+    "propose_skill_learning": "skill",
+    "propose_tool_learning": "tool",
+    "propose_learning_discard": "discard",
+}
+
 
 async def export_learning_report(
     client: ExoClient,
@@ -46,7 +54,7 @@ async def export_learning_report(
     page = ConversationEvents.model_validate_json(
         await client.read_conversation_events(
             conversation,
-            types=["messages", "tool_result"],
+            types=["messages", "tool_result", "learning_activated"],
             limit=10_000,
         )
     )
@@ -91,6 +99,11 @@ def build_learning_report(
     task_usage = _task_usage(events[:start_index])
     actions: list[dict[str, Any]] = []
     actions_by_call: dict[str, dict[str, Any]] = {}
+    proposals: list[dict[str, Any]] = []
+    proposals_by_call: dict[str, dict[str, Any]] = {}
+    candidates: dict[str, str] = {}
+    promotions: list[dict[str, Any]] = []
+    promotions_by_call: dict[str, dict[str, Any]] = {}
     for event in events[start_index:]:
         if isinstance(event.data, MessagesData):
             for message in event.data.messages:
@@ -98,6 +111,48 @@ def build_learning_report(
                     continue
                 for content in message.content:
                     if not isinstance(content, ToolCallContent):
+                        continue
+                    if content.tool_name in PROPOSAL_ROUTES:
+                        proposal = {
+                            "tool_call_id": content.tool_call_id,
+                            "route": PROPOSAL_ROUTES[content.tool_name],
+                            "title": _short_string(
+                                content.arguments.value.get("title"), limit=120
+                            ),
+                            "candidate_id": None,
+                            "status": None,
+                            "succeeded": None,
+                        }
+                        proposals.append(proposal)
+                        proposals_by_call[content.tool_call_id] = proposal
+                        continue
+                    if content.tool_name == "validate_and_promote_learning":
+                        candidate_id = _short_string(
+                            content.arguments.value.get("candidateId"), limit=80
+                        )
+                        promotion = {
+                            "tool_call_id": content.tool_call_id,
+                            "candidate_id": candidate_id,
+                            "route": (
+                                candidates.get(candidate_id)
+                                if candidate_id is not None
+                                else None
+                            ),
+                            "status": None,
+                            "succeeded": None,
+                        }
+                        promotions.append(promotion)
+                        promotions_by_call[content.tool_call_id] = promotion
+                        if promotion["route"] in LEARNING_ROUTES:
+                            action = {
+                                "route": promotion["route"],
+                                "tool": content.tool_name,
+                                "tool_call_id": content.tool_call_id,
+                                "detail": candidate_id,
+                                "succeeded": None,
+                            }
+                            actions.append(action)
+                            actions_by_call[content.tool_call_id] = action
                         continue
                     route = TOOL_ROUTES.get(content.tool_name)
                     if route is None:
@@ -117,10 +172,50 @@ def build_learning_report(
 
         if not isinstance(event.data, ToolResultData):
             continue
+        result = event.data.result
+        proposal = proposals_by_call.get(event.data.tool_call_id)
+        if proposal is not None:
+            value = result.value if isinstance(result.value, dict) else {}
+            candidate_id = _short_string(value.get("candidateId"), limit=80)
+            route = value.get("route")
+            status = value.get("status")
+            proposal["candidate_id"] = candidate_id
+            proposal["status"] = status if isinstance(status, str) else None
+            proposal["succeeded"] = _result_succeeded(result.ok, result.value)
+            if (
+                candidate_id is not None
+                and isinstance(route, str)
+                and route in {"memory", "skill", "tool", "discard"}
+            ):
+                candidates[candidate_id] = route
+            continue
+        promotion = promotions_by_call.get(event.data.tool_call_id)
+        if promotion is not None:
+            value = result.value if isinstance(result.value, dict) else {}
+            route = value.get("route")
+            status = value.get("status")
+            if isinstance(route, str):
+                promotion["route"] = route
+            promotion["status"] = status if isinstance(status, str) else None
+            promotion["succeeded"] = _result_succeeded(result.ok, result.value)
+            action = actions_by_call.get(event.data.tool_call_id)
+            if action is None and promotion["route"] in LEARNING_ROUTES:
+                action = {
+                    "route": promotion["route"],
+                    "tool": "validate_and_promote_learning",
+                    "tool_call_id": event.data.tool_call_id,
+                    "detail": promotion["candidate_id"],
+                    "succeeded": None,
+                }
+                actions.append(action)
+                actions_by_call[event.data.tool_call_id] = action
+            if action is not None:
+                action["route"] = promotion["route"]
+                action["succeeded"] = promotion["status"] == "promoted"
+            continue
         action = actions_by_call.get(event.data.tool_call_id)
         if action is None:
             continue
-        result = event.data.result
         action["succeeded"] = _result_succeeded(result.ok, result.value)
 
     route_counts = {
@@ -141,6 +236,24 @@ def build_learning_report(
         }
         for route in LEARNING_ROUTES
     }
+    terminal_candidate_ids = {
+        promotion["candidate_id"]
+        for promotion in promotions
+        if promotion["candidate_id"] is not None
+        and promotion["status"] in {"promoted", "rejected", "discarded"}
+    }
+    unresolved_proposals = sum(
+        proposal["succeeded"] is None
+        or (
+            proposal["succeeded"] is True
+            and proposal["status"] == "proposed"
+            and proposal["candidate_id"] not in terminal_candidate_ids
+        )
+        for proposal in proposals
+    )
+    unresolved_promotions = sum(
+        promotion["status"] is None for promotion in promotions
+    )
     return {
         "schema_version": 2,
         "trial_id": trial_id,
@@ -148,6 +261,21 @@ def build_learning_report(
         "reflection_strategy": strategy,
         "reflection_summary": reflection_summary,
         "task_usage": task_usage,
+        "lifecycle": {
+            "proposal_count": len(proposals),
+            "promotion_count": sum(
+                proposal.get("status") == "promoted" for proposal in promotions
+            ),
+            "rejection_count": sum(
+                proposal.get("status") == "rejected" for proposal in promotions
+            ),
+            "discard_count": sum(
+                proposal.get("status") == "discarded" for proposal in promotions
+            ),
+            "unresolved_count": unresolved_proposals + unresolved_promotions,
+            "proposals": proposals,
+            "promotions": promotions,
+        },
         "route_counts": route_counts,
         "actions": actions,
     }
@@ -160,9 +288,20 @@ def _task_usage(events: list[ConversationEvent]) -> dict[str, list[dict[str, str
     reused_skills: list[dict[str, str]] = []
     agent_tools: list[dict[str, str]] = []
     reused_agent_tools: list[dict[str, str]] = []
+    activated_learning: list[dict[str, str]] = []
     skills_installed_during_task: set[str] = set()
     tools_installed_during_task: set[str] = set()
     for event in events:
+        if isinstance(event.data, LearningActivatedData):
+            activated_learning.extend(
+                {
+                    "id": artifact.id,
+                    "route": artifact.route,
+                    "title": artifact.title,
+                }
+                for artifact in event.data.artifacts
+            )
+            continue
         if isinstance(event.data, MessagesData):
             for message in event.data.messages:
                 if not isinstance(message, AssistantMessage):
@@ -214,6 +353,23 @@ def _task_usage(events: list[ConversationEvent]) -> dict[str, list[dict[str, str
                 skills.append(use)
                 if skill not in skills_installed_during_task:
                     reused_skills.append(use)
+        if requested_name == "use_learning_skill" and isinstance(
+            result.value, dict
+        ):
+            skill = _short_string(result.value.get("name"))
+            candidate_id = _short_string(result.value.get("candidateId"))
+            if skill is not None:
+                use = {
+                    "name": skill,
+                    "tool_call_id": event.data.tool_call_id,
+                    **(
+                        {"candidate_id": candidate_id}
+                        if candidate_id is not None
+                        else {}
+                    ),
+                }
+                skills.append(use)
+                reused_skills.append(use)
         if result.source == "agent":
             use = {
                 "name": result.tool_name,
@@ -227,6 +383,7 @@ def _task_usage(events: list[ConversationEvent]) -> dict[str, list[dict[str, str
         "skills_reused_from_prior_tasks": reused_skills,
         "agent_tools_called": agent_tools,
         "agent_tools_reused_from_prior_tasks": reused_agent_tools,
+        "learning_artifacts_activated": activated_learning,
     }
 
 
@@ -363,6 +520,26 @@ def build_job_learning_summary(
         .get("task_usage", {})
         .get("agent_tools_reused_from_prior_tasks", [])
     ]
+    learning_activated = [
+        artifact
+        for entry in reports
+        for artifact in entry["report"]
+        .get("task_usage", {})
+        .get("learning_artifacts_activated", [])
+    ]
+    lifecycle = {
+        measure: sum(
+            int(entry["report"].get("lifecycle", {}).get(measure, 0))
+            for entry in reports
+        )
+        for measure in (
+            "proposal_count",
+            "promotion_count",
+            "rejection_count",
+            "discard_count",
+            "unresolved_count",
+        )
+    }
     reward_values: dict[str, list[float]] = {}
     for entry in reports:
         for name, value in entry["rewards"].items():
@@ -381,6 +558,7 @@ def build_job_learning_summary(
         "trial_count": len(reports),
         "reflection_report_count": sum(bool(entry["report"]) for entry in reports),
         "rewards": rewards,
+        "lifecycle": lifecycle,
         "memory": {
             "initial_count": 0,
             "final_count": final_memory_count,
@@ -392,6 +570,7 @@ def build_job_learning_summary(
             "agent_tool_call_count": len(agent_tools_called),
             "prior_skill_reuse_count": len(skills_reused),
             "prior_agent_tool_reuse_count": len(agent_tools_reused),
+            "learning_activation_count": len(learning_activated),
             "unique_skills_loaded": sorted(
                 {
                     skill["name"]
@@ -420,6 +599,13 @@ def build_job_learning_summary(
                     if isinstance(tool.get("name"), str)
                 }
             ),
+            "unique_learning_artifacts_activated": sorted(
+                {
+                    artifact["id"]
+                    for artifact in learning_activated
+                    if isinstance(artifact.get("id"), str)
+                }
+            ),
         },
         "trials": [
             {
@@ -429,6 +615,7 @@ def build_job_learning_summary(
                 "trial_id": entry["report"].get("trial_id"),
                 "rewards": entry["rewards"],
                 "route_counts": entry["report"].get("route_counts", {}),
+                "lifecycle": entry["report"].get("lifecycle", {}),
                 "task_usage": entry["report"].get("task_usage", {}),
             }
             for entry in reports

@@ -2,9 +2,9 @@ schema_version = "1.4"
 
 [task]
 name = "exo/learning-router-normalization-first"
-version = "1.0.0"
+version = "2.0.0"
 authors = []
-keywords = ["learning-router", "transfer", "normalization"]
+keywords = ["learning-router", "transfer", "normalization", "flint"]
 
 [metadata]
 difficulty = "easy"
@@ -15,7 +15,7 @@ tags = ["learning-router", "transfer"]
 timeout_sec = 30.0
 
 [agent]
-timeout_sec = 180.0
+timeout_sec = 360.0
 
 [environment]
 build_timeout_sec = 120.0

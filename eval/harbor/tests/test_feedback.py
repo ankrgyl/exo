@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 from exo_harbor.feedback import (
+    LIFECYCLE_REFLECTION_INSTRUCTIONS,
     MEMORY_REFLECTION_INSTRUCTIONS,
     ROUTER_REFLECTION_INSTRUCTIONS,
     build_feedback,
@@ -13,6 +14,23 @@ from exo_harbor.feedback import (
 
 
 class FeedbackTest(unittest.TestCase):
+    def test_lifecycle_reflection_requires_validation_before_activation(self) -> None:
+        self.assertIn("EXO_LEARNING_LIFECYCLE_V1", LIFECYCLE_REFLECTION_INSTRUCTIONS)
+        self.assertIn("propose_memory_learning", LIFECYCLE_REFLECTION_INSTRUCTIONS)
+        self.assertIn("propose_skill_learning", LIFECYCLE_REFLECTION_INSTRUCTIONS)
+        self.assertIn("propose_tool_learning", LIFECYCLE_REFLECTION_INSTRUCTIONS)
+        self.assertIn("propose_learning_discard", LIFECYCLE_REFLECTION_INSTRUCTIONS)
+        self.assertIn(
+            "validate_and_promote_learning", LIFECYCLE_REFLECTION_INSTRUCTIONS
+        )
+        self.assertIn("remain inactive", LIFECYCLE_REFLECTION_INSTRUCTIONS)
+        self.assertIn("learning catalog only if", LIFECYCLE_REFLECTION_INSTRUCTIONS)
+        self.assertIn("activation trigger matches", LIFECYCLE_REFLECTION_INSTRUCTIONS)
+        self.assertIs(
+            reflection_instructions("lifecycle"),
+            LIFECYCLE_REFLECTION_INSTRUCTIONS,
+        )
+
     def test_reflection_routes_learning_to_the_right_durable_form(self) -> None:
         for learning_form in (
             "Memory:",

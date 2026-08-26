@@ -1,8 +1,13 @@
 import { fileURLToPath } from "node:url";
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 // Mirror the tsconfig path aliases so tests can import modules that use them.
 export default defineConfig({
+  test: {
+    // Harbor comparisons retain isolated source snapshots under .local for
+    // inspection. They are experiment artifacts, not additional test roots.
+    exclude: [...configDefaults.exclude, "**/.local/**"],
+  },
   resolve: {
     alias: {
       "@exo/harness/tool": fileURLToPath(

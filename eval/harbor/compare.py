@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run contamination-safe memory-vs-router Harbor evaluation arms."""
+"""Run two contamination-safe Harbor reflection strategies as matched arms."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import sys
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
@@ -19,11 +20,21 @@ ROUTES = ("memory", "skill", "tool", "policy")
 REUSE_METRICS = (
     "prior_skill_reuse_count",
     "prior_agent_tool_reuse_count",
+    "learning_activation_count",
 )
+LIFECYCLE_METRICS = (
+    "proposal_count",
+    "promotion_count",
+    "rejection_count",
+    "discard_count",
+    "unresolved_count",
+)
+REFLECTION_STRATEGIES = ("memory", "router", "lifecycle")
 EXPECTED_TASK_SEQUENCES = {
     "learning-router-transfer-test": [
         "exo/learning-router-normalization-first",
         "exo/learning-router-normalization-transfer",
+        "exo/learning-router-unrelated-control",
     ],
 }
 SNAPSHOT_IGNORES = {
@@ -39,11 +50,16 @@ SNAPSHOT_IGNORES = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run identical Harbor tasks with PR #202 memory reflection and the learning router.",
+        description=(
+            "Run identical Harbor tasks with two reflection strategies from "
+            "fresh Exo states."
+        ),
     )
     parser.add_argument("--dataset", default="learning-router-transfer-test")
     parser.add_argument("--dataset-path", type=Path)
-    parser.add_argument("--provider", choices=("openai", "openrouter"), default="openai")
+    parser.add_argument(
+        "--provider", choices=("openai", "openrouter"), default="openai"
+    )
     parser.add_argument("--model", default="gpt-5.5")
     parser.add_argument("--n-tasks", type=int)
     parser.add_argument("--n-attempts", type=int, default=1)
@@ -54,9 +70,19 @@ def parse_args() -> argparse.Namespace:
         default=[],
     )
     parser.add_argument(
+        "--baseline-strategy",
+        choices=REFLECTION_STRATEGIES,
+        default="router",
+    )
+    parser.add_argument(
+        "--candidate-strategy",
+        choices=REFLECTION_STRATEGIES,
+        default="lifecycle",
+    )
+    parser.add_argument(
         "--arm-order",
-        choices=("memory-first", "router-first"),
-        default="memory-first",
+        choices=("baseline-first", "candidate-first"),
+        default="baseline-first",
     )
     parser.add_argument(
         "--exo-bin",
@@ -107,88 +133,169 @@ def workspace_digest(workspace: Path) -> str:
     return digest.hexdigest()
 
 
+def expected_task_sequence(args: argparse.Namespace) -> list[str] | None:
+    sequence = EXPECTED_TASK_SEQUENCES.get(args.dataset)
+    if sequence is None:
+        return None
+    selected = list(sequence)
+    if args.include_task_names:
+        selected = [
+            task
+            for task in selected
+            if any(fnmatch(task, pattern) for pattern in args.include_task_names)
+        ]
+    if args.n_tasks is not None:
+        selected = selected[: args.n_tasks]
+    return selected * args.n_attempts
+
+
 def build_comparison(
     *,
-    memory: dict[str, Any],
-    router: dict[str, Any],
-    memory_summary_path: Path,
-    router_summary_path: Path,
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    baseline_strategy: str,
+    candidate_strategy: str,
+    baseline_summary_path: Path,
+    candidate_summary_path: Path,
     provider: str,
     source_digest: str,
     arm_order: list[str],
     expected_task_sequence: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Validate matched arms and return router-minus-memory measurements."""
-    _validate_arm(memory, label="memory", expected_strategy="memory")
-    _validate_arm(router, label="router", expected_strategy="router")
-    if memory.get("model") != router.get("model"):
+    """Validate matched arms and return candidate-minus-baseline measurements."""
+    if baseline_strategy == candidate_strategy:
+        raise ValueError("baseline and candidate strategies must differ")
+    _validate_arm(
+        baseline, label="baseline", expected_strategy=baseline_strategy
+    )
+    _validate_arm(
+        candidate, label="candidate", expected_strategy=candidate_strategy
+    )
+    if baseline.get("model") != candidate.get("model"):
         raise ValueError("comparison arms used different models")
-    if arm_order not in (["memory", "router"], ["router", "memory"]):
-        raise ValueError("arm order must contain memory and router exactly once")
-    memory_tasks = [trial.get("task_name") for trial in memory.get("trials", [])]
-    router_tasks = [trial.get("task_name") for trial in router.get("trials", [])]
-    if memory_tasks != router_tasks:
+    if arm_order not in (
+        ["baseline", "candidate"],
+        ["candidate", "baseline"],
+    ):
+        raise ValueError("arm order must contain baseline and candidate exactly once")
+    baseline_tasks = [
+        trial.get("task_name") for trial in baseline.get("trials", [])
+    ]
+    candidate_tasks = [
+        trial.get("task_name") for trial in candidate.get("trials", [])
+    ]
+    if baseline_tasks != candidate_tasks:
         raise ValueError("comparison arms used different task sequences")
-    if expected_task_sequence is not None and memory_tasks != expected_task_sequence:
+    if (
+        expected_task_sequence is not None
+        and baseline_tasks != expected_task_sequence
+    ):
         raise ValueError(
             "comparison task sequence did not match the expected learning order"
         )
 
     reward_names = sorted(
-        set(memory.get("rewards", {})) | set(router.get("rewards", {}))
+        set(baseline.get("rewards", {})) | set(candidate.get("rewards", {}))
     )
     reward_deltas = {}
     for name in reward_names:
-        memory_reward = memory.get("rewards", {}).get(name, {}).get("mean")
-        router_reward = router.get("rewards", {}).get(name, {}).get("mean")
+        baseline_reward = baseline.get("rewards", {}).get(name, {}).get("mean")
+        candidate_reward = candidate.get("rewards", {}).get(name, {}).get("mean")
         reward_deltas[name] = (
-            router_reward - memory_reward
-            if isinstance(memory_reward, (int, float))
-            and isinstance(router_reward, (int, float))
+            candidate_reward - baseline_reward
+            if isinstance(baseline_reward, (int, float))
+            and isinstance(candidate_reward, (int, float))
             else None
         )
+    baseline_task_rewards = _task_reward_means(baseline)
+    candidate_task_rewards = _task_reward_means(candidate)
+    task_reward_deltas = {
+        task: {
+            name: (
+                candidate_task_rewards.get(task, {}).get(name)
+                - baseline_task_rewards.get(task, {}).get(name)
+                if isinstance(
+                    candidate_task_rewards.get(task, {}).get(name), (int, float)
+                )
+                and isinstance(
+                    baseline_task_rewards.get(task, {}).get(name), (int, float)
+                )
+                else None
+            )
+            for name in sorted(
+                set(baseline_task_rewards.get(task, {}))
+                | set(candidate_task_rewards.get(task, {}))
+            )
+        }
+        for task in sorted(set(baseline_task_rewards) | set(candidate_task_rewards))
+    }
+    baseline_task_activations = _task_activation_counts(baseline)
+    candidate_task_activations = _task_activation_counts(candidate)
+    task_activation_deltas = {
+        task: candidate_task_activations.get(task, 0)
+        - baseline_task_activations.get(task, 0)
+        for task in sorted(
+            set(baseline_task_activations) | set(candidate_task_activations)
+        )
+    }
 
     route_action_deltas = {
         measure: {
-            route: _route_action_count(router, route, measure)
-            - _route_action_count(memory, route, measure)
+            route: _route_action_count(candidate, route, measure)
+            - _route_action_count(baseline, route, measure)
             for route in ROUTES
         }
         for measure in ("succeeded", "failed", "unresolved")
     }
     reuse_deltas = {
-        metric: _reuse_count(router, metric) - _reuse_count(memory, metric)
+        metric: _reuse_count(candidate, metric) - _reuse_count(baseline, metric)
         for metric in REUSE_METRICS
     }
-    memory_growth = int(memory.get("memory", {}).get("growth", 0))
-    router_growth = int(router.get("memory", {}).get("growth", 0))
+    lifecycle_deltas = {
+        metric: _lifecycle_count(candidate, metric)
+        - _lifecycle_count(baseline, metric)
+        for metric in LIFECYCLE_METRICS
+    }
+    baseline_memory_growth = int(baseline.get("memory", {}).get("growth", 0))
+    candidate_memory_growth = int(candidate.get("memory", {}).get("growth", 0))
 
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "provider": provider,
-        "model": memory.get("model"),
+        "model": baseline.get("model"),
         "source_digest": source_digest,
-        "task_sequence": memory_tasks,
+        "task_sequence": baseline_tasks,
         "arm_order": arm_order,
         "arms": {
-            "memory": {
-                "summary_path": str(memory_summary_path),
-                "rewards": memory.get("rewards", {}),
-                "memory": memory.get("memory", {}),
-                "route_counts": memory.get("route_counts", {}),
-                "task_reuse": memory.get("task_reuse", {}),
+            "baseline": {
+                "strategy": baseline_strategy,
+                "summary_path": str(baseline_summary_path),
+                "rewards": baseline.get("rewards", {}),
+                "task_rewards": baseline_task_rewards,
+                "task_activations": baseline_task_activations,
+                "memory": baseline.get("memory", {}),
+                "lifecycle": baseline.get("lifecycle", {}),
+                "route_counts": baseline.get("route_counts", {}),
+                "task_reuse": baseline.get("task_reuse", {}),
             },
-            "router": {
-                "summary_path": str(router_summary_path),
-                "rewards": router.get("rewards", {}),
-                "memory": router.get("memory", {}),
-                "route_counts": router.get("route_counts", {}),
-                "task_reuse": router.get("task_reuse", {}),
+            "candidate": {
+                "strategy": candidate_strategy,
+                "summary_path": str(candidate_summary_path),
+                "rewards": candidate.get("rewards", {}),
+                "task_rewards": candidate_task_rewards,
+                "task_activations": candidate_task_activations,
+                "memory": candidate.get("memory", {}),
+                "lifecycle": candidate.get("lifecycle", {}),
+                "route_counts": candidate.get("route_counts", {}),
+                "task_reuse": candidate.get("task_reuse", {}),
             },
         },
-        "router_minus_memory": {
+        "candidate_minus_baseline": {
             "reward_mean": reward_deltas,
-            "memory_growth": router_growth - memory_growth,
+            "task_reward_mean": task_reward_deltas,
+            "task_activations": task_activation_deltas,
+            "memory_growth": candidate_memory_growth - baseline_memory_growth,
+            "lifecycle": lifecycle_deltas,
             "route_actions": route_action_deltas,
             "prior_task_reuse": reuse_deltas,
         },
@@ -227,6 +334,43 @@ def _route_action_count(summary: dict[str, Any], route: str, measure: str) -> in
 
 def _reuse_count(summary: dict[str, Any], metric: str) -> int:
     return int(summary.get("task_reuse", {}).get(metric, 0))
+
+
+def _lifecycle_count(summary: dict[str, Any], metric: str) -> int:
+    return int(summary.get("lifecycle", {}).get(metric, 0))
+
+
+def _task_reward_means(summary: dict[str, Any]) -> dict[str, dict[str, float]]:
+    values: dict[str, dict[str, list[float]]] = {}
+    for trial in summary.get("trials", []):
+        task = trial.get("task_name")
+        if not isinstance(task, str):
+            continue
+        for name, value in trial.get("rewards", {}).items():
+            if isinstance(name, str) and isinstance(value, (int, float)):
+                values.setdefault(task, {}).setdefault(name, []).append(float(value))
+    return {
+        task: {
+            name: sum(measurements) / len(measurements)
+            for name, measurements in sorted(rewards.items())
+        }
+        for task, rewards in sorted(values.items())
+    }
+
+
+def _task_activation_counts(summary: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for trial in summary.get("trials", []):
+        task = trial.get("task_name")
+        if not isinstance(task, str):
+            continue
+        activated = (
+            trial.get("task_usage", {}).get("learning_artifacts_activated", [])
+        )
+        counts[task] = counts.get(task, 0) + (
+            len(activated) if isinstance(activated, list) else 0
+        )
+    return counts
 
 
 def _run_eval(
@@ -290,10 +434,13 @@ def main() -> int:
         args = parse_args()
         if args.model == "openrouter/free":
             raise ValueError(
-                "openrouter/free is not a fixed model; pass an exact OpenRouter model id"
+                "openrouter/free is not a fixed model; pass an exact "
+                "OpenRouter model id"
             )
         if args.n_attempts <= 0 or (args.n_tasks is not None and args.n_tasks <= 0):
             raise ValueError("n_tasks and n_attempts must be positive")
+        if args.baseline_strategy == args.candidate_strategy:
+            raise ValueError("baseline and candidate strategies must differ")
 
         repo = Path(__file__).resolve().parents[2]
         exo_bin = (
@@ -307,57 +454,70 @@ def main() -> int:
         timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
         experiment_dir = repo / ".local/harbor-comparisons" / timestamp
         workspaces = experiment_dir / "workspaces"
-        memory_workspace = workspaces / "memory"
-        router_workspace = workspaces / "router"
+        baseline_workspace = workspaces / "baseline"
+        candidate_workspace = workspaces / "candidate"
         experiment_dir.mkdir(parents=True)
 
         print("Creating identical isolated source workspaces...", flush=True)
-        source_digest = copy_source_snapshot(repo, memory_workspace)
-        shutil.copytree(memory_workspace, router_workspace, symlinks=True)
-        if workspace_digest(router_workspace) != source_digest:
+        source_digest = copy_source_snapshot(repo, baseline_workspace)
+        shutil.copytree(baseline_workspace, candidate_workspace, symlinks=True)
+        if workspace_digest(candidate_workspace) != source_digest:
             raise ValueError("isolated workspaces differ before evaluation")
-        link_runtime_dependencies(repo, memory_workspace)
-        link_runtime_dependencies(repo, router_workspace)
+        link_runtime_dependencies(repo, baseline_workspace)
+        link_runtime_dependencies(repo, candidate_workspace)
 
         short_id = dt.datetime.now(dt.UTC).strftime("%H%M%S") + f"-{os.getpid()}"
         short_runs = repo / ".local/hr" / short_id
         order = (
-            ["memory", "router"]
-            if args.arm_order == "memory-first"
-            else ["router", "memory"]
+            ["baseline", "candidate"]
+            if args.arm_order == "baseline-first"
+            else ["candidate", "baseline"]
         )
-        workspace_by_strategy = {
-            "memory": memory_workspace,
-            "router": router_workspace,
+        strategy_by_arm = {
+            "baseline": args.baseline_strategy,
+            "candidate": args.candidate_strategy,
+        }
+        workspace_by_arm = {
+            "baseline": baseline_workspace,
+            "candidate": candidate_workspace,
+        }
+        # Darwin's sockaddr_un path limit is 104 bytes including the NUL.
+        # One-letter arm directories leave enough room for Exo's trial socket.
+        output_root_by_arm = {
+            "baseline": short_runs / "b",
+            "candidate": short_runs / "c",
         }
         summaries: dict[str, Path] = {}
-        for strategy in order:
-            print(f"\n=== {strategy} arm ===", flush=True)
-            summaries[strategy] = _run_eval(
+        for arm in order:
+            strategy = strategy_by_arm[arm]
+            print(f"\n=== {arm} arm ({strategy}) ===", flush=True)
+            summaries[arm] = _run_eval(
                 eval_script=Path(__file__).with_name("eval.py"),
-                workspace=workspace_by_strategy[strategy],
+                workspace=workspace_by_arm[arm],
                 exo_bin=exo_bin,
-                output_root=short_runs / strategy,
-                log_path=experiment_dir / f"{strategy}.log",
+                output_root=output_root_by_arm[arm],
+                log_path=experiment_dir / f"{arm}-{strategy}.log",
                 strategy=strategy,
                 args=args,
             )
 
-        memory_summary = json.loads(summaries["memory"].read_text(encoding="utf-8"))
-        router_summary = json.loads(summaries["router"].read_text(encoding="utf-8"))
+        baseline_summary = json.loads(
+            summaries["baseline"].read_text(encoding="utf-8")
+        )
+        candidate_summary = json.loads(
+            summaries["candidate"].read_text(encoding="utf-8")
+        )
         comparison = build_comparison(
-            memory=memory_summary,
-            router=router_summary,
-            memory_summary_path=summaries["memory"],
-            router_summary_path=summaries["router"],
+            baseline=baseline_summary,
+            candidate=candidate_summary,
+            baseline_strategy=args.baseline_strategy,
+            candidate_strategy=args.candidate_strategy,
+            baseline_summary_path=summaries["baseline"],
+            candidate_summary_path=summaries["candidate"],
             provider=args.provider,
             source_digest=source_digest,
             arm_order=order,
-            expected_task_sequence=(
-                EXPECTED_TASK_SEQUENCES[args.dataset] * args.n_attempts
-                if args.dataset in EXPECTED_TASK_SEQUENCES
-                else None
-            ),
+            expected_task_sequence=expected_task_sequence(args),
         )
         destination = experiment_dir / "comparison.json"
         destination.write_text(
@@ -365,7 +525,11 @@ def main() -> int:
             encoding="utf-8",
         )
         print(f"\nComparison: {destination}")
-        print(json.dumps(comparison["router_minus_memory"], indent=2, sort_keys=True))
+        print(
+            json.dumps(
+                comparison["candidate_minus_baseline"], indent=2, sort_keys=True
+            )
+        )
         return 0
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"error: {error}", file=sys.stderr)

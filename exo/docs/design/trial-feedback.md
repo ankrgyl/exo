@@ -110,9 +110,9 @@ lesson to become a memory, and it should ask Exo to avoid duplicate or
 superseded memories. The goal is learning, not repairing the already-graded
 submission.
 
-## Learning-router prototype
+## Learning-router experiments
 
-The Harbor plugin accepts two reflection strategies:
+The Harbor plugin accepts three reflection strategies:
 
 - `memory` preserves the original PR #202 prompt, which asks Exo to put every
   useful general lesson in durable memory and optionally create tools or change
@@ -121,22 +121,91 @@ The Harbor plugin accepts two reflection strategies:
   stable fact or heuristic, skill for a reusable procedure, tool for a repeated
   deterministic operation, policy or implementation for a broad behavior
   change, and discard for task-specific or unsupported conclusions.
+- `lifecycle` uses the same conceptual routes but changes the state machine and
+  tool surface rather than only changing the reflection prompt.
+
+### Prompt-only router
+
+The `router` arm is deliberately the strongest prompt-only baseline. The model
+receives routing instructions and can immediately call the existing `remember`,
+`install_skill`, `install_agent_tool`, policy, or restart tools. If it chooses a
+bad destination or writes a bad artifact, the mutation is already durable. In
+particular, a successful install call proves only that the artifact has a valid
+shape; it does not prove the learned procedure works.
+
+### Validated lifecycle router
+
+During a `lifecycle` reflection, direct memory, skill, tool-management, policy
+restart, and rebuild write surfaces are unavailable. Exo instead gets four
+route-specific proposal tools plus one promotion tool:
+
+```text
+reflection
+  -> propose memory | skill | tool | discard
+  -> inactive candidate in learning/index.json
+  -> route-specific validation
+  -> promoted | rejected | discarded
+  -> trigger match on a later task
+  -> explicit learning_activated event
+```
+
+The schemas are separate so choosing a skill cannot silently populate memory
+fields or rely on nullable placeholders. Promotion currently applies these
+checks:
+
+- every active route: require the structured evaluator feedback payload and
+  record its numeric rewards and whether verifier logs were present separately
+  from the model's evidence string;
+- memory: retain the lesson as scoped memory rather than injecting it globally;
+- skill: stage the complete skill in the restored task sandbox, run its
+  validation command there, and keep it in the learning catalog only after a
+  zero exit status;
+- tool: load the module from an isolated temporary directory, execute exact
+  self-test arguments, compare the canonical JSON result, and keep it in the
+  learning catalog only on success;
+- discard: make the decision terminal without creating active learning.
+
+Promoted learning is not injected globally. The harness matches explicit
+activation terms against a later task, emits `learning_activated`, and then
+injects a memory, exposes the matching skill through `use_learning_skill`, or
+registers the matching tool for that turn. Skills and tools remain absent from
+unrelated turns rather than leaking through Exo's global skill metadata or tool
+registry. Activation count and later skill/tool calls are therefore separately
+measurable.
+
+This produces a functional difference even with a deterministic model. The
+test suite sends the same broken-but-well-formed skill down both paths. The
+prompt-only path installs it immediately. The lifecycle path runs its failing
+sandbox check, marks the candidate rejected, and never publishes the skill.
+
+The lifecycle is not an independent truth oracle. The reflecting agent still
+writes the skill validation command and the expected tool result, and the
+memory evidence gate does not verify factual truth. Those checks catch broken
+or non-executable artifacts and make activation observable; they do not prove
+generalization. Only externally verified reward on a later task can establish
+that the learning improved behavior. The controlled Harbor comparison must
+therefore treat promotions as mechanism metrics and held-out task reward as
+the outcome metric. Its output reports reward and activation by task rather
+than only as aggregate means, so the learn, transfer, and unrelated control
+results remain distinguishable.
 
 After reflection, Harbor writes `agent/learning.json` beside the trajectory.
 The report counts actual successful calls to `remember`, `install_skill`,
 `install_agent_tool`, `manage_tool`, and the corresponding removal or restart
 tools. It does not treat the reflection summary as proof that learning was
 persisted. Discard decisions are intentionally not counted because they have no
-observable durable mutation. The report also records successful `use_skill`
-calls and calls whose tool-result source is `agent` during the task phase. This
-makes later skill and self-created-tool reuse observable. Installs performed in
-the same task are tracked and excluded from the prior-task reuse metric; memory
-reuse remains implicit because all durable memories are currently injected
-into every turn.
+observable durable mutation. The report also records successful `use_skill` and
+`use_learning_skill` calls and calls whose tool-result source is `agent` during
+the task phase. This makes later skill and self-created-tool reuse observable.
+Installs performed in the same task are tracked and excluded from the prior-task
+reuse metric; prompt-only memory reuse remains implicit because legacy durable
+memories are injected into every turn, while lifecycle memory emits an explicit
+activation event.
 
 At job end, Harbor writes `learning-summary.json` in the job directory. It
 aggregates reward; attempted, successful, failed, and unresolved actions by
-route; later skill/tool reuse; and the final durable-memory count, with the
+route; lifecycle proposal, promotion, rejection, discard, and activation
+counts; later skill/tool reuse; and the final durable-memory count, with the
 fixed model and task name recorded for comparison. An unresolved action was
 requested but has no matching result event. Because every comparison run
 starts with a fresh Exo root, that final count is also the run's memory growth.
@@ -145,14 +214,17 @@ invalid if any completed trial is missing its reflection report; the comparison
 runner rejects that arm instead of treating missing instrumentation as zero
 learning.
 
-The first controlled comparison should run both strategies from separate fresh
+The first controlled comparison should run prompt-only `router` and
+`lifecycle` from separate fresh
 Exo roots **and separate clean source checkouts created from the same commit**,
 with the same fixed model, selected tasks, task order, attempt count, and
 resource limits. A fresh Exo root alone is insufficient because a genuine
 self-edit or workspace-local tool source can otherwise contaminate the next
-experimental arm. Compare Harbor reward with memory, skill, tool, and policy
-actions from `learning.json`. Same-task reruns measure recovery; a held-out task
-set is still required to measure transfer.
+experimental arm. Compare Harbor reward with lifecycle decisions, activation,
+memory growth, and actual later skill/tool use from `learning.json`. Same-task
+reruns measure recovery; the second task in the bundled sequence measures
+narrow transfer and the third unrelated task checks for over-broad activation.
+A broader held-out set is still required for a general claim.
 
 One paired run is only a diagnostic probe. Repeat independent comparisons with
 both arm orders so stochastic tool behavior, provider variance, and shared
@@ -168,14 +240,17 @@ router arms.
 
 The bundled `self-evolution-smoke-test` forces tool creation and reuse, so it is
 only an integration test. The `learning-router-transfer-test` is the first
-router-behavior probe: two fresh task environments apply the same deterministic
-record-normalization rule to different inputs, without naming memory, skills,
-or tools. Harbor still verifies output externally. The first reflection has an
-opportunity to create a reusable artifact; the second task's report shows
-whether prior learning was actually reused. This is a targeted transfer probe,
-not evidence of broad benchmark improvement. The comparison must reject a run
-unless the recorded task sequence places the learn task before the transfer
-task; local dataset discovery order is not itself experimental evidence.
+router-behavior probe: the first fresh task defines a deterministic named FLINT
+records contract; the second fresh task requests FLINT on different input but
+omits the contract rules; the third fresh task is unrelated and intentionally
+contains none of the FLINT trigger vocabulary. Harbor verifies all outputs
+externally. The first reflection has an opportunity to create a reusable
+artifact; the second task's report shows whether that artifact was activated
+and actually used; the third checks whether it stays inactive off-topic. This
+is a targeted transfer probe, not evidence of broad benchmark improvement. The
+comparison must reject a run unless the recorded task sequence is learn,
+transfer, then unrelated control; local dataset discovery order is not itself
+experimental evidence.
 
 ## Exoharness changes
 

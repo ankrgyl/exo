@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -132,7 +133,7 @@ class EvalScriptTest(unittest.TestCase):
             ],
         )
 
-    def test_learning_router_transfer_test_uses_bundled_pair(self) -> None:
+    def test_learning_router_transfer_test_uses_bundled_sequence(self) -> None:
         args = self.parse("--dataset=learning-router-transfer-test")
         dataset = SCRIPT.parent / "datasets/learning-router-transfer-test"
 
@@ -142,8 +143,41 @@ class EvalScriptTest(unittest.TestCase):
         )
         self.assertEqual(
             sorted(path.name for path in dataset.iterdir()),
-            ["01-learn-normalization", "02-transfer-normalization"],
+            [
+                "01-learn-normalization",
+                "02-transfer-normalization",
+                "03-unrelated-control",
+            ],
         )
+
+    def test_local_multi_task_dataset_uses_explicit_ordered_config(self) -> None:
+        args = self.parse(
+            "--dataset=learning-router-transfer-test",
+            "--n-tasks=2",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "run"
+            config = eval_script.write_ordered_task_config(args, run_dir)
+            self.assertIsNotNone(config)
+            assert config is not None
+            payload = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [Path(task["path"]).name for task in payload["tasks"]],
+                ["01-learn-normalization", "02-transfer-normalization"],
+            )
+            command = eval_script.harbor_command(
+                args,
+                harbor="harbor",
+                repo=Path("/repo"),
+                exo=Path("/repo/exo"),
+                run_dir=run_dir,
+                job_name="learning-router-transfer-test-2-router",
+                ordered_tasks_config=config,
+            )
+
+        self.assertIn("--config", command)
+        self.assertNotIn("--path", command)
+        self.assertNotIn("--n-tasks", command)
 
     def test_terminal_bench_easy_selects_three_tasks(self) -> None:
         args = self.parse("--dataset=terminal-bench-easy")

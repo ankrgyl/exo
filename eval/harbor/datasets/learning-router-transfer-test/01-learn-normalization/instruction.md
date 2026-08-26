@@ -1,7 +1,10 @@
-Read `/app/records.txt`. Each non-empty line contains a name and integer score
-separated by `|`, with possible surrounding whitespace.
+This task defines the **FLINT records contract**, a named procedure that is
+expected to recur in later tasks and isolated conversations. Learn the contract
+from this task, then apply it to `/app/records.txt`.
 
-Create `/app/ranked.txt` using these rules:
+Each non-empty input line contains a name and integer score separated by `|`,
+with possible surrounding whitespace. Create `/app/ranked.txt` using the FLINT
+rules:
 
 1. Trim whitespace and lowercase each name.
 2. Keep only the highest score for each name.

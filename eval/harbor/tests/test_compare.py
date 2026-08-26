@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import tempfile
 import unittest
@@ -36,7 +37,7 @@ def summary(
                 "unresolved": 0,
             },
             "skill": {
-                "succeeded": 1 if strategy == "router" else 0,
+                "succeeded": 1 if strategy in {"router", "lifecycle"} else 0,
                 "failed": 0,
                 "unresolved": 0,
             },
@@ -46,113 +47,164 @@ def summary(
         "task_reuse": {
             "prior_skill_reuse_count": skill_reuse,
             "prior_agent_tool_reuse_count": tool_reuse,
+            "learning_activation_count": 1 if strategy == "lifecycle" else 0,
+        },
+        "lifecycle": {
+            "proposal_count": 1 if strategy == "lifecycle" else 0,
+            "promotion_count": 1 if strategy == "lifecycle" else 0,
+            "rejection_count": 0,
+            "discard_count": 0,
+            "unresolved_count": 0,
         },
         "trials": [
-            {"task_name": "learn"},
-            {"task_name": "transfer"},
+            {
+                "task_name": "learn",
+                "rewards": {"reward": reward},
+                "task_usage": {"learning_artifacts_activated": []},
+            },
+            {
+                "task_name": "transfer",
+                "rewards": {"reward": reward},
+                "task_usage": {
+                    "learning_artifacts_activated": (
+                        [{"id": "learn-1"}] if strategy == "lifecycle" else []
+                    )
+                },
+            },
         ],
     }
 
 
 class ComparisonTest(unittest.TestCase):
-    def test_reports_router_minus_memory_deltas(self) -> None:
+    def test_expected_sequence_respects_task_limit(self) -> None:
+        args = argparse.Namespace(
+            dataset="learning-router-transfer-test",
+            include_task_names=[],
+            n_tasks=2,
+            n_attempts=2,
+        )
+
+        self.assertEqual(
+            compare_script.expected_task_sequence(args),
+            [
+                "exo/learning-router-normalization-first",
+                "exo/learning-router-normalization-transfer",
+                "exo/learning-router-normalization-first",
+                "exo/learning-router-normalization-transfer",
+            ],
+        )
+
+    def test_reports_candidate_minus_baseline_deltas(self) -> None:
         comparison = compare_script.build_comparison(
-            memory=summary(
-                "memory",
+            baseline=summary(
+                "router",
                 reward=0.5,
                 memory_growth=3,
                 skill_reuse=0,
                 tool_reuse=0,
             ),
-            router=summary(
-                "router",
+            candidate=summary(
+                "lifecycle",
                 reward=1.0,
                 memory_growth=1,
                 skill_reuse=1,
                 tool_reuse=2,
             ),
-            memory_summary_path=Path("/runs/memory.json"),
-            router_summary_path=Path("/runs/router.json"),
+            baseline_strategy="router",
+            candidate_strategy="lifecycle",
+            baseline_summary_path=Path("/runs/baseline.json"),
+            candidate_summary_path=Path("/runs/candidate.json"),
             provider="openrouter",
             source_digest="abc123",
-            arm_order=["memory", "router"],
+            arm_order=["baseline", "candidate"],
         )
 
-        deltas = comparison["router_minus_memory"]
+        deltas = comparison["candidate_minus_baseline"]
         self.assertEqual(deltas["reward_mean"]["reward"], 0.5)
+        self.assertEqual(deltas["task_reward_mean"]["transfer"]["reward"], 0.5)
+        self.assertEqual(deltas["task_activations"]["learn"], 0)
+        self.assertEqual(deltas["task_activations"]["transfer"], 1)
         self.assertEqual(deltas["memory_growth"], -2)
-        self.assertEqual(deltas["route_actions"]["succeeded"]["skill"], 1)
-        self.assertEqual(deltas["route_actions"]["failed"]["memory"], -1)
+        self.assertEqual(deltas["route_actions"]["succeeded"]["skill"], 0)
+        self.assertEqual(deltas["route_actions"]["failed"]["memory"], 0)
         self.assertEqual(deltas["prior_task_reuse"]["prior_skill_reuse_count"], 1)
         self.assertEqual(
             deltas["prior_task_reuse"]["prior_agent_tool_reuse_count"], 2
         )
+        self.assertEqual(
+            deltas["prior_task_reuse"]["learning_activation_count"], 1
+        )
+        self.assertEqual(deltas["lifecycle"]["promotion_count"], 1)
 
     def test_rejects_mismatched_task_sequences(self) -> None:
-        memory = summary(
-            "memory",
-            reward=1.0,
-            memory_growth=1,
-            skill_reuse=0,
-            tool_reuse=0,
-        )
-        router = summary(
+        baseline = summary(
             "router",
             reward=1.0,
             memory_growth=1,
             skill_reuse=0,
             tool_reuse=0,
         )
-        router["trials"][1]["task_name"] = "different"
+        candidate = summary(
+            "lifecycle",
+            reward=1.0,
+            memory_growth=1,
+            skill_reuse=0,
+            tool_reuse=0,
+        )
+        candidate["trials"][1]["task_name"] = "different"
 
         with self.assertRaisesRegex(ValueError, "different task sequences"):
             compare_script.build_comparison(
-                memory=memory,
-                router=router,
-                memory_summary_path=Path("memory.json"),
-                router_summary_path=Path("router.json"),
+                baseline=baseline,
+                candidate=candidate,
+                baseline_strategy="router",
+                candidate_strategy="lifecycle",
+                baseline_summary_path=Path("baseline.json"),
+                candidate_summary_path=Path("candidate.json"),
                 provider="openrouter",
                 source_digest="abc123",
-                arm_order=["memory", "router"],
+                arm_order=["baseline", "candidate"],
             )
 
     def test_rejects_swapped_reflection_strategies(self) -> None:
-        memory = summary(
-            "router",
-            reward=1.0,
-            memory_growth=1,
-            skill_reuse=0,
-            tool_reuse=0,
-        )
-        router = summary(
+        baseline = summary(
             "memory",
             reward=1.0,
             memory_growth=1,
             skill_reuse=0,
             tool_reuse=0,
         )
+        candidate = summary(
+            "router",
+            reward=1.0,
+            memory_growth=1,
+            skill_reuse=0,
+            tool_reuse=0,
+        )
 
-        with self.assertRaisesRegex(ValueError, "memory reflection strategy"):
+        with self.assertRaisesRegex(ValueError, "router reflection strategy"):
             compare_script.build_comparison(
-                memory=memory,
-                router=router,
-                memory_summary_path=Path("memory.json"),
-                router_summary_path=Path("router.json"),
+                baseline=baseline,
+                candidate=candidate,
+                baseline_strategy="router",
+                candidate_strategy="lifecycle",
+                baseline_summary_path=Path("baseline.json"),
+                candidate_summary_path=Path("candidate.json"),
                 provider="openrouter",
                 source_digest="abc123",
-                arm_order=["memory", "router"],
+                arm_order=["baseline", "candidate"],
             )
 
     def test_rejects_unexpected_learning_task_order(self) -> None:
-        memory = summary(
-            "memory",
+        baseline = summary(
+            "router",
             reward=1.0,
             memory_growth=1,
             skill_reuse=0,
             tool_reuse=0,
         )
-        router = summary(
-            "router",
+        candidate = summary(
+            "lifecycle",
             reward=1.0,
             memory_growth=1,
             skill_reuse=0,
@@ -161,26 +213,28 @@ class ComparisonTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "expected learning order"):
             compare_script.build_comparison(
-                memory=memory,
-                router=router,
-                memory_summary_path=Path("memory.json"),
-                router_summary_path=Path("router.json"),
+                baseline=baseline,
+                candidate=candidate,
+                baseline_strategy="router",
+                candidate_strategy="lifecycle",
+                baseline_summary_path=Path("baseline.json"),
+                candidate_summary_path=Path("candidate.json"),
                 provider="openrouter",
                 source_digest="abc123",
-                arm_order=["memory", "router"],
+                arm_order=["baseline", "candidate"],
                 expected_task_sequence=["transfer", "learn"],
             )
 
     def test_rejects_invalid_arm_order(self) -> None:
-        memory = summary(
-            "memory",
+        baseline = summary(
+            "router",
             reward=1.0,
             memory_growth=1,
             skill_reuse=0,
             tool_reuse=0,
         )
-        router = summary(
-            "router",
+        candidate = summary(
+            "lifecycle",
             reward=1.0,
             memory_growth=1,
             skill_reuse=0,
@@ -189,41 +243,45 @@ class ComparisonTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "arm order"):
             compare_script.build_comparison(
-                memory=memory,
-                router=router,
-                memory_summary_path=Path("memory.json"),
-                router_summary_path=Path("router.json"),
+                baseline=baseline,
+                candidate=candidate,
+                baseline_strategy="router",
+                candidate_strategy="lifecycle",
+                baseline_summary_path=Path("baseline.json"),
+                candidate_summary_path=Path("candidate.json"),
                 provider="openrouter",
                 source_digest="abc123",
-                arm_order=["memory", "memory"],
+                arm_order=["baseline", "baseline"],
             )
 
     def test_rejects_incomplete_reflection_reports(self) -> None:
-        memory = summary(
-            "memory",
-            reward=1.0,
-            memory_growth=1,
-            skill_reuse=0,
-            tool_reuse=0,
-        )
-        router = summary(
+        baseline = summary(
             "router",
             reward=1.0,
             memory_growth=1,
             skill_reuse=0,
             tool_reuse=0,
         )
-        router["reflection_report_count"] = 1
+        candidate = summary(
+            "lifecycle",
+            reward=1.0,
+            memory_growth=1,
+            skill_reuse=0,
+            tool_reuse=0,
+        )
+        candidate["reflection_report_count"] = 1
 
         with self.assertRaisesRegex(ValueError, "incomplete reflection reports"):
             compare_script.build_comparison(
-                memory=memory,
-                router=router,
-                memory_summary_path=Path("memory.json"),
-                router_summary_path=Path("router.json"),
+                baseline=baseline,
+                candidate=candidate,
+                baseline_strategy="router",
+                candidate_strategy="lifecycle",
+                baseline_summary_path=Path("baseline.json"),
+                candidate_summary_path=Path("candidate.json"),
                 provider="openrouter",
                 source_digest="abc123",
-                arm_order=["memory", "router"],
+                arm_order=["baseline", "candidate"],
             )
 
     def test_source_snapshot_excludes_generated_state(self) -> None:

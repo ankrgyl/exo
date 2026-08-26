@@ -61,7 +61,163 @@ def tool_call(call_id: str, name: str, arguments: dict) -> dict:
     }
 
 
+def learning_activated_event(event_id: str, artifact_id: str, route: str) -> dict:
+    return {
+        "id": event_id,
+        "session_id": "session-1",
+        "turn_id": "turn-1",
+        "created_at": "2026-08-18T12:00:00Z",
+        "data": {
+            "type": "learning_activated",
+            "artifacts": [
+                {"id": artifact_id, "route": route, "title": "FLINT procedure"}
+            ],
+        },
+    }
+
+
 class LearningReportTest(unittest.TestCase):
+    def test_reports_lifecycle_promotion_and_prior_activation(self) -> None:
+        events = ConversationEvents.model_validate(
+            {
+                "events": [
+                    learning_activated_event("event-0", "learn-old", "skill"),
+                    messages_event(
+                        "event-1",
+                        [
+                            {
+                                "role": "user",
+                                "content": f"Feedback for trial `{TRIAL_ID}` is ready.",
+                            }
+                        ],
+                    ),
+                    messages_event(
+                        "event-2",
+                        [
+                            {
+                                "role": "assistant",
+                                "content": [
+                                    tool_call(
+                                        "propose-1",
+                                        "propose_skill_learning",
+                                        {"title": "FLINT procedure"},
+                                    )
+                                ],
+                            }
+                        ],
+                    ),
+                    tool_result_event(
+                        "event-3",
+                        "propose-1",
+                        {
+                            "ok": True,
+                            "candidateId": "learn-new",
+                            "route": "skill",
+                            "status": "proposed",
+                        },
+                        tool_name="propose_skill_learning",
+                    ),
+                    messages_event(
+                        "event-4",
+                        [
+                            {
+                                "role": "assistant",
+                                "content": [
+                                    tool_call(
+                                        "promote-1",
+                                        "validate_and_promote_learning",
+                                        {"candidateId": "learn-new"},
+                                    )
+                                ],
+                            }
+                        ],
+                    ),
+                    tool_result_event(
+                        "event-5",
+                        "promote-1",
+                        {
+                            "ok": True,
+                            "candidateId": "learn-new",
+                            "route": "skill",
+                            "status": "promoted",
+                        },
+                        tool_name="validate_and_promote_learning",
+                    ),
+                ]
+            }
+        ).events
+
+        report = build_learning_report(
+            events=events,
+            trial_id=TRIAL_ID,
+            conversation="conversation-1",
+            strategy="lifecycle",
+            reflection_summary="promoted validated skill",
+        )
+
+        self.assertEqual(report["lifecycle"]["proposal_count"], 1)
+        self.assertEqual(report["lifecycle"]["promotion_count"], 1)
+        self.assertEqual(report["route_counts"]["skill"]["succeeded"], 1)
+        self.assertEqual(
+            report["task_usage"]["learning_artifacts_activated"],
+            [{"id": "learn-old", "route": "skill", "title": "FLINT procedure"}],
+        )
+
+    def test_reports_proposal_that_was_never_promoted_as_unresolved(self) -> None:
+        events = ConversationEvents.model_validate(
+            {
+                "events": [
+                    messages_event(
+                        "event-1",
+                        [
+                            {
+                                "role": "user",
+                                "content": f"Feedback for trial `{TRIAL_ID}` is ready.",
+                            }
+                        ],
+                    ),
+                    messages_event(
+                        "event-2",
+                        [
+                            {
+                                "role": "assistant",
+                                "content": [
+                                    tool_call(
+                                        "propose-1",
+                                        "propose_memory_learning",
+                                        {"title": "Unfinished candidate"},
+                                    )
+                                ],
+                            }
+                        ],
+                    ),
+                    tool_result_event(
+                        "event-3",
+                        "propose-1",
+                        {
+                            "ok": True,
+                            "candidateId": "learn-unresolved",
+                            "route": "memory",
+                            "status": "proposed",
+                        },
+                        tool_name="propose_memory_learning",
+                    ),
+                ]
+            }
+        ).events
+
+        report = build_learning_report(
+            events=events,
+            trial_id=TRIAL_ID,
+            conversation="conversation-1",
+            strategy="lifecycle",
+            reflection_summary="forgot to promote",
+        )
+
+        self.assertEqual(report["lifecycle"]["proposal_count"], 1)
+        self.assertEqual(report["lifecycle"]["promotion_count"], 0)
+        self.assertEqual(report["lifecycle"]["unresolved_count"], 1)
+
     def test_job_summary_aggregates_rewards_routes_reuse_and_memory(self) -> None:
         reports = [
             {
@@ -328,6 +484,69 @@ class LearningReportTest(unittest.TestCase):
             report["task_usage"]["agent_tools_reused_from_prior_tasks"], []
         )
 
+    def test_counts_scoped_lifecycle_skill_load_as_prior_reuse(self) -> None:
+        events = ConversationEvents.model_validate(
+            {
+                "events": [
+                    learning_activated_event("event-0", "learn-skill", "skill"),
+                    messages_event(
+                        "event-1",
+                        [
+                            {
+                                "role": "assistant",
+                                "content": [
+                                    tool_call(
+                                        "use-learning-skill",
+                                        "use_learning_skill",
+                                        {"candidateId": "learn-skill"},
+                                    )
+                                ],
+                            }
+                        ],
+                    ),
+                    tool_result_event(
+                        "event-2",
+                        "use-learning-skill",
+                        {
+                            "ok": True,
+                            "candidateId": "learn-skill",
+                            "name": "flint-procedure",
+                        },
+                        tool_name="use_learning_skill",
+                        source="library",
+                    ),
+                    messages_event(
+                        "event-3",
+                        [
+                            {
+                                "role": "user",
+                                "content": f"Feedback for trial `{TRIAL_ID}` is ready.",
+                            }
+                        ],
+                    ),
+                ]
+            }
+        ).events
+
+        report = build_learning_report(
+            events=events,
+            trial_id=TRIAL_ID,
+            conversation="conversation-1",
+            strategy="lifecycle",
+            reflection_summary=None,
+        )
+
+        self.assertEqual(
+            report["task_usage"]["skills_reused_from_prior_tasks"],
+            [
+                {
+                    "name": "flint-procedure",
+                    "tool_call_id": "use-learning-skill",
+                    "candidate_id": "learn-skill",
+                }
+            ],
+        )
+
     def test_reports_only_persistence_actions_during_reflection(self) -> None:
         events = ConversationEvents.model_validate(
             {
@@ -448,6 +667,7 @@ class LearningReportTest(unittest.TestCase):
                 "agent_tools_reused_from_prior_tasks": [
                     {"name": "copy_checker", "tool_call_id": "agent-tool-use"}
                 ],
+                "learning_artifacts_activated": [],
             },
         )
         self.assertEqual(len(report["actions"]), 4)

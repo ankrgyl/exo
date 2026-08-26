@@ -20,7 +20,26 @@ Route each useful lesson to the narrowest durable form that fits:
 
 Do not put every lesson in durable memory. A poor reward is evidence that the attempted approach may be wrong, not proof that the opposite is universally correct. A good reward should preserve the specific behavior that evidence supports. Persist worthwhile learning through the selected memory, skill, tool, policy, or implementation mechanism before completing this reflection. The feedback_complete summary is only a report to the evaluator; it does not persist learning. If there is genuinely nothing worth retaining, say so explicitly in that summary. Focus on improving future behavior; this submission has already been graded."""
 
+LIFECYCLE_REFLECTION_INSTRUCTIONS = """EXO_LEARNING_LIFECYCLE_V1
+
+Review your work on this completed trial, its reward, and the grader evidence. This reflection uses a constrained learning lifecycle. Direct memory, skill, tool-management, and self-restart write tools are intentionally unavailable: an unvalidated reflection must not silently change future behavior.
+
+For each evidence-supported lesson, choose exactly one route-specific proposal tool:
+- `propose_memory_learning`: a concise stable fact or heuristic. It will be injected only when its activation trigger matches, rather than on every turn.
+- `propose_skill_learning`: a reusable multi-step procedure. Include a complete SKILL.md and a read-only or idempotent validationCommand that proves the procedure's core behavior in the restored submitted environment.
+- `propose_tool_learning`: a repeated deterministic operation. Include a complete generated-tool module plus exact JSON self-test arguments and expected result. Promotion loads the module from an isolated temporary directory, executes that self-test, and keeps it in the learning catalog only if the result matches; it becomes callable only on later tasks whose activation trigger matches.
+- `propose_learning_discard`: task-specific, redundant, or unsupported information that should never be activated.
+
+The route-specific schemas intentionally omit every other route's fields. Do not write null placeholders or call more than one proposal tool for the same lesson.
+
+Every active candidate needs precise activation terms and a minimumMatches threshold that avoids broad accidental activation. Evidence must point to the reward, verifier output, or something directly inspected in the restored environment. Do not infer a universal rule merely because one attempt failed.
+
+After proposing each candidate, call validate_and_promote_learning with its candidate id. Proposals remain inactive until that call succeeds. Failed validation is evidence: leave the candidate rejected rather than bypassing the lifecycle with another persistence tool. If nothing should be retained, propose and finalize one discard candidate so that decision is observable.
+
+Before completing feedback, ensure every proposal from this reflection is promoted, rejected, or discarded. The feedback_complete summary reports what happened but does not itself persist or activate learning. This submission has already been graded; improve later behavior rather than repairing it."""
+
 REFLECTION_STRATEGIES = {
+    "lifecycle": LIFECYCLE_REFLECTION_INSTRUCTIONS,
     "memory": MEMORY_REFLECTION_INSTRUCTIONS,
     "router": ROUTER_REFLECTION_INSTRUCTIONS,
 }

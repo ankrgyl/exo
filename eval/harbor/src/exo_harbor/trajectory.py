@@ -92,7 +92,21 @@ class ToolResultData(BaseModel):
     result: ToolResultValue
 
 
-EventData = Annotated[MessagesData | ToolResultData, Field(discriminator="type")]
+class LearningActivatedArtifact(BaseModel):
+    id: str
+    route: Literal["memory", "skill", "tool"]
+    title: str
+
+
+class LearningActivatedData(BaseModel):
+    type: Literal["learning_activated"]
+    artifacts: list[LearningActivatedArtifact]
+
+
+EventData = Annotated[
+    MessagesData | ToolResultData | LearningActivatedData,
+    Field(discriminator="type"),
+]
 
 
 class ConversationEvent(BaseModel):
@@ -228,6 +242,8 @@ def build_trajectory(
                 usages.append(event.data.usage)
             continue
 
+        if not isinstance(event.data, ToolResultData):
+            continue
         result = event.data.result
         step = calls.get(event.data.tool_call_id)
         if step is None:
