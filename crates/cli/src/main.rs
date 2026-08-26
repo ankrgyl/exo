@@ -774,13 +774,6 @@ enum ConversationCommands {
     Update {
         agent: String,
         conversation: String,
-        /// Sandbox this conversation should use from now on, by id. May belong
-        /// to this conversation or to its agent.
-        #[arg(long)]
-        sandbox_id: Option<String>,
-        /// Stop using an explicitly bound sandbox.
-        #[arg(long)]
-        clear_sandbox_id: bool,
         #[command(flatten)]
         sandbox_runtime: ConversationSandboxRuntimeUpdateArgs,
         #[arg(long, value_enum)]
@@ -907,6 +900,18 @@ enum SandboxCommands {
         external_id: String,
         #[arg(long)]
         default_workdir: Option<String>,
+    },
+    /// Choose the sandbox a conversation runs in. Written as an event.
+    Select {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
+        sandbox_id: String,
+    },
+    /// Stop using an explicitly selected sandbox, returning the conversation to
+    /// the sandbox its configuration describes.
+    Deselect {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
     },
     /// Release an adopted container.
     Detach {
@@ -1941,8 +1946,6 @@ async fn main() -> Result<()> {
             ConversationCommands::Update {
                 agent,
                 conversation,
-                sandbox_id,
-                clear_sandbox_id,
                 sandbox_scope,
                 sandbox_runtime,
                 model,
@@ -1968,45 +1971,8 @@ async fn main() -> Result<()> {
                     .get_conversation(&conversation)
                     .await?
                     .ok_or_else(|| anyhow!("conversation not found: {}", conversation))?;
-                if clear_sandbox_id && sandbox_id.is_some() {
-                    bail!("provide either --clear-sandbox-id or --sandbox-id, not both");
-                }
                 let mut config = conversation.config().await?;
                 let mut changed = sandbox_runtime.apply(&mut config)?;
-
-                // Sandbox selection is treated as an event, so from the event history
-                // we can tell which sandvox was selected for a given turn.
-                if let Some(sandbox_id) = sandbox_id {
-                    // The binding is a recorded event, not part of config, so
-                    // it counts as a change on its own.
-                    changed = true;
-                    conversation
-                        .exoharness_handle()
-                        .add_events(AddEventsRequest {
-                            session_id: None,
-                            turn_id: None,
-                            data: vec![EventData::SandboxSelected {
-                                sandbox_id: Some(sandbox_id.clone()),
-                            }],
-                        })
-                        .await?;
-                    println!(
-                        "{} now uses sandbox {}",
-                        conversation.record().slug,
-                        sandbox_id
-                    );
-                } else if clear_sandbox_id {
-                    changed = true;
-                    conversation
-                        .exoharness_handle()
-                        .add_events(AddEventsRequest {
-                            session_id: None,
-                            turn_id: None,
-                            data: vec![EventData::SandboxSelected { sandbox_id: None }],
-                        })
-                        .await?;
-                    println!("{} no longer pins a sandbox", conversation.record().slug);
-                }
 
                 if let Some(sandbox_scope) = sandbox_scope {
                     config.sandbox_scope = Some(sandbox_scope.into());
@@ -2723,6 +2689,46 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
                 .await?;
             println!("{sandbox_id}");
         }
+        SandboxCommands::Select { owner, sandbox_id } => {
+            let conversation = selected_sandbox_conversation(harness, &owner).await?;
+            let handle = conversation.exoharness_handle();
+            if !handle
+                .list_sandboxes()
+                .await?
+                .iter()
+                .any(|sandbox| sandbox.id == sandbox_id)
+            {
+                bail!(
+                    "conversation {slug} has no sandbox {sandbox_id}",
+                    slug = conversation.record().slug,
+                );
+            }
+            handle
+                .add_events(AddEventsRequest {
+                    session_id: None,
+                    turn_id: None,
+                    data: vec![EventData::SandboxSelected {
+                        sandbox_id: Some(sandbox_id.clone()),
+                    }],
+                })
+                .await?;
+            println!(
+                "{} now uses sandbox {sandbox_id}",
+                conversation.record().slug
+            );
+        }
+        SandboxCommands::Deselect { owner } => {
+            let conversation = selected_sandbox_conversation(harness, &owner).await?;
+            conversation
+                .exoharness_handle()
+                .add_events(AddEventsRequest {
+                    session_id: None,
+                    turn_id: None,
+                    data: vec![EventData::SandboxSelected { sandbox_id: None }],
+                })
+                .await?;
+            println!("{} no longer selects a sandbox", conversation.record().slug);
+        }
         SandboxCommands::Detach { owner, sandbox_id } => {
             let agent = sandbox_owner(harness, &owner).await?;
             let attachment = agent.detach_sandbox(sandbox_id.clone()).await?;
@@ -2830,6 +2836,20 @@ fn write_sandbox_ids(ids: impl IntoIterator<Item = String>) -> Result<()> {
 
 // A sandbox owner is either a conversation or an agent. If a conversation is
 // specified, it takes precedence over the agent.
+// A selection is recorded on a conversation: an agent's sandbox is chosen by
+// its durable name, so there is no binding for one to carry.
+async fn selected_sandbox_conversation(
+    harness: &dyn Harness,
+    owner: &SandboxOwnerArgs,
+) -> Result<Arc<dyn HarnessConversation>> {
+    let (Some(agent_ref), Some(conversation_ref)) =
+        (owner.agent.as_deref(), owner.conversation.as_deref())
+    else {
+        bail!("selecting a sandbox needs --agent and --conversation");
+    };
+    must_get_conversation(harness, agent_ref, conversation_ref).await
+}
+
 async fn sandbox_owner(
     harness: &dyn Harness,
     owner: &SandboxOwnerArgs,
@@ -4059,6 +4079,34 @@ mod create_tests {
                 && conversation == "conv"
                 && external_id == "harbor-task"
                 && default_workdir == "/task"
+        ));
+    }
+
+    #[test]
+    fn sandbox_select_names_a_conversation() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from([
+            "exo",
+            "sandbox",
+            "select",
+            "--agent",
+            "a",
+            "--conversation",
+            "c",
+            "sandbox-1",
+        ])
+        .expect("select parses with both refs");
+        assert!(matches!(
+            cli.command,
+            super::Commands::Sandbox {
+                command: super::SandboxCommands::Select {
+                    owner: super::SandboxOwnerArgs {
+                        agent: Some(agent),
+                        conversation: Some(conversation),
+                    },
+                    sandbox_id,
+                },
+            } if agent == "a" && conversation == "c" && sandbox_id == "sandbox-1"
         ));
     }
 
