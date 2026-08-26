@@ -46,7 +46,6 @@ pub use conversation_events::{
     HOST_EVENT_REBUILD_AND_RESTART, RebuildUpdateRecord, complete_rebuild_and_restart_update,
     finalize_rebuild_update_file, record_host_event,
 };
-pub use conversation_sandbox::attached_conversation_sandbox;
 pub use conversation_wakeup::send_conversation_wakeup;
 pub use executor_types::{
     AgentConfig, AgentHarnessKind, AgentSandboxConfig, ConversationConfig, ConversationModelConfig,
