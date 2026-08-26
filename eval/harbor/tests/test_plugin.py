@@ -76,6 +76,51 @@ class ExoSessionPluginTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conversation, "trial-abc")
         self.assertIn("Grader feedback:", prompt)
 
+    async def test_the_reflection_sandbox_is_destroyed_when_done(self) -> None:
+        # Nothing else will: the trial conversation is over, so a sandbox left
+        # running here is one container per trial for the length of the run.
+        plugin = ExoSessionPlugin()
+        client = AsyncMock()
+        client.restore_sandbox.return_value = "sandbox-new"
+        plugin._client = client
+        plugin._model = "gpt-5.5"
+        event = trial_event(
+            {
+                conventions.CONVERSATION_METADATA_KEY: "trial-abc",
+                conventions.SNAPSHOT_METADATA_KEY: "snapshot-1",
+                conventions.INSTRUCTION_METADATA_KEY: "do the thing",
+            },
+            Path("/tmp/trials"),
+        )
+
+        with patch("exo_harbor.plugin.export_trial_trajectory", AsyncMock()):
+            await plugin._reflect_on_trial(event)
+
+        client.terminate_sandbox.assert_awaited_once_with("trial-abc", "sandbox-new")
+
+    async def test_a_failed_reflection_still_destroys_its_sandbox(self) -> None:
+        # The leak is worst exactly here: a reflection that times out or errors
+        # would otherwise strand its container while the job carries on.
+        plugin = ExoSessionPlugin()
+        client = AsyncMock()
+        client.restore_sandbox.return_value = "sandbox-new"
+        client.send.side_effect = TimeoutError("reflection timed out")
+        plugin._client = client
+        plugin._model = "gpt-5.5"
+        event = trial_event(
+            {
+                conventions.CONVERSATION_METADATA_KEY: "trial-abc",
+                conventions.SNAPSHOT_METADATA_KEY: "snapshot-1",
+                conventions.INSTRUCTION_METADATA_KEY: "do the thing",
+            },
+            Path("/tmp/trials"),
+        )
+
+        with patch("exo_harbor.plugin.export_trial_trajectory", AsyncMock()):
+            await plugin._reflect_on_trial(event)
+
+        client.terminate_sandbox.assert_awaited_once_with("trial-abc", "sandbox-new")
+
     async def test_a_failed_reflection_does_not_abort_the_job(self) -> None:
         # Reflection runs after grading, so it cannot change this trial's
         # score -- but raising here forfeits every remaining trial.

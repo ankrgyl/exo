@@ -11,6 +11,10 @@ from pathlib import Path
 from exo_harbor import conventions
 
 
+EXO_HARNESS = "exo"
+BASIC_HARNESS = "basic"
+
+
 class ExoCommandError(RuntimeError):
     """An Exo CLI command failed."""
 
@@ -20,11 +24,12 @@ class ExoClient:
     exo_bin: Path
     exo_root: Path
     repo_root: Path
+    harness: str = EXO_HARNESS
 
     async def ensure_agent(self, model: str) -> None:
         if await self._exists("agent", "show", conventions.AGENT_SLUG):
             return
-        await self._run(
+        arguments = [
             "agent",
             "create",
             "Harbor eval",
@@ -32,15 +37,23 @@ class ExoClient:
             conventions.AGENT_SLUG,
             "--model",
             model,
-            "--module",
-            str(self.repo_root / conventions.HARNESS_MODULE),
             "--provider",
             "docker",
             "--sandbox-scope",
             "agent",
-            "--tool-creation",
-            "enabled",
-        )
+        ]
+        if self.harness == EXO_HARNESS:
+            # The module is where memory, skills and self-editing live; the
+            # basic harness has none of it and only gets a shell.
+            arguments.extend(
+                (
+                    "--module",
+                    str(self.repo_root / conventions.HARNESS_MODULE),
+                    "--tool-creation",
+                    "enabled",
+                )
+            )
+        await self._run(*arguments)
 
     async def ensure_conversation(self, slug: str) -> None:
         if await self._exists(
@@ -157,6 +170,15 @@ class ExoClient:
         await self._run("sandbox", "select", *self._owner(conversation), sandbox_id)
         return sandbox_id
 
+    async def terminate_sandbox(self, conversation: str, sandbox_id: str) -> None:
+        """Destroy a sandbox this conversation owns.
+
+        Only safe for sandboxes Exo created, such as one restored from a
+        snapshot. Harbor's own task container is attached rather than owned, so
+        Exo refuses to terminate it and Harbor tears it down itself.
+        """
+        await self._run("sandbox", "terminate", *self._owner(conversation), sandbox_id)
+
     async def read_conversation_events(
         self,
         conversation: str,
@@ -246,6 +268,6 @@ class ExoClient:
             "--root",
             str(self.exo_root),
             "--harness",
-            "exo",
+            self.harness,
             *args,
         ]
