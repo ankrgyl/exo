@@ -655,11 +655,6 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
     }
 
     async fn terminate(&self, request: SandboxRequest) -> Result<()> {
-        // One-shot sandboxes retain nothing to destroy: every process runs in
-        // its own `run --rm` container that the CLI removes on exit. Warm
-        // sandboxes own a named container, which may have been created by an
-        // earlier process and adopted by this one, so sweep by label as well as
-        // by what this process tracks.
         if let Some(entry) = self.warm_sandboxes.lock().await.remove(&request.key) {
             cleanup_named_container(&self.container_bin, self.cli, &entry.name).await?;
         }
@@ -906,8 +901,7 @@ impl ManagedSandboxBackend for LocalProcessSandboxBackend {
     }
 
     async fn terminate(&self, _request: SandboxRequest) -> Result<()> {
-        // Processes run directly on the host and are tied to the caller, so a
-        // local-process sandbox retains nothing to destroy.
+        // Nothing to destroy, as this is local.
         Ok(())
     }
 }
