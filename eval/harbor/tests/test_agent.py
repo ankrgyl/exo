@@ -63,6 +63,11 @@ class SetupTest(unittest.IsolatedAsyncioTestCase):
         agent._client.attach_container.assert_awaited_once_with(
             f"trial-{agent.context_id}", "abc123"
         )
+        # Attaching alone leaves the container unused, and the trial would be
+        # graded on a sandbox Harbor never sees.
+        agent._client.select_sandbox.assert_awaited_once_with(
+            f"trial-{agent.context_id}", "sandbox-1"
+        )
 
     async def test_a_missing_container_fails_the_trial(self) -> None:
         # Better to fail here than to open a conversation with no machine

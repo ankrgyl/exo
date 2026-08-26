@@ -74,7 +74,11 @@ class ExoClient:
         *,
         default_workdir: str | None = None,
     ) -> str:
-        """Attach Harbor's task container and return the Exo sandbox id."""
+        """Attach Harbor's task container and return the Exo sandbox id.
+
+        Attaching only registers the container as a sandbox the conversation
+        owns. Nothing runs there until it is selected.
+        """
         arguments = [
             "sandbox",
             "attach",
@@ -87,6 +91,15 @@ class ExoClient:
         if default_workdir is not None:
             arguments.extend(("--default-workdir", default_workdir))
         return (await self._run(*arguments)).strip()
+
+    async def select_sandbox(self, conversation: str, sandbox_id: str) -> None:
+        """Make the conversation run in this sandbox.
+
+        Without it the turn falls through to the conversation's configured spec
+        and builds a fresh sandbox, so the trial would be graded on a machine
+        Harbor never sees.
+        """
+        await self._run("sandbox", "select", *self._owner(conversation), sandbox_id)
 
     async def send(
         self, conversation: str, prompt: str, *, timeout_sec: float | None
@@ -141,14 +154,7 @@ class ExoClient:
                 "docker",
             )
         ).strip()
-        await self._run(
-            "conversation",
-            "update",
-            conventions.AGENT_SLUG,
-            conversation,
-            "--sandbox-id",
-            sandbox_id,
-        )
+        await self._run("sandbox", "select", *self._owner(conversation), sandbox_id)
         return sandbox_id
 
     async def read_conversation_events(

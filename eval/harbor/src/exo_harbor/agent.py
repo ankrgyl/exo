@@ -75,6 +75,8 @@ class ExoAgent(BaseAgent):
         self._sandbox_id = await self._client.attach_container(
             self._conversation, self._container_id
         )
+        # Attaching only registers it; this is what runs the trial in it.
+        await self._client.select_sandbox(self._conversation, self._sandbox_id)
 
         
         logger.info(
