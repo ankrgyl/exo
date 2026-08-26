@@ -147,9 +147,10 @@ pub(crate) async fn firecracker_backend_for_test(
     firecracker_backend(config, FirecrackerLimaConfig::default()).await
 }
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
-pub use smolvm::{
-    SmolvmBackendConfig, SmolvmExecutionMode, SmolvmSandboxBackend, default_smolvm_image,
-};
+// `default_smolvm_image` deliberately lives in `types`, not here: it must be
+// callable without the `basic-backend` feature this module is gated on, and
+// re-exporting a second copy made `exoharness::default_smolvm_image` ambiguous.
+pub use smolvm::{SmolvmBackendConfig, SmolvmExecutionMode, SmolvmSandboxBackend};
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use sprites::{DEFAULT_SPRITES_API_URL, SpritesConfig, SpritesSandboxBackend};
 pub use vercel::default_vercel_image;

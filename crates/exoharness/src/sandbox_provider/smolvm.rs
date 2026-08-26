@@ -28,10 +28,10 @@ use tokio::sync::OnceCell;
 
 use crate::SandboxAttachment;
 use crate::sandbox::{
-    DEFAULT_SANDBOX_IMAGE, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
-    SandboxCommandOutput, SandboxKey, SandboxMountAccess, SandboxNetworkPolicy, SandboxRequest,
-    SandboxSpec, SnapshotKind, SnapshotPayload, WARM_SANDBOX_KEY_LABEL,
-    WARM_SANDBOX_OWNER_PID_LABEL, owner_pid_is_alive, run_command, spawn_sandbox_process,
+    ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput, SandboxKey,
+    SandboxMountAccess, SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotKind,
+    SnapshotPayload, WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_OWNER_PID_LABEL, owner_pid_is_alive,
+    run_command, spawn_sandbox_process,
 };
 
 /// Default binary name; overridable with `SMOLVM_BIN` for a non-PATH install.
@@ -40,10 +40,6 @@ const DEFAULT_SMOLVM_BIN: &str = "smolvm";
 /// Also the variable smolvm itself reads, which is why the name is not ours to
 /// choose; `--smolvm-boot-binary` is the discoverable way to set it.
 const SMOLVM_BOOT_BIN_ENV: &str = "SMOLVM_BOOT_BINARY";
-
-pub fn default_smolvm_image() -> String {
-    DEFAULT_SANDBOX_IMAGE.to_string()
-}
 
 /// First smolvm release whose client drains the agent's `Progress` frames during
 /// a detached start, which is what warm mode needs; see [`SmolvmExecutionMode::Warm`].
