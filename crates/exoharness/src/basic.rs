@@ -2015,10 +2015,10 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         let _guard = self.harness.inner.write_lock.lock().await;
         let mut sandbox = self.load_sandbox(&sandbox_id).await?;
         if !sandbox.running {
+            if let Some(attachment) = sandbox.attachment {
+                return Ok(attachment);
+            }
             bail!("sandbox is not running: {sandbox_id}");
-        }
-        if sandbox.attachment.is_some() {
-            bail!("sandbox is already detached: {sandbox_id}");
         }
         let attachment = sandbox_handle.detach().await?;
         self.harness
