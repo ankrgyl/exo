@@ -16,8 +16,8 @@ use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixS
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -39,7 +39,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::net::{TcpStream, UnixStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 use crate::sandbox::{
@@ -435,6 +435,87 @@ struct WarmMachineEntry {
     last_used_at: Instant,
 }
 
+#[derive(Default)]
+struct MachineLifecycleLocks {
+    locks: StdMutex<HashMap<String, Weak<Mutex<()>>>>,
+}
+
+impl MachineLifecycleLocks {
+    async fn lock_machine(&self, machine_id: &str) -> OwnedMutexGuard<()> {
+        self.lock_key(machine_lifecycle_key(machine_id)).await
+    }
+
+    async fn lock_sandbox(&self, key: &SandboxKey) -> OwnedMutexGuard<()> {
+        self.lock_key(sandbox_lifecycle_key(key)).await
+    }
+
+    async fn lock_sandbox_pair(
+        &self,
+        first: &SandboxKey,
+        second: &SandboxKey,
+    ) -> (OwnedMutexGuard<()>, Option<OwnedMutexGuard<()>>) {
+        let first = sandbox_lifecycle_key(first);
+        let second = sandbox_lifecycle_key(second);
+        if first == second {
+            return (self.lock_key(first).await, None);
+        }
+        let (first, second) = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let first_guard = self.lock_key(first).await;
+        let second_guard = self.lock_key(second).await;
+        (first_guard, Some(second_guard))
+    }
+
+    async fn lock_key(&self, key: String) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self
+                .locks
+                .lock()
+                .expect("Firecracker lifecycle lock map must not be poisoned");
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
+    }
+}
+
+struct MachineCapacityReservation {
+    machine_id: Option<String>,
+    starting_machines: Arc<StdMutex<HashSet<String>>>,
+}
+
+impl MachineCapacityReservation {
+    fn inactive(starting_machines: Arc<StdMutex<HashSet<String>>>) -> Self {
+        Self {
+            machine_id: None,
+            starting_machines,
+        }
+    }
+}
+
+impl Drop for MachineCapacityReservation {
+    fn drop(&mut self) {
+        let Some(machine_id) = self.machine_id.as_ref() else {
+            return;
+        };
+        let removed = self
+            .starting_machines
+            .lock()
+            .expect("Firecracker starting-machine set must not be poisoned")
+            .remove(machine_id);
+        debug_assert!(removed, "Firecracker capacity reservation disappeared");
+    }
+}
+
 struct Shared {
     config: FirecrackerConfig,
     runtime: FirecrackerRuntimeFingerprint,
@@ -443,7 +524,9 @@ struct Shared {
     // lock prevents concurrent controllers from racing that reconciliation.
     _state_lock: File,
     warm_machines: Mutex<HashMap<SandboxKey, WarmMachineEntry>>,
-    lifecycle_lock: Mutex<()>,
+    lifecycle_locks: MachineLifecycleLocks,
+    capacity_gate: Mutex<()>,
+    starting_machines: Arc<StdMutex<HashSet<String>>>,
 }
 
 pub struct FirecrackerSandboxBackend {
@@ -536,7 +619,9 @@ impl FirecrackerSandboxBackend {
                 runtime,
                 _state_lock: state_lock,
                 warm_machines: Mutex::new(HashMap::new()),
-                lifecycle_lock: Mutex::new(()),
+                lifecycle_locks: MachineLifecycleLocks::default(),
+                capacity_gate: Mutex::new(()),
+                starting_machines: Arc::new(StdMutex::new(HashSet::new())),
             }),
         })
     }
@@ -544,28 +629,43 @@ impl FirecrackerSandboxBackend {
     // Entry point for the Lima bridge. Persisted leases are authoritative
     // across bridge/controller restarts.
     pub(super) async fn reap_expired(&self) -> Result<()> {
-        let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
+        self.reap_stale_machines().await?;
         self.reap_expired_machines().await?;
         self.shared.reap_orphaned_fork_snapshot_templates().await;
+        Ok(())
+    }
+
+    async fn reap_stale_machines(&self) -> Result<()> {
+        if self.shared.config.max_machines.is_none() {
+            return Ok(());
+        }
+        let config = self.shared.config.clone();
+        let capacity = tokio::task::spawn_blocking(move || {
+            machine_capacity_state(&config.state_root, |candidate| {
+                process_running(&jail_root(&config, candidate).join("firecracker.pid"))
+            })
+        })
+        .await
+        .context("joining Firecracker stale-machine scan")??;
+        for machine_id in capacity.dead_machine_ids {
+            let _lifecycle_guard = self.shared.lifecycle_locks.lock_machine(&machine_id).await;
+            self.shared.cleanup_stale_machine(&machine_id).await?;
+        }
         Ok(())
     }
 
     async fn reap_expired_machines(&self) -> Result<()> {
         let now = Instant::now();
         let mut expired = {
-            let mut machines = self.shared.warm_machines.lock().await;
-            let keys = machines
-                .iter()
-                .filter_map(|(key, entry)| {
+            let machines = self.shared.warm_machines.lock().await;
+            machines
+                .values()
+                .filter_map(|entry| {
                     entry
                         .idle_ttl
                         .filter(|ttl| entry.last_used_at + *ttl <= now)
-                        .map(|_| key.clone())
+                        .map(|_| entry.machine_id.clone())
                 })
-                .collect::<Vec<_>>();
-            keys.into_iter()
-                .filter_map(|key| machines.remove(&key))
-                .map(|entry| entry.machine_id)
                 .collect::<Vec<_>>()
         };
         let state_root = self.shared.config.state_root.clone();
@@ -577,14 +677,23 @@ impl FirecrackerSandboxBackend {
         expired.extend(persisted);
 
         let expired = expired.into_iter().collect::<HashSet<_>>();
-        if !expired.is_empty() {
+        for machine_id in expired {
+            let _lifecycle_guard = self.shared.lifecycle_locks.lock_machine(&machine_id).await;
+            let state_root = self.shared.config.state_root.clone();
+            let machine_id_for_check = machine_id.clone();
+            let still_expired = tokio::task::spawn_blocking(move || {
+                machine_lease_expired(&state_root, &machine_id_for_check, SystemTime::now())
+            })
+            .await
+            .context("joining Firecracker lease revalidation")??;
+            if !still_expired {
+                continue;
+            }
             self.shared
                 .warm_machines
                 .lock()
                 .await
-                .retain(|_, entry| !expired.contains(&entry.machine_id));
-        }
-        for machine_id in expired {
+                .retain(|_, entry| entry.machine_id != machine_id);
             self.shared.cleanup_machine(&machine_id, true).await?;
         }
         Ok(())
@@ -604,7 +713,9 @@ impl FirecrackerSandboxBackend {
         Ok(request)
     }
 
-    async fn capture_snapshot(
+    // The caller holds the source machine's lifecycle lock until capture has
+    // resumed the VM and published the immutable template.
+    async fn capture_snapshot_locked(
         shared: &Arc<Shared>,
         request: &SandboxRequest,
         source_machine_id: &str,
@@ -617,7 +728,6 @@ impl FirecrackerSandboxBackend {
         }
         validate_snapshot_key(&template_key)?;
 
-        let _lifecycle_guard = shared.lifecycle_lock.lock().await;
         let source = shared
             .load_machine_record(source_machine_id)
             .await?
@@ -670,6 +780,32 @@ impl FirecrackerSandboxBackend {
         lifecycle: SnapshotTemplateLifecycle,
         captured_lease: Option<File>,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        let spec_hash = sandbox_spec_hash(&request.spec);
+        let machine_id = machine_id(&request.key, &spec_hash);
+        let _lifecycle_guard = self.shared.lifecycle_locks.lock_sandbox(&request.key).await;
+        self.restore_snapshot_locked(
+            request,
+            manifest,
+            lifecycle,
+            captured_lease,
+            spec_hash,
+            machine_id,
+        )
+        .await
+    }
+
+    // The caller holds the target machine family's lifecycle lock. Fork holds
+    // source and target together in deterministic order through publication so
+    // another fork cannot replace its single-use template before restore.
+    async fn restore_snapshot_locked(
+        &self,
+        request: SandboxRequest,
+        manifest: FirecrackerSnapshotManifest,
+        lifecycle: SnapshotTemplateLifecycle,
+        captured_lease: Option<File>,
+        spec_hash: String,
+        machine_id: String,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let template_key = manifest.template_key.clone();
         let restore = async {
             manifest.validate()?;
@@ -679,7 +815,6 @@ impl FirecrackerSandboxBackend {
             if !request.spec.durable_file_systems.is_empty() {
                 bail!("Firecracker snapshot restore does not support durable filesystems")
             }
-            let spec_hash = sandbox_spec_hash(&request.spec);
             if spec_hash != manifest.spec_hash {
                 bail!("Firecracker snapshot specification does not match the requested sandbox")
             }
@@ -687,9 +822,7 @@ impl FirecrackerSandboxBackend {
                 bail!("Firecracker snapshot runtime does not match the configured runtime")
             }
 
-            let machine_id = machine_id(&request.key, &spec_hash);
-            let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
-            self.shared.ensure_machine_capacity(&machine_id).await?;
+            let capacity_reservation = self.shared.reserve_machine_capacity(&machine_id).await?;
             let config = self.shared.config.clone();
             let key = template_key.clone();
             let template_ready =
@@ -727,7 +860,16 @@ impl FirecrackerSandboxBackend {
                 .await?;
             drop(snapshot_lease);
 
-            match self.acquire_resolved_locked(request).await {
+            match self
+                .acquire_resolved_locked(
+                    request,
+                    spec_hash,
+                    machine_id.clone(),
+                    false,
+                    Some(capacity_reservation),
+                )
+                .await
+            {
                 Ok(handle) => Ok(handle),
                 Err(error) => {
                     if let Err(cleanup_error) = self.shared.cleanup_machine(&machine_id, true).await
@@ -746,7 +888,6 @@ impl FirecrackerSandboxBackend {
 
         match restore {
             Err(error) if lifecycle == SnapshotTemplateLifecycle::Machine => {
-                let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
                 if let Err(cleanup_error) =
                     self.shared.remove_snapshot_template(&template_key).await
                 {
@@ -764,19 +905,30 @@ impl FirecrackerSandboxBackend {
         &self,
         request: SandboxRequest,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
-        self.acquire_resolved_locked(request).await
+        let spec_hash = sandbox_spec_hash(&request.spec);
+        let one_shot = request.lifecycle.idle_ttl.is_none();
+        let machine_id = if one_shot {
+            let sequence = ONE_SHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            one_shot_machine_id(&request.key, &spec_hash, sequence)
+        } else {
+            machine_id(&request.key, &spec_hash)
+        };
+        let _lifecycle_guard = self.shared.lifecycle_locks.lock_sandbox(&request.key).await;
+        self.acquire_resolved_locked(request, spec_hash, machine_id, one_shot, None)
+            .await
     }
 
-    // The caller holds lifecycle_lock until the admitted machine is either
-    // running or cleaned up. That makes the capacity check and launch one
-    // atomic operation: while one not-yet-live VMM occupies the remaining
-    // slot, no second launch can pass its capacity check.
+    // The caller holds this machine family's lifecycle lock. The capacity
+    // reservation remains live until the VMM is running or fully cleaned up,
+    // while unrelated machine families may launch concurrently.
     async fn acquire_resolved_locked(
         &self,
         request: SandboxRequest,
+        spec_hash: String,
+        target_machine_id: String,
+        one_shot: bool,
+        capacity_reservation: Option<MachineCapacityReservation>,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        let spec_hash = sandbox_spec_hash(&request.spec);
         let stable_machine_id = machine_id(&request.key, &spec_hash);
         let machine_key_prefix = format!("fc-{}-", stable_id(&request.key.to_string()));
 
@@ -795,14 +947,6 @@ impl FirecrackerSandboxBackend {
             self.shared.cleanup_machine(&state.machine_id, true).await?;
         }
 
-        let one_shot = request.lifecycle.idle_ttl.is_none();
-        let machine_id = if one_shot {
-            let sequence = ONE_SHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            one_shot_machine_id(&request.key, &spec_hash, sequence)
-        } else {
-            stable_machine_id
-        };
-
         if !one_shot {
             let replaced = {
                 let mut machines = self.shared.warm_machines.lock().await;
@@ -817,16 +961,24 @@ impl FirecrackerSandboxBackend {
             }
         }
 
+        let _capacity_reservation = match capacity_reservation {
+            Some(reservation) => reservation,
+            None => {
+                self.shared
+                    .reserve_machine_capacity(&target_machine_id)
+                    .await?
+            }
+        };
         let machine = self
             .shared
-            .ensure_machine(&request, &machine_id, &spec_hash)
+            .ensure_machine(&request, &target_machine_id, &spec_hash)
             .await?;
         if !one_shot {
-            self.shared.touch_machine_lease(&machine_id).await?;
+            self.shared.touch_machine_lease(&target_machine_id).await?;
             self.shared.warm_machines.lock().await.insert(
                 request.key.clone(),
                 WarmMachineEntry {
-                    machine_id: machine_id.clone(),
+                    machine_id: target_machine_id.clone(),
                     spec_hash: spec_hash.clone(),
                     idle_ttl: request.lifecycle.idle_ttl,
                     last_used_at: Instant::now(),
@@ -835,9 +987,9 @@ impl FirecrackerSandboxBackend {
         }
 
         let id = if one_shot {
-            format!("firecracker-oneshot:{machine_id}")
+            format!("firecracker-oneshot:{target_machine_id}")
         } else {
-            format!("firecracker:{machine_id}")
+            format!("firecracker:{target_machine_id}")
         };
         Ok(Arc::new(FirecrackerSandboxHandle {
             id,
@@ -857,11 +1009,9 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        {
-            let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
-            self.reap_expired_machines().await?;
-            self.shared.reap_orphaned_fork_snapshot_templates().await;
-        }
+        self.reap_stale_machines().await?;
+        self.reap_expired_machines().await?;
+        self.shared.reap_orphaned_fork_snapshot_templates().await;
         let request = self.resolve_request(request).await?;
         self.acquire_resolved(request).await
     }
@@ -875,7 +1025,6 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
     }
 
     async fn terminate(&self, request: SandboxRequest) -> Result<()> {
-        let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
         let persisted_machine_id = request
             .provider_state
             .as_ref()
@@ -888,6 +1037,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
                 bail!("Firecracker provider state does not match the terminated sandbox key");
             }
         }
+        let _lifecycle_guard = self.shared.lifecycle_locks.lock_sandbox(&request.key).await;
         let machine_id = self
             .shared
             .warm_machines
@@ -910,21 +1060,29 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let mut source = prepare_request(source)?;
         let target = self.resolve_request(target).await?;
-        let source_record = {
-            let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
-            let source_entry = self
-                .shared
-                .warm_machines
-                .lock()
-                .await
-                .get(&source.key)
-                .cloned()
-                .context("Firecracker fork source is not active")?;
-            self.shared
-                .load_machine_record(&source_entry.machine_id)
-                .await?
-                .context("Firecracker fork source manifest is missing")?
-        };
+        if source.key == target.key {
+            bail!("Firecracker fork source and target must be different sandboxes")
+        }
+        let target_spec_hash = sandbox_spec_hash(&target.spec);
+        let target_machine_id = machine_id(&target.key, &target_spec_hash);
+        let (_first_lifecycle_guard, _second_lifecycle_guard) = self
+            .shared
+            .lifecycle_locks
+            .lock_sandbox_pair(&source.key, &target.key)
+            .await;
+        let source_entry = self
+            .shared
+            .warm_machines
+            .lock()
+            .await
+            .get(&source.key)
+            .cloned()
+            .context("Firecracker fork source is not active")?;
+        let source_record = self
+            .shared
+            .load_machine_record(&source_entry.machine_id)
+            .await?
+            .context("Firecracker fork source manifest is missing")?;
         source.spec.image = source_record.resolved_image.clone();
         if sandbox_spec_hash(&source.spec) != source_record.spec_hash {
             bail!("Firecracker fork source specification does not match the running machine")
@@ -933,10 +1091,8 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
             bail!("Firecracker fork source and target specifications must match")
         }
 
-        let target_spec_hash = sandbox_spec_hash(&target.spec);
-        let target_machine_id = machine_id(&target.key, &target_spec_hash);
         let template_key = fork_snapshot_template_key(&source_record, &target_machine_id);
-        let captured = Self::capture_snapshot(
+        let captured = Self::capture_snapshot_locked(
             &self.shared,
             &source,
             &source_record.machine_id,
@@ -945,11 +1101,13 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
             SnapshotTemplateLifecycle::Machine,
         )
         .await?;
-        self.restore_snapshot(
+        self.restore_snapshot_locked(
             target,
             captured.manifest,
             SnapshotTemplateLifecycle::Machine,
             Some(captured.lease),
+            target_spec_hash,
+            target_machine_id,
         )
         .await
     }
@@ -1005,7 +1163,11 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
             .exec(&self.request.spec, command)
             .await;
         if self.one_shot {
-            let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
+            let _lifecycle_guard = self
+                .shared
+                .lifecycle_locks
+                .lock_machine(&self.machine.record.machine_id)
+                .await;
             let cleanup = self
                 .shared
                 .cleanup_machine(&self.machine.record.machine_id, true)
@@ -1016,7 +1178,11 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
             };
         }
         {
-            let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
+            let _lifecycle_guard = self
+                .shared
+                .lifecycle_locks
+                .lock_machine(&self.machine.record.machine_id)
+                .await;
             touch_machine(
                 &self.shared,
                 &self.shared.warm_machines,
@@ -1036,7 +1202,11 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
             .start_process(&self.request.spec, command, cleanup_machine_id)
             .await?;
         if !self.one_shot {
-            let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
+            let _lifecycle_guard = self
+                .shared
+                .lifecycle_locks
+                .lock_machine(&self.machine.record.machine_id)
+                .await;
             touch_machine(
                 &self.shared,
                 &self.shared.warm_machines,
@@ -1061,7 +1231,11 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
     }
 
     async fn stop(&self) -> Result<()> {
-        let _lifecycle_guard = self.shared.lifecycle_lock.lock().await;
+        let _lifecycle_guard = self
+            .shared
+            .lifecycle_locks
+            .lock_machine(&self.machine.record.machine_id)
+            .await;
         if self.machine.record.workspace_id.is_some()
             && process_running(&self.shared.pid_path(&self.machine.record.machine_id))
         {
@@ -1089,7 +1263,12 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
     }
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {
-        let captured = FirecrackerSandboxBackend::capture_snapshot(
+        let _lifecycle_guard = self
+            .shared
+            .lifecycle_locks
+            .lock_machine(&self.machine.record.machine_id)
+            .await;
+        let captured = FirecrackerSandboxBackend::capture_snapshot_locked(
             &self.shared,
             &self.request,
             &self.machine.record.machine_id,
@@ -1139,10 +1318,16 @@ impl Shared {
         }
     }
 
-    async fn ensure_machine_capacity(&self, machine_id: &str) -> Result<()> {
+    async fn reserve_machine_capacity(
+        &self,
+        machine_id: &str,
+    ) -> Result<MachineCapacityReservation> {
         let Some(max_machines) = self.config.max_machines else {
-            return Ok(());
+            return Ok(MachineCapacityReservation::inactive(Arc::clone(
+                &self.starting_machines,
+            )));
         };
+        let _capacity_guard = self.capacity_gate.lock().await;
         let config = self.config.clone();
         let capacity = tokio::task::spawn_blocking(move || {
             machine_capacity_state(&config.state_root, |candidate| {
@@ -1152,33 +1337,42 @@ impl Shared {
         .await
         .context("joining Firecracker capacity scan")??;
 
-        let stale_machine_ids = capacity
-            .dead_machine_ids
-            .into_iter()
-            .filter(|candidate| candidate != machine_id)
-            .collect::<HashSet<_>>();
-        if !stale_machine_ids.is_empty() {
-            self.warm_machines
-                .lock()
-                .await
-                .retain(|_, entry| !stale_machine_ids.contains(&entry.machine_id));
-            for stale_machine_id in stale_machine_ids {
-                self.cleanup_machine(&stale_machine_id, true).await?;
-                tracing::info!(
-                    machine_id = stale_machine_id,
-                    "reaped stale Firecracker machine record"
-                );
-            }
-        }
-
-        ensure_machine_capacity(
+        let mut starting_machines = self
+            .starting_machines
+            .lock()
+            .expect("Firecracker starting-machine set must not be poisoned");
+        admit_machine_capacity(
             max_machines,
-            capacity.live_machine_ids.len(),
-            capacity
-                .live_machine_ids
-                .iter()
-                .any(|candidate| candidate == machine_id),
-        )
+            &capacity.live_machine_ids,
+            &mut starting_machines,
+            machine_id,
+        )?;
+        drop(starting_machines);
+        Ok(MachineCapacityReservation {
+            machine_id: Some(machine_id.to_string()),
+            starting_machines: Arc::clone(&self.starting_machines),
+        })
+    }
+
+    async fn cleanup_stale_machine(&self, machine_id: &str) -> Result<()> {
+        let starting = self
+            .starting_machines
+            .lock()
+            .expect("Firecracker starting-machine set must not be poisoned")
+            .contains(machine_id);
+        if starting || process_running(&self.pid_path(machine_id)) {
+            return Ok(());
+        }
+        if self.load_machine_record(machine_id).await?.is_none() {
+            return Ok(());
+        }
+        self.warm_machines
+            .lock()
+            .await
+            .retain(|_, entry| entry.machine_id != machine_id);
+        self.cleanup_machine(machine_id, true).await?;
+        tracing::info!(machine_id, "reaped stale Firecracker machine record");
+        Ok(())
     }
 
     async fn ensure_machine(
@@ -1208,7 +1402,6 @@ impl Shared {
             }
         }
 
-        self.ensure_machine_capacity(machine_id).await?;
         let record = match existing {
             Some(record) if record.spec_hash == spec_hash && record.runtime == self.runtime => {
                 record
@@ -1848,6 +2041,20 @@ fn one_shot_machine_id(key: &SandboxKey, spec_hash: &str, sequence: u64) -> Stri
     )
 }
 
+fn sandbox_lifecycle_key(key: &SandboxKey) -> String {
+    format!("fc-{}", stable_id(&key.to_string()))
+}
+
+fn machine_lifecycle_key(machine_id: &str) -> String {
+    machine_id
+        .strip_prefix("fc-")
+        .and_then(|suffix| suffix.split_once('-'))
+        .map_or_else(
+            || machine_id.to_string(),
+            |(family, _)| format!("fc-{family}"),
+        )
+}
+
 fn valid_machine_id(machine_id: &str) -> bool {
     machine_id.starts_with("fc-")
         && machine_id.len() <= 64
@@ -1991,6 +2198,39 @@ fn expired_machine_ids(state_root: &Path, now: SystemTime) -> Result<Vec<String>
     Ok(expired)
 }
 
+fn machine_lease_expired(state_root: &Path, machine_id: &str, now: SystemTime) -> Result<bool> {
+    if !valid_machine_id(machine_id) {
+        bail!("invalid Firecracker machine id: {machine_id}");
+    }
+    let manifest = manifest_path(state_root, machine_id);
+    let bytes = match fs::read(&manifest) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading Firecracker manifest {}", manifest.display()));
+        }
+    };
+    let record = serde_json::from_slice::<MachineRecord>(&bytes)
+        .with_context(|| format!("decoding Firecracker manifest {}", manifest.display()))?;
+    if record.machine_id != machine_id {
+        bail!("mismatched Firecracker manifest {}", manifest.display());
+    }
+    let Some(idle_ttl_seconds) = record.idle_ttl_seconds else {
+        return Ok(false);
+    };
+    let last_used = match fs::metadata(lease_path(state_root, machine_id)) {
+        Ok(metadata) => metadata.modified()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::metadata(&manifest)?.modified()?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(last_used
+        .checked_add(Duration::from_secs(idle_ttl_seconds))
+        .is_some_and(|deadline| deadline <= now))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct MachineCapacityState {
     live_machine_ids: Vec<String>,
@@ -2006,17 +2246,26 @@ fn machine_capacity_state(
     for entry in fs::read_dir(state_root.join("manifests"))? {
         let entry = entry?;
         let path = entry.path();
-        if !entry.file_type()?.is_file()
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !file_type.is_file()
             || path.extension().and_then(|extension| extension.to_str()) != Some("json")
         {
             continue;
         }
-        let record = fs::read(&path)
-            .with_context(|| format!("reading Firecracker manifest {}", path.display()))
-            .and_then(|bytes| {
-                serde_json::from_slice::<MachineRecord>(&bytes)
-                    .with_context(|| format!("decoding Firecracker manifest {}", path.display()))
-            })?;
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading Firecracker manifest {}", path.display()));
+            }
+        };
+        let record = serde_json::from_slice::<MachineRecord>(&bytes)
+            .with_context(|| format!("decoding Firecracker manifest {}", path.display()))?;
         if !valid_machine_id(&record.machine_id)
             || manifest_path(state_root, &record.machine_id) != path
         {
@@ -2046,6 +2295,31 @@ fn ensure_machine_capacity(
         "Firecracker host VM capacity exhausted: {live_machines} live, limit {}; stop a VM or raise the host limit",
         max_machines.get()
     )
+}
+
+fn admit_machine_capacity(
+    max_machines: NonZeroUsize,
+    live_machine_ids: &[String],
+    starting_machine_ids: &mut HashSet<String>,
+    machine_id: &str,
+) -> Result<()> {
+    if starting_machine_ids.contains(machine_id) {
+        bail!("Firecracker machine {machine_id} is already being admitted");
+    }
+    let occupied_machine_ids = live_machine_ids
+        .iter()
+        .chain(starting_machine_ids.iter())
+        .collect::<HashSet<_>>();
+    ensure_machine_capacity(
+        max_machines,
+        occupied_machine_ids.len(),
+        occupied_machine_ids
+            .iter()
+            .any(|candidate| candidate.as_str() == machine_id),
+    )?;
+    let inserted = starting_machine_ids.insert(machine_id.to_string());
+    debug_assert!(inserted, "Firecracker admission must create a reservation");
+    Ok(())
 }
 
 fn write_manifest(state_root: &Path, record: &MachineRecord) -> Result<()> {
@@ -2974,9 +3248,9 @@ fn reap_orphaned_fork_snapshot_templates_blocking(
         }
 
         // Restores hold a shared lock, while reclamation proceeds only after a
-        // non-blocking exclusive lock. The lifecycle lock prevents new restores
-        // from starting between the reference scan and removal in this backend;
-        // the lease also protects against readers outside that critical section.
+        // non-blocking exclusive lock. A restore that races this reference scan
+        // either acquires its shared lease before removal or observes that the
+        // template disappeared and fails without starting a VM.
         let lease_path = entry.path().join(SNAPSHOT_LEASE_FILE);
         let lease = File::open(&lease_path).with_context(|| {
             format!(
@@ -3874,7 +4148,11 @@ impl Drop for ProcessCleanup {
             }
             if let Some(machine_id) = machine_id
             {
-                let _lifecycle_guard = guest.shared.lifecycle_lock.lock().await;
+                let _lifecycle_guard = guest
+                    .shared
+                    .lifecycle_locks
+                    .lock_machine(&machine_id)
+                    .await;
                 if let Err(error) = guest.shared.cleanup_machine(&machine_id, true).await {
                     tracing::warn!(%error, machine_id, "failed to clean up one-shot Firecracker machine");
                 }
