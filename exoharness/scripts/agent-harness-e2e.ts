@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-type HarnessKey = "codex" | "claude" | "cursor";
+type HarnessKey = "codex" | "claude" | "cursor" | "pi";
 
 interface HarnessDefinition {
   key: HarnessKey;
@@ -78,6 +78,7 @@ interface ConversationEventsResult {
 
 interface EventRecord {
   id?: string;
+  data?: unknown;
 }
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -117,6 +118,19 @@ const harnesses: HarnessDefinition[] = [
     imageBuildArgs: [
       "-f",
       "exoharness/containers/cursor-sdk-sandbox/Containerfile",
+      ".",
+    ],
+  },
+  {
+    key: "pi",
+    envName: "ANTHROPIC_API_KEY",
+    secret: "pi-anthropic",
+    model: "anthropic/claude-sonnet-4-6",
+    module: "exoharness/examples/typescript/pi-harness.ts",
+    image: "exo-pi-sandbox:latest",
+    imageBuildArgs: [
+      "-f",
+      "exoharness/containers/pi-sandbox/Containerfile",
       ".",
     ],
   },
@@ -306,6 +320,9 @@ function runHistoryReplayCheck(
     toolMarker,
     `${harness.key} did not read the mounted marker file through a tool call`,
   );
+  if (harness.key === "pi") {
+    assertPiUsageEvents(agent.slug, conversation);
+  }
 
   const firstTurnEndedId = firstTurnEndedEventId(agent.slug, conversation);
   const fork = `fork-${harness.key}-${runId}`;
@@ -331,6 +348,29 @@ function runHistoryReplayCheck(
   );
 
   return { conversation, fork, codeWord };
+}
+
+function assertPiUsageEvents(agent: string, conversation: string): void {
+  const result = conversationEvents(agent, conversation, [
+    "--type",
+    "messages",
+    "--limit",
+    "100",
+  ]);
+  const serialized = JSON.stringify(result.events);
+  if (!serialized.includes('"usage"')) {
+    throw new Error("Pi did not persist usage on canonical message events");
+  }
+  for (const field of [
+    "model",
+    "prompt_tokens",
+    "completion_tokens",
+    "cost_usd",
+  ]) {
+    if (!serialized.includes(`"${field}"`)) {
+      throw new Error(`Pi canonical usage did not include ${field}`);
+    }
+  }
 }
 
 function runSandboxEscapeCheck(
@@ -689,7 +729,12 @@ function parseArgs(rawArgs: string[]): CliArgs {
 }
 
 function isHarnessKey(value: string): value is HarnessKey {
-  return value === "codex" || value === "claude" || value === "cursor";
+  return (
+    value === "codex" ||
+    value === "claude" ||
+    value === "cursor" ||
+    value === "pi"
+  );
 }
 
 function readArgValue(rawArgs: string[], index: number, flag: string): string {
@@ -790,10 +835,10 @@ function fail(message: string): never {
 function printHelpAndExit(): never {
   console.log(`Usage: pnpm e2e:agent-harnesses [options]
 
-Runs live Codex/Claude/Cursor history replay checks against exoharness.
+Runs live Codex/Claude/Cursor/Pi history replay checks against exoharness.
 
 Options:
-  --only <codex|claude|cursor>  Run one harness. Repeatable.
+  --only <codex|claude|cursor|pi>  Run one harness. Repeatable.
   --sandbox                     Also run sandbox escape/network-denial checks.
   --build-images                Build the required Apple container images first.
   --braintrust                  Verify traces using BRAINTRUST_* env vars.

@@ -1,0 +1,26 @@
+FROM docker.io/library/node:22-bookworm
+
+WORKDIR /opt/exo
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    git \
+    ripgrep \
+  && rm -rf /var/lib/apt/lists/* \
+  && mkdir -p /home/exo/workspace
+
+RUN corepack enable && corepack prepare pnpm@10.26.2 --activate
+
+COPY package.json pnpm-lock.yaml tsconfig.json ./
+COPY scripts ./scripts
+
+RUN pnpm install --frozen-lockfile --config.dangerously-allow-all-builds=true
+
+COPY exoharness/typescript ./exoharness/typescript
+
+ENV HOME=/home/exo
+WORKDIR /home/exo/workspace
+
+CMD ["bash"]

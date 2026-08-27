@@ -21,9 +21,9 @@ rewritten, which is what makes everything else safe to change.
 
 The layer that decides how the agent thinks and acts: prompt assembly,
 model calls, tool dispatch, memory and compaction. It is **fully editable
-and evolvable** — swappable wholesale (Codex, Claude Code, Cursor SDK, your
-own), and modifiable by the agent itself, because nothing durable lives in
-it.
+and evolvable** — swappable wholesale (Codex, Claude Code, Cursor SDK, Pi,
+your own), and modifiable by the agent itself, because nothing durable lives
+in it.
 
 ## Sandbox — the environment
 

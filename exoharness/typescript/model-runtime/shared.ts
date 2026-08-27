@@ -122,9 +122,33 @@ export interface WarmJsonlSandboxWorkerOptions<TEvent> {
   process: SandboxProcess;
 }
 
+export interface WarmJsonlSandboxWorkerRequestOptions {
+  startupTimeoutMs?: number;
+  timeoutMs?: number;
+}
+
+export class WarmJsonlSandboxWorkerTimeoutError extends Error {
+  readonly phase: "startup" | "request";
+  readonly timeoutMs: number;
+
+  constructor(
+    message: string,
+    phase: "startup" | "request",
+    timeoutMs: number,
+  ) {
+    super(message);
+    this.name = "WarmJsonlSandboxWorkerTimeoutError";
+    this.phase = phase;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+const JSONL_WORKER_STDERR_MAX_CHARS = 16_000;
+
 export class WarmJsonlSandboxWorker<TRequest, TEvent> {
   private readonly events = new AsyncQueue<TEvent>();
   private stderr = "";
+  private stderrTruncated = false;
 
   constructor(private readonly options: WarmJsonlSandboxWorkerOptions<TEvent>) {
     void this.readStdout();
@@ -134,24 +158,84 @@ export class WarmJsonlSandboxWorker<TRequest, TEvent> {
   async request<R>(
     request: TRequest,
     onEvent: (event: TEvent) => Promise<R | undefined> | R | undefined,
+    requestOptions: WarmJsonlSandboxWorkerRequestOptions = {},
   ): Promise<R> {
-    await this.options.process.writeStdin(`${JSON.stringify(request)}\n`);
-    while (true) {
-      const next = await this.events.next();
-      if (next.done) {
-        throw new Error(
-          `${this.options.name} exited before completion${this.stderrSuffix()}`,
-        );
+    const run = async (): Promise<R> => {
+      await this.options.process.writeStdin(`${JSON.stringify(request)}\n`);
+      let waitingForFirstEvent = true;
+      while (true) {
+        const next = waitingForFirstEvent
+          ? await this.nextStartupEvent(requestOptions.startupTimeoutMs)
+          : await this.events.next();
+        waitingForFirstEvent = false;
+        if (next.done) {
+          throw new Error(
+            `${this.options.name} exited before completion${this.stderrSuffix()}`,
+          );
+        }
+        const result = await onEvent(next.value);
+        if (result !== undefined) {
+          return result;
+        }
       }
-      const result = await onEvent(next.value);
-      if (result !== undefined) {
-        return result;
+    };
+
+    const timeoutMs = requestOptions.timeoutMs;
+    if (timeoutMs === undefined || timeoutMs <= 0) {
+      return run();
+    }
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timeoutResult = new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => {
+        reject(
+          new WarmJsonlSandboxWorkerTimeoutError(
+            `${this.options.name} timed out after ${timeoutMs}ms${this.stderrSuffix()}`,
+            "request",
+            timeoutMs,
+          ),
+        );
+      }, timeoutMs);
+      timeout.unref?.();
+    });
+    try {
+      return await Promise.race([run(), timeoutResult]);
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
       }
     }
   }
 
   async close(): Promise<void> {
     await this.options.process.close();
+  }
+
+  private async nextStartupEvent(
+    timeoutMs: number | undefined,
+  ): Promise<IteratorResult<TEvent>> {
+    if (timeoutMs === undefined || timeoutMs <= 0) {
+      return this.events.next();
+    }
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timeoutResult = new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => {
+        reject(
+          new WarmJsonlSandboxWorkerTimeoutError(
+            `${this.options.name} produced no events within ${timeoutMs}ms${this.stderrSuffix()}`,
+            "startup",
+            timeoutMs,
+          ),
+        );
+      }, timeoutMs);
+      timeout.unref?.();
+    });
+    try {
+      return await Promise.race([this.events.next(), timeoutResult]);
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+    }
   }
 
   private async readStdout(): Promise<void> {
@@ -195,12 +279,14 @@ export class WarmJsonlSandboxWorker<TRequest, TEvent> {
         if (result.done) {
           return;
         }
-        this.stderr += result.value;
+        this.appendStderr(result.value);
       }
     } catch (error) {
-      this.stderr += `\nfailed to read stderr: ${
-        error instanceof Error ? error.message : String(error)
-      }`;
+      this.appendStderr(
+        `\nfailed to read stderr: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     } finally {
       reader.releaseLock();
     }
@@ -212,17 +298,23 @@ export class WarmJsonlSandboxWorker<TRequest, TEvent> {
     }
   }
 
+  private appendStderr(text: string): void {
+    this.stderr += text;
+    if (this.stderr.length > JSONL_WORKER_STDERR_MAX_CHARS) {
+      this.stderr = this.stderr.slice(-JSONL_WORKER_STDERR_MAX_CHARS);
+      this.stderrTruncated = true;
+    }
+  }
+
   private stderrSuffix(): string {
     const stderr = this.stderr.trim();
     if (!stderr) {
       return "";
     }
-    const maxChars = 16_000;
-    const preview =
-      stderr.length > maxChars
-        ? `${stderr.slice(0, maxChars)}\n... stderr truncated ...`
-        : stderr;
-    return `\nstderr:\n${preview}`;
+    const truncation = this.stderrTruncated
+      ? "... earlier stderr truncated ...\n"
+      : "";
+    return `\nstderr:\n${truncation}${stderr}`;
   }
 }
 

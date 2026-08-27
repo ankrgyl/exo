@@ -1,6 +1,6 @@
 ---
 title: Executors & Harnesses
-description: The built-in executor runtimes, from basic to Codex, Claude Code, and Cursor.
+description: The built-in executor runtimes, from basic to Codex, Claude Code, Cursor, and Pi.
 ---
 
 # Executors & Harnesses
@@ -16,6 +16,7 @@ one with `--harness`:
 | `codex` | Backs OpenAI Codex with durable exoharness sessions |
 | `claude-code` | Backs Claude Code with durable exoharness sessions |
 | `cursor` | Backs the Cursor SDK with durable exoharness sessions |
+| `pi` | Backs Pi with durable exoharness sessions |
 | `<module.ts>` | Any TypeScript module path implementing the harness interface |
 
 ## The executor loop
@@ -50,8 +51,8 @@ This is the main extension point for building your own agent — see the
 
 ## Coding-agent harnesses
 
-The `codex`, `claude-code`, and `cursor` harnesses treat exoharness events
-as the canonical conversation state and run the native agent runtimes
+The `codex`, `claude-code`, `cursor`, and `pi` harnesses treat exoharness
+events as the canonical conversation state and run the native agent runtimes
 inside exoharness-managed sandboxes. The payoff: sessions you can stop,
 resume, fork, and rewind across runs, regardless of which coding agent is
 driving.

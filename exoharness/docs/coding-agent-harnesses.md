@@ -1,8 +1,8 @@
 # Coding Agent Harnesses
 
-The Codex, Claude Code, and Cursor examples treat exoharness events as canonical
-conversation state and run their native agent runtimes inside configured
-exoharness sandboxes.
+The Codex, Claude Code, Cursor, and Pi examples treat exoharness events as
+canonical conversation state and run their native agent runtimes inside
+configured exoharness sandboxes.
 
 Install dependencies and build the CLI first:
 
@@ -14,8 +14,8 @@ cargo build -p exo
 The examples below use `./target/debug/exo`. If you have the binary on your
 `PATH`, you can use `exo` instead.
 
-The `codex`, `claude-code`, and `cursor` harness presets select the matching
-TypeScript module, sandbox image, and networking defaults.
+The `codex`, `claude-code`, `cursor`, and `pi` harness presets select the
+matching TypeScript module, sandbox image, and networking defaults.
 
 For `secret set`, `--env` takes the variable name literally. For example, use
 `--env OPENAI_API_KEY`, not `--env $OPENAI_API_KEY`.
@@ -126,6 +126,60 @@ Create the agent and start a conversation:
 ./target/debug/exo repl --agent ts-cursor --conversation <conversation>
 ```
 
+## Pi
+
+Register a Pi model using its `provider/model` form:
+
+```bash
+./target/debug/exo secret set pi-anthropic --env ANTHROPIC_API_KEY
+./target/debug/exo model register pi-claude \
+  --model anthropic/claude-sonnet-4-6 \
+  --secret pi-anthropic
+```
+
+Build the sandbox image from the repository root:
+
+```bash
+container build \
+  --platform linux/arm64 \
+  -f exoharness/containers/pi-sandbox/Containerfile \
+  -t exo-pi-sandbox:latest \
+  .
+```
+
+Create the agent and start a conversation:
+
+```bash
+./target/debug/exo --harness pi agent create "TS Pi" \
+  --model pi-claude
+
+./target/debug/exo conversation create pi
+./target/debug/exo conversation mount add pi <conversation> "$PWD" /workspace --rw
+./target/debug/exo repl --agent pi --conversation <conversation>
+```
+
+Like the other coding-agent harnesses, Pi runs inside the configured sandbox
+and treats exoharness events as canonical history. Each turn uses an in-memory
+Pi session, so no separate Pi session is persisted. The worker does not load
+ambient `~/.pi` or project extensions, skills, prompts, or context files.
+Prior history and tool results use the same bounded replay approach as the Codex
+harness, with truncation metadata recorded on `pi_turn_started` events.
+
+Pi text, tools, raw SDK messages, retries, compaction, and standard usage/cost
+records are projected into exoharness events. The worker removes the provider
+credential from its environment before starting Pi, so tool subprocesses do not
+inherit it. Worker messages are scoped to the current turn ID, and turns time
+out after ten minutes by default; set
+`EXO_PI_TURN_TIMEOUT_MS` to a positive number of milliseconds to override it.
+Agent `max_output_tokens` and `max_tool_round_trips` limits are forwarded to the
+Pi runtime.
+
+The preset enables networking because Pi makes model requests in the sandbox.
+Remote endpoints fail early with an actionable networking error when it is
+disabled; loopback endpoints remain available for sandbox-local inference. The
+harness currently supports Pi's built-in model catalog; an Exo `--base-url`
+overrides the selected model's endpoint.
+
 ## Live E2E
 
 The live e2e script runs replay checks against the coding-agent harnesses:
@@ -134,6 +188,7 @@ The live e2e script runs replay checks against the coding-agent harnesses:
 pnpm e2e:agent-harnesses --only codex
 pnpm e2e:agent-harnesses --only claude
 pnpm e2e:agent-harnesses --only cursor
+pnpm e2e:agent-harnesses --only pi
 ```
 
 Use `--build-images` to build the required sandbox images before running.

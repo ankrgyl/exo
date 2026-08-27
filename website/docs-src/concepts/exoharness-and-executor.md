@@ -47,7 +47,7 @@ can:
 - **Fork or rewind** at any past event, without losing secrets, sandboxes,
   or history.
 - **Swap executors** — run the same agent via Codex, Claude Code, the
-  Cursor SDK, or your own executor, without rebuilding state.
+  Cursor SDK, Pi, or your own executor, without rebuilding state.
 - **Evolve safely** — change its own policy processes, tools, and even
   harness code, while the exoharness isolates secrets and compute and keeps
   canonical history out of reach.
