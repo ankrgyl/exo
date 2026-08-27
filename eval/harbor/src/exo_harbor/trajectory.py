@@ -26,7 +26,7 @@ class Usage(BaseModel):
     completion_tokens: int
     prompt_cached_tokens: int = 0
     completion_reasoning_tokens: int = 0
-    cost_usd: float
+    cost_usd: float | None = None
 
 
 class TextContent(BaseModel):
@@ -92,7 +92,21 @@ class ToolResultData(BaseModel):
     result: ToolResultValue
 
 
-EventData = Annotated[MessagesData | ToolResultData, Field(discriminator="type")]
+class LearningActivatedArtifact(BaseModel):
+    id: str
+    route: Literal["memory", "skill", "tool"]
+    title: str
+
+
+class LearningActivatedData(BaseModel):
+    type: Literal["learning_activated"]
+    artifacts: list[LearningActivatedArtifact]
+
+
+EventData = Annotated[
+    MessagesData | ToolResultData | LearningActivatedData,
+    Field(discriminator="type"),
+]
 
 
 class ConversationEvent(BaseModel):
@@ -228,6 +242,8 @@ def build_trajectory(
                 usages.append(event.data.usage)
             continue
 
+        if not isinstance(event.data, ToolResultData):
+            continue
         result = event.data.result
         step = calls.get(event.data.tool_call_id)
         if step is None:
@@ -260,7 +276,11 @@ def build_trajectory(
             total_prompt_tokens=sum(usage.prompt_tokens for usage in usages),
             total_completion_tokens=sum(usage.completion_tokens for usage in usages),
             total_cached_tokens=sum(usage.prompt_cached_tokens for usage in usages),
-            total_cost_usd=sum(usage.cost_usd for usage in usages),
+            total_cost_usd=(
+                sum(usage.cost_usd for usage in usages if usage.cost_usd is not None)
+                if usages and all(usage.cost_usd is not None for usage in usages)
+                else None
+            ),
             total_steps=len(steps),
         ),
         extra={

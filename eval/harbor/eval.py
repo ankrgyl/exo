@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import re
 import shlex
@@ -12,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
+from fnmatch import fnmatch
 from pathlib import Path
 
 
@@ -24,6 +26,7 @@ DATASETS = {
 LOCAL_DATASETS = {
     "smoke-test": "datasets/smoke-test",
     "self-evolution-smoke-test": "datasets/self-evolution-smoke-test",
+    "learning-router-transfer-test": "datasets/learning-router-transfer-test",
 }
 DATASET_TASKS = {
     "terminal-bench-easy": (
@@ -32,6 +35,16 @@ DATASET_TASKS = {
         "cobol-modernization",
     ),
 }
+PROVIDERS = {
+    "openai": {
+        "api_key_env": "OPENAI_API_KEY",
+        "base_url": None,
+    },
+    "openrouter": {
+        "api_key_env": "OPENROUTER_API_KEY",
+        "base_url": "https://openrouter.ai/api/v1",
+    },
+}
 CONFIG_FIELDS = {
     "dataset",
     "dataset_path",
@@ -39,6 +52,12 @@ CONFIG_FIELDS = {
     "n_tasks",
     "n_attempts",
     "include_task_names",
+    "reflection_strategy",
+    "provider",
+    "skip_build",
+    "workspace_root",
+    "exo_bin",
+    "output_root",
 }
 
 
@@ -54,6 +73,12 @@ def parse_args() -> argparse.Namespace:
         "n_tasks": None,
         "n_attempts": 1,
         "include_task_names": [],
+        "reflection_strategy": "router",
+        "provider": "openai",
+        "skip_build": False,
+        "workspace_root": None,
+        "exo_bin": None,
+        "output_root": None,
     }
     if known.config is not None:
         with known.config.open("rb") as file:
@@ -71,7 +96,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         help=(
-            "smoke-test, self-evolution-smoke-test, terminal-bench, "
+            "smoke-test, self-evolution-smoke-test, "
+            "learning-router-transfer-test, terminal-bench, "
             "terminal-bench-easy, terminal-bench-sample, terminal-bench-pro, "
             "or name@version"
         ),
@@ -82,6 +108,7 @@ def parse_args() -> argparse.Namespace:
         help="local dataset directory, for example an Endless Terminals checkout",
     )
     parser.add_argument("--model")
+    parser.add_argument("--provider", choices=tuple(PROVIDERS))
     parser.add_argument("--n-tasks", type=int)
     parser.add_argument(
         "--include-task-name",
@@ -93,9 +120,34 @@ def parse_args() -> argparse.Namespace:
         "--n-attempts", "--number-tries", dest="n_attempts", type=int
     )
     parser.add_argument(
+        "--reflection-strategy",
+        choices=("memory", "router", "lifecycle"),
+        help="memory baseline, prompt-only router, or validated learning lifecycle",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="print the resolved command without running it",
+    )
+    parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="reuse target/debug/exo instead of rebuilding it",
+    )
+    parser.add_argument(
+        "--workspace-root",
+        type=Path,
+        help="isolated Exo source workspace used for agent-local files and self-edits",
+    )
+    parser.add_argument(
+        "--exo-bin",
+        type=Path,
+        help="existing Exo binary to use with --skip-build",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        help="directory under which this run's timestamped result directory is created",
     )
     return parser.parse_args()
 
@@ -123,6 +175,69 @@ def dataset_arguments(args: argparse.Namespace) -> list[str]:
     return arguments
 
 
+def ordered_local_task_paths(args: argparse.Namespace) -> list[Path] | None:
+    """Resolve local dataset tasks in an explicit continual-learning order."""
+    if args.dataset_path is not None:
+        dataset_path = Path(args.dataset_path).expanduser().resolve()
+    elif local_dataset := LOCAL_DATASETS.get(args.dataset):
+        dataset_path = (Path(__file__).resolve().parent / local_dataset).resolve()
+    else:
+        return None
+
+    # A direct task path does not need an ordered JobConfig.
+    if (dataset_path / "task.toml").is_file():
+        return None
+
+    tasks = sorted(
+        path.resolve()
+        for path in dataset_path.iterdir()
+        if path.is_dir() and (path / "task.toml").is_file()
+    )
+    if args.include_task_names:
+        tasks = [
+            path
+            for path in tasks
+            if any(
+                fnmatch(_local_task_name(path), pattern)
+                for pattern in args.include_task_names
+            )
+        ]
+    if args.n_tasks is not None:
+        tasks = tasks[: args.n_tasks]
+    if not tasks:
+        raise ValueError(f"local dataset has no selected tasks: {dataset_path}")
+    return tasks
+
+
+def _local_task_name(task_path: Path) -> str:
+    with (task_path / "task.toml").open("rb") as file:
+        task = tomllib.load(file).get("task", {})
+    name = task.get("name")
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"local task has no task.name: {task_path}")
+    return name
+
+
+def write_ordered_task_config(
+    args: argparse.Namespace, run_dir: Path
+) -> Path | None:
+    """Write Harbor's ordered `tasks` list for a local multi-task dataset."""
+    tasks = ordered_local_task_paths(args)
+    if tasks is None:
+        return None
+    destination = run_dir / "ordered-tasks.json"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(
+            {"tasks": [{"path": str(task)} for task in tasks]},
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return destination
+
+
 def slug(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "eval"
 
@@ -135,8 +250,18 @@ def harbor_command(
     exo: Path,
     run_dir: Path,
     job_name: str,
+    ordered_tasks_config: Path | None = None,
 ) -> list[str]:
-    task_limit = [] if args.n_tasks is None else ["--n-tasks", str(args.n_tasks)]
+    task_limit = (
+        []
+        if args.n_tasks is None or ordered_tasks_config is not None
+        else ["--n-tasks", str(args.n_tasks)]
+    )
+    task_source = (
+        ["--config", str(ordered_tasks_config)]
+        if ordered_tasks_config is not None
+        else dataset_arguments(args)
+    )
     command = [
         str(harbor),
         "run",
@@ -162,6 +287,8 @@ def harbor_command(
         f"exo_model={args.model}",
         "--pk",
         "adapter_start_timeout_sec=90",
+        "--pk",
+        f"reflection_strategy={args.reflection_strategy}",
         "--jobs-dir",
         str(run_dir / "jobs"),
         *task_limit,
@@ -169,7 +296,7 @@ def harbor_command(
         job_name,
         "--yes",
         "--debug",
-        *dataset_arguments(args),
+        *task_source,
     ]
     return command
 
@@ -185,6 +312,7 @@ def print_result_paths(run_dir: Path, job_name: str) -> None:
     job_dir = run_dir / "jobs" / job_name
     print("\n===Results===")
     print(f"Harbor results: {job_dir / 'result.json'}")
+    print(f"Learning summary: {job_dir / 'learning-summary.json'}")
     print(f"View: harbor view {run_dir / 'jobs'}")
 
 
@@ -194,14 +322,33 @@ def main() -> int:
         if (args.n_tasks is not None and args.n_tasks <= 0) or args.n_attempts <= 0:
             raise ValueError("n_tasks and n_attempts must be positive")
 
-        repo = Path(__file__).resolve().parents[2]
-        exo = repo / "target/debug/exo"
+        source_repo = Path(__file__).resolve().parents[2]
+        repo = (
+            args.workspace_root.expanduser().resolve()
+            if args.workspace_root is not None
+            else source_repo
+        )
+        if not repo.is_dir():
+            raise ValueError(f"workspace root is not a directory: {repo}")
+        exo = (
+            args.exo_bin.expanduser().resolve()
+            if args.exo_bin is not None
+            else repo / "target/debug/exo"
+        )
+        if args.exo_bin is not None and not args.skip_build:
+            raise ValueError("--exo-bin requires --skip-build")
         timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
         # Keep the Unix socket below Linux's 108-byte path limit. Harbor's job
         # metadata already records the dataset and model.
-        run_dir = repo / ".local/harbor-evals" / timestamp
+        output_root = (
+            args.output_root.expanduser().resolve()
+            if args.output_root is not None
+            else source_repo / ".local/harbor-evals"
+        )
+        run_dir = output_root / timestamp
         task_count = args.n_tasks if args.n_tasks is not None else "all"
-        job_name = f"{slug(args.dataset)}-{task_count}"
+        job_name = f"{slug(args.dataset)}-{task_count}-{args.reflection_strategy}"
+        ordered_tasks_config = write_ordered_task_config(args, run_dir)
         harbor = Path(sys.executable).with_name("harbor")
         if not harbor.is_file():
             harbor = Path(require_command("harbor"))
@@ -212,6 +359,7 @@ def main() -> int:
             exo=exo,
             run_dir=run_dir,
             job_name=job_name,
+            ordered_tasks_config=ordered_tasks_config,
         )
 
         if args.dry_run:
@@ -219,9 +367,14 @@ def main() -> int:
             return 0
 
         print("\n===Setup===", flush=True)
-        if not os.environ.get("OPENAI_API_KEY"):
-            raise ValueError("OPENAI_API_KEY is not set")
-        for required in ("cargo", "docker", "node", "pnpm"):
+        provider = PROVIDERS[args.provider]
+        api_key_env = provider["api_key_env"]
+        if not os.environ.get(api_key_env):
+            raise ValueError(f"{api_key_env} is not set")
+        required_commands = ["docker", "node", "pnpm"]
+        if not args.skip_build:
+            required_commands.append("cargo")
+        for required in required_commands:
             require_command(required)
         if subprocess.run(
             ["docker", "info"],
@@ -230,8 +383,12 @@ def main() -> int:
         ).returncode:
             raise ValueError("Docker is unavailable; run this through ./eval.sh")
 
-        run_dir.mkdir(parents=True)
-        subprocess.run(["cargo", "build", "-p", "exo"], cwd=repo, check=True)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        if args.skip_build:
+            if not exo.is_file():
+                raise ValueError(f"--skip-build requires an existing Exo binary: {exo}")
+        else:
+            subprocess.run(["cargo", "build", "-p", "exo"], cwd=repo, check=True)
         subprocess.run(
             [
                 str(exo),
@@ -239,26 +396,29 @@ def main() -> int:
                 str(run_dir / "exo"),
                 "secret",
                 "set",
-                "openai",
+                args.provider,
                 "--env",
-                "OPENAI_API_KEY",
+                api_key_env,
             ],
             cwd=repo,
             check=True,
         )
+        register_command = [
+            str(exo),
+            "--root",
+            str(run_dir / "exo"),
+            "model",
+            "register",
+            args.model,
+            "--secret",
+            args.provider,
+            "--model",
+            args.model,
+        ]
+        if provider["base_url"] is not None:
+            register_command.extend(("--base-url", provider["base_url"]))
         subprocess.run(
-            [
-                str(exo),
-                "--root",
-                str(run_dir / "exo"),
-                "model",
-                "register",
-                args.model,
-                "--secret",
-                "openai",
-                "--model",
-                args.model,
-            ],
+            register_command,
             cwd=repo,
             check=True,
         )

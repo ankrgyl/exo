@@ -11,6 +11,7 @@ import {
 } from "@exo/harness";
 
 import { memoryInstruction } from "./tools/memory-tools";
+import { learningInstruction } from "./tools/learning-tools";
 import { resolveExoProfile } from "./profiles";
 import { todoInstruction } from "./tools/todo-tools";
 import {
@@ -148,6 +149,10 @@ Use web_search to find current information on the web and web_fetch to read a sp
   const skills = await skillsInstruction(context);
   if (skills !== null) {
     instructions.push(skills);
+  }
+  const learning = await learningInstruction(context);
+  if (learning !== null) {
+    instructions.push(learning);
   }
   return instructions;
 }

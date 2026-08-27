@@ -1,0 +1,153 @@
+{
+  "schemaVersion": 1,
+  "caseCount": 8,
+  "successCriteria": {
+    "higherRouteAccuracy": true,
+    "fewerUselessArtifacts": true,
+    "moreValidatedReuse": true,
+    "equalOrBetterHeldOutReward": true
+  },
+  "proven": true,
+  "promptOnly": {
+    "routeAccuracy": 0.5,
+    "correctRoutes": 4,
+    "uselessArtifacts": 3,
+    "validatedReuse": 0,
+    "falseActivation": 2,
+    "heldOutReward": 0.125,
+    "assignedRoutes": {
+      "flint-named-contract-discarded": "discard",
+      "flint-procedure-dumped-as-memory": "memory",
+      "byte-exact-output-heuristic": "memory",
+      "deterministic-text-transformer": "tool",
+      "line-count-one-off": "memory",
+      "unsupported-opposite-guess": "skill",
+      "broken-well-formed-skill": "skill",
+      "task-specific-discard-accepted": "discard"
+    }
+  },
+  "functional": {
+    "routeAccuracy": 1,
+    "correctRoutes": 8,
+    "uselessArtifacts": 0,
+    "validatedReuse": 4,
+    "falseActivation": 0,
+    "heldOutReward": 1,
+    "assignedRoutes": {
+      "flint-named-contract-discarded": "skill",
+      "flint-procedure-dumped-as-memory": "skill",
+      "byte-exact-output-heuristic": "memory",
+      "deterministic-text-transformer": "tool",
+      "line-count-one-off": "discard",
+      "unsupported-opposite-guess": "discard",
+      "broken-well-formed-skill": "skill",
+      "task-specific-discard-accepted": "discard"
+    }
+  },
+  "cases": [
+    {
+      "id": "flint-named-contract-discarded",
+      "goldRoute": "skill",
+      "modelChoice": "discard",
+      "promptOnlyRoute": "discard",
+      "functionalRoute": "skill",
+      "promptOnlyUseless": false,
+      "functionalUseless": false,
+      "promptOnlyReuse": false,
+      "functionalReuse": true,
+      "promptOnlyReward": 0,
+      "functionalReward": 1
+    },
+    {
+      "id": "flint-procedure-dumped-as-memory",
+      "goldRoute": "skill",
+      "modelChoice": "memory",
+      "promptOnlyRoute": "memory",
+      "functionalRoute": "skill",
+      "promptOnlyUseless": false,
+      "functionalUseless": false,
+      "promptOnlyReuse": false,
+      "functionalReuse": true,
+      "promptOnlyReward": 0,
+      "functionalReward": 1
+    },
+    {
+      "id": "byte-exact-output-heuristic",
+      "goldRoute": "memory",
+      "modelChoice": "memory",
+      "promptOnlyRoute": "memory",
+      "functionalRoute": "memory",
+      "promptOnlyUseless": false,
+      "functionalUseless": false,
+      "promptOnlyReuse": false,
+      "functionalReuse": true,
+      "promptOnlyReward": 0,
+      "functionalReward": 1
+    },
+    {
+      "id": "deterministic-text-transformer",
+      "goldRoute": "tool",
+      "modelChoice": "tool",
+      "promptOnlyRoute": "tool",
+      "functionalRoute": "tool",
+      "promptOnlyUseless": false,
+      "functionalUseless": false,
+      "promptOnlyReuse": false,
+      "functionalReuse": true,
+      "promptOnlyReward": 0,
+      "functionalReward": 1
+    },
+    {
+      "id": "line-count-one-off",
+      "goldRoute": "discard",
+      "modelChoice": "memory",
+      "promptOnlyRoute": "memory",
+      "functionalRoute": "discard",
+      "promptOnlyUseless": true,
+      "functionalUseless": false,
+      "promptOnlyReuse": false,
+      "functionalReuse": false,
+      "promptOnlyReward": 0,
+      "functionalReward": 1
+    },
+    {
+      "id": "unsupported-opposite-guess",
+      "goldRoute": "discard",
+      "modelChoice": "skill",
+      "promptOnlyRoute": "skill",
+      "functionalRoute": "discard",
+      "promptOnlyUseless": true,
+      "functionalUseless": false,
+      "promptOnlyReuse": false,
+      "functionalReuse": false,
+      "promptOnlyReward": 0,
+      "functionalReward": 1
+    },
+    {
+      "id": "broken-well-formed-skill",
+      "goldRoute": "skill",
+      "modelChoice": "skill",
+      "promptOnlyRoute": "skill",
+      "functionalRoute": "skill",
+      "promptOnlyUseless": true,
+      "functionalUseless": false,
+      "promptOnlyReuse": false,
+      "functionalReuse": false,
+      "promptOnlyReward": 0,
+      "functionalReward": 1
+    },
+    {
+      "id": "task-specific-discard-accepted",
+      "goldRoute": "discard",
+      "modelChoice": "discard",
+      "promptOnlyRoute": "discard",
+      "functionalRoute": "discard",
+      "promptOnlyUseless": false,
+      "functionalUseless": false,
+      "promptOnlyReuse": false,
+      "functionalReuse": false,
+      "promptOnlyReward": 1,
+      "functionalReward": 1
+    }
+  ]
+}

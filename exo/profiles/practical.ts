@@ -7,6 +7,11 @@ import {
 
 import { registerGuardianTools } from "../tools/guardian-tools";
 import { registerIntrospectionTools } from "../tools/introspection-tools";
+import {
+  isLearningLifecycleTurn,
+  registerActivatedLearningTools,
+  registerLearningTools,
+} from "../tools/learning-tools";
 import { registerMemoryTools } from "../tools/memory-tools";
 import { registerSandboxTools } from "../tools/sandbox-tools";
 import { registerSchedulerTools } from "../tools/scheduler-tools";
@@ -17,29 +22,41 @@ import type { ExoProfile } from "./types";
 export const practicalProfile: ExoProfile = {
   name: "practical",
   builtInToolNames(context) {
-    const names = bootstrapBuiltInToolNames();
-    if (context.agentConfig.enableAgentToolCreation) {
+    const lifecycle = isLearningLifecycleTurn(context);
+    const names = bootstrapBuiltInToolNames(lifecycle);
+    if (context.agentConfig.enableAgentToolCreation && !lifecycle) {
       names.push("install_agent_tool", "uninstall_agent_tool");
     }
     return names;
   },
-  registerTools(tools, context) {
+  async registerTools(tools, context) {
+    const lifecycle = isLearningLifecycleTurn(context);
     const libraryTools = new HarnessToolRegistry(context);
     registerSchedulerTools(libraryTools);
     registerAdapterTools(libraryTools);
     registerIntrospectionTools(libraryTools);
     registerSandboxTools(libraryTools);
-    registerMemoryTools(libraryTools);
+    if (!lifecycle) {
+      registerMemoryTools(libraryTools);
+    }
     registerTodoTools(libraryTools);
-    registerSkillTools(libraryTools);
+    if (!lifecycle) {
+      registerSkillTools(libraryTools);
+    }
+    registerLearningTools(libraryTools, context);
+    await registerActivatedLearningTools(libraryTools, context);
     registerWebTools(libraryTools);
     for (const tool of libraryTools.instances()) {
       tools.register({ ...tool, source: "library" });
     }
-    registerGuardianTools(tools);
+    if (!lifecycle) {
+      registerGuardianTools(tools);
+    }
   },
 };
 
-function bootstrapBuiltInToolNames(): BuiltInToolName[] {
-  return ["shell", "inspect_tools", "manage_tool"];
+function bootstrapBuiltInToolNames(lifecycle: boolean): BuiltInToolName[] {
+  return lifecycle
+    ? ["shell", "inspect_tools"]
+    : ["shell", "inspect_tools", "manage_tool"];
 }

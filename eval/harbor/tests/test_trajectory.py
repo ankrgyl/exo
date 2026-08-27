@@ -41,6 +41,37 @@ def messages_event(
 
 
 class TrajectoryTest(unittest.IsolatedAsyncioTestCase):
+    def test_usage_without_provider_cost_remains_valid_and_unknown(self) -> None:
+        event = messages_event(
+            "event-free-model",
+            [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Done."}],
+                    "id": "free-response",
+                }
+            ],
+            usage={
+                "model": "fixed-free-model",
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+            },
+        )
+        events = ConversationEvents.model_validate_json(event_page([event])).events
+
+        trajectory = build_trajectory(
+            events=events,
+            trial_id=TRIAL_ID,
+            turn_ids=[TURN_ID],
+            instruction="Do the task",
+            model_name="fixed-free-model",
+            conversation="harbor-shared",
+            started_at="2026-08-07T21:09:02.215Z",
+        )
+
+        self.assertIsNone(trajectory.steps[1].metrics.cost_usd)
+        self.assertIsNone(trajectory.final_metrics.total_cost_usd)
+
     async def test_export_includes_trial_continuation_turns_and_writes_atif(self) -> None:
         other = messages_event(
             "event-1",

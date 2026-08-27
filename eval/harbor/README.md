@@ -79,6 +79,127 @@ limit or override those defaults:
 ./eval.sh --dataset=terminal-bench --model=gpt-5.5 --n-tasks=10 --n-attempts=2
 ```
 
+OpenRouter is supported with an exact model id. Set `OPENROUTER_API_KEY` and
+pass both flags; do not use `openrouter/free` for controlled comparisons because
+the underlying model can change between requests:
+
+```bash
+./eval.sh --dataset=smoke-test --provider=openrouter \
+  --model=z-ai/glm-5.2
+```
+
+The feedback experiment supports three strategies:
+
+- `memory`: the memory-first PR #202 reflection prompt;
+- `router`: prompt-only routing, where the model can directly write memory,
+  install skills or tools, or discard a lesson;
+- `lifecycle`: typed proposals that remain inactive until route-specific
+  promotion succeeds, with a feature-based router that can reject a conflicting
+  model route.
+
+Run any strategy with the same fixed model and task selection:
+
+```bash
+./eval.sh --dataset=terminal-bench-easy --model=gpt-5.5 \
+  --reflection-strategy=memory
+./eval.sh --dataset=terminal-bench-easy --model=gpt-5.5 \
+  --reflection-strategy=router
+./eval.sh --dataset=terminal-bench-easy --model=gpt-5.5 \
+  --reflection-strategy=lifecycle
+```
+
+For a paired comparison, `compare.sh` snapshots the current source into two
+identical isolated workspaces, gives each arm a fresh Exo root, runs the same
+task sequence with one exact model id, and writes `comparison.json` containing
+candidate-minus-baseline reward, lifecycle, activation, reuse, and labeled-router
+deltas. Reward and activation are also broken out per task so transfer and false
+activation cannot be hidden by the overall mean. On
+`learning-router-transfer-test` it also scores gold labels: correct keep-route
+on the learn task, activation plus reuse on transfer, and no activation on the
+unrelated control. A better router must improve route accuracy, reduce useless
+artifacts, increase validated reuse, and hold or improve held-out reward. It
+defaults to prompt-only `router` as the baseline and `lifecycle` as the
+candidate:
+
+```bash
+./compare.sh --dataset=learning-router-transfer-test \
+  --provider=openrouter \
+  --model=z-ai/glm-5.2:free
+```
+
+For local multi-task datasets, the runner writes an explicit ordered Harbor
+`tasks` list instead of relying on directory iteration. `--n-concurrent 1`
+prevents overlap but does not by itself choose which queued task runs first;
+filesystem discovery order is not a valid continual-learning sequence. The
+comparison runner also uses one-letter result-arm directories so the trial
+socket stays below macOS's 104-byte Unix-socket path limit.
+
+Override the arms explicitly when testing another hypothesis:
+
+```bash
+./compare.sh --dataset=learning-router-transfer-test \
+  --baseline-strategy=memory \
+  --candidate-strategy=router \
+  --arm-order=candidate-first \
+  --provider=openrouter \
+  --model=z-ai/glm-5.2:free
+```
+
+Run `pnpm install` in the source checkout first. Generated state, including
+`node_modules`, is excluded from each source snapshot; both arms link to the
+checkout's installed dependency tree so their TypeScript harnesses can start
+without duplicating hundreds of megabytes of immutable packages.
+
+Do not pass `openrouter/free`: that router can select a different underlying
+model between requests, invalidating the comparison. The isolated workspaces
+are retained under `.local/harbor-comparisons` so agent-created tools or source
+changes can be inspected after the run.
+
+A single paired run is a diagnostic probe, not a stable performance estimate.
+Repeat independent runs with both `--arm-order=baseline-first` and
+`--arm-order=candidate-first`; otherwise provider variance, stochastic tool
+use, or shared rate-limit timing can be mistaken for a lifecycle effect.
+
+When running the arms manually instead of through `compare.sh`, use separate
+clean worktrees at the same commit. Separate Exo roots are not sufficient: a
+self-edit or workspace-local tool source from the first arm could contaminate
+the second.
+
+Each run gets a fresh Exo root. After feedback, every completed trial contains
+`agent/learning.json`, which records observable memory, skill, tool, and policy
+mutations made during reflection, plus skill loads and agent-created tool calls
+during task execution. For lifecycle runs it also records proposals,
+promotions, rejections, explicit discards, and later scoped activations. Each
+route separates attempted, successful, failed, and unresolved actions;
+unresolved means the request had no matching result event. The job directory
+also gets `learning-summary.json`, which aggregates reward, routed actions,
+later activation and skill/tool reuse, and final memory growth without copying
+memory text. `compare.sh` rejects an arm if any trial is missing its reflection
+report, so measurement failures cannot silently appear as zero learning.
+Compare these reports alongside Harbor reward; proposal, promotion, or artifact
+count alone is not evidence of better self-improvement.
+
+The lifecycle strategy is behaviorally different from a stronger system
+prompt. During reflection, direct memory, skill, tool-management, and restart
+writes are unavailable. The model must emit a route-specific candidate, the
+candidate is quarantined, and the harness promotes or rejects it. A promoted
+candidate is activated only when its declared trigger matches a later task,
+and that activation is emitted as a trajectory event. Matching skills receive
+a scoped loader and matching tools are registered only for that turn; neither
+is published into the global skill/tool surface. A deterministic test
+demonstrates the boundary: prompt-only routing installs a syntactically valid
+but behaviorally broken skill immediately, while lifecycle routing rejects the
+same skill after its sandbox check fails and leaves no installed skill.
+
+Active candidates also require the structured Harbor feedback payload from the
+reflection turn, and the validation record captures its numeric rewards and the
+presence of verifier logs separately from the model's evidence claim. These
+checks still do not make Exo its own trustworthy grader. The agent proposes a
+skill's validation command and a tool's expected self-test result; memory
+promotion does not establish factual truth. Harbor's external reward on later
+tasks remains the outcome measure that can show whether routed learning
+actually transfers.
+
 Select particular tasks by repeating `--include-task-name`:
 
 ```bash
@@ -96,15 +217,35 @@ For a quick end-to-end check using the bundled tiny task:
 ./eval.sh --dataset=smoke-test --n-tasks=1
 ```
 
-To test self-evolution across trials, run the bundled three-task dataset. Its
+To test self-evolution across trials, run the bundled four-task dataset. Its
 first trial asks Exo to install and use a custom tool; its second trial uses
 the installed tool again from a fresh conversation and container; its third
 trial changes durable agent policy state, rebuilds and restarts Exo, then
-finishes the trial after the adapter reconnects.
+finishes the trial after the adapter reconnects; and its fourth intentionally
+times out to verify that the partial trajectory is still exported.
 
 ```bash
 ./eval.sh --dataset=self-evolution-smoke-test
 ```
+
+That dataset explicitly requests tool installation, so it tests mechanics, not
+the router's judgment. The bundled transfer sequence defines a named FLINT
+records contract in the first task and asks for the same contract with different
+data in a fresh second conversation that omits the rules. A third unrelated
+line-counting task is a negative activation control. Use the sequence to check
+whether reflection creates a narrow artifact, whether the second task activates
+and uses it, and whether the third task leaves it inactive. The comparison
+runner verifies the exact learn → transfer → unrelated order; a different
+sequence is invalid rather than a transfer test:
+
+```bash
+./eval.sh --dataset=learning-router-transfer-test \
+  --reflection-strategy=lifecycle
+```
+
+When `target/debug/exo` is already built from the current checkout, pass
+`--skip-build` to reuse it. This is useful for repeated comparison runs and
+avoids growing Rust build artifacts between experimental arms.
 
 For a short real benchmark run, `terminal-bench-easy` selects three Terminal
 Bench 2 tasks marked easy: `fix-git`, `prove-plus-comm`, and

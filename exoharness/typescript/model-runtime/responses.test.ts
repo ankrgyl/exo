@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ChatCompletion } from "openai/resources/chat/completions";
 import type { Response } from "openai/resources/responses/responses";
 
 import {
@@ -78,6 +79,71 @@ describe("model runtime dispatch", () => {
         baseUrl: "https://openrouter.ai/api/v1",
       }),
     ).toBeInstanceOf(ChatCompletionsRuntime);
+  });
+});
+
+describe("chat completion provider errors", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("retries HTTP 200 provider-error envelopes without choices", async () => {
+    vi.useFakeTimers();
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce({
+        error: {
+          code: 502,
+          message: "provider unavailable",
+          metadata: { error_type: "provider_unavailable" },
+        },
+      })
+      .mockResolvedValueOnce({
+        id: "chatcmpl_1",
+        object: "chat.completion",
+        created: 1,
+        model: "test-model",
+        choices: [
+          {
+            index: 0,
+            finish_reason: "stop",
+            logprobs: null,
+            message: { role: "assistant", content: "hello", refusal: null },
+          },
+        ],
+      } satisfies ChatCompletion);
+    const runtime = new ChatCompletionsRuntime({ apiKey: "test-key" });
+    Reflect.set(runtime, "client", {
+      chat: { completions: { create } },
+    });
+
+    const completion = runtime.complete({ model: "test-model" });
+    await vi.runAllTimersAsync();
+
+    await expect(completion).resolves.toMatchObject({
+      status: "completed",
+      model: "test-model",
+    });
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces non-retryable HTTP 200 provider errors", async () => {
+    const create = vi.fn().mockResolvedValue({
+      error: {
+        code: 400,
+        message: "invalid request",
+        metadata: { error_type: "invalid_request" },
+      },
+    });
+    const runtime = new ChatCompletionsRuntime({ apiKey: "test-key" });
+    Reflect.set(runtime, "client", {
+      chat: { completions: { create } },
+    });
+
+    await expect(runtime.complete({ model: "test-model" })).rejects.toThrow(
+      "chat completion provider error (code=400, type=invalid_request): invalid request",
+    );
+    expect(create).toHaveBeenCalledOnce();
   });
 });
 

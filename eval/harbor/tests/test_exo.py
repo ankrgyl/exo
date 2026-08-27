@@ -7,6 +7,29 @@ from exo_harbor.exo import ExoClient
 
 
 class ExoClientTest(unittest.IsolatedAsyncioTestCase):
+    async def test_commands_select_docker_sandbox_backend(self) -> None:
+        client = ExoClient(
+            exo_bin=Path("/opt/exo/bin/exo"),
+            exo_root=Path("/tmp/exo-root"),
+            repo_root=Path("/src/exo"),
+        )
+
+        self.assertEqual(
+            client._argv("agent", "show", "harbor-eval"),
+            [
+                "/opt/exo/bin/exo",
+                "--root",
+                "/tmp/exo-root",
+                "--harness",
+                "exo",
+                "--sandbox-backend",
+                "docker",
+                "agent",
+                "show",
+                "harbor-eval",
+            ],
+        )
+
     async def test_delete_snapshots_preserves_other_exo_state(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             exo_root = Path(temporary_directory) / "exo"
