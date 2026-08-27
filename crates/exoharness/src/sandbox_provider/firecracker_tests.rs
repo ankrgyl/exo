@@ -42,6 +42,68 @@ fn validates_machine_ids() {
     assert_eq!(one_shot.len(), MAX_MACHINE_ID.len());
 }
 
+#[tokio::test]
+async fn lifecycle_locks_serialize_a_machine_family_but_not_other_machines() {
+    let locks = MachineLifecycleLocks::default();
+    let first = "fc-0123456789abcdef-aaaaaaaa";
+    let same_sandbox_new_spec = "fc-0123456789abcdef-bbbbbbbb";
+    let other = "fc-fedcba9876543210-aaaaaaaa";
+
+    let first_guard = locks.lock_machine(first).await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            locks.lock_machine(same_sandbox_new_spec)
+        )
+        .await
+        .is_err()
+    );
+    let other_guard = tokio::time::timeout(Duration::from_millis(20), locks.lock_machine(other))
+        .await
+        .expect("an unrelated machine lifecycle must not be serialized");
+    drop(other_guard);
+    drop(first_guard);
+
+    tokio::time::timeout(
+        Duration::from_millis(20),
+        locks.lock_machine(same_sandbox_new_spec),
+    )
+    .await
+    .expect("the machine-family lock must be released with its guard");
+
+    let key = SandboxKey::AgentSandbox {
+        agent_id: "agent".to_string(),
+        sandbox_id: "sandbox".to_string(),
+    };
+    let machine_id = machine_id(&key, "0123456789abcdef");
+    let sandbox_guard = locks.lock_sandbox(&key).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), locks.lock_machine(&machine_id))
+            .await
+            .is_err()
+    );
+    drop(sandbox_guard);
+
+    let other_key = SandboxKey::AgentSandbox {
+        agent_id: "agent".to_string(),
+        sandbox_id: "other".to_string(),
+    };
+    let (first_pair_guard, second_pair_guard) = locks.lock_sandbox_pair(&key, &other_key).await;
+    assert!(second_pair_guard.is_some());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), locks.lock_sandbox(&key))
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), locks.lock_sandbox(&other_key))
+            .await
+            .is_err()
+    );
+    drop(first_pair_guard);
+    drop(second_pair_guard);
+}
+
 // Caught live: growing machine ids from 16 to 32 hash characters pushed
 // the jailed API socket past sun_path's 108 bytes and made the backend
 // reject the README's default state root outright.
@@ -86,6 +148,27 @@ fn machine_capacity_allows_reuse_but_rejects_an_additional_vm() {
     ensure_machine_capacity(max_machines, 1, false).unwrap();
     ensure_machine_capacity(max_machines, 2, true).unwrap();
     assert!(ensure_machine_capacity(max_machines, 2, false).is_err());
+}
+
+#[test]
+fn machine_capacity_counts_launch_reservations() {
+    let max_machines = NonZeroUsize::new(1).unwrap();
+    let mut starting = HashSet::new();
+
+    admit_machine_capacity(max_machines, &[], &mut starting, "fc-first").unwrap();
+    assert!(admit_machine_capacity(max_machines, &[], &mut starting, "fc-second").is_err());
+    assert!(starting.remove("fc-first"));
+    admit_machine_capacity(max_machines, &[], &mut starting, "fc-second").unwrap();
+}
+
+#[test]
+fn machine_capacity_does_not_double_count_a_live_relaunch() {
+    let max_machines = NonZeroUsize::new(1).unwrap();
+    let live = vec!["fc-first".to_string()];
+    let mut starting = HashSet::new();
+
+    admit_machine_capacity(max_machines, &live, &mut starting, "fc-first").unwrap();
+    assert_eq!(starting, HashSet::from(["fc-first".to_string()]));
 }
 
 #[test]
@@ -219,6 +302,22 @@ fn persisted_lease_expires_machine_after_idle_ttl() {
         expired_machine_ids(directory.path(), last_used + Duration::from_secs(59))
             .unwrap()
             .is_empty()
+    );
+    assert!(
+        !machine_lease_expired(
+            directory.path(),
+            &record.machine_id,
+            last_used + Duration::from_secs(59)
+        )
+        .unwrap()
+    );
+    assert!(
+        machine_lease_expired(
+            directory.path(),
+            &record.machine_id,
+            last_used + Duration::from_secs(60)
+        )
+        .unwrap()
     );
     assert_eq!(
         expired_machine_ids(directory.path(), last_used + Duration::from_secs(60)).unwrap(),
