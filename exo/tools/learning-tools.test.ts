@@ -844,6 +844,48 @@ ${LEARNING_LIFECYCLE_MARKER}`);
     });
   });
 
+  it("rejects discarding a reusable FLINT procedure", async () => {
+    const context = makeContext(lifecycleInput());
+    const tools = lifecycleTools(context);
+    const result = await call(
+      tools,
+      "propose_learning_discard",
+      {
+        title: "FLINT records contract",
+        evidence:
+          "The task defined a named FLINT records contract, a reusable procedure expected to recur in later isolated conversations. Steps: 1. Trim and lowercase names. 2. Keep the highest score per name. 3. Sort by score then name. 4. Write name=score lines.",
+        expectedBenefit:
+          "Later FLINT tasks can apply the same contract without restating the rules.",
+        discardReason:
+          "This looked task-specific to /app/records.txt in this trial.",
+      },
+      context,
+    );
+    expect(result).toMatchObject({
+      ok: false,
+      error: "route_conflict",
+      proposedRoute: "discard",
+      suggestedRoute: "skill",
+    });
+  });
+
+  it("classifies a reusable procedure as skill before a proposal", async () => {
+    const context = makeContext(lifecycleInput());
+    const tools = lifecycleTools(context);
+    const result = await call(
+      tools,
+      "classify_learning_route",
+      {
+        title: "FLINT records contract",
+        evidence:
+          "The task defined a named FLINT records contract, a reusable procedure expected to recur in later isolated conversations. Steps: 1. Trim and lowercase names. 2. Keep the highest score per name. 3. Sort by score then name. 4. Write name=score lines.",
+        expectedBenefit: "Reuse the contract on later FLINT tasks.",
+      },
+      context,
+    );
+    expect(result).toMatchObject({ ok: true, route: "skill" });
+  });
+
   it("does not expose proposal or promotion tools outside lifecycle reflection", () => {
     const context = makeContext("normal task");
     const tools = lifecycleTools(context);
@@ -852,6 +894,7 @@ ${LEARNING_LIFECYCLE_MARKER}`);
     expect(tools.get("propose_skill_learning")).toBeUndefined();
     expect(tools.get("propose_tool_learning")).toBeUndefined();
     expect(tools.get("propose_learning_discard")).toBeUndefined();
+    expect(tools.get("classify_learning_route")).toBeUndefined();
     expect(tools.get("validate_and_promote_learning")).toBeUndefined();
   });
 });

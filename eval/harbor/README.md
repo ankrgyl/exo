@@ -94,7 +94,8 @@ The feedback experiment supports three strategies:
 - `router`: prompt-only routing, where the model can directly write memory,
   install skills or tools, or discard a lesson;
 - `lifecycle`: typed proposals that remain inactive until route-specific
-  promotion succeeds.
+  promotion succeeds, with a feature-based router that can reject a conflicting
+  model route.
 
 Run any strategy with the same fixed model and task selection:
 
@@ -110,10 +111,15 @@ Run any strategy with the same fixed model and task selection:
 For a paired comparison, `compare.sh` snapshots the current source into two
 identical isolated workspaces, gives each arm a fresh Exo root, runs the same
 task sequence with one exact model id, and writes `comparison.json` containing
-candidate-minus-baseline reward, lifecycle, activation, and reuse deltas. Reward
-and activation are also broken out per task so transfer and false activation
-cannot be hidden by the overall mean. It defaults to prompt-only `router` as the
-baseline and `lifecycle` as the candidate:
+candidate-minus-baseline reward, lifecycle, activation, reuse, and labeled-router
+deltas. Reward and activation are also broken out per task so transfer and false
+activation cannot be hidden by the overall mean. On
+`learning-router-transfer-test` it also scores gold labels: correct keep-route
+on the learn task, activation plus reuse on transfer, and no activation on the
+unrelated control. A better router must improve route accuracy, reduce useless
+artifacts, increase validated reuse, and hold or improve held-out reward. It
+defaults to prompt-only `router` as the baseline and `lifecycle` as the
+candidate:
 
 ```bash
 ./compare.sh --dataset=learning-router-transfer-test \

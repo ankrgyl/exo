@@ -1,0 +1,30 @@
+{
+  "dataset": "learning-router-transfer-test",
+  "description": "Learn a named reusable FLINT procedure, reuse it on a held-out transfer task, and keep it inactive on an unrelated control.",
+  "tasks": {
+    "exo/learning-router-normalization-first": {
+      "phase": "learn",
+      "expected_keep_routes": ["skill"],
+      "accepted_keep_routes": ["skill", "tool"],
+      "incorrect_routes": ["memory", "discard"],
+      "expected_activation": false,
+      "expected_prior_reuse": false
+    },
+    "exo/learning-router-normalization-transfer": {
+      "phase": "transfer",
+      "expected_keep_routes": [],
+      "accepted_keep_routes": [],
+      "incorrect_routes": [],
+      "expected_activation": true,
+      "expected_prior_reuse": true
+    },
+    "exo/learning-router-unrelated-control": {
+      "phase": "control",
+      "expected_keep_routes": [],
+      "accepted_keep_routes": [],
+      "incorrect_routes": ["memory", "skill", "tool"],
+      "expected_activation": false,
+      "expected_prior_reuse": false
+    }
+  }
+}

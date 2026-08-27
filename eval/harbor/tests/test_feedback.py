@@ -20,6 +20,8 @@ class FeedbackTest(unittest.TestCase):
         self.assertIn("propose_skill_learning", LIFECYCLE_REFLECTION_INSTRUCTIONS)
         self.assertIn("propose_tool_learning", LIFECYCLE_REFLECTION_INSTRUCTIONS)
         self.assertIn("propose_learning_discard", LIFECYCLE_REFLECTION_INSTRUCTIONS)
+        self.assertIn("classify_learning_route", LIFECYCLE_REFLECTION_INSTRUCTIONS)
+        self.assertIn("route_conflict", LIFECYCLE_REFLECTION_INSTRUCTIONS)
         self.assertIn(
             "validate_and_promote_learning", LIFECYCLE_REFLECTION_INSTRUCTIONS
         )

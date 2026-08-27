@@ -15,6 +15,16 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
+SRC = Path(__file__).resolve().parent / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from exo_harbor.router_quality import (
+    better_than_prompt_only,
+    load_gold_labels,
+    score_router_quality,
+)
+
 
 ROUTES = ("memory", "skill", "tool", "policy")
 REUSE_METRICS = (
@@ -36,6 +46,10 @@ EXPECTED_TASK_SEQUENCES = {
         "exo/learning-router-normalization-transfer",
         "exo/learning-router-unrelated-control",
     ],
+}
+GOLD_LABELS = {
+    "learning-router-transfer-test": Path(__file__).resolve().parent
+    / "gold-labels/learning-router-transfer-test.json",
 }
 SNAPSHOT_IGNORES = {
     ".exo",
@@ -259,8 +273,8 @@ def build_comparison(
     baseline_memory_growth = int(baseline.get("memory", {}).get("growth", 0))
     candidate_memory_growth = int(candidate.get("memory", {}).get("growth", 0))
 
-    return {
-        "schema_version": 3,
+    comparison = {
+        "schema_version": 4,
         "provider": provider,
         "model": baseline.get("model"),
         "source_digest": source_digest,
@@ -300,6 +314,30 @@ def build_comparison(
             "prior_task_reuse": reuse_deltas,
         },
     }
+    gold_path = gold_labels_path(expected_task_sequence)
+    if gold_path is not None:
+        gold = load_gold_labels(gold_path)
+        baseline_quality = score_router_quality(baseline, gold)
+        candidate_quality = score_router_quality(candidate, gold)
+        comparison["gold_labels_path"] = str(gold_path)
+        comparison["arms"]["baseline"]["router_quality"] = baseline_quality
+        comparison["arms"]["candidate"]["router_quality"] = candidate_quality
+        comparison["router_proof"] = better_than_prompt_only(
+            baseline=baseline_quality,
+            candidate=candidate_quality,
+        )
+        comparison["candidate_minus_baseline"]["router_quality"] = comparison[
+            "router_proof"
+        ]["candidate_minus_baseline"]
+    return comparison
+
+
+def gold_labels_path(expected_task_sequence: list[str] | None) -> Path | None:
+    if expected_task_sequence == EXPECTED_TASK_SEQUENCES.get(
+        "learning-router-transfer-test"
+    ):
+        return GOLD_LABELS["learning-router-transfer-test"]
+    return None
 
 
 def _validate_arm(

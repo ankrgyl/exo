@@ -24,13 +24,15 @@ LIFECYCLE_REFLECTION_INSTRUCTIONS = """EXO_LEARNING_LIFECYCLE_V1
 
 Review your work on this completed trial, its reward, and the grader evidence. This reflection uses a constrained learning lifecycle. Direct memory, skill, tool-management, and self-restart write tools are intentionally unavailable: an unvalidated reflection must not silently change future behavior.
 
+Call `classify_learning_route` before proposing. The harness classifies from checkable features: numbered reusable procedures become skills, exact self-tested operations become tools, short heuristics become scoped memory, and one-off or unsupported guesses are discarded. Proposal tools that conflict with that classification are rejected; do not persist a discard of a named procedure that is expected to recur.
+
 For each evidence-supported lesson, choose exactly one route-specific proposal tool:
 - `propose_memory_learning`: a concise stable fact or heuristic. It will be injected only when its activation trigger matches, rather than on every turn.
 - `propose_skill_learning`: a reusable multi-step procedure. Include a complete SKILL.md and a read-only or idempotent validationCommand that proves the procedure's core behavior in the restored submitted environment.
 - `propose_tool_learning`: a repeated deterministic operation. Include a complete generated-tool module plus exact JSON self-test arguments and expected result. Promotion loads the module from an isolated temporary directory, executes that self-test, and keeps it in the learning catalog only if the result matches; it becomes callable only on later tasks whose activation trigger matches.
 - `propose_learning_discard`: task-specific, redundant, or unsupported information that should never be activated.
 
-The route-specific schemas intentionally omit every other route's fields. Do not write null placeholders or call more than one proposal tool for the same lesson.
+The route-specific schemas intentionally omit every other route's fields. Do not write null placeholders or call more than one proposal tool for the same lesson. If a proposal is rejected with `route_conflict`, call the suggested route's proposal tool instead.
 
 Every active candidate needs precise activation terms and a minimumMatches threshold that avoids broad accidental activation. Evidence must point to the reward, verifier output, or something directly inspected in the restored environment. Do not infer a universal rule merely because one attempt failed.
 

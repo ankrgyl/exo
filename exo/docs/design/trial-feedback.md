@@ -122,7 +122,9 @@ The Harbor plugin accepts three reflection strategies:
   deterministic operation, policy or implementation for a broad behavior
   change, and discard for task-specific or unsupported conclusions.
 - `lifecycle` uses the same conceptual routes but changes the state machine and
-  tool surface rather than only changing the reflection prompt.
+  tool surface rather than only changing the reflection prompt. Proposal
+  routes are now classified from checkable features and conflicting writes
+  are rejected.
 
 ### Prompt-only router
 
@@ -137,17 +139,32 @@ shape; it does not prove the learned procedure works.
 
 During a `lifecycle` reflection, direct memory, skill, tool-management, policy
 restart, and rebuild write surfaces are unavailable. Exo instead gets four
-route-specific proposal tools plus one promotion tool:
+route-specific proposal tools, a feature-based route classifier, plus one
+promotion tool:
 
 ```text
 reflection
+  -> classify_learning_route
   -> propose memory | skill | tool | discard
+  -> feature router accepts or returns route_conflict
   -> inactive candidate in learning/index.json
   -> route-specific validation
   -> promoted | rejected | discarded
   -> trigger match on a later task
   -> explicit learning_activated event
 ```
+
+The classifier is the functional router. It scores numbered reusable
+procedures as skills, exact self-tested operations as tools, short heuristics
+as scoped memory, and one-off or unsupported guesses as discard. A prompt-only
+model can still say "this FLINT contract is task-specific" and discard it. The
+lifecycle path rejects that write with `suggestedRoute: skill`. That is the
+recorded first-run failure: the model discarded a reusable FLINT procedure.
+Labeled cases in `learning-router.test.ts` reconstruct that failure and the
+other gold routes. `compareRouterArms` reports route accuracy, useless
+artifacts, scoped reuse, and held-out reward for prompt-only versus the
+feature router. Harbor `compare.sh` scores the same criteria against
+`gold-labels.json` once a live paired run exists.
 
 The schemas are separate so choosing a skill cannot silently populate memory
 fields or rely on nullable placeholders. Promotion currently applies these

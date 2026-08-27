@@ -17,6 +17,13 @@ import {
   type TurnContext,
 } from "@exo/harness";
 
+import {
+  classifyLearningRoute,
+  enforceLearningRoute,
+  lessonFeaturesFromUnknown,
+  type LearningRoute,
+} from "./learning-router";
+
 export const LEARNING_LIFECYCLE_MARKER = "EXO_LEARNING_LIFECYCLE_V1";
 
 const LEARNING_INDEX_PATH = "learning/index.json";
@@ -32,7 +39,6 @@ const MAX_SKILL_MD_CHARS = 100_000;
 const MAX_TOOL_SOURCE_CHARS = 100_000;
 const MAX_VALIDATION_COMMAND_CHARS = 4_000;
 
-type LearningRoute = "memory" | "skill" | "tool" | "discard";
 type LearningStatus = "proposed" | "promoted" | "rejected" | "discarded";
 
 interface SkillPayload {
@@ -96,6 +102,7 @@ export function registerLearningTools(
   for (const tool of proposalTools()) {
     registry.register(tool);
   }
+  registry.register(classifyLearningRouteTool());
   registry.register(validateAndPromoteLearningTool());
 }
 
@@ -323,6 +330,21 @@ function proposalTool(
     },
     handler: {
       async execute(args, execution): Promise<ToolResult> {
+        const classification = classifyLearningRoute(
+          lessonFeaturesFromUnknown(args),
+        );
+        const enforced = enforceLearningRoute(route, classification);
+        if (!enforced.accepted) {
+          return {
+            ok: false,
+            error: "route_conflict",
+            proposedRoute: enforced.proposedRoute,
+            suggestedRoute: enforced.route,
+            corrected: enforced.corrected,
+            reasons: enforced.reasons,
+            scores: classification.scores,
+          };
+        }
         const candidate = parseCandidate(
           route,
           args,
@@ -357,6 +379,46 @@ function proposalTool(
           route: candidate.route,
           status: candidate.status,
           duplicate: false,
+        };
+      },
+    },
+  };
+}
+
+function classifyLearningRouteTool(): ToolInstance {
+  return {
+    source: "library",
+    definition: {
+      name: "classify_learning_route",
+      description:
+        "Classify a lesson into memory, skill, tool, or discard from checkable features. Use this before proposing. Conflicting proposal tools are rejected.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          title: { type: "string" },
+          evidence: { type: "string" },
+          expectedBenefit: { type: "string" },
+          memoryText: { type: "string" },
+          skillMd: { type: "string" },
+          toolSource: { type: "string" },
+          discardReason: { type: "string" },
+        },
+        required: ["title", "evidence", "expectedBenefit"],
+      },
+    },
+    handler: {
+      async execute(args): Promise<ToolResult> {
+        const classification = classifyLearningRoute(
+          lessonFeaturesFromUnknown({
+            ...args,
+            skill: { skillMd: args.skillMd },
+            tool: { moduleSource: args.toolSource },
+          }),
+        );
+        return {
+          ok: true,
+          ...classification,
         };
       },
     },

@@ -321,6 +321,102 @@ class ComparisonTest(unittest.TestCase):
             self.assertTrue(link.is_symlink())
             self.assertEqual(link.resolve(), dependencies.resolve())
 
+    def test_scores_gold_labels_for_the_transfer_protocol(self) -> None:
+        baseline = summary(
+            "router",
+            reward=0.0,
+            memory_growth=1,
+            skill_reuse=0,
+            tool_reuse=0,
+        )
+        candidate = summary(
+            "lifecycle",
+            reward=1.0,
+            memory_growth=0,
+            skill_reuse=1,
+            tool_reuse=0,
+        )
+        sequence = compare_script.EXPECTED_TASK_SEQUENCES[
+            "learning-router-transfer-test"
+        ]
+        baseline["trial_count"] = 3
+        baseline["reflection_report_count"] = 3
+        candidate["trial_count"] = 3
+        candidate["reflection_report_count"] = 3
+        baseline["trials"] = [
+            {
+                "task_name": sequence[0],
+                "rewards": {"reward": 1.0},
+                "route_counts": {
+                    "memory": {
+                        "succeeded": 1,
+                        "failed": 0,
+                        "unresolved": 0,
+                    }
+                },
+                "lifecycle": {},
+                "task_usage": {"learning_artifacts_activated": []},
+            },
+            {
+                "task_name": sequence[1],
+                "rewards": {"reward": 0.0},
+                "task_usage": {"learning_artifacts_activated": []},
+            },
+            {
+                "task_name": sequence[2],
+                "rewards": {"reward": 0.0},
+                "task_usage": {"learning_artifacts_activated": []},
+            },
+        ]
+        candidate["trials"] = [
+            {
+                "task_name": sequence[0],
+                "rewards": {"reward": 1.0},
+                "lifecycle": {
+                    "promotions": [{"route": "skill", "status": "promoted"}]
+                },
+                "task_usage": {"learning_artifacts_activated": []},
+            },
+            {
+                "task_name": sequence[1],
+                "rewards": {"reward": 1.0},
+                "task_usage": {
+                    "learning_artifacts_activated": [{"id": "learn-1"}],
+                    "skills_reused_from_prior_tasks": [
+                        {"name": "flint-normalization"}
+                    ],
+                    "agent_tools_reused_from_prior_tasks": [],
+                },
+            },
+            {
+                "task_name": sequence[2],
+                "rewards": {"reward": 1.0},
+                "task_usage": {"learning_artifacts_activated": []},
+            },
+        ]
+
+        comparison = compare_script.build_comparison(
+            baseline=baseline,
+            candidate=candidate,
+            baseline_strategy="router",
+            candidate_strategy="lifecycle",
+            baseline_summary_path=Path("baseline.json"),
+            candidate_summary_path=Path("candidate.json"),
+            provider="openrouter",
+            source_digest="abc123",
+            arm_order=["baseline", "candidate"],
+            expected_task_sequence=sequence,
+        )
+
+        self.assertEqual(comparison["schema_version"], 4)
+        self.assertTrue(comparison["router_proof"]["proven"])
+        self.assertEqual(
+            comparison["router_proof"]["candidate_minus_baseline"][
+                "route_accuracy"
+            ],
+            1.0,
+        )
+
     def test_runtime_dependencies_must_be_installed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

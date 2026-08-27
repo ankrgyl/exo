@@ -99,6 +99,7 @@ describe("Exo profiles", () => {
     expect(tools.get("propose_skill_learning")).toBeDefined();
     expect(tools.get("propose_tool_learning")).toBeDefined();
     expect(tools.get("propose_learning_discard")).toBeDefined();
+    expect(tools.get("classify_learning_route")).toBeDefined();
     expect(tools.get("validate_and_promote_learning")).toBeDefined();
   });
 
