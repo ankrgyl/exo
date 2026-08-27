@@ -15,12 +15,16 @@ import {
   registerLibraryTools,
   registerLibraryToolModulePath,
   registerTools,
+  contextCompactedEvent,
+  fitHistoryToContextLength,
   materializeEventsToMessages,
+  selectCompactionCut,
   toolResultMessage,
   toolResultEvent,
   type Event,
   type EventData,
   type JsonObject,
+  type Message,
   type ToolExecutionContext,
   type ToolInstance,
   type Tool,
@@ -30,6 +34,171 @@ import {
 import { ircTool } from "../../examples/typescript/tools/irc";
 import { uppercaseTool } from "../../examples/typescript/tools/uppercase";
 import { installToolSource, readToolRegistry } from "./tool-registry";
+
+describe("context compaction events", () => {
+  // user asks → assistant calls a tool → result → assistant replies.
+  const toolTurn: Event[] = [
+    historyEvent("e1", {
+      type: "messages",
+      messages: [{ role: "user", content: "run ls" }],
+    }),
+    historyEvent("e2", {
+      type: "messages",
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_call",
+              tool_call_id: "c",
+              tool_name: "shell",
+              arguments: {},
+            },
+          ],
+        },
+      ],
+    }),
+    historyEvent("e3", {
+      type: "tool_requested",
+      tool_call_id: "c",
+      request: { function_name: "shell", arguments: {} },
+    }),
+    historyEvent("e4", {
+      type: "tool_result",
+      tool_call_id: "c",
+      result: { stdout: "a b" },
+    }),
+    historyEvent("e5", {
+      type: "messages",
+      messages: [{ role: "assistant", content: "two files" }],
+    }),
+    historyEvent("e6", {
+      type: "messages",
+      messages: [{ role: "user", content: "thanks" }],
+    }),
+  ];
+  const payload = {
+    summary: "The user listed files.",
+    covers_through_event_id: "e4",
+    summarized_messages: 3,
+    model: "test-model",
+  };
+
+  it("materializes from the latest summary and the events after its cut", () => {
+    const messages = materializeEventsToMessages([
+      ...toolTurn,
+      historyEvent("c1", contextCompactedEvent(payload)),
+    ]);
+
+    expect(messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "user",
+    ]);
+    expect(String(messages[0].content)).toContain("The user listed files.");
+    expect(messages[1]).toEqual({ role: "assistant", content: "two files" });
+  });
+
+  it("ignores a compaction whose covered event is missing", () => {
+    const messages = materializeEventsToMessages([
+      ...toolTurn,
+      historyEvent(
+        "c1",
+        contextCompactedEvent({ ...payload, covers_through_event_id: "gone" }),
+      ),
+    ]);
+
+    expect(messages).toEqual(materializeEventsToMessages(toolTurn));
+  });
+
+  it("never cuts between a tool call and its result", () => {
+    // Head target is ~half; the only pending-free cuts are after e1, e4, e5.
+    // Only cuts after e1, e4, e5 are pending-free; e4 is the earliest that fits.
+    const cut = selectCompactionCut(toolTurn, 300);
+
+    expect(cut?.coversThroughEventId).toBe("e4");
+  });
+
+  it("returns null when no cut leaves a tail", () => {
+    expect(selectCompactionCut(toolTurn.slice(0, 1), 0)).toBeNull();
+    expect(selectCompactionCut([], 0)).toBeNull();
+  });
+
+  it("includes the previous summary in the next head", () => {
+    const cut = selectCompactionCut(
+      [...toolTurn, historyEvent("c1", contextCompactedEvent(payload))],
+      0,
+    );
+
+    expect(cut?.coversThroughEventId).toBe("e5");
+    expect(String(cut?.headMessages[0].content)).toContain(
+      "The user listed files.",
+    );
+    expect(cut?.headMessages).toHaveLength(2);
+  });
+});
+
+function historyEvent(id: string, data: EventData): Event {
+  return {
+    id,
+    conversationId: "conversation",
+    sessionId: null,
+    turnId: null,
+    createdAt: "2026-01-01T00:00:00Z",
+    data,
+  };
+}
+
+describe("fitHistoryToContextLength", () => {
+  const instructions: Message[] = [{ role: "developer", content: "be brief" }];
+  const history: Message[] = [
+    { role: "user", content: "a".repeat(400) },
+    { role: "assistant", content: "b".repeat(400) },
+    { role: "user", content: "c".repeat(400) },
+    { role: "assistant", content: "d".repeat(400) },
+  ];
+
+  it("returns history unchanged when no limit is set", () => {
+    expect(fitHistoryToContextLength(history, instructions, null)).toEqual(
+      history,
+    );
+  });
+
+  it("drops the oldest messages until the prompt fits", () => {
+    // ~4 chars/token: 250 tokens ≈ 1000 chars, room for two ~430-char messages.
+    expect(fitHistoryToContextLength(history, instructions, 250)).toEqual(
+      history.slice(2),
+    );
+  });
+
+  it("always keeps the newest message", () => {
+    expect(fitHistoryToContextLength(history, instructions, 1)).toEqual(
+      history.slice(3),
+    );
+  });
+
+  it("never starts the history on a tool message", () => {
+    const withTool: Message[] = [
+      { role: "user", content: "x".repeat(400) },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_call",
+            tool_call_id: "1",
+            tool_name: "shell",
+            arguments: {},
+          },
+        ],
+      },
+      toolResultMessage("1", "shell", { stdout: "y".repeat(400) }),
+      { role: "assistant", content: "done" },
+    ];
+    // Budget fits the tool result + final reply but not the tool call before it.
+    const result = fitHistoryToContextLength(withTool, [], 130);
+    expect(result).toEqual(withTool.slice(3));
+  });
+});
 
 describe("HarnessToolRegistry", () => {
   it("returns registered tool definitions", () => {

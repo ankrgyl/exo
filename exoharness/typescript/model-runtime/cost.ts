@@ -7,6 +7,7 @@ import { dirname } from "node:path";
 
 export type ModelEntry = {
   litellm_provider?: string;
+  max_input_tokens?: number;
   input_cost_per_token?: number;
   output_cost_per_token?: number;
   cache_read_input_token_cost?: number;

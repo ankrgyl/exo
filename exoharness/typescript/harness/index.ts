@@ -589,12 +589,23 @@ export async function materializeConversationMessages(
 ): Promise<Message[]> {
   const result = await conversation.getEvents({
     direction: "asc",
-    types: ["messages", "tool_requested", "tool_result"],
+    types: ["messages", "tool_requested", "tool_result", "context_compacted"],
   });
   return materializeEventsToMessages(result.events);
 }
 
+/**
+ * History as prompt messages. If the log holds a `context_compacted` event,
+ * the history starts with its summary and continues from the event after the
+ * one it covers; everything before that is represented only by the summary.
+ */
 export function materializeEventsToMessages(events: Event[]): Message[] {
+  const applied = applyLatestCompaction(events);
+  const messages = materializeEvents(applied.events);
+  return applied.summary ? [applied.summary, ...messages] : messages;
+}
+
+function materializeEvents(events: Event[]): Message[] {
   const messages: Message[] = [];
   const toolCallNames = new Map<string, string>();
   const pendingToolCallIds: string[] = [];
@@ -612,14 +623,226 @@ export function materializeEventsToMessages(events: Event[]): Message[] {
   return messages;
 }
 
+export const CHARS_PER_TOKEN = 4; // Approx. ratio of char to token budget.
+
+export interface MaterializePromptOptions {
+  maxContextLength?: number | null; // Approx. context window in tokens.
+}
+
 export async function materializePromptMessages(
   conversation: Conversation,
   instructions: Message[],
+  options: MaterializePromptOptions = {},
 ): Promise<Message[]> {
+  const result = await conversation.getEvents({
+    direction: "asc",
+    types: ["messages", "tool_requested", "tool_result", "context_compacted"],
+  });
+  const applied = applyLatestCompaction(result.events);
+  // The compaction summary is kept alongside the instructions: trimming it
+  // away would silently lose everything it stands for.
+  const kept = applied.summary
+    ? [...instructions, applied.summary]
+    : instructions;
   return [
-    ...instructions,
-    ...(await materializeConversationMessages(conversation)),
+    ...kept,
+    ...fitHistoryToContextLength(
+      materializeEvents(applied.events),
+      kept,
+      options.maxContextLength,
+    ),
   ];
+}
+
+export function fitHistoryToContextLength(
+  history: Message[],
+  instructions: Message[],
+  maxContextLength: number | null | undefined,
+): Message[] {
+  if (maxContextLength == null) {
+    return history;
+  }
+  const budget =
+    maxContextLength * CHARS_PER_TOKEN - messagesChars(instructions);
+  let used = messagesChars(history);
+  let start = 0;
+  // Drop the oldest messages until the rest fits; always keep the newest one.
+  while (start < history.length - 1 && used > budget) {
+    used -= messageChars(history[start]);
+    start += 1;
+  }
+  // Providers reject a tool result whose tool call was dropped, so never begin
+  // the history on a tool message.
+  while (start < history.length - 1 && history[start].role === "tool") {
+    start += 1;
+  }
+  return history.slice(start);
+}
+
+function messageChars(message: Message): number {
+  return JSON.stringify(message).length;
+}
+
+function messagesChars(messages: Message[]): number {
+  return messages.reduce((sum, message) => sum + messageChars(message), 0);
+}
+
+export function estimatePromptTokens(messages: Message[]): number {
+  return Math.ceil(messagesChars(messages) / CHARS_PER_TOKEN);
+}
+
+export interface ContextCompactedPayload {
+  summary: string; // Summary of the history up to and including `covers_through_event_id`.
+  covers_through_event_id: string;
+  summarized_messages: number; // How many prompt messages the summary replaced.
+  model: string;
+}
+
+export function contextCompactedEvent(
+  payload: ContextCompactedPayload,
+): EventData {
+  return {
+    type: "custom",
+    event_type: "context_compacted",
+    payload: { ...payload },
+  };
+}
+
+// Summarized history event, stands in for previous messages.
+export function compactionSummaryMessage(
+  payload: ContextCompactedPayload,
+): Message {
+  return {
+    role: "user",
+    content: `[context compaction] The ${payload.summarized_messages} oldest messages of this conversation were replaced by this summary to fit the context window.\n\n${payload.summary}`,
+  };
+}
+
+function applyLatestCompaction(events: Event[]): {
+  summary: Message | null;
+  events: Event[];
+} {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const data = events[index].data;
+    if (!isContextCompactedEvent(data)) {
+      continue;
+    }
+    const cut = events.findIndex(
+      (event) => event.id === data.payload.covers_through_event_id,
+    );
+    if (cut < 0) {
+      // Covered event not in this list: fall back to the full history rather
+      // than lose it.
+      return { summary: null, events };
+    }
+    return {
+      summary: compactionSummaryMessage(data.payload),
+      events: events.slice(cut + 1),
+    };
+  }
+  return { summary: null, events };
+}
+
+export interface CompactionCut {
+  /** Last event the summary will cover; history resumes after it. */
+  coversThroughEventId: string;
+  /** The messages to summarize (including any earlier summary). */
+  headMessages: Message[];
+}
+
+/**
+ * Choose which prefix of the (not yet compacted) history to summarize so that
+ * what remains after the cut is at most `maxTailChars` (serialized size). Cuts
+ * only land where no tool call is awaiting its result, so the tail never opens
+ * with an orphaned tool result. If no cut gets the tail under budget, the
+ * latest possible cut is used. Null when no cut leaves both a head and a tail.
+ */
+export function selectCompactionCut(
+  events: Event[],
+  maxTailChars: number,
+): CompactionCut | null {
+  const applied = applyLatestCompaction(events);
+  const tail = applied.events;
+  // The tail must keep at least one event that yields messages; earlier
+  // compaction events in the list carry none.
+  let lastMaterial = tail.length - 1;
+  while (lastMaterial >= 0 && !isMaterialEvent(tail[lastMaterial].data)) {
+    lastMaterial -= 1;
+  }
+  const pending = new Set<string>();
+  const sizes: number[] = [];
+  const candidates: number[] = [];
+  tail.forEach((event, index) => {
+    const data = event.data;
+    sizes.push(isMaterialEvent(data) ? JSON.stringify(data).length : 0);
+    if (isToolRequestedEvent(data)) {
+      pending.add(data.tool_call_id);
+    } else if (isToolResultEvent(data)) {
+      pending.delete(data.tool_call_id);
+    }
+    const carriesToolCalls =
+      isMessagesEvent(data) && hasToolCallParts(data.messages);
+    if (pending.size === 0 && !carriesToolCalls && index < lastMaterial) {
+      candidates.push(index);
+    }
+  });
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  // Earliest cut whose remaining tail fits the budget; else the latest cut.
+  let remaining = sizes.reduce((sum, size) => sum + size, 0);
+  let chosen = candidates[candidates.length - 1];
+  let index = 0;
+  for (const candidate of candidates) {
+    while (index <= candidate) {
+      remaining -= sizes[index];
+      index += 1;
+    }
+    if (remaining <= maxTailChars) {
+      chosen = candidate;
+      break;
+    }
+  }
+
+  const head = materializeEvents(tail.slice(0, chosen + 1));
+  return {
+    coversThroughEventId: tail[chosen].id,
+    headMessages: applied.summary ? [applied.summary, ...head] : head,
+  };
+}
+
+function isMaterialEvent(data: EventData): boolean {
+  return (
+    isMessagesEvent(data) ||
+    isToolRequestedEvent(data) ||
+    isToolResultEvent(data)
+  );
+}
+
+function hasToolCallParts(messages: Message[]): boolean {
+  return messages.some(
+    (message) =>
+      Array.isArray(message.content) &&
+      message.content.some(
+        (part) => isRecord(part) && part.type === "tool_call",
+      ),
+  );
+}
+
+function isContextCompactedEvent(data: EventData): data is EventData & {
+  type: "custom";
+  payload: ContextCompactedPayload;
+} {
+  if (data.type !== "custom" || data.event_type !== "context_compacted") {
+    return false;
+  }
+  const payload = data.payload;
+  return (
+    isRecord(payload) &&
+    typeof payload.summary === "string" &&
+    typeof payload.covers_through_event_id === "string"
+  );
 }
 
 export function messagesToHistoryMessages(
