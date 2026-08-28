@@ -594,11 +594,6 @@ export async function materializeConversationMessages(
   return materializeEventsToMessages(result.events);
 }
 
-/**
- * History as prompt messages. If the log holds a `context_compacted` event,
- * the history starts with its summary and continues from the event after the
- * one it covers; everything before that is represented only by the summary.
- */
 export function materializeEventsToMessages(events: Event[]): Message[] {
   const applied = applyLatestCompaction(events);
   const messages = materializeEvents(applied.events);
@@ -718,6 +713,7 @@ export function compactionSummaryMessage(
   };
 }
 
+// Trim the history to the latest compaction cut.
 function applyLatestCompaction(events: Event[]): {
   summary: Message | null;
   events: Event[];
@@ -731,8 +727,6 @@ function applyLatestCompaction(events: Event[]): {
       (event) => event.id === data.payload.covers_through_event_id,
     );
     if (cut < 0) {
-      // Covered event not in this list: fall back to the full history rather
-      // than lose it.
       return { summary: null, events };
     }
     return {
@@ -750,21 +744,14 @@ export interface CompactionCut {
   headMessages: Message[];
 }
 
-/**
- * Choose which prefix of the (not yet compacted) history to summarize so that
- * what remains after the cut is at most `maxTailChars` (serialized size). Cuts
- * only land where no tool call is awaiting its result, so the tail never opens
- * with an orphaned tool result. If no cut gets the tail under budget, the
- * latest possible cut is used. Null when no cut leaves both a head and a tail.
- */
+// Choose which prefix of the (not yet compacted) history to summarize so that
+// what remains after the cut is at most `maxTailChars` (serialized size).
 export function selectCompactionCut(
   events: Event[],
   maxTailChars: number,
 ): CompactionCut | null {
   const applied = applyLatestCompaction(events);
   const tail = applied.events;
-  // The tail must keep at least one event that yields messages; earlier
-  // compaction events in the list carry none.
   let lastMaterial = tail.length - 1;
   while (lastMaterial >= 0 && !isMaterialEvent(tail[lastMaterial].data)) {
     lastMaterial -= 1;
