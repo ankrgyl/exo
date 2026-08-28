@@ -53,6 +53,21 @@ fn test_image() -> Option<String> {
     }
 }
 
+/// Whether a `smolvm` binary is actually installed. Same "skip loudly" contract
+/// as [`test_image`]: the probe-backed assertions below describe the INSTALLED
+/// engine, so without one there is nothing to assert about — and asserting
+/// anyway turns "this machine has no smolvm" into a red build.
+fn smolvm_installed() -> bool {
+    let bin = env::var("SMOLVM_BIN").unwrap_or_else(|_| "smolvm".to_string());
+    match std::process::Command::new(&bin).arg("--version").output() {
+        Ok(out) if out.status.success() => true,
+        _ => {
+            eprintln!("skipping smolvm live test: no usable `{bin}` on PATH");
+            false
+        }
+    }
+}
+
 fn workspace_dir(tag: &str) -> PathBuf {
     let dir = env::temp_dir().join(format!("exo-smolvm-live-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -255,7 +270,12 @@ async fn smolvm_start_process_streams_and_exits() {
 #[ignore]
 async fn auto_mode_selects_warm_on_a_current_smolvm() {
     let backend = SmolvmSandboxBackend::new();
+    // Holds regardless of what is installed — `Auto` is the configured default,
+    // not a probe result, so it is worth asserting even on a bare machine.
     assert_eq!(backend.mode(), SmolvmExecutionMode::Auto);
+    if !smolvm_installed() {
+        return;
+    }
     assert!(
         backend.warm_supported().await,
         "a smolvm >= 1.7.2 should support warm; check `smolvm --version`"
