@@ -466,11 +466,19 @@ impl TuiApp {
         let mut keys = EventStream::new();
         let mut tick = tokio::time::interval(Duration::from_millis(120));
 
+        // Redraw only when something changed. Drawing on every idle tick kept
+        // the process busy (and on large conversations, pinned the CPU) for no
+        // visible effect.
+        let mut redraw = true;
         let outcome = loop {
-            terminal.draw(|frame| self.draw(frame))?;
+            if redraw {
+                terminal.draw(|frame| self.draw(frame))?;
+                redraw = false;
+            }
             tokio::select! {
                 key = keys.next() => match key {
                     Some(Ok(event)) => {
+                        redraw = true;
                         if self.handle_terminal_event(event, &tx).await? {
                             break Ok(());
                         }
@@ -490,11 +498,13 @@ impl TuiApp {
                 app_event = rx.recv() => {
                     if let Some(app_event) = app_event {
                         self.handle_app_event(app_event);
+                        redraw = true;
                     }
                 }
                 _ = tick.tick() => {
                     if self.is_busy() {
                         self.spinner_frame = self.spinner_frame.wrapping_add(1);
+                        redraw = true;
                     }
                 }
             }
@@ -1036,14 +1046,21 @@ impl TuiApp {
             self.agent.record().slug,
             self.conversation.record().slug
         );
-        // Count lines before attaching the block: line_count includes the
-        // block's border rows, which would over-scroll by two.
-        let transcript =
-            Paragraph::new(Text::from(self.transcript.clone())).wrap(Wrap { trim: false });
         self.transcript_inner = Block::new().borders(Borders::ALL).inner(transcript_area);
         let inner_width = transcript_area.width.saturating_sub(2);
         let inner_height = transcript_area.height.saturating_sub(2);
-        let total = transcript.line_count(inner_width) as u16;
+        // Only the last screenful plus the scrollback can be visible, and every
+        // transcript line wraps to at least one row, so rendering that many
+        // trailing lines always fills the viewport. Cloning and re-wrapping the
+        // whole transcript each frame made large conversations spin the CPU
+        // while idle and lag on every keystroke.
+        let wanted = usize::from(inner_height) + usize::from(self.scrollback);
+        let start = self.transcript.len().saturating_sub(wanted);
+        let transcript = Paragraph::new(Text::from(self.transcript[start..].to_vec()))
+            .wrap(Wrap { trim: false });
+        // Count lines before attaching the block: line_count includes the
+        // block's border rows, which would over-scroll by two.
+        let total = u16::try_from(transcript.line_count(inner_width)).unwrap_or(u16::MAX);
         let bottom = total.saturating_sub(inner_height);
         self.scrollback = self.scrollback.min(bottom);
         let scroll = bottom - self.scrollback;
