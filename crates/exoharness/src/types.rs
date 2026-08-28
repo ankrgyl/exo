@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::ops::Bound;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -701,6 +702,7 @@ impl SandboxProvider {
     pub const Docker: Self = Self::from_static("docker");
     pub const Firecracker: Self = Self::from_static("firecracker");
     pub const LocalProcess: Self = Self::from_static("local_process");
+    pub const Smolvm: Self = Self::from_static("smolvm");
 
     pub const fn from_static(provider: &'static str) -> Self {
         Self(Cow::Borrowed(provider))
@@ -969,6 +971,19 @@ pub enum SandboxProviderConfig {
         #[serde(default = "crate::sandbox_provider::default_docker_image")]
         default_image: String,
     },
+    Smolvm {
+        #[serde(default = "default_smolvm_image")]
+        default_image: String,
+        /// Path to the `smolvm` binary for a non-PATH install. Carried on the
+        /// config rather than read from the environment at construction, so the
+        /// setting is visible, persisted with the agent, and reproducible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binary: Option<PathBuf>,
+        /// Binary smolvm should exec to boot a VM, for installs where `binary`
+        /// is a wrapper script. Omitted derives it from `binary`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        boot_binary: Option<PathBuf>,
+    },
     Firecracker {
         #[serde(default = "crate::sandbox_provider::default_firecracker_image")]
         default_image: String,
@@ -1036,6 +1051,12 @@ pub fn default_e2b_template() -> String {
     "base".to_string()
 }
 
+pub fn default_smolvm_image() -> String {
+    // Same default as the docker provider (DEFAULT_SANDBOX_IMAGE aliases it);
+    // reuse its ungated helper so this compiles without the basic-backend feature.
+    crate::sandbox_provider::default_docker_image()
+}
+
 impl SandboxProviderConfig {
     pub fn provider(&self) -> SandboxProvider {
         match self {
@@ -1044,6 +1065,7 @@ impl SandboxProviderConfig {
             Self::Sprites { .. } => SandboxProvider::Sprites,
             Self::Vercel { .. } => SandboxProvider::Vercel,
             Self::Docker { .. } => SandboxProvider::Docker,
+            Self::Smolvm { .. } => SandboxProvider::Smolvm,
             Self::Firecracker { .. } => SandboxProvider::Firecracker,
             Self::AwsAgentCore { .. } => SandboxProvider::AwsAgentCore,
         }
@@ -1055,6 +1077,7 @@ impl SandboxProviderConfig {
             Self::Daytona { default_image, .. }
             | Self::Vercel { default_image, .. }
             | Self::Docker { default_image, .. }
+            | Self::Smolvm { default_image, .. }
             | Self::Firecracker { default_image, .. }
             | Self::E2b { default_image, .. }
             | Self::AwsAgentCore { default_image, .. } => Some(default_image),

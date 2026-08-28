@@ -139,6 +139,10 @@ pub enum SnapshotKind {
     /// Reference to a Sprites checkpoint id on a named sprite. Payload bytes are
     /// a small JSON manifest; restoring is `POST .../checkpoints/{id}/restore`.
     SpritesSnapshot,
+    /// Reference to a `.smolmachine` pack on the local disk. Payload bytes are a
+    /// small JSON manifest; restoring is `smolvm machine create --from <path>`.
+    /// A pack captures a whole stateful VM, so it is far too large to inline.
+    SmolMachinePack,
     /// Reference to an immutable Firecracker state/RAM/disk bundle in the
     /// backend's private state root. Payload bytes are a small JSON manifest;
     /// the multi-gigabyte snapshot remains local to that Firecracker host.
@@ -260,7 +264,7 @@ const DEFAULT_NETWORK_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_NETWORK_CREATE_RETRY_DELAY: Duration = Duration::from_millis(200);
 pub(crate) const WARM_SANDBOX_KEY_LABEL: &str = "exo.sandbox.key";
 pub(crate) const WARM_SANDBOX_SPEC_HASH_LABEL: &str = "exo.sandbox.spec-hash";
-const WARM_SANDBOX_OWNER_PID_LABEL: &str = "exo.sandbox.owner-pid";
+pub(crate) const WARM_SANDBOX_OWNER_PID_LABEL: &str = "exo.sandbox.owner-pid";
 const APPLE_ABSOLUTE_TIME_UNIX_OFFSET_SECONDS: f64 = 978_307_200.0;
 const DURABLE_FILE_SYSTEM_ROOT_ENV: &str = "EXO_DURABLE_FILE_SYSTEM_ROOT";
 
@@ -637,6 +641,10 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
             (_, SnapshotKind::SpritesSnapshot) => bail!(
                 "SpritesSnapshot payloads can only be restored by the Sprites sandbox provider; \
                  select provider sprites to rewind this snapshot"
+            ),
+            (_, SnapshotKind::SmolMachinePack) => bail!(
+                "SmolMachinePack payloads can only be restored by the smolvm sandbox provider; \
+                 select provider smolvm to rewind this snapshot"
             ),
             (_, SnapshotKind::FirecrackerSnapshot) => bail!(
                 "FirecrackerSnapshot payloads can only be restored by the Firecracker sandbox provider; \
@@ -1589,7 +1597,7 @@ async fn start_warm_process(
     spawn_sandbox_process(process, command).await
 }
 
-async fn run_command(
+pub(crate) async fn run_command(
     mut process: Command,
     command: &SandboxCommand,
     cwd: String,
@@ -1625,7 +1633,7 @@ async fn run_command(
     })
 }
 
-async fn spawn_sandbox_process(
+pub(crate) async fn spawn_sandbox_process(
     mut process: Command,
     command: &SandboxCommand,
 ) -> Result<crate::SandboxProcessParts> {
@@ -1932,7 +1940,7 @@ fn parse_docker_timestamp(value: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc))
 }
 
-fn owner_pid_is_alive(pid: &str) -> bool {
+pub(crate) fn owner_pid_is_alive(pid: &str) -> bool {
     if pid.parse::<u32>().is_err() {
         return false;
     }

@@ -101,6 +101,7 @@ impl SandboxBackendRegistration {
             "e2b" => Ok(Self::e2b(E2bBackendSpec::default())),
             "firecracker" => Ok(Self::firecracker(FirecrackerBackendSpec::default())),
             "local_process" => Ok(Self::local_process()),
+            "smolvm" => Ok(Self::smolvm()),
             "sprites" => Ok(Self::sprites(SpritesBackendSpec::default())),
             "vercel" => Ok(Self::vercel(VercelBackendSpec::with_conventional_secrets())),
             _ => bail!("sandbox provider {provider} is not built into exoharness"),
@@ -158,6 +159,25 @@ impl SandboxBackendRegistration {
             SandboxProvider::LocalProcess,
             Arc::new(LocalProcessSandboxBackend::new()),
         )
+    }
+
+    /// Local microVM sandboxes via the `smolvm` CLI. Unlike `docker` this puts a
+    /// hypervisor boundary around the workload, and unlike `apple_container` it
+    /// is not macOS-only.
+    pub fn smolvm() -> Self {
+        // A factory, not a fixed backend: the binary paths are configured per
+        // binding (`exo provider configure --provider smolvm --smolvm-binary`),
+        // so they have to be read when a request arrives rather than at startup —
+        // the same shape daytona/e2b use for their credentials. The result is
+        // cached per provider by `sandbox_backend_for_provider`, so this runs
+        // once per harness and not once per sandbox.
+        Self::from_factory(SandboxProvider::Smolvm, false, |inner| {
+            Box::pin(async move {
+                let config = inner.smolvm_config_from_binding().await?;
+                Ok(Arc::new(crate::SmolvmSandboxBackend::from_config(config))
+                    as Arc<dyn ManagedSandboxBackend>)
+            })
+        })
     }
 
     pub fn daytona(spec: DaytonaBackendSpec) -> Self {
@@ -651,6 +671,36 @@ impl BasicExoHarnessInner {
 
     /// `DaytonaConfig` from a root-scoped `Binding::Sandbox` (newest wins), or
     /// `None` if none is set so callers fall back to the secret-name spec.
+    /// The paths recorded on the most recent smolvm binding. Unset entries leave
+    /// the backend on its `SMOLVM_*`-or-PATH defaults, so an unconfigured install
+    /// keeps working exactly as before.
+    async fn smolvm_config_from_binding(&self) -> Result<crate::SmolvmBackendConfig> {
+        let bindings = list_binding_records(&self.storage, Path::new("bindings")).await?;
+        let paths = bindings
+            .into_iter()
+            .rev()
+            .find_map(|record| match record.binding {
+                Binding::Sandbox {
+                    config:
+                        SandboxProviderConfig::Smolvm {
+                            binary,
+                            boot_binary,
+                            ..
+                        },
+                    ..
+                } => Some((binary, boot_binary)),
+                _ => None,
+            });
+        // A binding that names neither path is still the newest binding, and its
+        // silence means "use the defaults" rather than "keep looking".
+        let (binary, boot_binary) = paths.unwrap_or((None, None));
+        Ok(crate::SmolvmBackendConfig {
+            mode: crate::SmolvmExecutionMode::default(),
+            binary,
+            boot_binary,
+        })
+    }
+
     async fn daytona_config_from_binding(&self) -> Result<Option<crate::DaytonaConfig>> {
         let bindings = list_binding_records(&self.storage, Path::new("bindings")).await?;
         let Some((api_key_secret_id, region, organization_id, api_url)) = bindings

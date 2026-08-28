@@ -428,6 +428,7 @@ enum SandboxProviderArg {
     #[value(name = "apple-container")]
     AppleContainer,
     Docker,
+    Smolvm,
     Firecracker,
     #[value(name = "local-process")]
     LocalProcess,
@@ -443,6 +444,7 @@ impl From<SandboxProviderArg> for SandboxProvider {
             SandboxProviderArg::AwsAgentCore => Self::AwsAgentCore,
             SandboxProviderArg::AppleContainer => Self::AppleContainer,
             SandboxProviderArg::Docker => Self::Docker,
+            SandboxProviderArg::Smolvm => Self::Smolvm,
             SandboxProviderArg::Firecracker => Self::Firecracker,
             SandboxProviderArg::LocalProcess => Self::LocalProcess,
         }
@@ -493,6 +495,7 @@ fn default_sandbox_backends(
     vec![
         SandboxBackendRegistration::apple_container(),
         SandboxBackendRegistration::docker(),
+        SandboxBackendRegistration::smolvm(),
         SandboxBackendRegistration::firecracker(firecracker),
         SandboxBackendRegistration::local_process(),
         SandboxBackendRegistration::daytona(DaytonaBackendSpec::default()),
@@ -1049,6 +1052,17 @@ struct ProviderConfigureArgs {
     /// Default base image for sandboxes that don't request one.
     #[arg(long)]
     default_image: Option<String>,
+    /// smolvm: path to the `smolvm` binary, for an install that is not on PATH.
+    /// Declared here rather than read from the environment inside the backend so
+    /// it appears in `--help` and is persisted with the binding; the `env`
+    /// fallback keeps existing `SMOLVM_BIN` setups working.
+    #[arg(long = "smolvm-binary", env = "SMOLVM_BIN")]
+    smolvm_binary: Option<PathBuf>,
+    /// smolvm: binary to exec when booting a VM, for installs where the entry
+    /// point is a wrapper script. Defaults to the `smolvm-bin` beside
+    /// `--smolvm-binary`, else that binary itself.
+    #[arg(long = "smolvm-boot-binary", env = "SMOLVM_BOOT_BINARY")]
+    smolvm_boot_binary: Option<PathBuf>,
     /// Sprites sprite HTTP URL auth: sprite | public.
     #[arg(long)]
     url_auth: Option<String>,
@@ -2434,6 +2448,8 @@ async fn main() -> Result<()> {
                     qualifier,
                     session_storage_mount_path,
                     default_image,
+                    smolvm_binary,
+                    smolvm_boot_binary,
                     url_auth,
                     labels,
                 } = *args;
@@ -2503,6 +2519,11 @@ async fn main() -> Result<()> {
                     }
                     SandboxProviderArg::Docker => SandboxProviderConfig::Docker {
                         default_image: default_image.unwrap_or_else(default_docker_image),
+                    },
+                    SandboxProviderArg::Smolvm => SandboxProviderConfig::Smolvm {
+                        default_image: default_image.unwrap_or_else(default_docker_image),
+                        binary: smolvm_binary,
+                        boot_binary: smolvm_boot_binary,
                     },
                     SandboxProviderArg::Firecracker => SandboxProviderConfig::Firecracker {
                         default_image: default_image.unwrap_or_else(default_firecracker_image),

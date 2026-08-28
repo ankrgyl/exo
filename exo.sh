@@ -118,7 +118,7 @@ Options:
                                             control console, or guardian config
   --profile <name>             Checked-in tool profile: practical (default) or bootstrap
   --sandbox-image <image>      Sandbox image (default: ubuntu:24.04)
-  --provider <provider>         Sandbox provider: daytona, apple-container, docker, or local-process
+  --provider <provider>         Sandbox provider: daytona, apple-container, docker, smolvm, or local-process
   --self-repo-mount <path>      Sandbox path for this repo (default: /workspace/exo)
   --agent-cli-mount <host-dir>  Bind-mount this host directory read-write into the
                                 sandbox for the agent-cli adapter (default: none)
@@ -1341,8 +1341,8 @@ while [[ $# -gt 0 ]]; do
     --provider)
       PROVIDER="${2:-}"
       case "$PROVIDER" in
-        daytona|apple-container|docker|local-process) ;;
-        *) die "--provider must be daytona, apple-container, docker, or local-process" ;;
+        daytona|apple-container|docker|smolvm|local-process) ;;
+        *) die "--provider must be daytona, apple-container, docker, smolvm, or local-process" ;;
       esac
       PROVIDER_EXPLICIT=true
       shift 2
