@@ -105,8 +105,10 @@ pub struct SmolvmSandboxBackend {
 }
 
 impl SmolvmSandboxBackend {
+    /// Delegates to [`Default`], which holds the body — a reader looking for how
+    /// an unconfigured backend is built finds it under the trait they expect.
     pub fn new() -> Self {
-        Self::with_mode(SmolvmExecutionMode::default())
+        Self::default()
     }
 
     pub fn with_mode(mode: SmolvmExecutionMode) -> Self {
@@ -403,7 +405,7 @@ impl SmolvmSandboxBackend {
 
 impl Default for SmolvmSandboxBackend {
     fn default() -> Self {
-        Self::new()
+        Self::with_mode(SmolvmExecutionMode::default())
     }
 }
 
