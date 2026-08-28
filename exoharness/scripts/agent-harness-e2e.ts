@@ -269,14 +269,7 @@ function runHistoryReplayCheck(
     "/workspace",
     "--rw",
   ]);
-  runExo([
-    "conversation",
-    "update",
-    agent.slug,
-    conversation,
-    "--networking",
-    "enabled",
-  ]);
+  runExo(["agent", "update", agent.slug, "--networking", "enabled"]);
 
   const codeWord = `${harness.key}-blue-lantern-${runId}`;
   runChat(
@@ -376,14 +369,7 @@ function runFilesystemSandboxCheck(
     "/workspace",
     "--rw",
   ]);
-  runExo([
-    "conversation",
-    "update",
-    agent.slug,
-    conversation,
-    "--networking",
-    "enabled",
-  ]);
+  runExo(["agent", "update", agent.slug, "--networking", "enabled"]);
 
   const outsideSecret = join(outside, "secret.txt");
   const outsideWrite = join(outside, "escape.txt");
@@ -469,14 +455,7 @@ function runNetworkDisabledCheck(
     "/workspace",
     "--rw",
   ]);
-  runExo([
-    "conversation",
-    "update",
-    agent.slug,
-    conversation,
-    "--networking",
-    "disabled",
-  ]);
+  runExo(["agent", "update", agent.slug, "--networking", "disabled"]);
 
   let failedText: string | null = null;
   try {
