@@ -126,6 +126,40 @@ Create the agent and start a conversation:
 ./target/debug/exo repl --agent ts-cursor --conversation <conversation>
 ```
 
+## Pi
+
+Register a model Pi supports. Pi reads the provider key from the sandbox
+environment, so the same variable has to be set where exo runs:
+
+```bash
+./target/debug/exo secret set openai --env OPENAI_API_KEY
+./target/debug/exo model register gpt-5.5 --secret openai
+```
+
+Build the sandbox image:
+
+```bash
+container build \
+  --platform linux/arm64 \
+  -t exo-pi-sandbox:latest \
+  exoharness/containers/pi-sandbox
+```
+
+Create the agent and start a conversation:
+
+```bash
+./target/debug/exo --harness pi agent create "TS Pi" \
+  --model gpt-5.5
+
+./target/debug/exo conversation create ts-pi
+./target/debug/exo conversation mount add ts-pi <conversation> "$PWD" /workspace --rw
+./target/debug/exo repl --agent ts-pi --conversation <conversation>
+```
+
+An agent model of `provider/model` selects a provider explicitly; a bare name
+is read as OpenAI. Pi otherwise picks its own default, which is an Anthropic
+model, and a run configured for another provider then produces nothing.
+
 ## Live E2E
 
 The live e2e script runs replay checks against the coding-agent harnesses:
@@ -134,6 +168,7 @@ The live e2e script runs replay checks against the coding-agent harnesses:
 pnpm e2e:agent-harnesses --only codex
 pnpm e2e:agent-harnesses --only claude
 pnpm e2e:agent-harnesses --only cursor
+pnpm e2e:agent-harnesses --only pi
 ```
 
 Use `--build-images` to build the required sandbox images before running.

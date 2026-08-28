@@ -326,6 +326,7 @@ enum TypeScriptHarnessPreset {
     Codex,
     ClaudeCode,
     Cursor,
+    Pi,
 }
 
 impl HarnessSelection {
@@ -370,6 +371,7 @@ impl FromStr for HarnessSelection {
             "typescript" => Ok(Self::Kind(HarnessKind::TypeScript)),
             "exo" => Ok(Self::Kind(HarnessKind::Exo)),
             "codex" => Ok(Self::TypeScriptPreset(TypeScriptHarnessPreset::Codex)),
+            "pi" => Ok(Self::TypeScriptPreset(TypeScriptHarnessPreset::Pi)),
             "claude-code" => Ok(Self::TypeScriptPreset(TypeScriptHarnessPreset::ClaudeCode)),
             "cursor" | "cursor-sdk" => Ok(Self::TypeScriptPreset(TypeScriptHarnessPreset::Cursor)),
             value if looks_like_typescript_module_path(value) => {
@@ -388,6 +390,7 @@ impl TypeScriptHarnessPreset {
             Self::Codex => "codex",
             Self::ClaudeCode => "claude-code",
             Self::Cursor => "cursor",
+            Self::Pi => "pi",
         }
     }
 
@@ -396,6 +399,7 @@ impl TypeScriptHarnessPreset {
             Self::Codex => Path::new("exoharness/examples/typescript/codex-harness.ts"),
             Self::ClaudeCode => Path::new("exoharness/examples/typescript/claude-code-harness.ts"),
             Self::Cursor => Path::new("exoharness/examples/typescript/cursor-sdk-harness.ts"),
+            Self::Pi => Path::new("exoharness/examples/typescript/pi-harness.ts"),
         }
     }
 
@@ -404,6 +408,7 @@ impl TypeScriptHarnessPreset {
             Self::Codex => Some("exo-codex-sandbox:latest"),
             Self::ClaudeCode => Some("exo-claude-code-sandbox:latest"),
             Self::Cursor => Some("exo-cursor-sdk-sandbox:latest"),
+            Self::Pi => Some("exo-pi-sandbox:latest"),
         }
     }
 }
@@ -3282,6 +3287,7 @@ fn format_harness_selection(selection: &HarnessSelection) -> String {
             HarnessKind::Exo => "exo".to_string(),
         },
         HarnessSelection::TypeScriptPreset(preset) => match preset {
+            TypeScriptHarnessPreset::Pi => "pi".to_string(),
             TypeScriptHarnessPreset::Codex => "codex".to_string(),
             TypeScriptHarnessPreset::ClaudeCode => "claude-code".to_string(),
             TypeScriptHarnessPreset::Cursor => "cursor".to_string(),
