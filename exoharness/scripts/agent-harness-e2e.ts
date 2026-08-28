@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-type HarnessKey = "codex" | "claude" | "cursor";
+type HarnessKey = "codex" | "claude" | "cursor" | "pi";
 
 interface HarnessDefinition {
   key: HarnessKey;
@@ -106,6 +106,15 @@ const harnesses: HarnessDefinition[] = [
     module: "exoharness/examples/typescript/claude-code-harness.ts",
     image: "exo-claude-code-sandbox:latest",
     imageBuildArgs: ["exoharness/containers/claude-code-sandbox"],
+  },
+  {
+    key: "pi",
+    envName: "OPENAI_API_KEY",
+    secret: "openai",
+    model: "gpt-5.5",
+    module: "exoharness/examples/typescript/pi-harness.ts",
+    image: "exo-pi-sandbox:latest",
+    imageBuildArgs: ["exoharness/containers/pi-sandbox"],
   },
   {
     key: "cursor",
@@ -260,14 +269,7 @@ function runHistoryReplayCheck(
     "/workspace",
     "--rw",
   ]);
-  runExo([
-    "conversation",
-    "update",
-    agent.slug,
-    conversation,
-    "--networking",
-    "enabled",
-  ]);
+  runExo(["agent", "update", agent.slug, "--networking", "enabled"]);
 
   const codeWord = `${harness.key}-blue-lantern-${runId}`;
   runChat(
@@ -367,14 +369,7 @@ function runFilesystemSandboxCheck(
     "/workspace",
     "--rw",
   ]);
-  runExo([
-    "conversation",
-    "update",
-    agent.slug,
-    conversation,
-    "--networking",
-    "enabled",
-  ]);
+  runExo(["agent", "update", agent.slug, "--networking", "enabled"]);
 
   const outsideSecret = join(outside, "secret.txt");
   const outsideWrite = join(outside, "escape.txt");
@@ -460,14 +455,7 @@ function runNetworkDisabledCheck(
     "/workspace",
     "--rw",
   ]);
-  runExo([
-    "conversation",
-    "update",
-    agent.slug,
-    conversation,
-    "--networking",
-    "disabled",
-  ]);
+  runExo(["agent", "update", agent.slug, "--networking", "disabled"]);
 
   let failedText: string | null = null;
   try {
@@ -689,7 +677,12 @@ function parseArgs(rawArgs: string[]): CliArgs {
 }
 
 function isHarnessKey(value: string): value is HarnessKey {
-  return value === "codex" || value === "claude" || value === "cursor";
+  return (
+    value === "codex" ||
+    value === "claude" ||
+    value === "cursor" ||
+    value === "pi"
+  );
 }
 
 function readArgValue(rawArgs: string[], index: number, flag: string): string {
