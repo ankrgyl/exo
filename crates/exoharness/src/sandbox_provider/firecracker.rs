@@ -1988,17 +1988,33 @@ pub(super) fn trusted_host_command(program: &str) -> Result<PathBuf> {
     Ok(executable)
 }
 
-pub(super) fn copy_sparse_reflink(source: &Path, destination: &Path) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SparseCopyMode {
+    Full,
+    ReflinkRequired,
+}
+
+impl SparseCopyMode {
+    fn cp_arg(self) -> &'static str {
+        match self {
+            Self::Full => "--reflink=never",
+            Self::ReflinkRequired => "--reflink=always",
+        }
+    }
+}
+
+fn copy_sparse_with_mode(source: &Path, destination: &Path, mode: SparseCopyMode) -> Result<()> {
+    let reflink_mode = mode.cp_arg();
     let executable = trusted_host_command("cp")?;
     let output = Command::new(executable)
-        .args(["--sparse=always", "--reflink=auto", "--"])
+        .args(["--sparse=always", reflink_mode, "--"])
         .arg(source)
         .arg(destination)
         .output()
         .with_context(|| format!("copying {} to {}", source.display(), destination.display()))?;
     if !output.status.success() {
         bail!(
-            "copying {} to {} failed with {}: {}",
+            "copying {} to {} with {reflink_mode} failed with {}: {}",
             source.display(),
             destination.display(),
             output.status,
@@ -2006,6 +2022,14 @@ pub(super) fn copy_sparse_reflink(source: &Path, destination: &Path) -> Result<(
         );
     }
     Ok(())
+}
+
+pub(super) fn copy_sparse_full(source: &Path, destination: &Path) -> Result<()> {
+    copy_sparse_with_mode(source, destination, SparseCopyMode::Full)
+}
+
+fn copy_sparse_reflink(source: &Path, destination: &Path) -> Result<()> {
+    copy_sparse_with_mode(source, destination, SparseCopyMode::ReflinkRequired)
 }
 
 fn binary_version(path: &Path) -> Result<String> {

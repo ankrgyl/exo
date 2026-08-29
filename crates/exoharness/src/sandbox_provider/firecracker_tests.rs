@@ -16,6 +16,12 @@ fn test_runtime() -> FirecrackerRuntimeFingerprint {
 }
 
 #[test]
+fn sparse_copy_modes_never_allow_automatic_reflink_fallback() {
+    assert_eq!(SparseCopyMode::Full.cp_arg(), "--reflink=never");
+    assert_eq!(SparseCopyMode::ReflinkRequired.cp_arg(), "--reflink=always");
+}
+
+#[test]
 fn resource_names_and_addresses_are_distinct() {
     let first = network_config(1);
     let second = network_config(2);
