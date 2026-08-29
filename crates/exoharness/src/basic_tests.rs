@@ -29,7 +29,7 @@ use crate::{
     SandboxAttachment, SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput,
     SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent,
     SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin,
-    SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotKind,
+    SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotFormat,
     SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
     WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
@@ -2336,6 +2336,10 @@ impl ManagedSandboxBackend for TestProviderStateBackend {
         false
     }
 
+    fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
+        &[]
+    }
+
     async fn acquire(
         &self,
         request: SandboxRequest,
@@ -2423,6 +2427,10 @@ impl TestSandboxBackend {
 impl ManagedSandboxBackend for TestSandboxBackend {
     fn is_local(&self) -> bool {
         false
+    }
+
+    fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
+        &[]
     }
 
     async fn acquire(
@@ -2716,6 +2724,11 @@ impl ManagedSandboxBackend for RestoreImageTestBackend {
         false
     }
 
+    fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
+        static FORMATS: [SnapshotFormat; 1] = [SnapshotFormat::DockerImageTar];
+        &FORMATS
+    }
+
     async fn acquire(
         &self,
         request: SandboxRequest,
@@ -2782,7 +2795,7 @@ impl ManagedSandboxHandle for RestoreImageTestHandle {
 
     async fn snapshot(&self) -> crate::Result<SnapshotPayload> {
         Ok(SnapshotPayload {
-            kind: SnapshotKind::DockerImageTar,
+            format: SnapshotFormat::DockerImageTar,
             bytes: bytes::Bytes::from_static(b"restore-image-test"),
         })
     }

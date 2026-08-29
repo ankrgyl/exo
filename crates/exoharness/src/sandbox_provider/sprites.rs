@@ -5,7 +5,7 @@
 //! checkpoint/restore snapshots. Cross-process resume uses a
 //! deterministic sprite name derived from [`SandboxKey`] + spec hash (same role
 //! as Docker labels / E2B metadata). Snapshots are bytes-by-reference via
-//! [`SnapshotKind::SpritesSnapshot`] manifests pointing at a checkpoint id.
+//! [`SnapshotFormat::SpritesRef`] manifests pointing at a checkpoint id.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -29,7 +29,7 @@ use url::Url;
 use crate::SandboxAttachment;
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput,
-    SandboxRequest, SandboxSpec, SnapshotKind, SnapshotPayload, WARM_SANDBOX_KEY_LABEL,
+    SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload, WARM_SANDBOX_KEY_LABEL,
     WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
 };
 
@@ -41,6 +41,7 @@ const SPRITES_STREAM_STDOUT: u8 = 1;
 const SPRITES_STREAM_STDERR: u8 = 2;
 const SPRITES_STREAM_EXIT: u8 = 3;
 const SPRITES_STREAM_STDIN_EOF: u8 = 4;
+static CONSUMABLE_SNAPSHOT_FORMATS: [SnapshotFormat; 1] = [SnapshotFormat::SpritesRef];
 
 #[derive(Debug, Clone)]
 pub struct SpritesConfig {
@@ -54,7 +55,7 @@ pub struct SpritesConfig {
     pub extra_labels: Vec<String>,
 }
 
-/// JSON persisted for [`SnapshotKind::SpritesSnapshot`]. Filesystem state lives on
+/// JSON persisted for [`SnapshotFormat::SpritesRef`]. Filesystem state lives on
 /// the sprite; we only store the checkpoint id and sprite name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SpritesSnapshotManifest {
@@ -172,6 +173,10 @@ impl ManagedSandboxBackend for SpritesSandboxBackend {
         false
     }
 
+    fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
+        &CONSUMABLE_SNAPSHOT_FORMATS
+    }
+
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_host_mounts(&request)?;
         let sprite_name = sprite_name_for_request(&request);
@@ -198,11 +203,11 @@ impl ManagedSandboxBackend for SpritesSandboxBackend {
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_host_mounts(&request)?;
-        if !matches!(payload.kind, SnapshotKind::SpritesSnapshot) {
+        if payload.format != SnapshotFormat::SpritesRef {
             bail!(
-                "Sprites sandbox backend can only restore from SnapshotKind::SpritesSnapshot, \
-                 got {:?}",
-                payload.kind
+                "Sprites sandbox backend can only restore from {}, got {}",
+                SnapshotFormat::SpritesRef,
+                payload.format
             );
         }
         let manifest: SpritesSnapshotManifest =
@@ -660,7 +665,7 @@ async fn save_checkpoint_via_backend(
     };
     let bytes = serde_json::to_vec(&manifest).context("serializing Sprites snapshot manifest")?;
     Ok(SnapshotPayload {
-        kind: SnapshotKind::SpritesSnapshot,
+        format: SnapshotFormat::SpritesRef,
         bytes: Bytes::from(bytes),
     })
 }

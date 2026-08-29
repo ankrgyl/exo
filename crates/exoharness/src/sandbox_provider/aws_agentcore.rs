@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::SandboxAttachment;
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput,
-    SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotPayload, sandbox_spec_hash,
-    validate_durable_file_systems,
+    SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
+    sandbox_spec_hash, validate_durable_file_systems,
 };
 use crate::sandbox_provider::process_bridge;
 
@@ -94,6 +94,10 @@ impl AwsAgentCoreSandboxBackend {
 impl ManagedSandboxBackend for AwsAgentCoreSandboxBackend {
     fn is_local(&self) -> bool {
         false
+    }
+
+    fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
+        &[]
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {

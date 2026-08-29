@@ -8,7 +8,7 @@ use bytes::Bytes;
 use exoharness::{
     E2bConfig, E2bSandboxBackend, ManagedSandboxBackend, SandboxCommand, SandboxKey,
     SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxNetworkPolicy, SandboxRequest,
-    SandboxSpec, SnapshotKind, SnapshotPayload,
+    SandboxSpec, SnapshotFormat, SnapshotPayload,
 };
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
@@ -317,7 +317,7 @@ async fn snapshot_returns_e2b_snapshot_payload() {
         .unwrap();
     let payload = handle.snapshot().await.expect("snapshot ok");
 
-    assert!(matches!(payload.kind, SnapshotKind::E2bSnapshot));
+    assert_eq!(payload.format, SnapshotFormat::E2bRef);
     let manifest: Value = serde_json::from_slice(&payload.bytes).unwrap();
     assert_eq!(
         manifest.get("snapshot_id").and_then(Value::as_str),
@@ -342,7 +342,7 @@ async fn acquire_from_snapshot_uses_snapshot_template_id() {
         "base_template": "base",
     });
     let payload = SnapshotPayload {
-        kind: SnapshotKind::E2bSnapshot,
+        format: SnapshotFormat::E2bRef,
         bytes: Bytes::from(serde_json::to_vec(&manifest).unwrap()),
     };
 
@@ -364,23 +364,23 @@ async fn acquire_from_snapshot_uses_snapshot_template_id() {
 }
 
 #[tokio::test]
-async fn acquire_from_snapshot_rejects_wrong_kind() {
+async fn acquire_from_snapshot_rejects_wrong_format() {
     let server = MockServer::start().await;
     let backend = backend_for_mock(&server);
 
     let payload = SnapshotPayload {
-        kind: SnapshotKind::DockerImageTar,
+        format: SnapshotFormat::DockerImageTar,
         bytes: Bytes::from_static(b"\x00"),
     };
     let error = match backend
         .acquire_from_snapshot(make_request("conv-9", "sandbox-9"), payload)
         .await
     {
-        Ok(_) => panic!("expected kind mismatch error"),
+        Ok(_) => panic!("expected format mismatch error"),
         Err(error) => error,
     };
     let msg = format!("{error:#}").to_lowercase();
-    assert!(msg.contains("e2b") || msg.contains("kind"));
+    assert!(msg.contains("e2b") || msg.contains("format"));
 }
 
 #[tokio::test]

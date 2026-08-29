@@ -13,7 +13,7 @@ use crate::{
     EventQueryDirection, ExoHarness, HttpExoHarness, ManagedSandboxBackend, ManagedSandboxHandle,
     RestoreSandboxRequest, RunInSandboxRequest, SandboxAttachment, SandboxCommand,
     SandboxCommandOutput, SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts,
-    SandboxProcessStatus, SandboxProcessStdin, SandboxProvider, SandboxRequest, SnapshotKind,
+    SandboxProcessStatus, SandboxProcessStdin, SandboxProvider, SandboxRequest, SnapshotFormat,
     SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, WaitSandboxProcessRequest,
     WriteSandboxProcessInputRequest, serve_exoharness_http_listener,
 };
@@ -507,6 +507,11 @@ impl ManagedSandboxBackend for SnapshotTestSandboxBackend {
         false
     }
 
+    fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
+        static FORMATS: [SnapshotFormat; 1] = [SnapshotFormat::DaytonaRef];
+        &FORMATS
+    }
+
     async fn acquire(
         &self,
         _request: SandboxRequest,
@@ -558,7 +563,7 @@ impl ManagedSandboxHandle for SnapshotTestSandboxHandle {
 
     async fn snapshot(&self) -> crate::Result<SnapshotPayload> {
         Ok(SnapshotPayload {
-            kind: SnapshotKind::DaytonaSnapshot,
+            format: SnapshotFormat::DaytonaRef,
             bytes: Bytes::from_static(b"snapshot"),
         })
     }

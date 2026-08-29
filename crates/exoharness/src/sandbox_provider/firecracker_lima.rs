@@ -31,7 +31,7 @@ use tokio_util::sync::PollSender;
 
 use crate::sandbox::{
     BoxSandboxTcpStream, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
-    SandboxCommandOutput, SandboxRequest, SnapshotPayload,
+    SandboxCommandOutput, SandboxRequest, SnapshotFormat, SnapshotPayload,
 };
 use crate::{SandboxAttachment, SandboxProcessParts};
 
@@ -42,6 +42,8 @@ use super::firecracker_bridge::{
     FirecrackerBridgeServerFrame, FirecrackerBridgeStreamChannel, STREAM_CHUNK_BYTES, read_frame,
     write_frame,
 };
+
+static CONSUMABLE_SNAPSHOT_FORMATS: [SnapshotFormat; 1] = [SnapshotFormat::FirecrackerHostRef];
 
 const BRIDGE_FRAME_QUEUE_DEPTH: usize = 16;
 const BRIDGE_STREAM_QUEUE_DEPTH: usize = 16;
@@ -107,6 +109,10 @@ impl LimaFirecrackerSandboxBackend {
 impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
     fn is_local(&self) -> bool {
         true
+    }
+
+    fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
+        &CONSUMABLE_SNAPSHOT_FORMATS
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
@@ -199,7 +205,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
             .request(FirecrackerBridgeRequest::AcquireFromSnapshot {
                 config: self.config.clone(),
                 request: request.clone(),
-                kind: payload.kind,
+                format: payload.format,
                 payload: BASE64.encode(payload.bytes),
             })
             .await?;
@@ -315,14 +321,14 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
                 request: self.request.clone(),
             })
             .await?;
-        let FirecrackerBridgeResponse::Snapshot { kind, payload } = response else {
+        let FirecrackerBridgeResponse::Snapshot { format, payload } = response else {
             bail!("Firecracker Lima bridge returned the wrong response to snapshot");
         };
         let bytes = BASE64
             .decode(payload)
             .context("decoding Firecracker snapshot bridge response")?;
         Ok(SnapshotPayload {
-            kind,
+            format,
             bytes: Bytes::from(bytes),
         })
     }

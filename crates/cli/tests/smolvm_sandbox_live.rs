@@ -402,8 +402,8 @@ async fn snapshot_round_trip_preserves_guest_state() {
 
     let payload = source.snapshot().await.expect("snapshot");
     println!(
-        "snapshot kind={:?} manifest={} bytes",
-        payload.kind,
+        "snapshot format={} manifest={} bytes",
+        payload.format,
         payload.bytes.len()
     );
 

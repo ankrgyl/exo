@@ -45,7 +45,7 @@ use uuid::Uuid;
 use crate::sandbox::{
     BoxSandboxTcpStream, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
     SandboxCommandOutput, SandboxKey, SandboxNetworkPolicy, SandboxRequest, SandboxSpec,
-    SnapshotKind, SnapshotPayload, sandbox_spec_hash,
+    SnapshotFormat, SnapshotPayload, sandbox_spec_hash,
 };
 use crate::sandbox_provider::process_bridge;
 use crate::{FileSystemMountMode, SandboxAttachment, SandboxProcessParts};
@@ -95,6 +95,7 @@ pub const DEFAULT_MEMORY_MIB: u32 = 4096;
 #[cfg(target_os = "macos")]
 pub const DEFAULT_MEMORY_MIB: u32 = 1024;
 const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+static CONSUMABLE_SNAPSHOT_FORMATS: [SnapshotFormat; 1] = [SnapshotFormat::FirecrackerHostRef];
 // Upstream warns that a compromised guest kernel can reactivate the serial
 // device even with 8250.nr_uarts=0, and unbounded console output written to a
 // host file is their named disk-fill DoS. VMM output therefore goes to
@@ -228,10 +229,11 @@ struct FirecrackerSnapshotManifest {
 
 impl FirecrackerSnapshotManifest {
     fn from_payload(payload: SnapshotPayload) -> Result<Self> {
-        if payload.kind != SnapshotKind::FirecrackerSnapshot {
+        if payload.format != SnapshotFormat::FirecrackerHostRef {
             bail!(
-                "Firecracker sandbox backend can only restore a FirecrackerSnapshot payload, got {:?}",
-                payload.kind
+                "Firecracker sandbox backend can only restore a {} payload, got {}",
+                SnapshotFormat::FirecrackerHostRef,
+                payload.format
             );
         }
         let manifest: Self = serde_json::from_slice(&payload.bytes)
@@ -244,7 +246,7 @@ impl FirecrackerSnapshotManifest {
         let bytes =
             serde_json::to_vec(&self).context("serializing FirecrackerSnapshot manifest")?;
         Ok(SnapshotPayload {
-            kind: SnapshotKind::FirecrackerSnapshot,
+            format: SnapshotFormat::FirecrackerHostRef,
             bytes: Bytes::from(bytes),
         })
     }
@@ -1006,6 +1008,10 @@ impl FirecrackerSandboxBackend {
 impl ManagedSandboxBackend for FirecrackerSandboxBackend {
     fn is_local(&self) -> bool {
         true
+    }
+
+    fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
+        &CONSUMABLE_SNAPSHOT_FORMATS
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {

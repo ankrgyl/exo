@@ -3,9 +3,9 @@
 //!
 //! Daytona persists state itself: `stop` keeps the filesystem and the next
 //! `acquire` finds the sandbox by label and `start`s it. Snapshots use
-//! [`SnapshotKind::DaytonaSnapshot`] payloads — a JSON manifest naming a
+//! [`SnapshotFormat::DaytonaRef`] payload — a JSON manifest naming a
 //! snapshot in Daytona's registry, not the bytes themselves. A
-//! [`SnapshotKind::DockerImageTar`] payload (the Docker backend's snapshot
+//! [`SnapshotFormat::DockerImageTar`] payload (the Docker backend's snapshot
 //! format) can also be restored here, which is how a sandbox teleports from
 //! local Docker up to Daytona.
 
@@ -33,7 +33,7 @@ use uuid::Uuid;
 use crate::SandboxAttachment;
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput,
-    SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotKind, SnapshotPayload,
+    SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
     WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
 };
 use crate::sandbox_provider::shell_quote;
@@ -48,6 +48,8 @@ const START_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 const SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const SNAPSHOT_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
+static CONSUMABLE_SNAPSHOT_FORMATS: [SnapshotFormat; 2] =
+    [SnapshotFormat::DaytonaRef, SnapshotFormat::DockerImageTar];
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PROCESS_PIPE_BUFFER_SIZE: usize = 64 * 1024;
 const PROCESS_ENV_END_MARKER: &str = "__EXO_ENV_END__";
@@ -249,6 +251,10 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
         false
     }
 
+    fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
+        &CONSUMABLE_SNAPSHOT_FORMATS
+    }
+
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_unsupported_mounts(&request)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
@@ -293,23 +299,17 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_unsupported_mounts(&request)?;
-        let snapshot_name = match payload.kind {
-            SnapshotKind::DaytonaSnapshot => {
-                let manifest: DaytonaSnapshotManifest = serde_json::from_slice(&payload.bytes)
-                    .context("decoding DaytonaSnapshot manifest")?;
-                manifest.snapshot_name
-            }
-            SnapshotKind::DockerImageTar => {
-                import_docker_image_tar(&self.handle_backend(), &payload.bytes).await?
-            }
-            SnapshotKind::E2bSnapshot
-            | SnapshotKind::SpritesSnapshot
-            | SnapshotKind::SmolMachinePack
-            | SnapshotKind::FirecrackerSnapshot => bail!(
-                "the Daytona backend cannot restore a {:?} payload; \
-                 select the provider that produced the snapshot",
-                payload.kind
-            ),
+        let snapshot_name = if payload.format == SnapshotFormat::DaytonaRef {
+            let manifest: DaytonaSnapshotManifest = serde_json::from_slice(&payload.bytes)
+                .context("decoding Daytona snapshot manifest")?;
+            manifest.snapshot_name
+        } else if payload.format == SnapshotFormat::DockerImageTar {
+            import_docker_image_tar(&self.handle_backend(), &payload.bytes).await?
+        } else {
+            bail!(
+                "the Daytona backend cannot restore a {} payload",
+                payload.format
+            )
         };
         let spec_hash = sandbox_spec_hash(&request.spec);
         let sandbox = self
@@ -1132,7 +1132,7 @@ async fn save_as_snapshot_via_backend(
     let manifest = DaytonaSnapshotManifest { snapshot_name };
     let bytes = serde_json::to_vec(&manifest).context("serializing Daytona snapshot manifest")?;
     Ok(SnapshotPayload {
-        kind: SnapshotKind::DaytonaSnapshot,
+        format: SnapshotFormat::DaytonaRef,
         bytes: Bytes::from(bytes),
     })
 }
@@ -1530,7 +1530,7 @@ struct DaytonaSessionCommandInputRequest {
     data: String,
 }
 
-/// Persisted alongside a `SnapshotKind::DaytonaSnapshot`: a Daytona snapshot is
+/// Persisted alongside a `SnapshotFormat::DaytonaRef`: a Daytona snapshot is
 /// self-contained, so the registered name is all we need to recreate it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaytonaSnapshotManifest {

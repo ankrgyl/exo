@@ -29,7 +29,7 @@ use tokio::sync::OnceCell;
 use crate::SandboxAttachment;
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput, SandboxKey,
-    SandboxMountAccess, SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotKind,
+    SandboxMountAccess, SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat,
     SnapshotPayload, WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_OWNER_PID_LABEL, owner_pid_is_alive,
     run_command, spawn_sandbox_process,
 };
@@ -48,6 +48,7 @@ const MIN_WARM_VERSION: Version = Version::new(1, 7, 2);
 /// Probed from `--help`, not the version: a build carrying `--label` still
 /// reported 1.7.5, so a version gate would refuse a flag that is right there.
 const LABEL_FLAG: &str = "--label";
+static CONSUMABLE_SNAPSHOT_FORMATS: [SnapshotFormat; 1] = [SnapshotFormat::SmolvmMachinePack];
 
 /// What the installed smolvm supports. Probed once per backend.
 #[derive(Debug, Clone, Copy)]
@@ -415,6 +416,10 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
         true
     }
 
+    fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
+        &CONSUMABLE_SNAPSHOT_FORMATS
+    }
+
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_unsupported_spec(&request.spec)?;
         match self.resolve_mode(&request).await {
@@ -457,10 +462,10 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
         request: SandboxRequest,
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        if payload.kind != SnapshotKind::SmolMachinePack {
+        if payload.format != SnapshotFormat::SmolvmMachinePack {
             bail!(
-                "smolvm backend cannot restore snapshot kind {:?}",
-                payload.kind
+                "smolvm backend cannot restore snapshot format {}",
+                payload.format
             );
         }
         reject_unsupported_spec(&request.spec)?;
@@ -704,7 +709,7 @@ impl ManagedSandboxHandle for SmolvmWarmHandle {
         run_checked(start, "smolvm machine start").await?;
 
         Ok(SnapshotPayload {
-            kind: SnapshotKind::SmolMachinePack,
+            format: SnapshotFormat::SmolvmMachinePack,
             bytes: Bytes::from(bytes),
         })
     }

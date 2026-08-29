@@ -10,7 +10,7 @@ use bytes::Bytes;
 use exoharness::{
     DaytonaConfig, DaytonaSandboxBackend, ManagedSandboxBackend, SandboxKey,
     SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxNetworkPolicy, SandboxRequest,
-    SandboxSpec, SnapshotKind, SnapshotPayload,
+    SandboxSpec, SnapshotFormat, SnapshotPayload,
 };
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 use serde_json::{Value, json};
@@ -434,11 +434,7 @@ async fn snapshot_returns_daytona_snapshot_payload_with_manifest() {
         .await
         .expect("snapshot should succeed against the mock");
 
-    assert!(
-        matches!(payload.kind, SnapshotKind::DaytonaSnapshot),
-        "kind should be DaytonaSnapshot, got {:?}",
-        payload.kind
-    );
+    assert_eq!(payload.format, SnapshotFormat::DaytonaRef);
 
     let manifest: Value =
         serde_json::from_slice(&payload.bytes).expect("payload should be a JSON manifest");
@@ -517,7 +513,7 @@ async fn acquire_from_snapshot_passes_snapshot_name_in_create_body() {
 
     let manifest = json!({ "snapshot_name": "exo-snap-canonical-fixture" });
     let payload = SnapshotPayload {
-        kind: SnapshotKind::DaytonaSnapshot,
+        format: SnapshotFormat::DaytonaRef,
         bytes: Bytes::from(serde_json::to_vec(&manifest).unwrap()),
     };
 
@@ -543,27 +539,27 @@ async fn acquire_from_snapshot_passes_snapshot_name_in_create_body() {
 }
 
 #[tokio::test]
-async fn acquire_from_snapshot_rejects_foreign_kinds() {
+async fn acquire_from_snapshot_rejects_foreign_formats() {
     let server = MockServer::start().await;
     let backend = backend_for_mock(&server);
 
     let payload = SnapshotPayload {
-        kind: SnapshotKind::E2bSnapshot,
+        format: SnapshotFormat::E2bRef,
         bytes: Bytes::from_static(b"{}"),
     };
     let request = make_request("conv-10", "sandbox-10");
     let error = match backend.acquire_from_snapshot(request, payload).await {
-        Ok(_) => panic!("Daytona backend must reject an E2bSnapshot payload"),
+        Ok(_) => panic!("Daytona backend must reject an e2b-ref payload"),
         Err(e) => e,
     };
     let msg = format!("{error:#}").to_lowercase();
     assert!(
-        msg.contains("daytona") && msg.contains("e2bsnapshot"),
-        "error should explain the kind mismatch: {msg}"
+        msg.contains("daytona") && msg.contains("e2b-ref"),
+        "error should explain the format mismatch: {msg}"
     );
 
     let requests = server.received_requests().await.unwrap_or_default();
-    assert_eq!(requests.len(), 0, "kind-mismatch must not reach the API");
+    assert_eq!(requests.len(), 0, "format mismatch must not reach the API");
 }
 
 #[tokio::test]
@@ -575,7 +571,7 @@ async fn acquire_from_snapshot_bridges_docker_tar_but_fails_on_garbage() {
     let backend = backend_for_mock(&server);
 
     let payload = SnapshotPayload {
-        kind: SnapshotKind::DockerImageTar,
+        format: SnapshotFormat::DockerImageTar,
         bytes: Bytes::from_static(b"\x00not-a-real-tar"),
     };
     let request = make_request("conv-11", "sandbox-11");
