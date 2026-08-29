@@ -322,7 +322,10 @@ fn cache_local_image(
     // The shared helper captures both output streams instead of inheriting
     // them. On macOS this code runs inside the Lima bridge process, whose
     // stdout is the length-prefixed protocol.
-    super::firecracker::copy_sparse_reflink(&source, &staged).with_context(|| {
+    // The allow-listed source can live on a different filesystem from the
+    // state root. This is an intentional one-time full copy into the cache,
+    // not a latency-sensitive snapshot/template clone.
+    super::firecracker::copy_sparse_full(&source, &staged).with_context(|| {
         format!(
             "staging local Firecracker image {} into its immutable cache",
             source.display()

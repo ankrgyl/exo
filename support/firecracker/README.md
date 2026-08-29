@@ -235,11 +235,13 @@ interface at all — the control channel is vsock, so exec still works.
 Forking pauses the source VM, snapshots memory and disk, and boots clones with
 their own copy-on-write disk, network namespace, and IP; snapshot templates
 are copied out of the source VM's jail (never shared by hard link) and
-published root-owned and immutable. Every fork snapshots the source at the
-time of that call. The source resumes alongside its clones, which briefly
-share identical userspace state (PRNG pools, session tokens, boot_id), and only
-a VMGenID-capable guest kernel (5.18+) reseeds the kernel CSPRNG on restore.
-Forks are an explicit API call, never guest-triggerable.
+published root-owned and immutable. Snapshot capture and clone creation require
+reflink support in the state-root filesystem and fail rather than silently
+performing a full copy. Every fork snapshots the source at the time of that
+call. The source resumes alongside its clones, which briefly share identical
+userspace state (PRNG pools, session tokens, boot_id), and only a VMGenID-capable
+guest kernel (5.18+) reseeds the kernel CSPRNG on restore. Forks are an explicit
+API call, never guest-triggerable.
 
 ## Limitations and operator responsibilities
 
