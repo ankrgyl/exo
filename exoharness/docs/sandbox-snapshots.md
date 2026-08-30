@@ -1,13 +1,13 @@
 # Sandbox Snapshots
 
-Status: implemented for the Docker, E2B, Sprites, and Daytona sandbox
-backends; stubs in place for the others. Daytona can additionally restore a
-Docker snapshot (the cross-provider "teleport" bridge).
+Status: implemented for Docker, Daytona, E2B, Sprites, SmolVM, and
+Firecracker. Daytona can additionally restore a Docker snapshot (the
+cross-provider "teleport" bridge).
 
 ## Summary
 
-A snapshot captures the current filesystem state of a sandboxed container so
-that the sandbox can later be rewound to that state. Snapshots are taken,
+A snapshot captures backend-defined sandbox state so that the sandbox can
+later be rewound to that state. Snapshots are taken,
 listed, and replayed within an `exo` conversation. They give the user — or in
 a later iteration, an executor policy — the ability to time-travel a
 sandbox's state without forking the conversation itself.
@@ -33,9 +33,10 @@ it, and the restore path that actually consumes it.
 
 ## What this is not
 
-- **Not a process or memory checkpoint.** Only filesystem state is captured.
-  Running processes inside the container are not preserved; they are
-  re-launched fresh from the restored image.
+- **Not uniformly a process or memory checkpoint.** Image-based formats such
+  as `docker-image-tar` capture filesystem state only, while
+  `firecracker-host-ref` points to a host-local full-VM snapshot. Consumers
+  must use the semantics of the specific format.
 - **Not a conversation rewind.** The event log, message history, and prior
   tool calls are untouched. Use `conversation fork` to rewind the
   conversation itself.
@@ -52,7 +53,7 @@ ConversationHandle             ManagedSandboxHandle           ManagedSandboxBack
        │                              │                                │
   snapshot_sandbox(id) ──► running_sandboxes.get(id).snapshot() ──┐    │
        │                                                          │    │
-       ◄────────── SnapshotPayload { kind, bytes } ────────────────┘    │
+       ◄────────── SnapshotPayload { format, bytes } ──────────────┘    │
        │                                                                │
   put_bytes / put_json                                                  │
   (manifest.json + payload.bin)                                         │
@@ -66,25 +67,44 @@ payload, persists the bytes, updates sandbox metadata, and emits the
 `ManagedSandboxBackend::acquire_from_snapshot` are the backend-specific
 methods that produce and consume the bytes.
 
-### SnapshotPayload and SnapshotKind
+### SnapshotPayload and SnapshotFormat
 
 ```rust
 pub struct SnapshotPayload {
-    pub kind: SnapshotKind,
+    pub format: SnapshotFormat,
     pub bytes: Bytes,
 }
 
-pub enum SnapshotKind {
-    DockerImageTar,
-    // future: AppleContainerImageTar, etc.
+pub struct SnapshotFormat(Cow<'static, str>);
+
+impl SnapshotFormat {
+    pub const DockerImageTar: Self = Self::from_static("docker-image-tar");
+    pub const WorkspaceChunksV1: Self = Self::from_static("workspace-chunks-v1");
 }
 ```
 
-`SnapshotPayload` is opaque to the harness. The `kind` tag is the contract
+`SnapshotPayload` is opaque to the harness. The `format` identifier is the contract
 between producer and consumer: a payload produced by one backend can only be
-restored by a backend that knows how to interpret that kind. The harness
+restored by a backend that declares that format in
+`ManagedSandboxBackend::consumable_snapshot_formats`. The harness validates
+that capability before dispatch. It
 never inspects `bytes` — it just persists them and hands them back on
 restore.
+
+`SnapshotFormat` is an open string newtype, like `SandboxProvider`, so adding a
+backend or a private format does not require editing a core enum. Portable
+formats use shared names; opaque references use backend-namespaced names. A
+format name includes a version when its wire representation can evolve.
+
+| Format                 | Producer                          | Consumers                          |
+| ---------------------- | --------------------------------- | ---------------------------------- |
+| `docker-image-tar`     | Docker                            | Docker, Daytona                    |
+| `daytona-ref`          | Daytona                           | Daytona                            |
+| `e2b-ref`              | E2B                               | E2B                                |
+| `sprites-ref`          | Sprites                           | Sprites                            |
+| `smolvm-machine-pack`  | SmolVM                            | SmolVM                             |
+| `firecracker-host-ref` | Firecracker                       | Firecracker, Firecracker-over-Lima |
+| `workspace-chunks-v1`  | reserved for workspace durability | none yet                           |
 
 ## Docker pipeline
 
@@ -102,7 +122,8 @@ restore.
 
 `ManagedSandboxBackend::acquire_from_snapshot` (Docker):
 
-1. Validate that `payload.kind == DockerImageTar`.
+1. The harness validates that the selected backend declares
+   `docker-image-tar` as consumable.
 2. `docker load < payload.bytes` — load the image back into the local
    daemon; parse stdout to find the assigned image reference (the line
    `Loaded image: <ref>`).
@@ -123,7 +144,7 @@ conversation-scoped artifacts:
 ```
 agents/<agent_id>/conversations/<conversation_id>/snapshots/<snapshot_id>/
 ├── manifest.json   JSON sidecar (StoredSnapshotManifest)
-└── payload.bin     raw blob (docker save tarball for SnapshotKind::DockerImageTar)
+└── payload.bin     raw blob (docker save tarball for `docker-image-tar`)
 ```
 
 The manifest schema:
@@ -132,7 +153,7 @@ The manifest schema:
 {
   "snapshot_id": "019e5782-7c6b-72a2-b4fa-a81bf56eb37e",
   "sandbox_id": "sandbox-019e5782-2a46-7970-a5bf-62900a2233e8",
-  "kind": "docker_image_tar",
+  "format": "docker-image-tar",
   "created_at": "2026-05-24T01:03:49.867230008Z",
   "payload_size_bytes": 48498688
 }
@@ -141,6 +162,11 @@ The manifest schema:
 This mirrors the existing artifact layout (sidecar `.json` + `.bin` blob in
 a per-id directory). A future migration to chunked or streamed storage
 would touch a small surface.
+
+Existing manifests need no migration. Deserialization accepts the old `kind`
+field and both legacy enum spellings (`docker_image_tar` and
+`DockerImageTar`, with equivalent mappings for every former variant). New
+writes always use the `format` field and canonical hyphenated identifier.
 
 The snapshot's existence is also recorded in the conversation event log as
 `SandboxSnapshotted { sandbox_id, snapshot_id }`, which is what
@@ -199,17 +225,18 @@ cargo test -p exo --test teleport_docker_to_daytona -- --ignored --nocapture
 To add snapshot support for a new backend (say, Apple's `container` CLI
 when it grows a commit/save flow):
 
-1. Add a new variant to `SnapshotKind` — e.g. `AppleContainerImageTar`.
-   The tag is the contract; pick a name that names the on-disk format.
+1. Choose a stable format identifier. Reuse an existing portable format when
+   the bytes have the same contract; otherwise define a backend-local
+   `SnapshotFormat::from_static(...)` constant. No core change is required.
 2. Implement `ManagedSandboxHandle::snapshot` for that backend's handle
    type, producing the appropriate `SnapshotPayload`. The Docker version in
    `docker_snapshot_container` is the template — three CLI calls and a
    `Bytes` capture.
-3. Implement `ManagedSandboxBackend::acquire_from_snapshot` to consume the
-   same `kind`, including the safety check that the payload's `kind`
-   matches what the backend understands. The Docker version is the
-   template here too — load the bytes, get the loaded image reference,
-   swap `request.spec.image`, evict + recreate the warm container.
+3. Return every supported identifier from
+   `ManagedSandboxBackend::consumable_snapshot_formats`, then implement
+   `acquire_from_snapshot` for those formats. The Docker version is the
+   template here — load the bytes, get the loaded image reference, swap
+   `request.spec.image`, evict + recreate the warm container.
 4. Backends that genuinely can't snapshot (the local-process backend
    today, since there's no isolated filesystem) should return an explicit
    error from both methods rather than silently degrading.
@@ -253,9 +280,8 @@ recent N, or evict by total size.
 
 ### Restore semantics
 
-Restore is a fresh container booted from the restored image, not a
-checkpoint of running processes or in-memory state. Any long-running
-processes the agent had started inside the container are not preserved;
-they would need to be re-launched from the restored filesystem state.
-This is consistent with how a fresh container is brought up for any chat
-turn.
+Restore semantics belong to the format. Restoring `docker-image-tar` boots a
+fresh container from the restored image, so long-running processes are not
+preserved and must be relaunched. Opaque backend references may represent a
+different checkpoint boundary; callers can route them safely but must not
+infer their semantics from the payload bytes.

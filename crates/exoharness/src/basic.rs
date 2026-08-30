@@ -22,7 +22,7 @@ use crate::sandbox::{
     BoxSandboxTcpStream, CliContainerSandboxBackend, LocalProcessSandboxBackend,
     ManagedSandboxBackend, ManagedSandboxHandle, SANDBOX_MAIN_MOUNT_DIR, SandboxCommand,
     SandboxKey, SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxNetworkPolicy,
-    SandboxRequest, SandboxSpec, SnapshotKind, SnapshotPayload, sandbox_spec_hash,
+    SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload, sandbox_spec_hash,
 };
 #[cfg(feature = "apple-keychain")]
 use crate::secrets::AppleKeychainSecretKeyProvider;
@@ -1944,6 +1944,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .inner
             .sandbox_backend_for_provider(sandbox.provider.clone())
             .await?;
+        ensure_snapshot_format_supported(backend.as_ref(), &sandbox.provider, &payload.format)?;
         let sandbox_handle = backend
             .acquire_from_snapshot(
                 sandbox_request(self.owner, &sandbox_id, &sandbox, None),
@@ -3244,7 +3245,7 @@ async fn snapshot_sandbox_side_effect(
     let manifest = StoredSnapshotManifest {
         snapshot_id,
         sandbox_id: id.clone(),
-        kind: payload.kind,
+        format: payload.format,
         created_at: Utc::now(),
         payload_size_bytes: payload.bytes.len() as u64,
     };
@@ -3298,12 +3299,17 @@ async fn start_sandbox_side_effect(
     // Optional provider override: restore under a different backend (e.g.
     // teleport a Docker snapshot up to Daytona). Set before routing so the
     // restore targets the new backend and the new provider is persisted;
-    // unsupported providers / snapshot kinds error in the calls below.
+    // unsupported providers / snapshot formats error before dispatch.
     let previous_provider = sandbox.provider.clone();
     if let Some(provider) = request.provider {
         sandbox.provider = provider;
     }
     let cross_provider = sandbox.provider != previous_provider;
+    let backend = harness
+        .inner
+        .sandbox_backend_for_provider(sandbox.provider.clone())
+        .await?;
+    ensure_snapshot_format_supported(backend.as_ref(), &sandbox.provider, &payload.format)?;
 
     // Two orders, chosen by whether the restore changes providers:
     //   - Cross-provider (teleport): make-before-break. Boot the new sandbox
@@ -3315,10 +3321,7 @@ async fn start_sandbox_side_effect(
     //     handle after the new one exists would tear down the new container's
     //     warm-cache entry (both handles share the same SandboxKey).
     let sandbox_handle = if cross_provider {
-        let sandbox_handle = harness
-            .inner
-            .sandbox_backend_for_provider(sandbox.provider.clone())
-            .await?
+        let sandbox_handle = backend
             .acquire_from_snapshot(sandbox_request(owner, &request.id, &sandbox, None), payload)
             .await?;
         let previous_handle = harness
@@ -3350,10 +3353,7 @@ async fn start_sandbox_side_effect(
         if let Some(previous_handle) = previous_handle {
             previous_handle.stop().await?;
         }
-        harness
-            .inner
-            .sandbox_backend_for_provider(sandbox.provider.clone())
-            .await?
+        backend
             .acquire_from_snapshot(sandbox_request(owner, &request.id, &sandbox, None), payload)
             .await?
     };
@@ -3417,9 +3417,33 @@ async fn load_snapshot_payload(
     let payload_bytes =
         payload_result.with_context(|| format!("loading snapshot payload for {snapshot_id}"))?;
     Ok(SnapshotPayload {
-        kind: manifest.kind,
+        format: manifest.format,
         bytes: Bytes::from(payload_bytes),
     })
+}
+
+fn ensure_snapshot_format_supported(
+    backend: &dyn ManagedSandboxBackend,
+    provider: &SandboxProvider,
+    format: &SnapshotFormat,
+) -> Result<()> {
+    let supported = backend.consumable_snapshot_formats();
+    if supported.contains(format) {
+        return Ok(());
+    }
+    let supported = supported
+        .iter()
+        .map(SnapshotFormat::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let supported = if supported.is_empty() {
+        "none".to_string()
+    } else {
+        supported
+    };
+    bail!(
+        "sandbox provider {provider} cannot restore snapshot format {format}; supported formats: {supported}"
+    )
 }
 
 async fn load_stored_sandbox(
@@ -4346,14 +4370,15 @@ async fn wait_for_sandbox_process_terminal_status(
 /// Sidecar JSON describing a snapshot payload.
 ///
 /// Lives at `{conversation_dir}/snapshots/{snapshot_id}/manifest.json` alongside
-/// the payload blob at `payload.bin`. The `kind` controls how the payload is
-/// interpreted on restore — only a backend that recognises that kind can
+/// the payload blob at `payload.bin`. The `format` controls how the payload is
+/// interpreted on restore — only a backend that declares that format can
 /// reconstruct a sandbox from it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredSnapshotManifest {
     snapshot_id: SnapshotId,
     sandbox_id: SandboxId,
-    kind: SnapshotKind,
+    #[serde(alias = "kind")]
+    format: SnapshotFormat,
     created_at: DateTime<Utc>,
     payload_size_bytes: u64,
 }
@@ -4783,4 +4808,46 @@ fn build_secret_cipher(
         SecretBackendChoice::Static(key) => Arc::new(StaticSecretKeyProvider::new(key)),
     };
     Ok(SecretCipher::new(provider))
+}
+
+#[cfg(test)]
+mod snapshot_manifest_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_format_validation_uses_backend_capabilities() {
+        let docker = CliContainerSandboxBackend::docker();
+        ensure_snapshot_format_supported(
+            &docker,
+            &SandboxProvider::Docker,
+            &SnapshotFormat::DockerImageTar,
+        )
+        .expect("Docker should consume docker-image-tar");
+
+        let error = ensure_snapshot_format_supported(
+            &docker,
+            &SandboxProvider::Docker,
+            &SnapshotFormat::WorkspaceChunksV1,
+        )
+        .expect_err("Docker should reject undeclared formats");
+        assert!(error.to_string().contains("workspace-chunks-v1"));
+    }
+
+    #[test]
+    fn stored_snapshot_manifest_reads_legacy_kind_field_and_value() {
+        let snapshot_id = Uuid7::now();
+        let manifest: StoredSnapshotManifest = serde_json::from_value(serde_json::json!({
+            "snapshot_id": snapshot_id,
+            "sandbox_id": "sandbox-legacy",
+            "kind": "docker_image_tar",
+            "created_at": "2026-08-29T00:00:00Z",
+            "payload_size_bytes": 42,
+        }))
+        .expect("deserialize legacy snapshot manifest");
+        assert_eq!(manifest.format, SnapshotFormat::DockerImageTar);
+
+        let rewritten = serde_json::to_value(manifest).expect("serialize snapshot manifest");
+        assert_eq!(rewritten.get("format").unwrap(), "docker-image-tar");
+        assert!(rewritten.get("kind").is_none());
+    }
 }

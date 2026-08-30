@@ -8,7 +8,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use exoharness::{
     ManagedSandboxBackend, SandboxKey, SandboxLifecycleConfig, SandboxMount, SandboxMountAccess,
-    SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotKind, SnapshotPayload,
+    SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
     SpritesConfig, SpritesSandboxBackend,
 };
 use serde_json::{Value, json};
@@ -386,7 +386,7 @@ async fn snapshot_returns_sprites_snapshot_payload() {
     let handle = backend.acquire(request).await.unwrap();
     let payload = handle.snapshot().await.expect("snapshot");
 
-    assert!(matches!(payload.kind, SnapshotKind::SpritesSnapshot));
+    assert_eq!(payload.format, SnapshotFormat::SpritesRef);
     let manifest: Value = serde_json::from_slice(&payload.bytes).unwrap();
     assert_eq!(
         manifest.get("checkpoint_id").and_then(Value::as_str),
@@ -426,7 +426,7 @@ async fn acquire_from_snapshot_restores_checkpoint() {
         "sprite_name": name,
     });
     let payload = SnapshotPayload {
-        kind: SnapshotKind::SpritesSnapshot,
+        format: SnapshotFormat::SpritesRef,
         bytes: Bytes::from(serde_json::to_vec(&manifest).unwrap()),
     };
 
@@ -437,12 +437,12 @@ async fn acquire_from_snapshot_restores_checkpoint() {
 }
 
 #[tokio::test]
-async fn acquire_from_snapshot_rejects_wrong_kind() {
+async fn acquire_from_snapshot_rejects_wrong_format() {
     let server = MockServer::start().await;
     let backend = backend_for_mock(&server);
 
     let payload = SnapshotPayload {
-        kind: SnapshotKind::DockerImageTar,
+        format: SnapshotFormat::DockerImageTar,
         bytes: Bytes::from_static(b"not-a-tar"),
     };
 
@@ -450,12 +450,12 @@ async fn acquire_from_snapshot_rejects_wrong_kind() {
         .acquire_from_snapshot(make_request("conv-9", "sandbox-9"), payload)
         .await
     {
-        Ok(_) => panic!("wrong snapshot kind should fail"),
+        Ok(_) => panic!("wrong snapshot format should fail"),
         Err(error) => error,
     };
     let msg = format!("{error:#}").to_lowercase();
     assert!(
-        msg.contains("sprites") || msg.contains("kind"),
+        msg.contains("sprites") || msg.contains("format"),
         "unexpected: {msg}"
     );
 }

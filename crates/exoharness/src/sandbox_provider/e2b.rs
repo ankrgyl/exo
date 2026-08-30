@@ -3,7 +3,7 @@
 //! Uses E2B's platform REST API (`api.e2b.app`) for lifecycle and the per-sandbox
 //! envd Connect API for command execution. Cross-process resume uses sandbox
 //! `metadata` (same keys as Docker/Daytona labels). Snapshots are bytes-by-reference
-//! via [`SnapshotKind::E2bSnapshot`] manifests pointing at an E2B snapshot template id.
+//! via [`SnapshotFormat::E2bRef`] manifests pointing at an E2B snapshot template id.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::SandboxAttachment;
 use crate::sandbox::{
     DEFAULT_SANDBOX_IMAGE, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
-    SandboxCommandOutput, SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotKind,
+    SandboxCommandOutput, SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat,
     SnapshotPayload, WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
 };
 
@@ -40,6 +40,7 @@ const CONNECT_FLAG_COMPRESSED: u8 = 0x01;
 /// Connect envelope flag: final message carrying stream status / errors.
 const CONNECT_FLAG_END_STREAM: u8 = 0x02;
 const CONNECT_MAX_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
+static CONSUMABLE_SNAPSHOT_FORMATS: [SnapshotFormat; 1] = [SnapshotFormat::E2bRef];
 
 #[derive(Debug, Clone)]
 pub struct E2bConfig {
@@ -53,7 +54,7 @@ pub struct E2bConfig {
     pub secure: bool,
 }
 
-/// JSON persisted for [`SnapshotKind::E2bSnapshot`]. Filesystem state lives in E2B;
+/// JSON persisted for [`SnapshotFormat::E2bRef`]. Filesystem state lives in E2B;
 /// we only store the snapshot template id returned by `POST /sandboxes/{id}/snapshots`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct E2bSnapshotManifest {
@@ -222,6 +223,10 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
         false
     }
 
+    fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
+        &CONSUMABLE_SNAPSHOT_FORMATS
+    }
+
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_host_mounts(&request)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
@@ -275,10 +280,11 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_host_mounts(&request)?;
-        if !matches!(payload.kind, SnapshotKind::E2bSnapshot) {
+        if payload.format != SnapshotFormat::E2bRef {
             bail!(
-                "E2B sandbox backend can only restore from SnapshotKind::E2bSnapshot, got {:?}",
-                payload.kind
+                "E2B sandbox backend can only restore from {}, got {}",
+                SnapshotFormat::E2bRef,
+                payload.format
             );
         }
         let manifest: E2bSnapshotManifest =
@@ -1053,7 +1059,7 @@ async fn save_snapshot_via_backend(
     };
     let bytes = serde_json::to_vec(&manifest).context("serializing E2bSnapshot manifest")?;
     Ok(SnapshotPayload {
-        kind: SnapshotKind::E2bSnapshot,
+        format: SnapshotFormat::E2bRef,
         bytes: Bytes::from(bytes),
     })
 }

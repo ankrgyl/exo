@@ -14,7 +14,7 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 
 use crate::{
     FirecrackerConfig, FirecrackerSandboxBackend, ManagedSandboxBackend, ManagedSandboxHandle,
-    SandboxCommand, SandboxCommandOutput, SandboxProcessParts, SandboxRequest, SnapshotKind,
+    SandboxCommand, SandboxCommandOutput, SandboxProcessParts, SandboxRequest, SnapshotFormat,
     SnapshotPayload,
 };
 
@@ -57,7 +57,7 @@ pub enum FirecrackerBridgeRequest {
     AcquireFromSnapshot {
         config: FirecrackerConfig,
         request: SandboxRequest,
-        kind: SnapshotKind,
+        format: SnapshotFormat,
         payload: String,
     },
     Snapshot {
@@ -88,7 +88,7 @@ pub enum FirecrackerBridgeResponse {
         output: SandboxCommandOutput,
     },
     Snapshot {
-        kind: SnapshotKind,
+        format: SnapshotFormat,
         payload: String,
     },
     Unit,
@@ -336,7 +336,7 @@ async fn handle_request(
         FirecrackerBridgeRequest::AcquireFromSnapshot {
             config,
             request,
-            kind,
+            format,
             payload,
         } => {
             let payload = BASE64
@@ -348,7 +348,7 @@ async fn handle_request(
                 .acquire_from_snapshot(
                     request,
                     SnapshotPayload {
-                        kind,
+                        format,
                         bytes: payload.into(),
                     },
                 )
@@ -362,7 +362,7 @@ async fn handle_request(
         FirecrackerBridgeRequest::Snapshot { config, request } => {
             let snapshot = backends.acquire(config, request).await?.snapshot().await?;
             Ok(FirecrackerBridgeResponse::Snapshot {
-                kind: snapshot.kind,
+                format: snapshot.format,
                 payload: BASE64.encode(snapshot.bytes),
             })
         }

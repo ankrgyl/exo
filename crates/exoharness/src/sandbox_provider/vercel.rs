@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use crate::SandboxAttachment;
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput,
-    SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotPayload, WARM_SANDBOX_KEY_LABEL,
-    WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
+    SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
+    WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
 };
 use crate::sandbox_provider::{process_bridge, shell_quote};
 
@@ -153,6 +153,10 @@ impl VercelSandboxBackend {
 impl ManagedSandboxBackend for VercelSandboxBackend {
     fn is_local(&self) -> bool {
         false
+    }
+
+    fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
+        &[]
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::ffi::OsString;
 use std::fmt;
@@ -112,41 +113,92 @@ pub struct SandboxCommandOutput {
 }
 
 /// Opaque blob produced by `ManagedSandboxHandle::snapshot` and consumed by
-/// `ManagedSandboxBackend::acquire_from_snapshot`. The `kind` tag is the
-/// contract: a snapshot produced by one backend can only be restored by a
-/// backend that knows how to interpret that kind.
+/// `ManagedSandboxBackend::acquire_from_snapshot`. The `format` identifier is
+/// the contract: a snapshot produced by one backend can only be restored by a
+/// backend that declares support for that format.
 #[derive(Debug, Clone)]
 pub struct SnapshotPayload {
-    pub kind: SnapshotKind,
+    pub format: SnapshotFormat,
     pub bytes: Bytes,
 }
 
-/// Tag identifying the on-disk format of a snapshot payload. Backends both
-/// produce and consume a specific kind; the conversation layer just hands the
-/// bytes back to the same backend type that produced them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SnapshotKind {
-    /// `docker save` output: a tar of OCI image layers + manifest, loadable
-    /// with `docker load`.
-    DockerImageTar,
-    /// JSON manifest pointing at a named snapshot in Daytona's registry; the
-    /// filesystem bytes live in Daytona, not in the payload.
-    DaytonaSnapshot,
-    /// Reference to an E2B snapshot template id. Payload bytes are a small JSON
-    /// manifest; restoring is `POST /sandboxes { templateID: <snapshot_id> }`.
-    E2bSnapshot,
-    /// Reference to a Sprites checkpoint id on a named sprite. Payload bytes are
-    /// a small JSON manifest; restoring is `POST .../checkpoints/{id}/restore`.
-    SpritesSnapshot,
-    /// Reference to a `.smolmachine` pack on the local disk. Payload bytes are a
-    /// small JSON manifest; restoring is `smolvm machine create --from <path>`.
-    /// A pack captures a whole stateful VM, so it is far too large to inline.
-    SmolMachinePack,
-    /// Reference to an immutable Firecracker state/RAM/disk bundle in the
-    /// backend's private state root. Payload bytes are a small JSON manifest;
-    /// the multi-gigabyte snapshot remains local to that Firecracker host.
-    FirecrackerSnapshot,
+/// Open identifier for the on-disk format of a snapshot payload.
+///
+/// Portable formats use shared names that any backend can declare support for.
+/// Backend-private references use namespaced names. Format evolution is
+/// represented by a new, versioned identifier rather than a core enum variant.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct SnapshotFormat(Cow<'static, str>);
+
+#[allow(non_upper_case_globals)]
+impl SnapshotFormat {
+    /// `docker save` output: a tar of OCI image layers + manifest.
+    pub const DockerImageTar: Self = Self::from_static("docker-image-tar");
+    /// Portable content-addressed workspace chunks plus a manifest.
+    pub const WorkspaceChunksV1: Self = Self::from_static("workspace-chunks-v1");
+    /// Reference to a named snapshot in Daytona's registry.
+    pub const DaytonaRef: Self = Self::from_static("daytona-ref");
+    /// Reference to an E2B snapshot template id.
+    pub const E2bRef: Self = Self::from_static("e2b-ref");
+    /// Reference to a Sprites checkpoint id.
+    pub const SpritesRef: Self = Self::from_static("sprites-ref");
+    /// Reference to a `.smolmachine` pack on the local disk.
+    pub const SmolvmMachinePack: Self = Self::from_static("smolvm-machine-pack");
+    /// Reference to an immutable bundle in a Firecracker host's private root.
+    pub const FirecrackerHostRef: Self = Self::from_static("firecracker-host-ref");
+
+    pub const fn from_static(format: &'static str) -> Self {
+        Self(Cow::Borrowed(format))
+    }
+
+    pub fn new(format: impl Into<Cow<'static, str>>) -> Self {
+        Self(format.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+
+    fn from_serialized(format: String) -> Self {
+        match format.as_str() {
+            "docker-image-tar" | "DockerImageTar" | "docker_image_tar" => Self::DockerImageTar,
+            "workspace-chunks-v1" => Self::WorkspaceChunksV1,
+            "daytona-ref" | "DaytonaSnapshot" | "daytona_snapshot" => Self::DaytonaRef,
+            "e2b-ref" | "E2bSnapshot" | "e2b_snapshot" => Self::E2bRef,
+            "sprites-ref" | "SpritesSnapshot" | "sprites_snapshot" => Self::SpritesRef,
+            "smolvm-machine-pack" | "SmolMachinePack" | "smol_machine_pack" => {
+                Self::SmolvmMachinePack
+            }
+            "firecracker-host-ref" | "FirecrackerSnapshot" | "firecracker_snapshot" => {
+                Self::FirecrackerHostRef
+            }
+            _ => Self(Cow::Owned(format)),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SnapshotFormat {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::from_serialized)
+    }
+}
+
+impl fmt::Display for SnapshotFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SnapshotFormat {
+    type Err = std::convert::Infallible;
+
+    fn from_str(format: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(Self(Cow::Owned(format.to_string())))
+    }
 }
 
 #[async_trait]
@@ -198,6 +250,9 @@ pub type BoxSandboxTcpStream = Pin<Box<dyn SandboxTcpStream>>;
 pub trait ManagedSandboxBackend: Send + Sync {
     fn is_local(&self) -> bool;
 
+    /// Formats this backend can consume in `acquire_from_snapshot`.
+    fn consumable_snapshot_formats(&self) -> &[SnapshotFormat];
+
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>>;
     async fn attach(
         &self,
@@ -209,7 +264,7 @@ pub trait ManagedSandboxBackend: Send + Sync {
     /// The request is honoured for mounts, network, lifecycle, etc., but the
     /// container's filesystem is sourced from the payload instead of
     /// `request.spec.image`. Returns an error if this backend can't restore
-    /// the supplied `payload.kind`.
+    /// the supplied `payload.format`.
     async fn acquire_from_snapshot(
         &self,
         request: SandboxRequest,
@@ -355,6 +410,8 @@ pub struct CliContainerSandboxBackend {
     network_created: Mutex<bool>,
     warm_sandboxes: Arc<Mutex<HashMap<SandboxKey, WarmSandboxEntry>>>,
 }
+
+static DOCKER_CONSUMABLE_SNAPSHOT_FORMATS: [SnapshotFormat; 1] = [SnapshotFormat::DockerImageTar];
 
 impl CliContainerSandboxBackend {
     pub fn apple_container() -> Self {
@@ -533,6 +590,13 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
         true
     }
 
+    fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
+        match self.cli {
+            ContainerCliFlavor::Docker => &DOCKER_CONSUMABLE_SNAPSHOT_FORMATS,
+            ContainerCliFlavor::AppleContainer => &[],
+        }
+    }
+
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let request = self.prepare_request(request).await?;
 
@@ -626,30 +690,8 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
         if request.lifecycle.idle_ttl.is_none() {
             bail!("restore-from-snapshot requires a warm sandbox lifecycle (idle_ttl must be set)");
         }
-        match (self.cli, payload.kind) {
-            (ContainerCliFlavor::Docker, SnapshotKind::DockerImageTar) => {}
-            (ContainerCliFlavor::AppleContainer, _) => bail!(
-                "restore-from-snapshot is not yet implemented for the apple-container backend"
-            ),
-            (_, SnapshotKind::DaytonaSnapshot) => {
-                bail!("restoring a Daytona snapshot on a container backend is not implemented yet")
-            }
-            (_, SnapshotKind::E2bSnapshot) => bail!(
-                "E2bSnapshot payloads can only be restored by the E2B sandbox provider; \
-                 select provider e2b to rewind this snapshot"
-            ),
-            (_, SnapshotKind::SpritesSnapshot) => bail!(
-                "SpritesSnapshot payloads can only be restored by the Sprites sandbox provider; \
-                 select provider sprites to rewind this snapshot"
-            ),
-            (_, SnapshotKind::SmolMachinePack) => bail!(
-                "SmolMachinePack payloads can only be restored by the smolvm sandbox provider; \
-                 select provider smolvm to rewind this snapshot"
-            ),
-            (_, SnapshotKind::FirecrackerSnapshot) => bail!(
-                "FirecrackerSnapshot payloads can only be restored by the Firecracker sandbox provider; \
-                 select provider firecracker to rewind this snapshot"
-            ),
+        if self.cli == ContainerCliFlavor::AppleContainer {
+            bail!("restore-from-snapshot is not yet implemented for the apple-container backend");
         }
 
         let image_tag = docker_load_image(&self.container_bin, &payload.bytes).await?;
@@ -888,8 +930,7 @@ impl ManagedSandboxHandle for WarmSandboxHandle {
             // `container commit`-style flow on its roadmap but neither is in
             // the released versions we target today. When it lands, the path
             // will mirror docker_snapshot_container: produce a single tarball
-            // and tag it with a new SnapshotKind variant (e.g.
-            // AppleContainerImageTar). Until then, fail explicitly so callers
+            // and tag it with a new SnapshotFormat. Until then, fail explicitly so callers
             // know to choose Docker for snapshot-using flows.
             ContainerCliFlavor::AppleContainer => bail!(
                 "snapshot is not yet implemented for the apple-container backend; \
@@ -912,6 +953,10 @@ impl LocalProcessSandboxBackend {
 impl ManagedSandboxBackend for LocalProcessSandboxBackend {
     fn is_local(&self) -> bool {
         true
+    }
+
+    fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
+        &[]
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
@@ -2124,7 +2169,7 @@ async fn docker_snapshot_container(
     }
 
     Ok(SnapshotPayload {
-        kind: SnapshotKind::DockerImageTar,
+        format: SnapshotFormat::DockerImageTar,
         bytes,
     })
 }
@@ -2186,6 +2231,42 @@ async fn docker_load_image(container_bin: &Path, payload: &Bytes) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_format_reads_legacy_names_and_writes_canonical_names() {
+        let cases = [
+            ("DockerImageTar", SnapshotFormat::DockerImageTar),
+            ("docker_image_tar", SnapshotFormat::DockerImageTar),
+            ("DaytonaSnapshot", SnapshotFormat::DaytonaRef),
+            ("daytona_snapshot", SnapshotFormat::DaytonaRef),
+            ("E2bSnapshot", SnapshotFormat::E2bRef),
+            ("e2b_snapshot", SnapshotFormat::E2bRef),
+            ("SpritesSnapshot", SnapshotFormat::SpritesRef),
+            ("sprites_snapshot", SnapshotFormat::SpritesRef),
+            ("SmolMachinePack", SnapshotFormat::SmolvmMachinePack),
+            ("smol_machine_pack", SnapshotFormat::SmolvmMachinePack),
+            ("FirecrackerSnapshot", SnapshotFormat::FirecrackerHostRef),
+            ("firecracker_snapshot", SnapshotFormat::FirecrackerHostRef),
+        ];
+
+        for (legacy, expected) in cases {
+            let decoded: SnapshotFormat =
+                serde_json::from_value(serde_json::Value::String(legacy.to_string()))
+                    .expect("deserialize legacy snapshot format");
+            assert_eq!(decoded, expected);
+            assert_eq!(serde_json::to_value(&decoded).unwrap(), expected.as_str());
+        }
+    }
+
+    #[test]
+    fn snapshot_format_preserves_unknown_open_identifiers() {
+        let decoded: SnapshotFormat = serde_json::from_str(r#""vendor-format-v3""#).unwrap();
+        assert_eq!(decoded.as_str(), "vendor-format-v3");
+        assert_eq!(
+            serde_json::to_string(&decoded).unwrap(),
+            r#""vendor-format-v3""#
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
