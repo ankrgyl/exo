@@ -333,10 +333,62 @@ struct WarmSandboxEntry {
 
 #[derive(Debug, Deserialize)]
 struct ContainerListItem {
-    status: Option<String>,
+    status: Option<AppleContainerListStatus>,
     #[serde(rename = "startedDate")]
     started_date: Option<f64>,
     configuration: ContainerListConfiguration,
+}
+
+impl ContainerListItem {
+    fn state(&self) -> Option<&str> {
+        self.status.as_ref().map(AppleContainerListStatus::state)
+    }
+
+    fn apple_absolute_started_date(&self) -> Result<Option<f64>> {
+        if self.started_date.is_some() {
+            return Ok(self.started_date);
+        }
+        let Some(started_date) = self
+            .status
+            .as_ref()
+            .and_then(AppleContainerListStatus::started_date)
+        else {
+            return Ok(None);
+        };
+        let unix_timestamp = DateTime::parse_from_rfc3339(started_date)
+            .with_context(|| format!("invalid Apple container startedDate {started_date:?}"))?
+            .timestamp_millis() as f64
+            / 1_000.0;
+        Ok(Some(
+            unix_timestamp - APPLE_ABSOLUTE_TIME_UNIX_OFFSET_SECONDS,
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AppleContainerListStatus {
+    Legacy(String),
+    Current {
+        state: String,
+        #[serde(rename = "startedDate")]
+        started_date: Option<String>,
+    },
+}
+
+impl AppleContainerListStatus {
+    fn state(&self) -> &str {
+        match self {
+            Self::Legacy(state) | Self::Current { state, .. } => state,
+        }
+    }
+
+    fn started_date(&self) -> Option<&str> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Current { started_date, .. } => started_date.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1372,11 +1424,7 @@ async fn find_running_apple_container_warm_sandbox(
     let spec_hash = sandbox_spec_hash(&request.spec);
     let containers: Vec<ContainerListItem> = serde_json::from_slice(&output.stdout)?;
     Ok(containers.into_iter().find_map(|container| {
-        if !container
-            .status
-            .as_deref()
-            .is_some_and(is_running_container_status)
-        {
+        if !container.state().is_some_and(is_running_container_status) {
             return None;
         }
         let labels = &container.configuration.labels;
@@ -1862,14 +1910,10 @@ async fn reap_orphaned_apple_warm_sandboxes(container_bin: &Path) -> Result<()> 
         {
             continue;
         }
-        if !container
-            .status
-            .as_deref()
-            .is_some_and(is_running_container_status)
-        {
+        if !container.state().is_some_and(is_running_container_status) {
             continue;
         }
-        let Some(started_date) = container.started_date else {
+        let Some(started_date) = container.apple_absolute_started_date()? else {
             continue;
         };
         if now - started_date < ORPHANED_WARM_SANDBOX_MIN_AGE.as_secs_f64() {
@@ -2233,6 +2277,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn apple_container_list_item_reads_current_status_shape() {
+        let container: ContainerListItem = serde_json::from_value(serde_json::json!({
+            "configuration": {
+                "id": "apple-container-id",
+                "labels": {}
+            },
+            "status": {
+                "state": "running",
+                "startedDate": "2001-01-01T00:00:00Z"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(container.state(), Some("running"));
+        assert_eq!(container.apple_absolute_started_date().unwrap(), Some(0.0));
+    }
+
+    #[test]
+    fn apple_container_list_item_reads_legacy_status_shape() {
+        let container: ContainerListItem = serde_json::from_value(serde_json::json!({
+            "configuration": {
+                "id": "apple-container-id",
+                "labels": {}
+            },
+            "status": "running",
+            "startedDate": 12.5
+        }))
+        .unwrap();
+
+        assert_eq!(container.state(), Some("running"));
+        assert_eq!(container.apple_absolute_started_date().unwrap(), Some(12.5));
+    }
+
+    #[test]
+    fn apple_container_list_item_rejects_invalid_current_started_date() {
+        let container: ContainerListItem = serde_json::from_value(serde_json::json!({
+            "configuration": {
+                "id": "apple-container-id",
+                "labels": {}
+            },
+            "status": {
+                "state": "running",
+                "startedDate": "invalid"
+            }
+        }))
+        .unwrap();
+
+        assert!(container.apple_absolute_started_date().is_err());
+    }
+
+    #[test]
     fn snapshot_format_reads_legacy_names_and_writes_canonical_names() {
         let cases = [
             ("DockerImageTar", SnapshotFormat::DockerImageTar),
@@ -2430,7 +2525,7 @@ done
 printf '%s\n' '---' >> '{}'
 case "$1" in
   list)
-    printf '%s\n' '[{{"configuration":{{"id":"apple-container-id","labels":{{"{}":"conversation:conversation:sandbox","{}":"999999"}}}},"status":"running","startedDate":0}}]'
+    printf '%s\n' '[{{"configuration":{{"id":"apple-container-id","labels":{{"{}":"conversation:conversation:sandbox","{}":"999999"}}}},"status":{{"state":"running","startedDate":"2001-01-01T00:00:00Z"}}}}]'
     ;;
   kill)
     ;;
