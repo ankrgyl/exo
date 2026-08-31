@@ -287,6 +287,7 @@ impl FirecrackerArgs {
             jailer_uid_base: self.jailer_uid_base,
             dns_server: self.dns_server,
             allowed_egress_cidrs,
+            network_device_policy: Default::default(),
             allowed_local_images,
             allowed_registries: self.allowed_registries.clone(),
             network_bytes_per_second: self.network_bytes_per_second,
