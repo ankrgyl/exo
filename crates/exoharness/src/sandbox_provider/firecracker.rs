@@ -2001,28 +2001,31 @@ enum SparseCopyMode {
 }
 
 impl SparseCopyMode {
-    fn cp_arg(self) -> &'static str {
+    fn cp_args(self) -> [&'static str; 2] {
         match self {
-            Self::Full => "--reflink=never",
-            Self::ReflinkRequired => "--reflink=always",
+            Self::Full => ["--sparse=always", "--reflink=never"],
+            Self::ReflinkRequired => ["--sparse=auto", "--reflink=always"],
         }
     }
 }
 
 fn copy_sparse_with_mode(source: &Path, destination: &Path, mode: SparseCopyMode) -> Result<()> {
-    let reflink_mode = mode.cp_arg();
+    let copy_mode = mode.cp_args();
     let executable = trusted_host_command("cp")?;
     let output = Command::new(executable)
-        .args(["--sparse=always", reflink_mode, "--"])
+        .args(copy_mode)
+        .arg("--")
         .arg(source)
         .arg(destination)
         .output()
         .with_context(|| format!("copying {} to {}", source.display(), destination.display()))?;
     if !output.status.success() {
         bail!(
-            "copying {} to {} with {reflink_mode} failed with {}: {}",
+            "copying {} to {} with {} {} failed with {}: {}",
             source.display(),
             destination.display(),
+            copy_mode[0],
+            copy_mode[1],
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         );
