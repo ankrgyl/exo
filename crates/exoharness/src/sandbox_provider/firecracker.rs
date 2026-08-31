@@ -142,6 +142,24 @@ static ONE_SHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Controls whether Firecracker attaches a network device. The sandbox's
+/// [`SandboxNetworkPolicy`] independently controls what egress the firewall permits.
+pub enum FirecrackerNetworkDevicePolicy {
+    /// Attach a network device only when the sandbox requests enabled networking.
+    EnabledSandboxes,
+    /// Attach a network device to every sandbox, including network-disabled sandboxes that
+    /// need host-to-guest connectivity. Their configured egress restrictions still apply.
+    AllSandboxes,
+}
+
+impl Default for FirecrackerNetworkDevicePolicy {
+    fn default() -> Self {
+        Self::EnabledSandboxes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FirecrackerConfig {
     pub firecracker_bin: PathBuf,
     pub jailer_bin: PathBuf,
@@ -155,6 +173,8 @@ pub struct FirecrackerConfig {
     pub jailer_uid_base: u32,
     pub dns_server: Ipv4Addr,
     pub allowed_egress_cidrs: Vec<Ipv4Net>,
+    #[serde(default)]
+    pub network_device_policy: FirecrackerNetworkDevicePolicy,
     pub allowed_local_images: Vec<PathBuf>,
     // Registry entry points the root-run materializer may contact; empty =
     // unrestricted. Permitted registries are trusted for process availability
@@ -185,6 +205,7 @@ impl Default for FirecrackerConfig {
             jailer_uid_base: DEFAULT_JAILER_UID_BASE,
             dns_server: Ipv4Addr::new(1, 1, 1, 1),
             allowed_egress_cidrs: Vec::new(),
+            network_device_policy: FirecrackerNetworkDevicePolicy::default(),
             allowed_local_images: vec![PathBuf::from(super::default_firecracker_image())],
             allowed_registries: Vec::new(),
             network_bytes_per_second: DEFAULT_NETWORK_BYTES_PER_SECOND,
@@ -216,6 +237,8 @@ struct FirecrackerRuntimeFingerprint {
     initramfs_sha256: String,
     vcpu_count: u8,
     memory_mib: u32,
+    #[serde(default)]
+    network_device_policy: FirecrackerNetworkDevicePolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1510,7 +1533,7 @@ impl Shared {
         let machine_id = machine_id.to_string();
         let spec_hash = spec_hash.to_string();
         let resolved_image = request.spec.image.clone();
-        let network_enabled = request.spec.network == SandboxNetworkPolicy::Enabled;
+        let network_enabled = network_device_enabled(&self.config, request.spec.network);
         let workspace_id = if snapshot.is_none() {
             request
                 .spec
@@ -1578,7 +1601,12 @@ impl Shared {
             let network = record.network();
             let result = (|| {
                 if record.network_enabled {
-                    prepare_network(&config, &network, jailer_uid(&config, &record)?)?;
+                    prepare_network(
+                        &config,
+                        &network,
+                        request.spec.network,
+                        jailer_uid(&config, &record)?,
+                    )?;
                 }
                 prepare_and_launch_blocking(&config, &request, &record)
             })();
@@ -1833,6 +1861,7 @@ fn firecracker_runtime_fingerprint(
         initramfs_sha256: super::firecracker_image::sha256_hex_of_file(&config.initramfs)?,
         vcpu_count: config.vcpu_count,
         memory_mib: config.memory_mib,
+        network_device_policy: config.network_device_policy.clone(),
     })
 }
 
@@ -2121,6 +2150,21 @@ fn hash_runtime_fingerprint(hasher: &mut Sha256, runtime: &FirecrackerRuntimeFin
     hash_snapshot_string(hasher, &runtime.initramfs_sha256);
     hasher.update(runtime.vcpu_count.to_le_bytes());
     hasher.update(runtime.memory_mib.to_le_bytes());
+    hash_snapshot_string(
+        hasher,
+        match runtime.network_device_policy {
+            FirecrackerNetworkDevicePolicy::EnabledSandboxes => "enabled_sandboxes",
+            FirecrackerNetworkDevicePolicy::AllSandboxes => "all_sandboxes",
+        },
+    );
+}
+
+fn network_device_enabled(
+    config: &FirecrackerConfig,
+    sandbox_policy: SandboxNetworkPolicy,
+) -> bool {
+    sandbox_policy == SandboxNetworkPolicy::Enabled
+        || config.network_device_policy == FirecrackerNetworkDevicePolicy::AllSandboxes
 }
 
 fn machine_from_record(config: &FirecrackerConfig, record: MachineRecord) -> Machine {
@@ -2462,6 +2506,7 @@ fn ipv4_add(address: Ipv4Addr, offset: u32) -> Ipv4Addr {
 fn prepare_network(
     config: &FirecrackerConfig,
     network: &NetworkConfig,
+    policy: SandboxNetworkPolicy,
     jailer_uid: u32,
 ) -> Result<()> {
     // Firecracker intentionally delegates TAP routing and firewalling to the host.
@@ -2602,7 +2647,7 @@ fn prepare_network(
         ],
     )?;
 
-    install_network_firewall(config, network)?;
+    install_network_firewall(config, network, policy)?;
     // Docker and similar host services commonly leave the compatibility
     // FORWARD chain at DROP. An accept verdict in our nftables base chain does
     // not override a later base-chain drop, so admit only this VM's veth there.
@@ -2642,7 +2687,20 @@ fn prepare_network(
     Ok(())
 }
 
-fn install_network_firewall(config: &FirecrackerConfig, network: &NetworkConfig) -> Result<()> {
+fn install_network_firewall(
+    config: &FirecrackerConfig,
+    network: &NetworkConfig,
+    policy: SandboxNetworkPolicy,
+) -> Result<()> {
+    let rules = network_firewall_rules(config, network, policy)?;
+    run_checked_input("nft", &["-f", "-"], rules.as_bytes())
+}
+
+fn network_firewall_rules(
+    config: &FirecrackerConfig,
+    network: &NetworkConfig,
+    policy: SandboxNetworkPolicy,
+) -> Result<String> {
     let mut rules = String::new();
     let table = &network.nft_table;
     let interface = &network.host_veth;
@@ -2695,9 +2753,14 @@ fn install_network_firewall(config: &FirecrackerConfig, network: &NetworkConfig)
         "add rule inet {table} forward iifname {interface} ip daddr {{ {} }} counter reject",
         BLOCKED_EGRESS_CIDRS.join(", ")
     )?;
+    let final_egress_verdict = if policy == SandboxNetworkPolicy::Enabled {
+        "accept"
+    } else {
+        "reject"
+    };
     writeln!(
         rules,
-        "add rule inet {table} forward iifname {interface} counter accept"
+        "add rule inet {table} forward iifname {interface} counter {final_egress_verdict}"
     )?;
     writeln!(
         rules,
@@ -2712,7 +2775,7 @@ fn install_network_firewall(config: &FirecrackerConfig, network: &NetworkConfig)
         "add rule inet {table} postrouting ip saddr {} counter masquerade",
         network.guest_cidr
     )?;
-    run_checked_input("nft", &["-f", "-"], rules.as_bytes())
+    Ok(rules)
 }
 
 fn cleanup_network_blocking(network: &NetworkConfig) {
