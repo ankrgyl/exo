@@ -143,8 +143,13 @@ static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Controls whether Firecracker attaches a network device. The sandbox's
+/// [`SandboxNetworkPolicy`] independently controls what egress the firewall permits.
 pub enum FirecrackerNetworkDevicePolicy {
+    /// Attach a network device only when the sandbox requests enabled networking.
     EnabledSandboxes,
+    /// Attach a network device to every sandbox, including network-disabled sandboxes that
+    /// need host-to-guest connectivity. Their configured egress restrictions still apply.
     AllSandboxes,
 }
 
