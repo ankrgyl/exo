@@ -69,6 +69,7 @@ async fn daytona_snapshot_and_rewind_round_trip() {
             name: None,
             provider: SandboxProvider::Daytona,
             image: String::new(),
+            resources: Default::default(),
             default_workdir: Some("/".into()),
             file_system_mounts: None,
             durable_file_systems: None,

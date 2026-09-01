@@ -48,7 +48,7 @@ use crate::sandbox::{
     SnapshotFormat, SnapshotPayload, sandbox_spec_hash,
 };
 use crate::sandbox_provider::process_bridge;
-use crate::{FileSystemMountMode, SandboxAttachment, SandboxProcessParts};
+use crate::{FileSystemMountMode, SandboxAttachment, SandboxProcessParts, SandboxResourceShape};
 
 use super::firecracker_image::resolve_image;
 #[cfg(test)]
@@ -89,11 +89,8 @@ pub const DEFAULT_WORKSPACE_SIZE_GIB: u64 = 20;
 pub const DEFAULT_IMAGE_SIZE_GIB: u64 = 8;
 pub const DEFAULT_NETWORK_BYTES_PER_SECOND: u64 = 100 * 1024 * 1024;
 pub const DEFAULT_JAILER_UID_BASE: u32 = 100_000;
-pub const DEFAULT_VCPU_COUNT: u8 = 2;
-#[cfg(not(target_os = "macos"))]
-pub const DEFAULT_MEMORY_MIB: u32 = 4096;
-#[cfg(target_os = "macos")]
-pub const DEFAULT_MEMORY_MIB: u32 = 1024;
+pub const DEFAULT_VCPU_COUNT: u8 = crate::DEFAULT_SANDBOX_VCPU_COUNT;
+pub const DEFAULT_MEMORY_MIB: u32 = crate::DEFAULT_SANDBOX_MEMORY_MIB;
 const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 static CONSUMABLE_SNAPSHOT_FORMATS: [SnapshotFormat; 1] = [SnapshotFormat::FirecrackerHostRef];
 // Upstream warns that a compromised guest kernel can reactivate the serial
@@ -166,8 +163,6 @@ pub struct FirecrackerConfig {
     pub kernel: PathBuf,
     pub initramfs: PathBuf,
     pub state_root: PathBuf,
-    pub vcpu_count: u8,
-    pub memory_mib: u32,
     pub image_size_gib: u64,
     pub workspace_size_gib: u64,
     pub jailer_uid_base: u32,
@@ -198,8 +193,6 @@ impl Default for FirecrackerConfig {
             kernel: PathBuf::from(DEFAULT_FIRECRACKER_KERNEL),
             initramfs: PathBuf::from(DEFAULT_FIRECRACKER_INITRAMFS),
             state_root: PathBuf::from(DEFAULT_FIRECRACKER_STATE_ROOT),
-            vcpu_count: DEFAULT_VCPU_COUNT,
-            memory_mib: DEFAULT_MEMORY_MIB,
             image_size_gib: DEFAULT_IMAGE_SIZE_GIB,
             workspace_size_gib: DEFAULT_WORKSPACE_SIZE_GIB,
             jailer_uid_base: DEFAULT_JAILER_UID_BASE,
@@ -239,6 +232,35 @@ struct FirecrackerRuntimeFingerprint {
     memory_mib: u32,
     #[serde(default)]
     network_device_policy: FirecrackerNetworkDevicePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FirecrackerHostFingerprint {
+    architecture: String,
+    protocol_version: u32,
+    firecracker_version: String,
+    firecracker_sha256: String,
+    jailer_sha256: String,
+    kernel_sha256: String,
+    initramfs_sha256: String,
+    network_device_policy: FirecrackerNetworkDevicePolicy,
+}
+
+impl FirecrackerHostFingerprint {
+    fn for_resources(&self, resources: SandboxResourceShape) -> FirecrackerRuntimeFingerprint {
+        FirecrackerRuntimeFingerprint {
+            architecture: self.architecture.clone(),
+            protocol_version: self.protocol_version,
+            firecracker_version: self.firecracker_version.clone(),
+            firecracker_sha256: self.firecracker_sha256.clone(),
+            jailer_sha256: self.jailer_sha256.clone(),
+            kernel_sha256: self.kernel_sha256.clone(),
+            initramfs_sha256: self.initramfs_sha256.clone(),
+            vcpu_count: resources.vcpu_count.get(),
+            memory_mib: resources.memory_mib.get(),
+            network_device_policy: self.network_device_policy.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -543,7 +565,7 @@ impl Drop for MachineCapacityReservation {
 
 struct Shared {
     config: FirecrackerConfig,
-    runtime: FirecrackerRuntimeFingerprint,
+    host_fingerprint: FirecrackerHostFingerprint,
     // Serialize controllers for a state root. A later controller adopts live,
     // matching machines after the prior controller releases this lock; the
     // lock prevents concurrent controllers from racing that reconciliation.
@@ -635,13 +657,13 @@ impl FirecrackerSandboxBackend {
         config.kernel = cache_immutable_artifact(&config.state_root, "kernel", &config.kernel)?;
         config.initramfs =
             cache_immutable_artifact(&config.state_root, "initramfs", &config.initramfs)?;
-        let runtime = firecracker_runtime_fingerprint(&config, firecracker_version)?;
+        let host_fingerprint = firecracker_host_fingerprint(&config, firecracker_version)?;
         validate_jailed_socket_paths(&config)?;
 
         Ok(Self {
             shared: Arc::new(Shared {
                 config,
-                runtime,
+                host_fingerprint,
                 _state_lock: state_lock,
                 warm_machines: Mutex::new(HashMap::new()),
                 lifecycle_locks: MachineLifecycleLocks::default(),
@@ -726,6 +748,7 @@ impl FirecrackerSandboxBackend {
 
     async fn resolve_request(&self, request: SandboxRequest) -> Result<SandboxRequest> {
         let mut request = prepare_request(request)?;
+        validate_resource_shape(request.spec.resources)?;
         let image = resolve_image(
             &self.shared.config.state_root,
             &request.spec.image,
@@ -762,7 +785,11 @@ impl FirecrackerSandboxBackend {
         {
             bail!("Firecracker snapshot source specification changed")
         }
-        if source.runtime != shared.runtime {
+        if source.runtime
+            != shared
+                .host_fingerprint
+                .for_resources(request.spec.resources)
+        {
             bail!("Firecracker snapshot source runtime does not match the configured runtime")
         }
         if !process_running(&shared.pid_path(&source.machine_id)) {
@@ -843,17 +870,24 @@ impl FirecrackerSandboxBackend {
             if spec_hash != manifest.spec_hash {
                 bail!("Firecracker snapshot specification does not match the requested sandbox")
             }
-            if manifest.runtime != self.shared.runtime {
+            if manifest.runtime
+                != self
+                    .shared
+                    .host_fingerprint
+                    .for_resources(request.spec.resources)
+            {
                 bail!("Firecracker snapshot runtime does not match the configured runtime")
             }
 
             let capacity_reservation = self.shared.reserve_machine_capacity(&machine_id).await?;
             let config = self.shared.config.clone();
             let key = template_key.clone();
-            let template_ready =
-                tokio::task::spawn_blocking(move || snapshot_template_ready(&config, &key))
-                    .await
-                    .context("joining Firecracker snapshot template validation")??;
+            let memory_mib = manifest.runtime.memory_mib;
+            let template_ready = tokio::task::spawn_blocking(move || {
+                snapshot_template_ready(&config, &key, memory_mib)
+            })
+            .await
+            .context("joining Firecracker snapshot template validation")??;
             if !template_ready {
                 bail!("Firecracker snapshot {template_key} is not available on this host")
             }
@@ -1410,12 +1444,13 @@ impl Shared {
         machine_id: &str,
         spec_hash: &str,
     ) -> Result<Machine> {
+        let runtime = self.host_fingerprint.for_resources(request.spec.resources);
         let existing = self.load_machine_record(machine_id).await?;
         let reusing_existing_machine = existing
             .as_ref()
-            .is_some_and(|record| record.spec_hash == spec_hash && record.runtime == self.runtime);
+            .is_some_and(|record| record.spec_hash == spec_hash && record.runtime == runtime);
         if let Some(record) = existing.as_ref() {
-            if record.spec_hash != spec_hash || record.runtime != self.runtime {
+            if record.spec_hash != spec_hash || record.runtime != runtime {
                 self.cleanup_machine(machine_id, true).await?;
             } else {
                 let machine = machine_from_record(&self.config, record.clone());
@@ -1432,9 +1467,7 @@ impl Shared {
         }
 
         let record = match existing {
-            Some(record) if record.spec_hash == spec_hash && record.runtime == self.runtime => {
-                record
-            }
+            Some(record) if record.spec_hash == spec_hash && record.runtime == runtime => record,
             _ => {
                 self.new_machine_record(request, machine_id, spec_hash, None)
                     .await?
@@ -1544,7 +1577,7 @@ impl Shared {
             None
         };
         let idle_ttl_seconds = request.lifecycle.idle_ttl.map(|ttl| ttl.as_secs());
-        let runtime = self.runtime.clone();
+        let runtime = self.host_fingerprint.for_resources(request.spec.resources);
         tokio::task::spawn_blocking(move || {
             let (slot, snapshot_template, snapshot_network_slot) = match snapshot {
                 Some(snapshot) => {
@@ -1813,12 +1846,6 @@ fn validate_host_blocking(config: &FirecrackerConfig) -> Result<String> {
         trusted_host_command(program)
             .with_context(|| format!("required trusted host command {program}"))?;
     }
-    if config.vcpu_count == 0 || config.vcpu_count > 32 {
-        bail!("Firecracker vCPU count must be between 1 and 32");
-    }
-    if config.memory_mib < 128 {
-        bail!("Firecracker memory must be at least 128 MiB");
-    }
     if config.image_size_gib == 0 {
         bail!("Firecracker OCI image size must be positive");
     }
@@ -1847,11 +1874,11 @@ fn validate_host_blocking(config: &FirecrackerConfig) -> Result<String> {
     Ok(firecracker_version)
 }
 
-fn firecracker_runtime_fingerprint(
+fn firecracker_host_fingerprint(
     config: &FirecrackerConfig,
     firecracker_version: String,
-) -> Result<FirecrackerRuntimeFingerprint> {
-    Ok(FirecrackerRuntimeFingerprint {
+) -> Result<FirecrackerHostFingerprint> {
+    Ok(FirecrackerHostFingerprint {
         architecture: std::env::consts::ARCH.to_string(),
         protocol_version: PROTOCOL_VERSION,
         firecracker_version,
@@ -1859,10 +1886,18 @@ fn firecracker_runtime_fingerprint(
         jailer_sha256: super::firecracker_image::sha256_hex_of_file(&config.jailer_bin)?,
         kernel_sha256: super::firecracker_image::sha256_hex_of_file(&config.kernel)?,
         initramfs_sha256: super::firecracker_image::sha256_hex_of_file(&config.initramfs)?,
-        vcpu_count: config.vcpu_count,
-        memory_mib: config.memory_mib,
         network_device_policy: config.network_device_policy.clone(),
     })
+}
+
+fn validate_resource_shape(resources: SandboxResourceShape) -> Result<()> {
+    if resources.vcpu_count.get() > 32 {
+        bail!("Firecracker vCPU count must be between 1 and 32");
+    }
+    if resources.memory_mib.get() < 128 {
+        bail!("Firecracker memory must be at least 128 MiB");
+    }
+    Ok(())
 }
 
 fn validate_file(label: &str, path: &Path) -> Result<()> {
@@ -3060,13 +3095,14 @@ fn spawn_jailed_firecracker(
 ) -> Result<()> {
     let host_uid = jailer_uid(config, record)?;
     let memory_max = u64::from(
-        config
+        record
+            .runtime
             .memory_mib
             .checked_add(256)
             .context("Firecracker cgroup memory limit overflow")?,
     ) * 1024
         * 1024;
-    let cpu_max = format!("{} 100000", u32::from(config.vcpu_count) * 100_000);
+    let cpu_max = format!("{} 100000", u32::from(record.runtime.vcpu_count) * 100_000);
     // Always use the matching jailer: it creates the mount/PID namespaces and
     // cgroup, then drops to a unique unprivileged UID before execing Firecracker.
     // https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md#jailer-operation
@@ -3217,8 +3253,8 @@ fn firecracker_vm_configuration(
         },
         drives,
         machine_config: FirecrackerMachineConfiguration {
-            vcpu_count: config.vcpu_count,
-            mem_size_mib: config.memory_mib,
+            vcpu_count: record.runtime.vcpu_count,
+            mem_size_mib: record.runtime.memory_mib,
             smt: false,
             track_dirty_pages: false,
         },
@@ -3534,7 +3570,11 @@ fn firecracker_api_request<T: Serialize>(
     )
 }
 
-fn validate_snapshot_template(config: &FirecrackerConfig, directory: &Path) -> Result<bool> {
+fn validate_snapshot_template(
+    config: &FirecrackerConfig,
+    directory: &Path,
+    memory_mib: u32,
+) -> Result<bool> {
     let complete = directory.join("complete");
     if !complete.try_exists()? {
         return Ok(false);
@@ -3543,7 +3583,7 @@ fn validate_snapshot_template(config: &FirecrackerConfig, directory: &Path) -> R
         (directory.join("state"), None),
         (
             directory.join("memory"),
-            Some(u64::from(config.memory_mib) * 1024 * 1024),
+            Some(u64::from(memory_mib) * 1024 * 1024),
         ),
         (
             directory.join("overlay.ext4"),
@@ -3574,12 +3614,12 @@ fn gib_bytes(size_gib: u64, label: &str) -> Result<u64> {
         .with_context(|| format!("Firecracker {label} size overflows bytes"))
 }
 
-fn snapshot_template_ready(config: &FirecrackerConfig, key: &str) -> Result<bool> {
+fn snapshot_template_ready(config: &FirecrackerConfig, key: &str, memory_mib: u32) -> Result<bool> {
     let directory = snapshot_template_dir(config, key)?;
     if !directory.try_exists()? {
         return Ok(false);
     }
-    validate_snapshot_template(config, &directory)
+    validate_snapshot_template(config, &directory, memory_mib)
 }
 
 fn fork_snapshot_template_key(source: &MachineRecord, target_machine_id: &str) -> String {
@@ -3738,7 +3778,7 @@ fn capture_snapshot_template(
     }
     fs::rename(&temporary, &destination)
         .with_context(|| format!("publishing Firecracker snapshot {}", destination.display()))?;
-    validate_snapshot_template(config, &destination)?;
+    validate_snapshot_template(config, &destination, source.runtime.memory_mib)?;
     open_snapshot_template_lease(config, template_key)
 }
 

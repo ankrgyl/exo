@@ -32,19 +32,20 @@ use executor::{
     AgentHandle, AgentHarnessKind, AttachSandboxRequest, BasicExoHarness, BasicExoHarnessConfig,
     BasicHarness, BasicToolRuntime, Binding, BraintrustProject, BraintrustRuntimeConfig,
     BraintrustTracingConfig, ConversationModelConfig, CreateAgentRequest,
-    CreateConversationRequest, CreateSandboxRequest, DaytonaBackendSpec, DurableFileSystem,
-    E2bBackendSpec, EventKind, EventQuery, EventQueryDirection, ExoHarness,
-    ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount, FileSystemMountMode,
-    FirecrackerBackendSpec, ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART,
-    HTTP_EXOHARNESS_TRACING_TARGET, Harness, HarnessAgent, HarnessConversation, HttpExoHarness,
-    LocalSandboxExoHarness, NewAgentRequest, PutSecretRequest, RlmHarness, RunInSandboxRequest,
-    SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment, SandboxBackendRegistration, SandboxProcess,
-    SandboxProvider, SandboxProviderConfig, SandboxScope, Secret, SecretBackendChoice,
-    SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness, TypeScriptHarnessConfig,
-    Uuid7, VercelBackendSpec, default_aws_agentcore_image, default_daytona_image,
-    default_docker_image, default_e2b_template, default_firecracker_image, default_vercel_image,
-    effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config, record_host_event,
-    send_conversation_wakeup, serve_exoharness_http_listener_with_options,
+    CreateConversationRequest, CreateSandboxRequest, DEFAULT_SANDBOX_MEMORY_MIB,
+    DEFAULT_SANDBOX_VCPU_COUNT, DaytonaBackendSpec, DurableFileSystem, E2bBackendSpec, EventKind,
+    EventQuery, EventQueryDirection, ExoHarness, ExoHarnessHttpServeOptions, ExoToolRuntime,
+    FileSystemMount, FileSystemMountMode, FirecrackerBackendSpec, ForkConversationRequest,
+    HOST_EVENT_REBUILD_AND_RESTART, HTTP_EXOHARNESS_TRACING_TARGET, Harness, HarnessAgent,
+    HarnessConversation, HttpExoHarness, LocalSandboxExoHarness, NewAgentRequest, PutSecretRequest,
+    RlmHarness, RunInSandboxRequest, SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment,
+    SandboxBackendRegistration, SandboxProcess, SandboxProvider, SandboxProviderConfig,
+    SandboxResourceShape, SandboxScope, Secret, SecretBackendChoice, SpritesBackendSpec,
+    ToolRequest, ToolRuntime, TypeScriptHarness, TypeScriptHarnessConfig, Uuid7, VercelBackendSpec,
+    default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
+    default_firecracker_image, default_vercel_image, effective_sandbox_scope,
+    finalize_rebuild_update_file, load_agent_config, record_host_event, send_conversation_wakeup,
+    serve_exoharness_http_listener_with_options,
 };
 use serde::Deserialize;
 use tabwriter::TabWriter;
@@ -55,8 +56,8 @@ use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 use executor::{
     DEFAULT_FIRECRACKER_BINARY, DEFAULT_FIRECRACKER_INITRAMFS, DEFAULT_FIRECRACKER_JAILER,
     DEFAULT_FIRECRACKER_KERNEL, DEFAULT_FIRECRACKER_STATE_ROOT, DEFAULT_IMAGE_SIZE_GIB,
-    DEFAULT_JAILER_UID_BASE, DEFAULT_MEMORY_MIB, DEFAULT_NETWORK_BYTES_PER_SECOND,
-    DEFAULT_VCPU_COUNT, DEFAULT_WORKSPACE_SIZE_GIB, FirecrackerConfig, FirecrackerLimaConfig,
+    DEFAULT_JAILER_UID_BASE, DEFAULT_NETWORK_BYTES_PER_SECOND, DEFAULT_WORKSPACE_SIZE_GIB,
+    FirecrackerConfig, FirecrackerLimaConfig,
 };
 
 use crate::env::CliEnvironment;
@@ -178,20 +179,6 @@ struct FirecrackerArgs {
         default_value = DEFAULT_FIRECRACKER_STATE_ROOT
     )]
     state_root: PathBuf,
-    /// Virtual CPUs assigned to each microVM.
-    #[arg(
-        long = "firecracker-vcpu-count",
-        env = "EXO_FIRECRACKER_VCPU_COUNT",
-        default_value_t = DEFAULT_VCPU_COUNT
-    )]
-    vcpu_count: u8,
-    /// Memory assigned to each microVM, in MiB.
-    #[arg(
-        long = "firecracker-memory-mib",
-        env = "EXO_FIRECRACKER_MEMORY_MIB",
-        default_value_t = DEFAULT_MEMORY_MIB
-    )]
-    memory_mib: u32,
     /// Maximum materialized OCI root filesystem size, in GiB.
     #[arg(
         long = "firecracker-image-size-gib",
@@ -280,8 +267,6 @@ impl FirecrackerArgs {
             kernel: self.kernel.clone(),
             initramfs: self.initramfs.clone(),
             state_root: self.state_root.clone(),
-            vcpu_count: self.vcpu_count,
-            memory_mib: self.memory_mib,
             image_size_gib: self.image_size_gib,
             workspace_size_gib: self.workspace_size_gib,
             jailer_uid_base: self.jailer_uid_base,
@@ -958,6 +943,22 @@ struct SandboxCreateArgs {
     /// Omitting it uses the provider binding's default.
     #[arg(long, default_value = "")]
     image: String,
+    /// Virtual CPUs requested for the sandbox.
+    #[arg(
+        long,
+        alias = "firecracker-vcpu-count",
+        env = "EXO_FIRECRACKER_VCPU_COUNT",
+        default_value_t = DEFAULT_SANDBOX_VCPU_COUNT
+    )]
+    vcpu_count: u8,
+    /// Memory requested for the sandbox, in MiB.
+    #[arg(
+        long,
+        alias = "firecracker-memory-mib",
+        env = "EXO_FIRECRACKER_MEMORY_MIB",
+        default_value_t = DEFAULT_SANDBOX_MEMORY_MIB
+    )]
+    memory_mib: u32,
     #[arg(long)]
     workdir: Option<String>,
     #[arg(long, value_enum)]
@@ -2810,6 +2811,8 @@ async fn start_sandbox(
     let SandboxCreateArgs {
         provider,
         image,
+        vcpu_count,
+        memory_mib,
         workdir,
         networking,
         idle_seconds,
@@ -2831,6 +2834,8 @@ async fn start_sandbox(
             name,
             provider: provider.into(),
             image,
+            resources: SandboxResourceShape::new(vcpu_count, memory_mib)
+                .context("sandbox vCPU count and memory must be positive")?,
             default_workdir: workdir,
             file_system_mounts: (!mounts.is_empty()).then_some(mounts),
             durable_file_systems: (!durable_file_systems.is_empty())

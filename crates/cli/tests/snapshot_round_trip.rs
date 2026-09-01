@@ -73,6 +73,7 @@ async fn filesystem_snapshot_and_rewind_round_trip() {
             name: None,
             provider: SandboxProvider::Docker,
             image: SANDBOX_IMAGE.into(),
+            resources: Default::default(),
             default_workdir: Some("/".into()),
             file_system_mounts: None,
             durable_file_systems: None,

@@ -179,6 +179,7 @@ pub(crate) async fn create_conversation_sandbox(
             name: None,
             provider: spec.provider,
             image: spec.image,
+            resources: Default::default(),
             default_workdir: Some(spec.default_workdir),
             file_system_mounts: Some(spec.file_system_mounts),
             durable_file_systems: Some(spec.durable_file_systems),
