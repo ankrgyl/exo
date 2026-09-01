@@ -1006,6 +1006,7 @@ pub(crate) async fn ensure_shell_sandbox(
             name: None,
             provider: desired_provider,
             image: desired_image,
+            resources: Default::default(),
             default_workdir: Some(desired_default_workdir),
             file_system_mounts: Some(desired_mounts),
             durable_file_systems: Some(desired_durable_file_systems),

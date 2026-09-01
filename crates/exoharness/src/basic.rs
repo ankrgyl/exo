@@ -2023,6 +2023,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             name: None,
             provider,
             image: String::new(),
+            resources: Default::default(),
             requested_image: None,
             default_workdir: Some(request.default_workdir.unwrap_or_default()),
             file_system_mounts: Vec::new(),
@@ -3479,6 +3480,7 @@ async fn prepare_sandbox_request(
         name: request.name,
         provider: request.provider,
         image,
+        resources: request.resources,
         default_workdir: request.default_workdir,
         file_system_mounts: request.file_system_mounts.unwrap_or_default(),
         durable_file_systems: request.durable_file_systems.unwrap_or_default(),
@@ -3512,6 +3514,7 @@ async fn find_matching_stored_sandbox(
         let comparable_image = sandbox.requested_image.as_ref().unwrap_or(&sandbox.image);
         if sandbox.provider != request.provider
             || comparable_image != &request.image
+            || sandbox.resources != request.resources
             || sandbox.default_workdir != request.default_workdir
             || sandbox.file_system_mounts != request.file_system_mounts
             || sandbox.durable_file_systems != request.durable_file_systems
@@ -3900,6 +3903,8 @@ struct StoredSandbox {
     name: Option<String>,
     provider: SandboxProvider,
     image: String,
+    #[serde(default)]
+    resources: crate::SandboxResourceShape,
     /// The image originally requested at creation, kept when a snapshot
     /// restore rewrites `image` to the restored tag. Named-sandbox matching
     /// compares against this so config-derived requests still resolve to the
@@ -3935,6 +3940,7 @@ struct PreparedSandboxRequest {
     name: Option<String>,
     provider: SandboxProvider,
     image: String,
+    resources: crate::SandboxResourceShape,
     default_workdir: Option<String>,
     file_system_mounts: Vec<FileSystemMount>,
     durable_file_systems: Vec<DurableFileSystem>,
@@ -3949,6 +3955,7 @@ impl PreparedSandboxRequest {
             name: self.name.clone(),
             provider: self.provider.clone(),
             image: self.image.clone(),
+            resources: self.resources,
             requested_image: None,
             default_workdir: self.default_workdir.clone(),
             file_system_mounts: self.file_system_mounts.clone(),
@@ -4420,6 +4427,7 @@ fn sandbox_request(
         },
         spec: SandboxSpec {
             image: sandbox.image.clone(),
+            resources: sandbox.resources,
             mounts: sandbox
                 .file_system_mounts
                 .iter()

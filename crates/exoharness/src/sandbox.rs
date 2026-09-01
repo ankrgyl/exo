@@ -79,6 +79,8 @@ pub enum SandboxNetworkPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SandboxSpec {
     pub image: String,
+    #[serde(default)]
+    pub resources: crate::SandboxResourceShape,
     pub mounts: Vec<SandboxMount>,
     pub durable_file_systems: Vec<DurableFileSystem>,
     pub network: SandboxNetworkPolicy,
@@ -594,6 +596,7 @@ impl CliContainerSandboxBackend {
                 } else {
                     request.spec.image
                 },
+                resources: request.spec.resources,
                 mounts,
                 durable_file_systems: request.spec.durable_file_systems,
                 network: request.spec.network,
@@ -2393,6 +2396,7 @@ mod tests {
             },
             spec: SandboxSpec {
                 image: "docker.io/library/ubuntu:24.04".to_string(),
+                resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
                 network: SandboxNetworkPolicy::Disabled,
@@ -2469,6 +2473,7 @@ mod tests {
             },
             spec: SandboxSpec {
                 image: "docker.io/library/ubuntu:24.04".to_string(),
+                resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
                 network: SandboxNetworkPolicy::Disabled,
@@ -2561,6 +2566,7 @@ esac
             },
             spec: SandboxSpec {
                 image: "docker.io/library/ubuntu:24.04".to_string(),
+                resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
                 network: SandboxNetworkPolicy::Disabled,
@@ -2672,6 +2678,7 @@ esac
             },
             spec: SandboxSpec {
                 image: "task-image".to_string(),
+                resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
                 network: SandboxNetworkPolicy::Enabled,

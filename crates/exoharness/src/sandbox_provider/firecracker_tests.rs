@@ -1,8 +1,8 @@
 use super::*;
 use tokio::net::UnixListener;
 
-fn test_runtime() -> FirecrackerRuntimeFingerprint {
-    FirecrackerRuntimeFingerprint {
+fn test_host_runtime() -> FirecrackerHostFingerprint {
+    FirecrackerHostFingerprint {
         architecture: "x86_64".to_string(),
         protocol_version: PROTOCOL_VERSION,
         firecracker_version: "v1.16.1".to_string(),
@@ -10,10 +10,27 @@ fn test_runtime() -> FirecrackerRuntimeFingerprint {
         jailer_sha256: "jailer".to_string(),
         kernel_sha256: "kernel".to_string(),
         initramfs_sha256: "initramfs".to_string(),
-        vcpu_count: 2,
-        memory_mib: 4096,
         network_device_policy: FirecrackerNetworkDevicePolicy::default(),
     }
+}
+
+fn test_runtime() -> FirecrackerRuntimeFingerprint {
+    test_host_runtime().for_resources(SandboxResourceShape::default())
+}
+
+#[test]
+fn runtime_fingerprint_uses_requested_resources() {
+    let resources = SandboxResourceShape::new(8, 16_384).unwrap();
+    let runtime = test_host_runtime().for_resources(resources);
+    assert_eq!(runtime.vcpu_count, 8);
+    assert_eq!(runtime.memory_mib, 16_384);
+}
+
+#[test]
+fn firecracker_validates_provider_specific_resource_limits() {
+    validate_resource_shape(SandboxResourceShape::new(1, 128).unwrap()).unwrap();
+    assert!(validate_resource_shape(SandboxResourceShape::new(33, 4096).unwrap()).is_err());
+    assert!(validate_resource_shape(SandboxResourceShape::new(1, 127).unwrap()).is_err());
 }
 
 #[test]

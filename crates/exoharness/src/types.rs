@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
+use std::num::{NonZeroU8, NonZeroU32};
 use std::ops::Bound;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -633,6 +634,38 @@ pub struct DurableFileSystem {
     pub mode: FileSystemMountMode,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SandboxResourceShape {
+    pub vcpu_count: NonZeroU8,
+    pub memory_mib: NonZeroU32,
+}
+
+pub const DEFAULT_SANDBOX_VCPU_COUNT: u8 = 2;
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_SANDBOX_MEMORY_MIB: u32 = 4096;
+#[cfg(target_os = "macos")]
+pub const DEFAULT_SANDBOX_MEMORY_MIB: u32 = 1024;
+
+impl SandboxResourceShape {
+    pub fn new(vcpu_count: u8, memory_mib: u32) -> Option<Self> {
+        Some(Self {
+            vcpu_count: NonZeroU8::new(vcpu_count)?,
+            memory_mib: NonZeroU32::new(memory_mib)?,
+        })
+    }
+}
+
+impl Default for SandboxResourceShape {
+    fn default() -> Self {
+        Self {
+            vcpu_count: NonZeroU8::new(DEFAULT_SANDBOX_VCPU_COUNT)
+                .expect("default sandbox vCPU count must be positive"),
+            memory_mib: NonZeroU32::new(DEFAULT_SANDBOX_MEMORY_MIB)
+                .expect("default sandbox memory must be positive"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SandboxRecord {
     pub id: SandboxId,
@@ -648,6 +681,8 @@ pub struct CreateSandboxRequest {
     pub name: Option<String>,
     pub provider: SandboxProvider,
     pub image: String,
+    #[serde(default)]
+    pub resources: SandboxResourceShape,
     pub default_workdir: Option<String>,
     pub file_system_mounts: Option<Vec<FileSystemMount>>,
     pub durable_file_systems: Option<Vec<DurableFileSystem>>,
@@ -1276,6 +1311,32 @@ mod tests {
             serde_json::to_value(FileSystemMountMode::ReadWrite).expect("mode should serialize");
         assert_eq!(ro, Value::String("ro".to_string()));
         assert_eq!(rw, Value::String("rw".to_string()));
+    }
+
+    #[test]
+    fn sandbox_resource_shape_rejects_zero_and_serializes_as_numbers() {
+        assert!(SandboxResourceShape::new(0, 4096).is_none());
+        assert!(SandboxResourceShape::new(2, 0).is_none());
+        assert_eq!(
+            serde_json::to_value(SandboxResourceShape::new(2, 4096).unwrap()).unwrap(),
+            serde_json::json!({"vcpu_count": 2, "memory_mib": 4096})
+        );
+    }
+
+    #[test]
+    fn create_sandbox_request_defaults_resources_for_older_clients() {
+        let request: CreateSandboxRequest = serde_json::from_value(serde_json::json!({
+            "name": null,
+            "provider": "firecracker",
+            "image": "example.com/sandbox:latest",
+            "default_workdir": null,
+            "file_system_mounts": null,
+            "durable_file_systems": null,
+            "enable_networking": true,
+            "idle_seconds": 60
+        }))
+        .unwrap();
+        assert_eq!(request.resources, SandboxResourceShape::default());
     }
 
     #[test]

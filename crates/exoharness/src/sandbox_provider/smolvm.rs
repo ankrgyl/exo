@@ -1022,6 +1022,7 @@ mod tests {
             },
             spec: SandboxSpec {
                 image: "alpine".into(),
+                resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
                 network: SandboxNetworkPolicy::Disabled,
@@ -1159,6 +1160,7 @@ mod tests {
     fn read_only_mounts_get_the_ro_suffix() {
         let spec = SandboxSpec {
             image: "alpine".into(),
+            resources: Default::default(),
             mounts: vec![
                 crate::sandbox::SandboxMount {
                     host_path: PathBuf::from("/host/rw"),
