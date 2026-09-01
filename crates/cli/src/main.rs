@@ -29,22 +29,22 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use executor::{
-    AgentHandle, AgentHarnessKind, AttachSandboxRequest, BasicExoHarness, BasicExoHarnessConfig,
-    BasicHarness, BasicToolRuntime, Binding, BraintrustProject, BraintrustRuntimeConfig,
-    BraintrustTracingConfig, ConversationModelConfig, CreateAgentRequest,
+    AddEventsRequest, AgentHarnessKind, AttachSandboxRequest, BasicExoHarness,
+    BasicExoHarnessConfig, BasicHarness, BasicToolRuntime, Binding, BraintrustProject,
+    BraintrustRuntimeConfig, BraintrustTracingConfig, ConversationModelConfig, CreateAgentRequest,
     CreateConversationRequest, CreateSandboxRequest, DaytonaBackendSpec, DurableFileSystem,
-    E2bBackendSpec, EventKind, EventQuery, EventQueryDirection, ExoHarness,
+    E2bBackendSpec, EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness,
     ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount, FileSystemMountMode,
     FirecrackerBackendSpec, ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART,
     HTTP_EXOHARNESS_TRACING_TARGET, Harness, HarnessAgent, HarnessConversation, HttpExoHarness,
-    LocalSandboxExoHarness, NewAgentRequest, PutSecretRequest, RlmHarness, RunInSandboxRequest,
-    SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment, SandboxBackendRegistration, SandboxProcess,
-    SandboxProvider, SandboxProviderConfig, SandboxScope, Secret, SecretBackendChoice,
-    SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness, TypeScriptHarnessConfig,
-    Uuid7, VercelBackendSpec, default_aws_agentcore_image, default_daytona_image,
-    default_docker_image, default_e2b_template, default_firecracker_image, default_vercel_image,
-    effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config, record_host_event,
-    send_conversation_wakeup, serve_exoharness_http_listener_with_options,
+    LocalSandboxExoHarness, NewAgentRequest, PutSecretRequest, RestoreSandboxRequest, RlmHarness,
+    RunInSandboxRequest, SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment, SandboxBackendRegistration,
+    SandboxHandle, SandboxProcess, SandboxProvider, SandboxProviderConfig, SandboxScope, Secret,
+    SecretBackendChoice, SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness,
+    TypeScriptHarnessConfig, Uuid7, VercelBackendSpec, default_aws_agentcore_image,
+    default_daytona_image, default_docker_image, default_e2b_template, default_firecracker_image,
+    default_vercel_image, effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config,
+    record_host_event, send_conversation_wakeup, serve_exoharness_http_listener_with_options,
 };
 use serde::Deserialize;
 use tabwriter::TabWriter;
@@ -853,21 +853,6 @@ enum ConversationCommands {
 
 #[derive(Debug, Subcommand)]
 enum ConversationSandboxCommands {
-    Attach {
-        agent: String,
-        conversation: String,
-        #[arg(long, value_enum)]
-        provider: SandboxProviderArg,
-        #[arg(long)]
-        external_id: String,
-        #[arg(long)]
-        default_workdir: Option<String>,
-    },
-    Detach {
-        agent: String,
-        conversation: String,
-        sandbox_id: String,
-    },
     Run {
         agent: String,
         conversation: String,
@@ -912,6 +897,53 @@ enum SandboxCommands {
         #[arg(long = "env", value_name = "NAME=VALUE")]
         env: Vec<String>,
     },
+    /// Adopt an externally managed container as a sandbox and print its id.
+    /// Note: can run or snapshot, but cannot stop/terminate/delete as this
+    /// sandbox is not managed by the CLI.
+    Attach {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
+        #[arg(long, value_enum)]
+        provider: SandboxProviderArg,
+        #[arg(long)]
+        external_id: String,
+        #[arg(long)]
+        default_workdir: Option<String>,
+    },
+    /// Choose the sandbox a conversation runs in. Written as an event.
+    Select {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
+        sandbox_id: String,
+    },
+    /// Stop using an explicitly selected sandbox, returning the conversation to
+    /// the sandbox its configuration describes.
+    Deselect {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
+    },
+    /// Release an adopted container.
+    Detach {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
+        sandbox_id: String,
+    },
+    /// Capture a filesystem snapshot of a sandbox and print its id.
+    Snapshot {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
+        sandbox_id: String,
+    },
+    /// Start a new sandbox from a snapshot.
+    Restore {
+        #[command(flatten)]
+        owner: SandboxOwnerArgs,
+        snapshot_id: String,
+        #[arg(long, value_enum)]
+        provider: SandboxProviderArg,
+        #[arg(long)]
+        idle_seconds: Option<u64>,
+    },
     /// Stop a sandbox while retaining its stored record.
     Stop {
         #[command(flatten)]
@@ -935,6 +967,9 @@ struct SandboxOwnerArgs {
     /// Agent that owns the sandbox; omitted uses the shared CLI owner.
     #[arg(long, value_name = "AGENT")]
     agent: Option<String>,
+    /// Conversation that owns the sandbox; omitted uses the agent itself as the owner.
+    #[arg(long, value_name = "CONVERSATION", requires = "agent")]
+    conversation: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -2089,57 +2124,6 @@ async fn main() -> Result<()> {
                 }
             },
             ConversationCommands::Sandbox { command } => match command {
-                ConversationSandboxCommands::Attach {
-                    agent,
-                    conversation,
-                    provider,
-                    external_id,
-                    default_workdir,
-                } => {
-                    let provider = SandboxProvider::from(provider);
-                    let attachment = if provider == SandboxProvider::Docker {
-                        SandboxAttachment::DockerContainer {
-                            container_id: external_id,
-                        }
-                    } else {
-                        bail!(
-                            "sandbox provider {} does not support external attachments",
-                            provider.as_str()
-                        )
-                    };
-                    let conversation =
-                        must_get_conversation(harness.as_ref(), &agent, &conversation).await?;
-                    let sandbox_id = conversation
-                        .exoharness_handle()
-                        .attach_sandbox(AttachSandboxRequest {
-                            attachment,
-                            default_workdir,
-                        })
-                        .await?;
-                    println!(
-                        "attached Docker container as sandbox {} for {}",
-                        sandbox_id,
-                        conversation.record().slug
-                    );
-                }
-                ConversationSandboxCommands::Detach {
-                    agent,
-                    conversation,
-                    sandbox_id,
-                } => {
-                    let conversation =
-                        must_get_conversation(harness.as_ref(), &agent, &conversation).await?;
-                    let attachment = conversation
-                        .exoharness_handle()
-                        .detach_sandbox(sandbox_id.clone())
-                        .await?;
-                    println!(
-                        "detached sandbox {} from {}: {}",
-                        sandbox_id,
-                        conversation.record().slug,
-                        serde_json::to_string(&attachment)?
-                    );
-                }
                 ConversationSandboxCommands::Run {
                     agent,
                     conversation,
@@ -2592,7 +2576,7 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
                 sandbox,
                 ..
             } = *args;
-            let (_, sandbox_id) = start_sandbox(harness, owner.agent, name, sandbox).await?;
+            let (_, sandbox_id) = start_sandbox(harness, owner, name, sandbox).await?;
             println!("{sandbox_id}");
         }
         SandboxCommands::Play(args) => {
@@ -2604,7 +2588,7 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
                 ..
             } = *args;
             let env = parse_environment(env)?;
-            let (agent, sandbox_id) = start_sandbox(harness, owner.agent, None, sandbox).await?;
+            let (agent, sandbox_id) = start_sandbox(harness, owner, None, sandbox).await?;
             println!("started {sandbox_id}");
             let shell_result = tokio::select! {
                 result = run_sandbox_process(
@@ -2635,7 +2619,7 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
             }
         }
         SandboxCommands::Ps { owner, all, quiet } => {
-            let mut sandboxes = sandbox_owner(harness, owner.agent.as_deref())
+            let mut sandboxes = sandbox_owner(harness, &owner)
                 .await?
                 .list_sandboxes()
                 .await?;
@@ -2676,7 +2660,7 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
             env,
             command,
         } => {
-            let agent = sandbox_owner(harness, owner.agent.as_deref()).await?;
+            let agent = sandbox_owner(harness, &owner).await?;
             let exit_code = run_sandbox_process(
                 agent.as_ref(),
                 sandbox_id,
@@ -2695,7 +2679,7 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
             shell,
             env,
         } => {
-            let agent = sandbox_owner(harness, owner.agent.as_deref()).await?;
+            let agent = sandbox_owner(harness, &owner).await?;
             let exit_code = run_sandbox_process(
                 agent.as_ref(),
                 sandbox_id,
@@ -2708,12 +2692,121 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
                 bail!("sandbox shell exited with status {exit_code}");
             }
         }
+        SandboxCommands::Attach {
+            owner,
+            provider,
+            external_id,
+            default_workdir,
+        } => {
+            let provider = SandboxProvider::from(provider);
+            if provider != SandboxProvider::Docker {
+                bail!(
+                    "sandbox provider {} does not support external attachments",
+                    provider.as_str()
+                );
+            }
+            let agent = sandbox_owner(harness, &owner).await?;
+            let sandbox_id = agent
+                .attach_sandbox(AttachSandboxRequest {
+                    attachment: SandboxAttachment::DockerContainer {
+                        container_id: external_id,
+                    },
+                    default_workdir,
+                })
+                .await?;
+            println!("{sandbox_id}");
+        }
+        SandboxCommands::Select { owner, sandbox_id } => {
+            let conversation = selected_sandbox_conversation(harness, &owner).await?;
+            let handle = conversation.exoharness_handle();
+            if !handle
+                .list_sandboxes()
+                .await?
+                .iter()
+                .any(|sandbox| sandbox.id == sandbox_id)
+            {
+                bail!(
+                    "conversation {slug} has no sandbox {sandbox_id}",
+                    slug = conversation.record().slug,
+                );
+            }
+            handle
+                .add_events(AddEventsRequest {
+                    session_id: None,
+                    turn_id: None,
+                    data: vec![EventData::SandboxSelected {
+                        sandbox_id: Some(sandbox_id.clone()),
+                    }],
+                })
+                .await?;
+            println!(
+                "{} now uses sandbox {sandbox_id}",
+                conversation.record().slug
+            );
+        }
+        SandboxCommands::Deselect { owner } => {
+            let conversation = selected_sandbox_conversation(harness, &owner).await?;
+            conversation
+                .exoharness_handle()
+                .add_events(AddEventsRequest {
+                    session_id: None,
+                    turn_id: None,
+                    data: vec![EventData::SandboxSelected { sandbox_id: None }],
+                })
+                .await?;
+            println!("{} no longer selects a sandbox", conversation.record().slug);
+        }
+        SandboxCommands::Detach { owner, sandbox_id } => {
+            let agent = sandbox_owner(harness, &owner).await?;
+            let attachment = agent.detach_sandbox(sandbox_id.clone()).await?;
+            println!(
+                "detached {sandbox_id}: {}",
+                serde_json::to_string(&attachment)?
+            );
+        }
+        SandboxCommands::Snapshot { owner, sandbox_id } => {
+            let agent = sandbox_owner(harness, &owner).await?;
+            let snapshot_id = agent
+                .snapshot_sandbox(sandbox_id.clone())
+                .await
+                .with_context(|| format!("snapshotting sandbox {sandbox_id}"))?;
+            println!("{snapshot_id}");
+        }
+        SandboxCommands::Restore {
+            owner,
+            snapshot_id,
+            provider,
+            idle_seconds,
+        } => {
+            let snapshot_id = snapshot_id
+                .parse()
+                .map_err(|error| anyhow!("invalid snapshot id {snapshot_id}: {error}"))?;
+            let agent = sandbox_owner(harness, &owner).await?;
+            let sandbox_id = agent
+                .restore_sandbox(RestoreSandboxRequest {
+                    snapshot_id,
+                    sandbox: CreateSandboxRequest {
+                        name: None,
+                        provider: SandboxProvider::from(provider),
+                        // The snapshot carries the filesystem; the provider
+                        // binding supplies a base image.
+                        image: String::new(),
+                        default_workdir: None,
+                        file_system_mounts: None,
+                        durable_file_systems: None,
+                        enable_networking: None,
+                        idle_seconds,
+                    },
+                })
+                .await?;
+            println!("{sandbox_id}");
+        }
         SandboxCommands::Stop { owner, sandbox_ids } => {
             let sandbox_ids = sandbox_ids_or_stdin(sandbox_ids)?;
             if sandbox_ids.is_empty() {
                 return Ok(());
             }
-            let agent = sandbox_owner(harness, owner.agent.as_deref()).await?;
+            let agent = sandbox_owner(harness, &owner).await?;
             for sandbox_id in sandbox_ids {
                 agent
                     .stop_sandbox(sandbox_id.clone())
@@ -2726,7 +2819,7 @@ async fn handle_sandbox_command(harness: &dyn Harness, command: SandboxCommands)
             if sandbox_ids.is_empty() {
                 return Ok(());
             }
-            let agent = sandbox_owner(harness, owner.agent.as_deref()).await?;
+            let agent = sandbox_owner(harness, &owner).await?;
             for sandbox_id in sandbox_ids {
                 agent
                     .terminate_sandbox(sandbox_id.clone())
@@ -2768,12 +2861,37 @@ fn write_sandbox_ids(ids: impl IntoIterator<Item = String>) -> Result<()> {
     Ok(())
 }
 
+// A sandbox owner is either a conversation or an agent. If a conversation is
+// specified, it takes precedence over the agent.
+// A selection is recorded on a conversation: an agent's sandbox is chosen by
+// its durable name, so there is no binding for one to carry.
+async fn selected_sandbox_conversation(
+    harness: &dyn Harness,
+    owner: &SandboxOwnerArgs,
+) -> Result<Arc<dyn HarnessConversation>> {
+    let (Some(agent_ref), Some(conversation_ref)) =
+        (owner.agent.as_deref(), owner.conversation.as_deref())
+    else {
+        bail!("selecting a sandbox needs --agent and --conversation");
+    };
+    must_get_conversation(harness, agent_ref, conversation_ref).await
+}
+
 async fn sandbox_owner(
     harness: &dyn Harness,
-    agent_ref: Option<&str>,
-) -> Result<Arc<dyn AgentHandle>> {
+    owner: &SandboxOwnerArgs,
+) -> Result<Arc<dyn SandboxHandle>> {
+    if let Some(conversation_ref) = owner.conversation.as_deref() {
+        let agent_ref = owner
+            .agent
+            .as_deref()
+            .context("--conversation requires --agent")?;
+        let conversation = must_get_conversation(harness, agent_ref, conversation_ref).await?;
+        return Ok(conversation.exoharness_handle());
+    }
+
     let exoharness = harness.exoharness_handle();
-    if let Some(agent_ref) = agent_ref {
+    if let Some(agent_ref) = owner.agent.as_deref() {
         return exoharness
             .list_agents()
             .await?
@@ -2781,6 +2899,7 @@ async fn sandbox_owner(
             .find(|agent| {
                 agent.record().slug == agent_ref || agent.record().id.to_string() == agent_ref
             })
+            .map(|agent| agent as Arc<dyn SandboxHandle>)
             .ok_or_else(|| anyhow!("agent not found: {agent_ref}"));
     }
 
@@ -2793,20 +2912,20 @@ async fn sandbox_owner(
         return Ok(agent);
     }
 
-    exoharness
+    Ok(exoharness
         .new_agent(NewAgentRequest {
             slug: SANDBOX_CLI_AGENT_SLUG.to_string(),
             name: "Sandbox CLI".to_string(),
         })
-        .await
+        .await?)
 }
 
 async fn start_sandbox(
     harness: &dyn Harness,
-    agent: Option<String>,
+    owner: SandboxOwnerArgs,
     name: Option<String>,
     args: SandboxCreateArgs,
-) -> Result<(Arc<dyn AgentHandle>, String)> {
+) -> Result<(Arc<dyn SandboxHandle>, String)> {
     let SandboxCreateArgs {
         provider,
         image,
@@ -2825,8 +2944,8 @@ async fn start_sandbox(
     }
     mounts.extend(internal_mounts);
 
-    let agent = sandbox_owner(harness, agent.as_deref()).await?;
-    let sandbox_id = agent
+    let owner = sandbox_owner(harness, &owner).await?;
+    let sandbox_id = owner
         .create_sandbox(CreateSandboxRequest {
             name,
             provider: provider.into(),
@@ -2839,17 +2958,17 @@ async fn start_sandbox(
             idle_seconds,
         })
         .await?;
-    Ok((agent, sandbox_id))
+    Ok((owner, sandbox_id))
 }
 
 async fn run_sandbox_process(
-    agent: &dyn AgentHandle,
+    owner: &dyn SandboxHandle,
     sandbox_id: String,
     command: Vec<String>,
     env: HashMap<String, String>,
     connect_stdin: bool,
 ) -> Result<i32> {
-    let process = agent
+    let process = owner
         .run_in_sandbox(RunInSandboxRequest {
             id: sandbox_id,
             command,
@@ -2952,9 +3071,7 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
                 | ConversationMountCommands::Remove { agent, .. } => Some(agent.as_str()),
             },
             ConversationCommands::Sandbox { command } => match command {
-                ConversationSandboxCommands::Attach { agent, .. }
-                | ConversationSandboxCommands::Detach { agent, .. }
-                | ConversationSandboxCommands::Run { agent, .. } => Some(agent.as_str()),
+                ConversationSandboxCommands::Run { agent, .. } => Some(agent.as_str()),
             },
             ConversationCommands::CompleteRebuildUpdate { .. } => None,
         },
@@ -3956,14 +4073,15 @@ mod create_tests {
     }
 
     #[test]
-    fn conversation_sandbox_attach_command_parses() {
+    fn sandbox_attach_accepts_a_conversation_owner() {
         use clap::Parser;
         let cli = super::Cli::try_parse_from([
             "exo",
-            "conversation",
             "sandbox",
             "attach",
+            "--agent",
             "agent",
+            "--conversation",
             "conv",
             "--provider",
             "docker",
@@ -3972,24 +4090,61 @@ mod create_tests {
             "--default-workdir",
             "/task",
         ])
-        .expect("conversation sandbox attach parses");
+        .expect("sandbox attach parses with a conversation owner");
         assert!(matches!(
             cli.command,
-            super::Commands::Conversation {
-                command: super::ConversationCommands::Sandbox {
-                    command: super::ConversationSandboxCommands::Attach {
-                        agent,
-                        conversation,
-                        provider: super::SandboxProviderArg::Docker,
-                        external_id,
-                        default_workdir: Some(default_workdir),
+            super::Commands::Sandbox {
+                command: super::SandboxCommands::Attach {
+                    owner: super::SandboxOwnerArgs {
+                        agent: Some(agent),
+                        conversation: Some(conversation),
                     },
-                }
+                    provider: super::SandboxProviderArg::Docker,
+                    external_id,
+                    default_workdir: Some(default_workdir),
+                },
             } if agent == "agent"
                 && conversation == "conv"
                 && external_id == "harbor-task"
                 && default_workdir == "/task"
         ));
+    }
+
+    #[test]
+    fn sandbox_select_names_a_conversation() {
+        use clap::Parser;
+        let cli = super::Cli::try_parse_from([
+            "exo",
+            "sandbox",
+            "select",
+            "--agent",
+            "a",
+            "--conversation",
+            "c",
+            "sandbox-1",
+        ])
+        .expect("select parses with both refs");
+        assert!(matches!(
+            cli.command,
+            super::Commands::Sandbox {
+                command: super::SandboxCommands::Select {
+                    owner: super::SandboxOwnerArgs {
+                        agent: Some(agent),
+                        conversation: Some(conversation),
+                    },
+                    sandbox_id,
+                },
+            } if agent == "a" && conversation == "c" && sandbox_id == "sandbox-1"
+        ));
+    }
+
+    #[test]
+    fn sandbox_conversation_owner_requires_an_agent() {
+        use clap::Parser;
+        // A convo without an agent doesn't make sense.
+        assert!(
+            super::Cli::try_parse_from(["exo", "sandbox", "ps", "--conversation", "conv"]).is_err()
+        );
     }
 
     #[test]

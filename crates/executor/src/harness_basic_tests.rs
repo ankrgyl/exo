@@ -1207,6 +1207,7 @@ async fn updating_sandbox_image_recreates_shell_sandbox_without_shell_program() 
         })
         .await
         .expect("sandbox attachment event should be recorded");
+    // Attaching only adds the container to the inventory, not used until selected.
     assert_eq!(
         ensure_shell_sandbox(
             conversation.exoharness_handle().as_ref(),
@@ -1214,7 +1215,29 @@ async fn updating_sandbox_image_recreates_shell_sandbox_without_shell_program() 
             &conversation_config,
         )
         .await
-        .expect("attached sandbox should be selected"),
+        .expect("attaching alone should not change what the conversation uses"),
+        second_sandbox_id
+    );
+
+    conversation
+        .exoharness_handle()
+        .add_events(AddEventsRequest {
+            session_id: None,
+            turn_id: None,
+            data: vec![EventData::SandboxSelected {
+                sandbox_id: Some(attached_sandbox_id.clone()),
+            }],
+        })
+        .await
+        .expect("sandbox selection event should be recorded");
+    assert_eq!(
+        ensure_shell_sandbox(
+            conversation.exoharness_handle().as_ref(),
+            &agent_config,
+            &conversation_config,
+        )
+        .await
+        .expect("the selected sandbox should be used"),
         attached_sandbox_id
     );
 
@@ -1232,6 +1255,25 @@ async fn updating_sandbox_image_recreates_shell_sandbox_without_shell_program() 
         })
         .await
         .expect("sandbox detachment event should be recorded");
+    // A selected sandbox that's beed detached is no longer usable, error.
+    ensure_shell_sandbox(
+        conversation.exoharness_handle().as_ref(),
+        &agent_config,
+        &conversation_config,
+    )
+    .await
+    .expect_err("a binding to a detached sandbox should not resolve");
+
+    // Clearing it is the way back to the configured sandbox.
+    conversation
+        .exoharness_handle()
+        .add_events(AddEventsRequest {
+            session_id: None,
+            turn_id: None,
+            data: vec![EventData::SandboxSelected { sandbox_id: None }],
+        })
+        .await
+        .expect("clearing the selection should be recorded");
     assert_eq!(
         ensure_shell_sandbox(
             conversation.exoharness_handle().as_ref(),
@@ -1239,7 +1281,7 @@ async fn updating_sandbox_image_recreates_shell_sandbox_without_shell_program() 
             &conversation_config,
         )
         .await
-        .expect("previous sandbox should be selected after detachment"),
+        .expect("previous sandbox should be selected after clearing"),
         second_sandbox_id
     );
 }

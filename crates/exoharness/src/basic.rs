@@ -2066,10 +2066,10 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         let _guard = self.harness.inner.write_lock.lock().await;
         let mut sandbox = self.load_sandbox(&sandbox_id).await?;
         if !sandbox.running {
+            if let Some(attachment) = sandbox.attachment {
+                return Ok(attachment);
+            }
             bail!("sandbox is not running: {sandbox_id}");
-        }
-        if sandbox.attachment.is_some() {
-            bail!("sandbox is already detached: {sandbox_id}");
         }
         let attachment = sandbox_handle.detach().await?;
         self.harness
@@ -2102,7 +2102,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
 
     async fn snapshot_sandbox(&self, id: SandboxId) -> Result<SnapshotId> {
         let (snapshot_id, event) =
-            snapshot_sandbox_side_effect(self.harness, &self.owner_dir, id).await?;
+            snapshot_sandbox_side_effect(self.harness, &self.owner_dir, self.owner, id).await?;
         self.append_events(vec![event]).await?;
         Ok(snapshot_id)
     }
@@ -3220,22 +3220,21 @@ impl BasicConversationHandle {
 async fn snapshot_sandbox_side_effect(
     harness: &BasicExoHarness,
     owner_dir: &Path,
+    owner: SandboxOwner,
     id: SandboxId,
 ) -> Result<(SnapshotId, EventData)> {
     let sandbox = load_stored_sandbox(harness, owner_dir, &id).await?;
-    if sandbox.attachment.is_some() {
-        bail!("attached sandboxes cannot be snapshotted");
+    if !sandbox.running {
+        bail!("sandbox is not running: {id}");
     }
     // Capture the payload before taking the write lock. Backends may need to
     // talk to docker or pause the container, which can be slow.
-    let handle = harness
-        .inner
-        .running_sandboxes
-        .lock()
-        .await
-        .get(&id)
-        .cloned()
-        .ok_or_else(|| anyhow!("sandbox {id} is not running; start it before snapshotting"))?;
+    //
+    // Resolved through active_sandbox_handle rather than only the in-process
+    // map: each CLI invocation is its own process, so a sandbox created by an
+    // earlier one has no live handle here even though it is still running.
+    let (handle, _provider_state_event) =
+        active_sandbox_handle(harness, owner_dir, owner, &id, &sandbox).await?;
     let payload = handle.snapshot().await?;
 
     let _guard = harness.inner.write_lock.lock().await;

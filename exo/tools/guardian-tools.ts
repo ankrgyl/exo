@@ -22,16 +22,23 @@ const GUARDIAN_SCRIPT = new URL(
   import.meta.url,
 ).pathname;
 const DEFERRED_SCRIPT = new URL(
-  "./scripts/deferred-rebuild-and-restart",
+  "../scripts/deferred-rebuild-and-restart",
   import.meta.url,
 ).pathname;
 const ROOT_DIR = new URL("../..", import.meta.url).pathname;
-const STATE_DIR = join(ROOT_DIR, ".exo");
+const STATE_DIR = guardianStateDir(process.env, ROOT_DIR);
 const DEFERRED_LOG_PATH = join(STATE_DIR, "exo-service-guardian-actions.log");
 const UPDATE_DIR = join(STATE_DIR, "guardian-updates");
 const EXO_BIN = join(ROOT_DIR, "target/debug/exo");
 const ENV_FILE = join(ROOT_DIR, ".env");
 const DEFERRED_RESTART_DELAY_SECONDS = 2;
+
+export function guardianStateDir(
+  env: NodeJS.ProcessEnv,
+  repoRoot: string,
+): string {
+  return env.EXO_ROOT ?? join(repoRoot, ".exo");
+}
 
 export function registerGuardianTools(registry: HarnessToolRegistry): void {
   registry.register(rebuildAndRestartExoTool());
@@ -141,6 +148,7 @@ function runGuardianDeferredWithOutcome(
       JSON.stringify(reason),
       EXO_BIN,
       ENV_FILE,
+      STATE_DIR,
       ...command,
     ],
     {

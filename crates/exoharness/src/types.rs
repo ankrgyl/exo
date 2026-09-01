@@ -311,6 +311,7 @@ impl EventKind {
     pub const SANDBOX_STOPPED: EventKind = EventKind(Cow::Borrowed("sandbox_stopped"));
     pub const SANDBOX_ATTACHED: EventKind = EventKind(Cow::Borrowed("sandbox_attached"));
     pub const SANDBOX_DETACHED: EventKind = EventKind(Cow::Borrowed("sandbox_detached"));
+    pub const SANDBOX_SELECTED: EventKind = EventKind(Cow::Borrowed("sandbox_selected"));
     pub const SANDBOX_SNAPSHOTTED: EventKind = EventKind(Cow::Borrowed("sandbox_snapshotted"));
     pub const SANDBOX_PROCESS_STARTED: EventKind =
         EventKind(Cow::Borrowed("sandbox_process_started"));
@@ -499,6 +500,15 @@ pub enum EventData {
         attachment: SandboxAttachment,
         default_workdir: String,
     },
+    /// This owner now uses `sandbox_id`, which may belong to a parent scope.
+    ///
+    /// Recorded rather than kept as configuration so the log answers which
+    /// sandbox any given turn ran in. Selection reads the most recent one, so
+    /// a rebind is an append rather than an overwrite.
+    SandboxSelected {
+        /// None unpins, so selection falls back to configuration again.
+        sandbox_id: Option<SandboxId>,
+    },
     SandboxDetached {
         sandbox_id: SandboxId,
         attachment: SandboxAttachment,
@@ -562,6 +572,7 @@ impl EventData {
             Self::SandboxStopped { .. } => EventKind::SANDBOX_STOPPED,
             Self::SandboxAttached { .. } => EventKind::SANDBOX_ATTACHED,
             Self::SandboxDetached { .. } => EventKind::SANDBOX_DETACHED,
+            Self::SandboxSelected { .. } => EventKind::SANDBOX_SELECTED,
             Self::SandboxSnapshotted { .. } => EventKind::SANDBOX_SNAPSHOTTED,
             Self::SandboxProcessStarted { .. } => EventKind::SANDBOX_PROCESS_STARTED,
             Self::SandboxProcessStateUpdated { .. } => EventKind::SANDBOX_PROCESS_STATE_UPDATED,

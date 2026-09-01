@@ -1351,3 +1351,133 @@ fn default_agent_config() -> AgentConfig {
         braintrust: None,
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn clearing_a_binding_unpins_instead_of_restoring_the_previous_one() {
+    let agent_id = Uuid7::now();
+    let conversation_id = Uuid7::now();
+    let exoharness = Arc::new(FakeExoHarness::new(agent_id, conversation_id));
+    let agent = exoharness
+        .get_agent(&agent_id)
+        .await
+        .expect("get agent should succeed")
+        .expect("agent should exist");
+    let conversation = agent
+        .get_conversation(&conversation_id)
+        .await
+        .expect("get conversation should succeed")
+        .expect("conversation should exist");
+
+    let select = |sandbox_id: Option<&str>| AddEventsRequest {
+        session_id: None,
+        turn_id: None,
+        data: vec![EventData::SandboxSelected {
+            sandbox_id: sandbox_id.map(str::to_string),
+        }],
+    };
+
+    conversation
+        .add_events(select(Some("sandbox-one")))
+        .await
+        .expect("first binding should be recorded");
+    assert_eq!(
+        crate::conversation_sandbox::selected_conversation_sandbox(conversation.as_ref())
+            .await
+            .expect("selection should resolve"),
+        Some("sandbox-one".to_string())
+    );
+
+    conversation
+        .add_events(select(Some("sandbox-two")))
+        .await
+        .expect("rebinding should append");
+    assert_eq!(
+        crate::conversation_sandbox::selected_conversation_sandbox(conversation.as_ref())
+            .await
+            .expect("selection should resolve"),
+        Some("sandbox-two".to_string()),
+        "the newest binding wins"
+    );
+
+    conversation
+        .add_events(select(None))
+        .await
+        .expect("clearing should append");
+    assert_eq!(
+        crate::conversation_sandbox::selected_conversation_sandbox(conversation.as_ref())
+            .await
+            .expect("selection should resolve"),
+        None,
+        "clearing unpins entirely rather than falling back to sandbox-one"
+    );
+}
+#[tokio::test(flavor = "current_thread")]
+async fn a_binding_to_a_detached_sandbox_is_an_error() {
+    let agent_id = Uuid7::now();
+    let conversation_id = Uuid7::now();
+    let exoharness = Arc::new(FakeExoHarness::new(agent_id, conversation_id));
+    let agent = exoharness
+        .get_agent(&agent_id)
+        .await
+        .expect("get agent should succeed")
+        .expect("agent should exist");
+    let conversation = agent
+        .get_conversation(&conversation_id)
+        .await
+        .expect("get conversation should succeed")
+        .expect("conversation should exist");
+
+    let attachment = SandboxAttachment::DockerContainer {
+        container_id: "harbor-task".to_string(),
+    };
+    let append = |data: Vec<EventData>| AddEventsRequest {
+        session_id: None,
+        turn_id: None,
+        data,
+    };
+
+    conversation
+        .add_events(append(vec![
+            EventData::SandboxAttached {
+                sandbox_id: "sandbox-borrowed".to_string(),
+                attachment: attachment.clone(),
+                default_workdir: "/".to_string(),
+            },
+            EventData::SandboxSelected {
+                sandbox_id: Some("sandbox-borrowed".to_string()),
+            },
+        ]))
+        .await
+        .expect("attaching and selecting should be recorded");
+    assert_eq!(
+        crate::conversation_sandbox::resolve_conversation_sandbox_selection(conversation.as_ref())
+            .await
+            .expect("selection should resolve"),
+        Some("sandbox-borrowed".to_string()),
+        "an attached sandbox is usable once it has been selected"
+    );
+
+    conversation
+        .add_events(append(vec![EventData::SandboxDetached {
+            sandbox_id: "sandbox-borrowed".to_string(),
+            attachment,
+        }]))
+        .await
+        .expect("detach should be recorded");
+    let error =
+        crate::conversation_sandbox::resolve_conversation_sandbox_selection(conversation.as_ref())
+            .await
+            .expect_err("a binding naming a sandbox that is gone must not resolve");
+    let message = error.to_string();
+    assert!(
+        message.contains("sandbox-borrowed") && message.contains("exo sandbox deselect"),
+        "the error should name the sandbox and how to recover: {message}"
+    );
+    // The binding itself is untouched; only resolving it fails.
+    assert_eq!(
+        crate::conversation_sandbox::selected_conversation_sandbox(conversation.as_ref())
+            .await
+            .expect("selection should resolve"),
+        Some("sandbox-borrowed".to_string())
+    );
+}

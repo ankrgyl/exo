@@ -1,0 +1,30 @@
+schema_version = "1.4"
+
+[task]
+name = "exo/self-evolution-restart-and-observe"
+version = "1.0.0"
+authors = []
+keywords = ["smoke", "self-evolution", "restart"]
+
+[metadata]
+difficulty = "easy"
+category = "testing"
+tags = ["smoke", "self-evolution", "restart"]
+
+[verifier]
+timeout_sec = 30.0
+
+[agent]
+timeout_sec = 900.0
+
+[environment]
+build_timeout_sec = 120.0
+cpus = 1
+memory_mb = 512
+storage_mb = 1024
+gpus = 0
+mcp_servers = []
+
+[verifier.env]
+
+[solution.env]

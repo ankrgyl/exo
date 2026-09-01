@@ -2,12 +2,20 @@ import { HarnessToolRegistry, type TurnContext } from "@exo/harness";
 import { describe, expect, it } from "vitest";
 
 import {
+  guardianStateDir,
   parseRebuildReason,
   rebuildAndRestartExoTool,
   registerGuardianTools,
 } from "./guardian-tools";
 
 describe("guardian tools", () => {
+  it("uses the active Exo root for guardian state", () => {
+    expect(guardianStateDir({ EXO_ROOT: "/tmp/eval-exo" }, "/src/exo")).toBe(
+      "/tmp/eval-exo",
+    );
+    expect(guardianStateDir({}, "/src/exo")).toBe("/src/exo/.exo");
+  });
+
   it("registers only rebuild_and_restart_exo", () => {
     const registry = new HarnessToolRegistry({} as TurnContext);
 

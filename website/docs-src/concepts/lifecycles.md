@@ -249,33 +249,84 @@ by any external process (Harbor and similar flows). Exo does not build that
 container; it binds an existing one into the conversation and routes
 execution there.
 
+Every `exo sandbox` verb names its owner. `--agent` alone makes the agent the
+owner; adding `--conversation` makes that conversation the owner instead.
+Ownership is not cosmetic: sandbox records live under the owner, so a
+conversation cannot address a sandbox its agent owns.
+
 ```bash
 # Attach an existing Docker container to a conversation
-exo conversation sandbox attach <agent> <conversation> \
+exo sandbox attach --agent <agent> --conversation <conversation> \
   --provider docker \
   --external-id <container-id> \
   --default-workdir /workspace
 
 # Later, hand it back
-exo conversation sandbox detach <agent> <conversation> <exo-sandbox-id>
+exo sandbox detach --agent <agent> --conversation <conversation> <exo-sandbox-id>
 ```
 
 ### Which sandbox does a turn use?
 
 Executor selection (simplified):
 
-1. Replay conversation sandbox events into **active candidates**
-   (`sandbox_created` / `sandbox_attached`, minus stopped/detached).
-2. Prefer the **most recent active attached** sandbox.
-3. Else prefer the most recent **created** sandbox that still matches the
-   current config-derived spec.
+1. Replay conversation sandbox events into the **sandboxes this conversation
+   has**: `sandbox_created` and `sandbox_attached` add one, `sandbox_stopped`
+   and `sandbox_detached` remove it.
+2. If a **selection** (`sandbox_selected`) names one of them, use it. If the
+   selection names a sandbox the conversation no longer has, that is an
+   **error**, not a fallback — see below.
+3. Else prefer the most recent sandbox this conversation **created** that
+   still matches the current config-derived spec.
 4. Else **create** a new one.
 5. If the conversation's sandbox scope is **agent**, use the shared
    agent sandbox (durable name recorded on the agent) instead of a
    per-conversation create — canonical Exo defaults here.
 
-An attached sandbox wins over a normal created one so external workflows
-can temporarily own execution without fighting auto-provisioning.
+Attaching and selecting are separate steps, and both are explicit. Attaching
+adds a container to the conversation's inventory; it does not make anything run
+there. That takes a selection. An adopted container can *only* be reached by
+selection: it was never created from this conversation's config, so step 3 can
+never match it.
+
+```bash
+exo sandbox attach --agent <agent> --conversation <conversation> \
+  --provider docker --external-id <container-id>
+exo sandbox select --agent <agent> --conversation <conversation> <sandbox-id>
+```
+
+A selection that cannot be honored fails the turn rather than quietly falling
+back, so history never claims a sandbox the turns did not use. Releasing a
+sandbox is therefore two explicit steps — detach it, then clear the binding:
+
+```bash
+exo sandbox detach   --agent <agent> --conversation <conversation> <sandbox-id>
+exo sandbox deselect --agent <agent> --conversation <conversation>
+```
+
+`attach`/`detach` govern what the conversation *has*; `select`/`deselect`
+govern what it *uses*. Selecting an existing sandbox is its own command:
+
+```bash
+exo sandbox select --agent <agent> --conversation <conversation> <sandbox-id>
+```
+
+**Creating a conversation-owned sandbox is not enough to make a turn use
+it.** The spec match in step 3 compares image, workdir, mounts, durable
+filesystems, networking, and an idle timeout of exactly 300s, and
+`exo sandbox start` does not produce those defaults — it leaves the workdir
+unset, networking on, and its own idle timeout. So a sandbox you started by
+hand loses the match and the next turn builds a second one beside it. Bind it
+explicitly when you want it used:
+
+```bash
+exo sandbox start --agent <agent> --conversation <conversation> \
+  --provider docker --image ubuntu:24.04
+exo conversation update <agent> <conversation> --sandbox-id <sandbox-id>
+```
+
+The binding is recorded as a `sandbox_selected` event and takes priority over
+both attachment and spec matching, which is also what makes a sandbox restored
+from a snapshot usable when its image no longer matches the configured spec.
 
 **Config changes do not migrate an existing conversation sandbox.** If you
 change the sandbox spec mid-flight (image, mounts, networking, provider,

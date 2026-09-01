@@ -1,3 +1,4 @@
+use anyhow::bail;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -50,40 +51,73 @@ pub(crate) async fn ensure_conversation_sandbox(
 ) -> Result<String> {
     let sandbox_lock = conversation_sandbox_lock(&conversation.record().id.to_string());
     let _guard = sandbox_lock.lock().await;
+    if let Some(sandbox_id) = resolve_conversation_sandbox_selection(conversation).await? {
+        return Ok(sandbox_id);
+    }
+
     let spec = conversation_sandbox_spec(agent_config, config);
 
-    // Of the still-active candidates in conversation history, prefer the most recent one
-    // that was either explicitly attached or matches the spec derived from configuration.
-    for candidate in conversation_sandbox_candidates(conversation)
+    // Of the sandboxes this conversation still has, prefer the most recent one
+    // matching the spec derived from configuration.
+    for sandbox in conversation_sandboxes(conversation)
         .await?
         .into_iter()
         .rev()
     {
-        match candidate {
-            ConversationSandboxCandidate::Attached { id } => return Ok(id),
-            ConversationSandboxCandidate::Created(sandbox) if sandbox.matches_spec(&spec) => {
-                return Ok(sandbox.id);
-            }
-            ConversationSandboxCandidate::Created(_) => {}
+        if sandbox.matches_spec(&spec) {
+            return Ok(sandbox.id);
         }
     }
 
     create_conversation_sandbox(conversation, agent_config, config).await
 }
 
-pub async fn attached_conversation_sandbox(
+/// The sandbox this conversation is bound to, if any (else none).
+pub(crate) async fn resolve_conversation_sandbox_selection(
     conversation: &dyn ConversationHandle,
 ) -> Result<Option<String>> {
-    Ok(
-        match conversation_sandbox_candidates(conversation)
-            .await?
-            .into_iter()
-            .next_back()
-        {
-            Some(ConversationSandboxCandidate::Attached { id }) => Some(id),
-            Some(ConversationSandboxCandidate::Created(_)) | None => None,
-        },
-    )
+    let Some(selected) = selected_conversation_sandbox(conversation).await? else {
+        return Ok(None);
+    };
+    // Check to make sure the selected sandbox is still active for this conversation.
+    let active = conversation_sandbox_candidates(conversation)
+        .await?
+        .iter()
+        .any(|candidate| candidate.id() == selected);
+    if !active {
+        bail!(
+            "conversation {} selects sandbox {selected}, which it no longer has; \
+             it was detached or terminated. Run `exo sandbox deselect --agent <agent> \
+             --conversation <conversation>` to go back to its configured sandbox",
+            conversation.record().slug
+        );
+    }
+    Ok(Some(selected))
+}
+
+/// Return the most recent sandbox selection event, if any, for the conversation.
+/// Note: deselection is recorded as selection of 'None', which is caught here.
+pub(crate) async fn selected_conversation_sandbox(
+    conversation: &dyn ConversationHandle,
+) -> Result<Option<String>> {
+    let events = conversation
+        .get_events(Some(EventQuery {
+            cursor: None,
+            direction: Some(EventQueryDirection::Desc),
+            limit: Some(1),
+            session_id: None,
+            turn_id: None,
+            types: Some(vec![EventKind::SANDBOX_SELECTED]),
+        }))
+        .await?
+        .events;
+    Ok(events
+        .into_iter()
+        .next()
+        .and_then(|event| match event.data {
+            EventData::SandboxSelected { sandbox_id } => sandbox_id,
+            _ => None,
+        }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

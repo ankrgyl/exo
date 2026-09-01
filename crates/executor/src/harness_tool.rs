@@ -9,8 +9,8 @@ use crate::adapter::tools::{
 use crate::agent_sandbox::{current_agent_sandbox, ensure_agent_sandbox};
 use crate::conversation_events::execute_list_conversation_events_tool;
 use crate::conversation_sandbox::{
-    agent_sandbox_spec, attached_conversation_sandbox, conversation_sandbox_spec,
-    conversation_sandboxes, ensure_conversation_sandbox,
+    agent_sandbox_spec, conversation_sandbox_spec, conversation_sandboxes,
+    ensure_conversation_sandbox, resolve_conversation_sandbox_selection,
 };
 use crate::scheduler_store::SchedulerStore;
 use crate::scheduler_types::{
@@ -94,8 +94,10 @@ impl ToolRuntime for ExoToolRuntime {
         agent_config: &AgentConfig,
         config: &ConversationConfig,
     ) -> Result<()> {
-        // No need to create a new sandbox if one is already attached to the conversation.
-        if attached_conversation_sandbox(conversation).await?.is_some() {
+        if resolve_conversation_sandbox_selection(conversation)
+            .await?
+            .is_some()
+        {
             return Ok(());
         }
         match effective_sandbox_scope(agent_config, config) {
@@ -922,7 +924,10 @@ async fn execute_exo_shell_tool(
     config: &ConversationConfig,
     request: &ToolRequest,
 ) -> Result<ToolResult> {
-    if attached_conversation_sandbox(conversation).await?.is_some()
+    // A selected sandbox wins over configured scope.
+    if resolve_conversation_sandbox_selection(conversation)
+        .await?
+        .is_some()
         || effective_sandbox_scope(agent_config, config) == SandboxScope::Conversation
     {
         return execute_shell_tool(conversation, agent_config, config, request).await;
@@ -950,7 +955,7 @@ pub(crate) async fn ensure_shell_sandbox(
     agent_config: &AgentConfig,
     config: &ConversationConfig,
 ) -> Result<String> {
-    if let Some(sandbox_id) = attached_conversation_sandbox(conversation).await? {
+    if let Some(sandbox_id) = resolve_conversation_sandbox_selection(conversation).await? {
         return Ok(sandbox_id);
     }
     let desired_default_workdir = config
