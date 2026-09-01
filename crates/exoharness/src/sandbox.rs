@@ -24,6 +24,11 @@ use uuid::Uuid;
 
 use crate::{DurableFileSystem, SandboxAttachment};
 
+/// Provider-facing key for a sandbox.
+///
+/// `sandbox_id` is the globally unique logical sandbox identity. The owner is
+/// retained in this key because providers persist its display form in resource
+/// names, labels, and provider-state events.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SandboxKey {
     AgentSandbox {
@@ -34,6 +39,15 @@ pub enum SandboxKey {
         conversation_id: String,
         sandbox_id: String,
     },
+}
+
+impl SandboxKey {
+    pub fn sandbox_id(&self) -> &str {
+        match self {
+            Self::AgentSandbox { sandbox_id, .. }
+            | Self::ConversationSandbox { sandbox_id, .. } => sandbox_id,
+        }
+    }
 }
 
 impl fmt::Display for SandboxKey {
@@ -2278,6 +2292,30 @@ async fn docker_load_image(container_bin: &Path, payload: &Bytes) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_key_exposes_global_sandbox_id_without_changing_provider_key() {
+        let sandbox_id = "sandbox-019c0000-0000-7000-8000-000000000000";
+        let agent_key = SandboxKey::AgentSandbox {
+            agent_id: "agent-id".to_string(),
+            sandbox_id: sandbox_id.to_string(),
+        };
+        let conversation_key = SandboxKey::ConversationSandbox {
+            conversation_id: "conversation-id".to_string(),
+            sandbox_id: sandbox_id.to_string(),
+        };
+
+        assert_eq!(agent_key.sandbox_id(), sandbox_id);
+        assert_eq!(conversation_key.sandbox_id(), sandbox_id);
+        assert_eq!(
+            agent_key.to_string(),
+            format!("agent:agent-id:{sandbox_id}")
+        );
+        assert_eq!(
+            conversation_key.to_string(),
+            format!("conversation:conversation-id:{sandbox_id}")
+        );
+    }
 
     #[test]
     fn apple_container_list_item_reads_current_status_shape() {
