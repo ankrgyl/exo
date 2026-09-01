@@ -16,6 +16,7 @@ import {
   rebuildWithCompression,
   selectCompressIndices,
   selectPinIndices,
+  stripVisionImageParts,
 } from "./context-compress.js";
 import {
   clearLearnedContextWindows,
@@ -69,6 +70,7 @@ describe("context-window", () => {
     expect(resolveContextWindowTokens("anthropic:claude-sonnet-5")).toBe(
       1_000_000,
     );
+    expect(resolveContextWindowTokens("grok-4.6")).toBe(500_000);
     expect(resolveContextWindowTokens("grok-4.5")).toBe(500_000);
     expect(resolveContextWindowTokens("grok-4.3")).toBe(1_000_000);
     expect(resolveContextWindowTokens("claude-opus-5")).toBe(1_000_000);
@@ -192,6 +194,23 @@ describe("context-compress selection", () => {
     expect(windowed[0]?.content).toBe("Original client request");
     expect(String(windowed[1]?.content)).toContain(COMPRESSED_MARKER);
     expect(windowed[2]?.content).toBe("new work");
+  });
+
+  it("strips vision image parts for context-window retry", () => {
+    const messages: Message[] = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "see this" },
+          { type: "image", image: "AAAA", media_type: "image/png" },
+        ],
+      },
+      assistantText("ok"),
+    ];
+    const { messages: out, strippedCount } = stripVisionImageParts(messages);
+    expect(strippedCount).toBe(1);
+    expect(JSON.stringify(out)).not.toContain('"type":"image"');
+    expect(JSON.stringify(out)).toContain("image omitted");
   });
 });
 

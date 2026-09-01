@@ -36,6 +36,36 @@ export const TOKEN_ESTIMATE_CHARS_PER_TOKEN = 4;
  */
 export const IMAGE_TOKEN_BUDGET = 1_600;
 
+/**
+ * Replace multimodal image parts with short text notes. Used on context-window
+ * retry — providers may bill large PNGs far above {@link IMAGE_TOKEN_BUDGET}.
+ */
+export function stripVisionImageParts(messages: Message[]): {
+  messages: Message[];
+  strippedCount: number;
+} {
+  let strippedCount = 0;
+  const next = messages.map((msg) => {
+    if (!Array.isArray(msg.content)) return msg;
+    let changed = false;
+    const content = msg.content.map((part) => {
+      if (!part || typeof part !== "object") return part;
+      const p = part as { type?: string };
+      if (p.type !== "image" && p.type !== "image-data" && p.type !== "media") {
+        return part;
+      }
+      changed = true;
+      strippedCount += 1;
+      return {
+        type: "text" as const,
+        text: "[image omitted to fit model context window — re-run a single-slide preview/screenshot if needed]",
+      };
+    });
+    return changed ? { ...msg, content: content as Message["content"] } : msg;
+  });
+  return { messages: next, strippedCount };
+}
+
 export const SUMMARY_OVERHEAD_TOKENS = 3_000;
 
 export const DEFAULT_MAX_OUTPUT_TOKENS = 16_000;

@@ -49,13 +49,13 @@ export const LATEST_TOOL_RESULT_CHAR_CAP = 32_000;
 export const HISTORY_TOOL_RESULT_CHAR_CAP = 4_000;
 
 /** Max vision image attaches per trailing tool round. */
-export const MAX_VISION_IMAGES_PER_ROUND = 4;
+export const MAX_VISION_IMAGES_PER_ROUND = 1;
 
 /**
- * Max decoded image bytes (~750KB) for a single vision attach. Base64 is
- * ~4/3 of this. Over the limit we keep a text note instead of attaching.
+ * Max decoded image bytes (~120KB) for a single vision attach. Larger PNG
+ * slide previews were counting as ~200K+ tokens each toward provider limits.
  */
-export const MAX_VISION_IMAGE_BYTES = 750_000;
+export const MAX_VISION_IMAGE_BYTES = 120_000;
 
 export type VisionImageCandidate = {
   toolName: string;
@@ -558,6 +558,14 @@ export function stripAllImagePayloads(
   const out: Record<string, unknown> = {};
   let omitted = false;
   for (const [key, child] of Object.entries(value)) {
+    // Host-only vision batches (previewPresentation) — never keep the array
+    // skeleton in the prompt after images were extracted.
+    if (key === "_visionSlides" || key === "_previewFiles") {
+      omitted = true;
+      out[`${key}Omitted`] = true;
+      if (Array.isArray(child)) out[`${key}Count`] = child.length;
+      continue;
+    }
     if (IMAGE_BASE64_KEYS.has(key) && typeof child === "string") {
       omitted = true;
       out[`${key}Omitted`] = true;

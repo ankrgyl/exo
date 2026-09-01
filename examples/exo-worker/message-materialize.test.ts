@@ -362,6 +362,69 @@ describe("hydrateToolResultsForVision", () => {
     );
   });
 
+  it("does not attach vision for path-only preview results", async () => {
+    const artifactJson = JSON.stringify({
+      success: true,
+      slides: [
+        { slideNumber: 1, path: "/tmp/1.png" },
+        { slideNumber: 2, path: "/tmp/2.png" },
+      ],
+      message: "Rendered 2 slide preview(s) to disk.",
+    });
+
+    const conversation = {
+      async readArtifactText() {
+        return artifactJson;
+      },
+    };
+
+    const previewEnvelope = {
+      ok: true,
+      toolName: "previewPresentation",
+      toolCallId: "prev_vision",
+      truncated: true,
+      preview: '{"success":true,"slides":2}',
+      value: {
+        success: true,
+        slides: [
+          { slideNumber: 1, path: "/tmp/1.png" },
+          { slideNumber: 2, path: "/tmp/2.png" },
+        ],
+      },
+      resultArtifact: { artifactId: "art-preview-vision", version: 1 },
+    };
+
+    const hydrated = await hydrateToolResultsForVision(conversation as never, [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_call",
+            tool_call_id: "prev_vision",
+            tool_name: "previewPresentation",
+            arguments: {},
+          },
+        ],
+      },
+      toolResultMessage("prev_vision", "previewPresentation", previewEnvelope),
+    ]);
+
+    const toolOut = (
+      hydrated.find((m) => m.role === "tool")!.content as Array<{
+        output?: unknown;
+      }>
+    )[0]?.output;
+    expect(JSON.stringify(toolOut)).toContain("/tmp/1.png");
+    expect(JSON.stringify(toolOut)).not.toContain('"imageBase64"');
+    const visionCount = hydrated.filter(
+      (m) =>
+        m.role === "user" &&
+        Array.isArray(m.content) &&
+        m.content.some((p) => (p as { type?: string }).type === "image"),
+    ).length;
+    expect(visionCount).toBe(0);
+  });
+
   it("shows nested slide previews once, then strips them from later rounds", async () => {
     let artifactReads = 0;
     const artifactJson = JSON.stringify({
@@ -413,9 +476,7 @@ describe("hydrateToolResultsForVision", () => {
     );
     const firstRepaired = repairLinguaToolPairing(first);
     expect(artifactReads).toBe(1);
-    expect(JSON.stringify(firstRepaired)).toContain(fakeJpegA);
-    expect(JSON.stringify(firstRepaired)).toContain(fakeJpegB);
-    // Base64 must live only in image parts, not tool JSON.
+    // At most one image attaches per round; base64 must not remain in tool JSON.
     const firstToolOut = (
       firstRepaired.find((m) => m.role === "tool")!.content as Array<{
         output?: unknown;
@@ -429,7 +490,8 @@ describe("hydrateToolResultsForVision", () => {
         Array.isArray(m.content) &&
         m.content.some((p) => (p as { type?: string }).type === "image"),
     ).length;
-    expect(visionCount).toBe(2);
+    expect(visionCount).toBe(MAX_VISION_IMAGES_PER_ROUND);
+    expect(JSON.stringify(firstRepaired)).toContain(fakeJpegA);
 
     // After the model replies, the same tool result is historical — no re-read.
     const round2: Message[] = [

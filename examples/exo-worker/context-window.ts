@@ -30,6 +30,7 @@ export const KNOWN_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
   "claude-haiku-4-5": 200_000,
   "claude-haiku": 200_000,
   // xAI
+  "grok-4.6": 500_000,
   "grok-4.5": 500_000,
   "grok-4.3": 1_000_000,
   // Moonshot Kimi
