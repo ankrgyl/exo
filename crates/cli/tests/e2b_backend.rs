@@ -160,7 +160,7 @@ async fn acquire_reuses_running_sandbox_without_connect() {
         .await
         .expect("acquire should reuse running sandbox");
 
-    assert_eq!(handle.id(), "e2b:conversation:conv-3:sandbox-3");
+    assert_eq!(handle.id(), "e2b:thread:conv-3:sandbox-3");
 
     let requests = server.received_requests().await.unwrap_or_default();
     assert!(
@@ -225,8 +225,8 @@ async fn acquire_list_metadata_query_is_not_double_url_encoded() {
         "metadata filter must not double-encode ':' in sandbox keys; got {query}"
     );
     assert!(
-        query.contains("conversation%3Aconv-colons%3Asandbox-colons")
-            || query.contains("conversation:conv-colons:sandbox-colons"),
+        query.contains("thread%3Aconv-colons%3Asandbox-colons")
+            || query.contains("thread:conv-colons:sandbox-colons"),
         "expected sandbox key in metadata query; got {query}"
     );
     assert!(

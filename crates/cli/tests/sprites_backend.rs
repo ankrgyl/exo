@@ -99,7 +99,7 @@ async fn acquire_creates_sprite_when_missing() {
         .await;
 
     let handle = backend.acquire(request).await.expect("acquire");
-    assert_eq!(handle.id(), "sprites:conversation:conv-1:sandbox-1");
+    assert_eq!(handle.id(), "sprites:thread:conv-1:sandbox-1");
 }
 
 #[tokio::test]
@@ -135,7 +135,7 @@ async fn acquire_create_includes_exo_metadata_labels() {
         .and_then(Value::as_array)
         .expect("labels array");
     assert!(labels.iter().any(|label| {
-        label.as_str() == Some("exo.sandbox.key=conversation:conv-labels:sandbox-labels")
+        label.as_str() == Some("exo.sandbox.key=thread:conv-labels:sandbox-labels")
     }));
     assert!(
         labels
@@ -241,7 +241,7 @@ async fn acquire_reuses_existing_sprite_without_create() {
         .acquire(request)
         .await
         .expect("acquire should reuse existing sprite");
-    assert_eq!(handle.id(), "sprites:conversation:conv-3:sandbox-3");
+    assert_eq!(handle.id(), "sprites:thread:conv-3:sandbox-3");
 
     let requests = server.received_requests().await.unwrap_or_default();
     assert!(
