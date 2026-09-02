@@ -7,6 +7,8 @@ import { parseHTML } from "linkedom";
 import TurndownService from "turndown";
 import { Agent, fetch as undiciFetch } from "undici";
 
+import { searchParallel } from "./parallel-search";
+
 import type {
   HarnessToolRegistry,
   JsonObject,
@@ -24,7 +26,8 @@ import type {
 // of a Brave key in the exo secret store (`exo secret set brave-api-key ...`)
 // or BRAVE_API_KEY env var.
 //
-// EXO_WEB_SEARCH_PROVIDER=brave|duckduckgo to force a provider.
+// EXO_WEB_SEARCH_PROVIDER=brave|duckduckgo|parallel to force a provider.
+// Parallel is anonymous Search MCP and is never selected automatically.
 
 const BRAVE_SECRET_ID = "brave-api-key";
 
@@ -47,7 +50,7 @@ export type WebSearchResult = {
   snippet: string;
 };
 
-type SearchProvider = "brave" | "duckduckgo";
+type SearchProvider = "brave" | "duckduckgo" | "parallel";
 
 const searchCache = new Map<
   string,
@@ -304,11 +307,11 @@ async function resolveSearchProvider(
 ): Promise<{ provider: SearchProvider; braveKey: string | null } | string> {
   const braveKey = await resolveBraveKey(context);
   const forced = process.env.EXO_WEB_SEARCH_PROVIDER?.trim().toLowerCase();
-  if (forced === "brave" || forced === "duckduckgo") {
+  if (forced === "brave" || forced === "duckduckgo" || forced === "parallel") {
     return { provider: forced, braveKey };
   }
   if (forced !== undefined && forced !== "") {
-    return `unknown EXO_WEB_SEARCH_PROVIDER: ${forced} (use brave or duckduckgo)`;
+    return `unknown EXO_WEB_SEARCH_PROVIDER: ${forced} (use brave, duckduckgo, or parallel)`;
   }
   return { provider: braveKey !== null ? "brave" : "duckduckgo", braveKey };
 }
@@ -596,7 +599,7 @@ function webSearchTool(): ToolInstance {
     definition: {
       name: "web_search",
       description:
-        "Search the web for current information. Uses the Brave Search API when a brave-api-key secret (or BRAVE_API_KEY env) is configured, otherwise key-free DuckDuckGo. Returns normalized results with title, url, and snippet. Results are cached for 15 minutes.",
+        "Search the web for current information. Uses the Brave Search API when a brave-api-key secret (or BRAVE_API_KEY env) is configured, otherwise key-free DuckDuckGo. EXO_WEB_SEARCH_PROVIDER can explicitly select Brave, DuckDuckGo, or anonymous Parallel Search MCP. Parallel queries are limited to 200 characters. Returns normalized results with title, url, and snippet. Results are cached for 15 minutes.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -640,11 +643,25 @@ function webSearchTool(): ToolInstance {
           return { ...cached, cached: true };
         }
         let results: WebSearchResult[];
+        let parallelMetadata: JsonObject = {};
         try {
-          results =
-            provider === "brave"
-              ? await searchBrave(query, count, braveKey)
-              : await searchDuckDuckGo(query, count);
+          if (provider === "parallel") {
+            const search = await searchParallel(
+              query,
+              count,
+              execution.context.exoharness.current.conversation.record.id,
+            );
+            results = search.results;
+            parallelMetadata = {
+              warnings: search.warnings,
+              truncated: search.truncated,
+            };
+          } else {
+            results =
+              provider === "brave"
+                ? await searchBrave(query, count, braveKey)
+                : await searchDuckDuckGo(query, count);
+          }
         } catch (error) {
           const message =
             error instanceof Error ? error.message : String(error);
@@ -655,6 +672,7 @@ function webSearchTool(): ToolInstance {
           provider,
           query,
           results: results.map((result) => ({ ...result })),
+          ...parallelMetadata,
         };
         if (results.length === 0 && provider === "duckduckgo") {
           value.note = `No results parsed; DuckDuckGo may be rate limiting or its markup may have changed. Consider configuring a Brave key (exo secret set ${BRAVE_SECRET_ID}).`;

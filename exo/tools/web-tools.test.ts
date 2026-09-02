@@ -1,4 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
+
+import { HarnessToolRegistry, type TurnContext } from "@exo/harness";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { resolveExoProfile } from "../profiles";
 
 import {
   decodeEntities,
@@ -241,5 +247,412 @@ describe("decodeEntities", () => {
     expect(decodeEntities("&bogus; &#x110000; &#0;")).toBe(
       "&bogus; &#x110000; &#0;",
     );
+  });
+});
+
+describe("web search provider selection", () => {
+  const nativeFetch = globalThis.fetch;
+  const entries = [
+    {
+      url: "https://example.com/one",
+      title: "One",
+      excerpts: ["first", "second"],
+    },
+    { url: "https://example.com/two", title: null, excerpts: ["third"] },
+  ];
+
+  let now = Date.now();
+  beforeEach(() => {
+    // The existing Brave credential cache lasts one minute; isolate each case.
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    now += 61_000;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  function context(conversationId = randomUUID()) {
+    return {
+      agentConfig: { enableAgentToolCreation: false },
+      streaming: false,
+      exoharness: {
+        listSecrets: async () => [],
+        current: {
+          conversation: { record: { id: conversationId } },
+          turn: {
+            writeArtifactText: async ({
+              path,
+              text,
+            }: {
+              path: string;
+              text: string;
+            }) => ({
+              artifactId: "artifact",
+              path,
+              version: 1,
+              sizeBytes: text.length,
+            }),
+          },
+        },
+      },
+    } as unknown as TurnContext;
+  }
+
+  async function search(
+    query: string = randomUUID(),
+    count: number | null = null,
+    ctx = context(),
+  ) {
+    const registry = new HarnessToolRegistry(ctx);
+    resolveExoProfile("practical").registerTools(registry, ctx);
+    const [event] = await registry.executePending([
+      {
+        toolCallId: "test-search",
+        request: { functionName: "web_search", arguments: { query, count } },
+      },
+    ]);
+    const result = event.result as { value: Record<string, unknown> };
+    return result.value;
+  }
+
+  function mcp(
+    result: unknown = { content: [], structuredContent: { results: entries } },
+    options: {
+      rpcError?: boolean;
+      status?: number;
+      sse?: boolean;
+      missingTool?: boolean;
+      cleanupFails?: boolean;
+    } = {},
+  ) {
+    vi.stubEnv("EXO_WEB_SEARCH_PROVIDER", "parallel");
+    const requests: { method: string; params?: Record<string, unknown> }[] = [];
+    const mock = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      expect(String(_url)).toBe("https://search.parallel.ai/mcp");
+      expect(init?.redirect).toBe("error");
+      const headers = new Headers(init?.headers);
+      expect(headers.has("authorization")).toBe(false);
+      expect(headers.has("x-api-key")).toBe(false);
+      if (init?.method === "GET") return new Response(null, { status: 405 });
+      if (init?.method === "DELETE") {
+        if (options.cleanupFails) throw new Error("cleanup failed");
+        return new Response(null, { status: 200 });
+      }
+      const request = JSON.parse(String(init?.body));
+      requests.push(request);
+      if (request.method === "notifications/initialized")
+        return new Response(null, { status: 202 });
+      let payload: unknown;
+      if (request.method === "initialize") {
+        payload = {
+          protocolVersion: request.params.protocolVersion,
+          capabilities: { tools: {} },
+          serverInfo: { name: "fixture", version: "1" },
+        };
+      } else if (request.method === "tools/list") {
+        payload = options.missingTool
+          ? { tools: [] }
+          : {
+              tools: [{ name: "web_search", inputSchema: { type: "object" } }],
+            };
+      } else {
+        if (options.status)
+          return new Response("service unavailable", {
+            status: options.status,
+          });
+        payload = result;
+      }
+      const envelope =
+        options.rpcError && request.method === "tools/call"
+          ? {
+              jsonrpc: "2.0",
+              id: request.id,
+              error: { code: -32000, message: "quota reached" },
+            }
+          : { jsonrpc: "2.0", id: request.id, result: payload };
+      const isSse = options.sse && request.method === "tools/call";
+      return new Response(
+        isSse
+          ? `event: message\ndata: ${JSON.stringify(envelope)}\n\n`
+          : JSON.stringify(envelope),
+        {
+          headers: {
+            "content-type": isSse ? "text/event-stream" : "application/json",
+            "mcp-session-id": "fixture-session",
+          },
+        },
+      );
+    });
+    vi.stubGlobal("fetch", mock);
+    return { mock, requests };
+  }
+
+  it("maps search through the practical profile and real MCP SDK without credentials", async () => {
+    vi.stubEnv("BRAVE_API_KEY", "unused-brave-key");
+    vi.stubEnv("PARALLEL_API_KEY", "must-not-be-sent");
+    const { requests } = mcp({
+      content: [{ type: "text", text: "not the structured representation" }],
+      structuredContent: { results: entries, warnings: ["service warning"] },
+    });
+    const ctx = context();
+    const value = await search("public documentation", 1, ctx);
+    expect(value).toMatchObject({
+      ok: true,
+      provider: "parallel",
+      results: [
+        { title: "One", url: entries[0].url, snippet: "first\nsecond" },
+      ],
+      warnings: ["service warning"],
+      truncated: false,
+    });
+    expect(
+      requests.find(({ method }) => method === "tools/call")?.params,
+    ).toEqual({
+      name: "web_search",
+      arguments: {
+        objective: "public documentation",
+        search_queries: ["public documentation"],
+        session_id: ctx.exoharness.current.conversation.record.id,
+      },
+    });
+    expect(requests.map(({ method }) => method)).toContain("tools/list");
+  });
+
+  it("accepts text-only payloads and SDK-parsed SSE", async () => {
+    mcp(
+      {
+        content: [{ type: "text", text: JSON.stringify({ results: entries }) }],
+      },
+      { sse: true },
+    );
+    expect(await search()).toMatchObject({
+      ok: true,
+      results: [{ snippet: "first\nsecond" }, { title: "" }],
+    });
+  });
+
+  it("preserves valid empty results", async () => {
+    mcp({ content: [], structuredContent: { results: [] } });
+    expect(await search()).toMatchObject({ ok: true, results: [] });
+  });
+
+  it.each([
+    [
+      { content: [{ type: "text", text: "rate limited" }], isError: true },
+      {},
+      "rate limited",
+    ],
+    [
+      {
+        content: [],
+        structuredContent: { results: [{ url: "bad", excerpts: [] }] },
+      },
+      {},
+      "Invalid",
+    ],
+    [{ content: [] }, { rpcError: true }, "quota reached"],
+    [{ content: [] }, { status: 503 }, "service unavailable"],
+    [{ content: [] }, { missingTool: true }, "did not advertise"],
+  ])(
+    "returns errors without falling back: %j",
+    async (result, options, error) => {
+      mcp(result, options);
+      expect(await search()).toMatchObject({
+        ok: false,
+        provider: "parallel",
+        error: expect.stringContaining(error),
+      });
+    },
+  );
+
+  it("caps snippets and preserves warnings", async () => {
+    mcp({
+      content: [],
+      structuredContent: {
+        results: [{ ...entries[0], excerpts: ["x".repeat(3_000)] }],
+        warnings: ["partial"],
+      },
+    });
+    expect(await search()).toMatchObject({
+      truncated: true,
+      warnings: ["partial"],
+      results: [{ snippet: "x".repeat(2_500) }],
+    });
+  });
+
+  it("rejects overlong queries before making a request", async () => {
+    const { mock } = mcp();
+    expect(await search("x".repeat(201))).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("200 characters"),
+    });
+    expect(mock).not.toHaveBeenCalled();
+  });
+
+  it("enforces the response byte limit before parsing", async () => {
+    mcp({ content: [{ type: "text", text: "x".repeat(1_000_001) }] });
+    expect(await search()).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("exceeded 1 MB"),
+    });
+  });
+
+  it("keeps conversation metadata stable across turns and distinct across conversations", async () => {
+    const { requests } = mcp();
+    const ctx = context();
+    await search(randomUUID(), 1, ctx);
+    await search(randomUUID(), 1, ctx);
+    await search();
+    const ids = requests
+      .filter(({ method }) => method === "tools/call")
+      .map(
+        ({ params }) =>
+          (params?.arguments as { session_id: string } | undefined)?.session_id,
+      );
+    expect(ids[0]).toBe(ids[1]);
+    expect(ids[2]).not.toBe(ids[0]);
+  });
+
+  it("retains provider-scoped caching and does not repeat an MCP call on a cache hit", async () => {
+    const { requests } = mcp();
+    const query = randomUUID();
+    await search(query);
+    expect(await search(query)).toMatchObject({
+      ok: true,
+      cached: true,
+      provider: "parallel",
+    });
+    expect(
+      requests.filter(({ method }) => method === "tools/call"),
+    ).toHaveLength(1);
+  });
+
+  it("does not let cleanup failure replace a successful result", async () => {
+    mcp(undefined, { cleanupFails: true });
+    expect(await search()).toMatchObject({ ok: true, provider: "parallel" });
+  });
+
+  it("aborts a stalled request at the host deadline", async () => {
+    vi.useFakeTimers();
+    vi.stubEnv("EXO_WEB_SEARCH_PROVIDER", "parallel");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url, init) =>
+          new Promise((_resolve, reject) => {
+            init.signal.addEventListener(
+              "abort",
+              () => reject(init.signal.reason),
+              { once: true },
+            );
+          }),
+      ),
+    );
+    // Node's AbortSignal.timeout uses native timers, so stub only its clock.
+    vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new Error("request deadline")), ms);
+      return controller.signal;
+    });
+    try {
+      const pending = search();
+      await vi.advanceTimersByTimeAsync(12_000);
+      expect(await pending).toMatchObject({
+        ok: false,
+        error: expect.stringContaining("deadline"),
+      });
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("rejects redirects without contacting their destination", async () => {
+    let destinationRequests = 0;
+    const destination = createServer((_req, res) => {
+      destinationRequests++;
+      res.end("unexpected");
+    });
+    const redirect = createServer((_req, res) => {
+      const address = destination.address();
+      if (!address || typeof address === "string")
+        throw new Error("missing address");
+      res.writeHead(307, { Location: `http://127.0.0.1:${address.port}` });
+      res.end();
+    });
+    await new Promise<void>((resolve) =>
+      destination.listen(0, "127.0.0.1", resolve),
+    );
+    await new Promise<void>((resolve) =>
+      redirect.listen(0, "127.0.0.1", resolve),
+    );
+    vi.stubEnv("EXO_WEB_SEARCH_PROVIDER", "parallel");
+    vi.stubGlobal("fetch", (_url: unknown, init?: RequestInit) => {
+      const address = redirect.address();
+      if (!address || typeof address === "string")
+        throw new Error("missing address");
+      return nativeFetch(`http://127.0.0.1:${address.port}`, init);
+    });
+    try {
+      expect(await search()).toMatchObject({ ok: false, provider: "parallel" });
+      expect(destinationRequests).toBe(0);
+    } finally {
+      redirect.closeAllConnections();
+      destination.closeAllConnections();
+      await Promise.all(
+        [redirect, destination].map(
+          (server) =>
+            new Promise<void>((resolve) => server.close(() => resolve())),
+        ),
+      );
+    }
+  });
+
+  it.each([
+    [undefined, undefined, "duckduckgo"],
+    [undefined, "brave-key", "brave"],
+    ["duckduckgo", "brave-key", "duckduckgo"],
+    ["brave", "brave-key", "brave"],
+  ])(
+    "preserves existing provider routing: %s / %s",
+    async (forced, key, provider) => {
+      vi.stubEnv("EXO_WEB_SEARCH_PROVIDER", forced ?? "");
+      vi.stubEnv("BRAVE_API_KEY", key ?? "");
+      const mock = vi.fn(async (url: unknown) => {
+        if (provider === "brave") {
+          expect(String(url)).toContain("api.search.brave.com");
+          return Response.json({
+            web: {
+              results: [
+                { title: "Brave", url: entries[0].url, description: "snippet" },
+              ],
+            },
+          });
+        }
+        expect(String(url)).toContain("html.duckduckgo.com");
+        return new Response(
+          `<a class="result__a" href="${entries[0].url}">DuckDuckGo</a>`,
+        );
+      });
+      vi.stubGlobal("fetch", mock);
+      expect(await search()).toMatchObject({ ok: true, provider });
+      expect(mock).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("keeps explicitly selected Brave credential failure without a fallback", async () => {
+    vi.stubEnv("EXO_WEB_SEARCH_PROVIDER", "brave");
+    vi.stubEnv("BRAVE_API_KEY", "");
+    const mock = vi.fn();
+    vi.stubGlobal("fetch", mock);
+    expect(await search()).toMatchObject({
+      ok: false,
+      provider: "brave",
+      error: expect.stringContaining("no Brave key"),
+    });
+    expect(mock).not.toHaveBeenCalled();
   });
 });

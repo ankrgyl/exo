@@ -94,5 +94,39 @@ Code mode, generic adapter command generation, and treating the scheduler as an
 adapter are also deferred. Scheduling continues through the current scheduler
 service.
 
+## Web search providers
+
+The practical profile's `web_search` uses Brave when a `brave-api-key` secret
+or `BRAVE_API_KEY` environment variable is configured, otherwise DuckDuckGo.
+Set `EXO_WEB_SEARCH_PROVIDER` on the host to explicitly select `brave`,
+`duckduckgo`, or `parallel`. For example, start Exo with:
+
+```bash
+EXO_WEB_SEARCH_PROVIDER=parallel ./exo.sh
+```
+
+The `parallel` option uses [Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp)
+at `https://search.parallel.ai/mcp` over Streamable HTTP. It needs no Parallel
+account or API key. Free access is rate limited; errors are returned without
+switching providers. Unset the variable to restore automatic Brave/DuckDuckGo
+selection. Restart an already-running executor with the new environment.
+
+Once selected, the agent can call `web_search` during its turns. Each uncached
+call sends its query (also used as the search objective) and conversation ID
+to Parallel from the host, even if sandbox networking is disabled. Do not put
+private information in queries. See Parallel's [terms](https://parallel.ai/customer-terms)
+and [privacy policy](https://parallel.ai/privacy-policy).
+
+Queries can contain up to 200 characters. `count` caps returned results locally
+at 1-10, with a default of 5; it does not control how much Parallel retrieves.
+Results keep their source URLs, titles, and excerpt snippets. Snippets are
+limited to 2,500 characters each, with `truncated` indicating shortening;
+service warnings are preserved. Requests have a 12-second deadline and a 1 MB
+response limit. The existing 15-minute search cache still applies.
+
+This option changes only search. `web_fetch` still fetches pages directly from
+the host with Exo's existing private-address guards; it does not use Parallel.
+The bootstrap profile does not gain web tools.
+
 See [Adapters](./adapters) for the long-running integrations that can wake a
 conversation.
