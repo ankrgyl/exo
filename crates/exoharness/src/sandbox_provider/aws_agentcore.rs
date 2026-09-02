@@ -555,11 +555,12 @@ mod tests {
     fn durable_request(mount_path: &str, mode: FileSystemMountMode) -> SandboxRequest {
         SandboxRequest {
             key: SandboxKey::ConversationSandbox {
-                conversation_id: "conversation".to_string(),
+                thread_id: "thread".to_string(),
                 sandbox_id: "sandbox".to_string(),
             },
             spec: SandboxSpec {
                 image: "agentcore".to_string(),
+                resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: vec![DurableFileSystem {
                     name: "workspace".to_string(),

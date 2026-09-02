@@ -4420,8 +4420,8 @@ fn sandbox_request(
                 agent_id: agent_id.to_string(),
                 sandbox_id: sandbox_id.to_string(),
             },
-            SandboxOwner::Conversation(conversation_id) => SandboxKey::ConversationSandbox {
-                conversation_id: conversation_id.to_string(),
+            SandboxOwner::Conversation(thread_id) => SandboxKey::ConversationSandbox {
+                thread_id: thread_id.to_string(),
                 sandbox_id: sandbox_id.to_string(),
             },
         },

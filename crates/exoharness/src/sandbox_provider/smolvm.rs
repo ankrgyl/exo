@@ -1142,7 +1142,7 @@ mod tests {
             sandbox_id: "sandbox-1".into(),
         };
         let b = SandboxKey::ConversationSandbox {
-            conversation_id: "agent-1".into(),
+            thread_id: "agent-1".into(),
             sandbox_id: "sandbox-1".into(),
         };
         assert_eq!(machine_name(&a), machine_name(&a));

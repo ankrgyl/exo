@@ -14,10 +14,10 @@ use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
-fn make_request(conversation_id: &str, sandbox_id: &str) -> SandboxRequest {
+fn make_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
         key: SandboxKey::ConversationSandbox {
-            conversation_id: conversation_id.into(),
+            thread_id: thread_id.into(),
             sandbox_id: sandbox_id.into(),
         },
         spec: SandboxSpec {
