@@ -670,7 +670,7 @@ async fn local_process_contract_handle(
     backend
         .acquire(SandboxRequest {
             key: SandboxKey::ConversationSandbox {
-                conversation_id: Uuid7::now().to_string(),
+                thread_id: Uuid7::now().to_string(),
                 sandbox_id: sandbox_id.to_string(),
             },
             spec: SandboxSpec {
@@ -871,7 +871,7 @@ fn provider_contract_request(
 ) -> SandboxRequest {
     SandboxRequest {
         key: SandboxKey::ConversationSandbox {
-            conversation_id: Uuid7::now().to_string(),
+            thread_id: Uuid7::now().to_string(),
             sandbox_id: format!("{provider}-{contract}-contract"),
         },
         spec: SandboxSpec {

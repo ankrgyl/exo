@@ -31,7 +31,8 @@ pub enum SandboxKey {
         sandbox_id: String,
     },
     ConversationSandbox {
-        conversation_id: String,
+        #[serde(alias = "conversation_id")]
+        thread_id: String,
         sandbox_id: String,
     },
 }
@@ -44,9 +45,9 @@ impl fmt::Display for SandboxKey {
                 sandbox_id,
             } => write!(f, "agent:{agent_id}:{sandbox_id}"),
             Self::ConversationSandbox {
-                conversation_id,
+                thread_id,
                 sandbox_id,
-            } => write!(f, "conversation:{conversation_id}:{sandbox_id}"),
+            } => write!(f, "thread:{thread_id}:{sandbox_id}"),
         }
     }
 }
@@ -2280,6 +2281,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn conversation_sandbox_key_uses_thread_id_and_reads_conversation_id() {
+        let key = SandboxKey::ConversationSandbox {
+            thread_id: "thread-1".to_string(),
+            sandbox_id: "sandbox-1".to_string(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&key).unwrap(),
+            serde_json::json!({
+                "ConversationSandbox": {
+                    "thread_id": "thread-1",
+                    "sandbox_id": "sandbox-1"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<SandboxKey>(serde_json::json!({
+                "ConversationSandbox": {
+                    "conversation_id": "thread-1",
+                    "sandbox_id": "sandbox-1"
+                }
+            }))
+            .unwrap(),
+            key
+        );
+        assert_eq!(key.to_string(), "thread:thread-1:sandbox-1");
+    }
+
+    #[test]
     fn apple_container_list_item_reads_current_status_shape() {
         let container: ContainerListItem = serde_json::from_value(serde_json::json!({
             "configuration": {
@@ -2391,7 +2421,7 @@ mod tests {
 
         let request = SandboxRequest {
             key: SandboxKey::ConversationSandbox {
-                conversation_id: "conversation".to_string(),
+                thread_id: "thread".to_string(),
                 sandbox_id: "sandbox".to_string(),
             },
             spec: SandboxSpec {
@@ -2468,7 +2498,7 @@ mod tests {
         };
         let request = SandboxRequest {
             key: SandboxKey::ConversationSandbox {
-                conversation_id: "conversation".to_string(),
+                thread_id: "thread".to_string(),
                 sandbox_id: "sandbox".to_string(),
             },
             spec: SandboxSpec {
@@ -2561,7 +2591,7 @@ esac
         };
         let request = SandboxRequest {
             key: SandboxKey::ConversationSandbox {
-                conversation_id: "conversation".to_string(),
+                thread_id: "thread".to_string(),
                 sandbox_id: "sandbox".to_string(),
             },
             spec: SandboxSpec {
@@ -2673,7 +2703,7 @@ esac
         };
         let request = SandboxRequest {
             key: SandboxKey::ConversationSandbox {
-                conversation_id: "conversation".to_string(),
+                thread_id: "thread".to_string(),
                 sandbox_id: "sandbox".to_string(),
             },
             spec: SandboxSpec {
