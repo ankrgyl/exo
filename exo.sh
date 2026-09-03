@@ -39,6 +39,8 @@ USE_SANDBOX=true
 PULL_SANDBOX=false
 START_SCHEDULER="${EXO_START_SCHEDULER:-true}"
 START_ADAPTERS="${EXO_START_ADAPTERS:-true}"
+# Set by ensure_adapters when it reuses an adapter runner started earlier.
+ADAPTERS_ALREADY_RUNNING=false
 ADAPTER_LIMIT="${EXO_ADAPTER_LIMIT:-50}"
 CONTROL=false
 SETUP_PROFILE=false
@@ -481,6 +483,7 @@ ensure_adapters() {
     return
   fi
   if adapters_process_running; then
+    ADAPTERS_ALREADY_RUNNING=true
     return
   fi
 
@@ -1147,6 +1150,12 @@ show_exochat_url_if_needed() {
   fi
 
   local start_line="${1:-0}"
+  # A runner we did not start printed its URL during an earlier launch and
+  # will not print it again, so take the last URL already in the log instead
+  # of waiting 30 seconds for a line that never comes.
+  if [[ "$ADAPTERS_ALREADY_RUNNING" == true ]]; then
+    start_line=0
+  fi
   local log_file
   log_file="$(adapters_log_file)"
   echo "Waiting for ExoChat URL in $log_file..."
@@ -1161,8 +1170,13 @@ show_exochat_url_if_needed() {
           next
         }
         capture && /^https?:\/\// {
-          print
-          exit
+          url = $0
+          capture = 0
+        }
+        END {
+          if (url != "") {
+            print url
+          }
         }
       ' "$log_file")"
       if [[ -n "$url" ]]; then
