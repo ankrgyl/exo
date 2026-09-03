@@ -11,9 +11,20 @@ const SECURITY_HEADERS = {
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const MAX_RELAY_MESSAGE_BYTES = 10 * 1024 * 1024;
 
+// A sender that includes an envelope-level `id` gets replay protection: the
+// relay remembers recently accepted ids and answers a repeat with an ack
+// instead of a second broadcast. The window is a bounded cache, not a ledger —
+// losing it (expiry, session teardown) degrades to at-least-once delivery.
+const REPLAY_CACHE_KEY = "replay-cache";
+const REPLAY_CACHE_LIMIT = 64;
+const REPLAY_CACHE_TTL_MS = 10 * 60 * 1000;
+
 export class RendezvousSession {
-  constructor(ctx) {
+  constructor(ctx, env) {
     this.ctx = ctx;
+    this.replayLimit = Number(env?.EXOCHAT_REPLAY_LIMIT) || REPLAY_CACHE_LIMIT;
+    this.replayTtlMs =
+      Number(env?.EXOCHAT_REPLAY_TTL_MS) || REPLAY_CACHE_TTL_MS;
   }
 
   async fetch(request) {
@@ -59,7 +70,7 @@ export class RendezvousSession {
     });
   }
 
-  webSocketMessage(socket, message) {
+  async webSocketMessage(socket, message) {
     if (typeof message !== "string") {
       socket.close(1003, "Only text relay messages are supported");
       return;
@@ -76,6 +87,15 @@ export class RendezvousSession {
       return;
     }
 
+    const sendId = relaySendId(message);
+    if (sendId !== null) {
+      const cache = await this.replayCache();
+      if (cache.has(sendId)) {
+        socket.send(sendAck(sendId, true));
+        return;
+      }
+    }
+
     for (const peer of this.ctx.getWebSockets()) {
       if (peer === socket) {
         continue;
@@ -89,6 +109,13 @@ export class RendezvousSession {
       ) {
         peer.send(message);
       }
+    }
+
+    // Record after the broadcast and ack after the record, so a crash anywhere
+    // in between resolves as a retry-and-duplicate, never a silent loss.
+    if (sendId !== null) {
+      await this.recordSend(sendId);
+      socket.send(sendAck(sendId, false));
     }
   }
 
@@ -105,6 +132,33 @@ export class RendezvousSession {
       socket.close(1000, "Session expired");
     }
     await this.ctx.storage.deleteAll();
+    this.replaySends = undefined;
+  }
+
+  // The in-memory map dies with every hibernation, so accepted ids are written
+  // through to durable object storage and rehydrated on the next wake. Expired
+  // entries are pruned on read; the storage row dies with the session alarm.
+  async replayCache() {
+    if (!this.replaySends) {
+      const stored = await this.ctx.storage.get(REPLAY_CACHE_KEY);
+      this.replaySends = new Map(stored ?? []);
+    }
+    const cutoff = Date.now() - this.replayTtlMs;
+    for (const [id, at] of this.replaySends) {
+      if (at < cutoff) {
+        this.replaySends.delete(id);
+      }
+    }
+    return this.replaySends;
+  }
+
+  async recordSend(id) {
+    const cache = await this.replayCache();
+    cache.set(id, Date.now());
+    while (cache.size > this.replayLimit) {
+      cache.delete(cache.keys().next().value);
+    }
+    await this.ctx.storage.put(REPLAY_CACHE_KEY, [...cache]);
   }
 
   broadcastPresence() {
@@ -188,6 +242,37 @@ function isSessionPage(url) {
   return Boolean(
     url.searchParams.get("c") && parseRole(url.searchParams.get("role")),
   );
+}
+
+// Only an `exo.chat` envelope that opted in with a string `id` is inspected;
+// everything else stays an opaque string and follows the legacy path
+// byte-for-byte. The ciphertext is never touched.
+function relaySendId(message) {
+  let value;
+  try {
+    value = JSON.parse(message);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  if (value.channel !== "exo.chat" || typeof value.id !== "string") {
+    return null;
+  }
+  if (value.id.length < 8 || value.id.length > 128) {
+    return null;
+  }
+  return value.id;
+}
+
+function sendAck(id, duplicate) {
+  return JSON.stringify({
+    channel: "exo.chat.ack",
+    id,
+    duplicate,
+    at: Date.now(),
+  });
 }
 
 function parseRole(role) {

@@ -9,6 +9,7 @@ import {
   parseWorkerCommand,
   writeWorkerEvent,
 } from "../protocol";
+import { parseSendAck, type SendAck, sendDedupeId } from "./exochat";
 
 const config = adapterConfig();
 const baseUrl = normalizeBaseUrl(
@@ -40,6 +41,10 @@ const userUrl = sessionUrl("user", session.channelId, session.secret);
 const agentUrl = sessionUrl("agent", session.channelId, session.secret);
 let seq = 0;
 let socket: WebSocket | null = null;
+const pendingAcks = new Map<
+  string,
+  { resolve: (ack: SendAck) => void; reject: (error: Error) => void }
+>();
 // Declared before the top-level connect() call below runs.
 let reconnectDelayMs = 1000;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -86,12 +91,15 @@ for await (const line of input) {
         "ExoChat is text-only right now; use another adapter for attachments",
       );
     }
-    await sendFrame({
-      type: "chat",
-      id: command.id,
-      text: command.text,
-      createdAt: Date.now(),
-    });
+    await sendFrame(
+      {
+        type: "chat",
+        id: command.id,
+        text: command.text,
+        createdAt: Date.now(),
+      },
+      sendDedupeId(command.id),
+    );
     writeWorkerEvent({
       type: "lifecycle",
       name: "send_result",
@@ -140,6 +148,7 @@ async function connect(): Promise<void> {
       type: "disconnected",
       reason: event.reason || String(event.code),
     });
+    failPendingAcks("ExoChat WebSocket closed before the send was acked");
     // The relay drops idle connections; reconnect in-process instead of
     // exiting so the runner does not restart us (and reprint the chat URL).
     scheduleReconnect();
@@ -196,6 +205,11 @@ async function handleSocketMessage(data: unknown): Promise<void> {
     return;
   }
   const message = JSON.parse(data) as unknown;
+  const ack = parseSendAck(message);
+  if (ack) {
+    pendingAcks.get(ack.id)?.resolve(ack);
+    return;
+  }
   if (isPresenceMessage(message)) {
     writeWorkerEvent({
       type: "lifecycle",
@@ -241,12 +255,56 @@ async function handleSocketMessage(data: unknown): Promise<void> {
   });
 }
 
-async function sendFrame(frame: Record<string, unknown>): Promise<void> {
+// A dedupe id opts the frame into the relay's replay protection: the id rides
+// at envelope level (outside the ciphertext and outside the AAD, so pre-id
+// peers still authenticate the envelope), and the send only settles once the
+// relay acks the id. A duplicate ack is still success — the original broadcast
+// already happened.
+async function sendFrame(
+  frame: Record<string, unknown>,
+  dedupeId?: string,
+): Promise<void> {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     throw new Error("ExoChat WebSocket is not open");
   }
   const envelope = encryptRelayFrame(frame, ++seq);
+  if (dedupeId !== undefined) {
+    envelope.id = dedupeId;
+  }
+  const acked = dedupeId !== undefined ? waitForSendAck(dedupeId) : null;
   socket.send(JSON.stringify(envelope));
+  if (acked) {
+    await acked;
+  }
+}
+
+function waitForSendAck(dedupeId: string): Promise<SendAck> {
+  return new Promise<SendAck>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      pendingAcks.delete(dedupeId);
+      reject(
+        new Error(`ExoChat send was not acked within ${SEND_TIMEOUT_MS}ms`),
+      );
+    }, SEND_TIMEOUT_MS);
+    pendingAcks.set(dedupeId, {
+      resolve: (ack) => {
+        clearTimeout(timeout);
+        pendingAcks.delete(dedupeId);
+        resolve(ack);
+      },
+      reject: (error) => {
+        clearTimeout(timeout);
+        pendingAcks.delete(dedupeId);
+        reject(error);
+      },
+    });
+  });
+}
+
+function failPendingAcks(message: string): void {
+  for (const pending of pendingAcks.values()) {
+    pending.reject(new Error(message));
+  }
 }
 
 function encryptRelayFrame(
@@ -448,6 +506,7 @@ type RelayEnvelope = {
   channelId: string;
   ciphertext: string;
   from: "agent" | "user";
+  id?: string;
   nonce: string;
   seq: number;
   version: 1;
