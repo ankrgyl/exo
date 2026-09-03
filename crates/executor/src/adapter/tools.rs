@@ -99,6 +99,7 @@ enum AdapterCreationConfig {
     Discord(DiscordAdapterCreationConfig),
     Slack(SlackAdapterCreationConfig),
     Exochat(ExochatAdapterCreationConfig),
+    Telegram(TelegramAdapterCreationConfig),
     AgentCli(AgentCliAdapterCreationConfig),
 }
 
@@ -254,6 +255,41 @@ enum ExochatAdapterType {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
+enum TelegramTrigger {
+    AllMessages,
+    MentionsOnly,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TelegramAdapterCreationConfig {
+    #[serde(rename = "type")]
+    _adapter_type: TelegramAdapterType,
+    bot_token_secret_id: String,
+    #[serde(default)]
+    default_chat_id: Option<String>,
+    #[serde(default = "default_telegram_trigger")]
+    trigger: TelegramTrigger,
+    #[serde(default)]
+    allowed_chats: Option<Vec<String>>,
+    #[serde(default)]
+    allow_bots: bool,
+    #[serde(default)]
+    conversation_scope: Option<AdapterConversationScope>,
+}
+
+fn default_telegram_trigger() -> TelegramTrigger {
+    TelegramTrigger::AllMessages
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TelegramAdapterType {
+    Telegram,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum IrcTrigger {
     Mention,
     AllMessages,
@@ -323,6 +359,7 @@ impl AdapterCreationConfig {
             Self::Discord(_) => "discord",
             Self::Slack(_) => "slack",
             Self::Exochat(_) => "exochat",
+            Self::Telegram(_) => "telegram",
             Self::AgentCli(_) => "agent-cli",
         }
     }
@@ -499,6 +536,32 @@ impl AdapterCreationConfig {
                             }]
                         })
                         .unwrap_or_default(),
+                })
+            }
+            Self::Telegram(config) => {
+                require_source(source, AdapterSource::Library, "telegram")?;
+                Ok(AdapterConfig {
+                    adapter_type: "telegram".to_string(),
+                    worker_command: options.worker_command("telegram"),
+                    initialization: serde_json::json!({
+                        "tokenEnv": "EXO_TELEGRAM_BOT_TOKEN",
+                        "defaultChatId": config.default_chat_id,
+                        "trigger": match config.trigger {
+                            TelegramTrigger::AllMessages => "all_messages",
+                            TelegramTrigger::MentionsOnly => "mentions_only",
+                        },
+                        "allowedChats": config.allowed_chats,
+                        "allowBots": config.allow_bots,
+                        "conversationScope": config
+                            .conversation_scope
+                            .map(|scope| scope.as_str())
+                            .unwrap_or("adapter"),
+                    }),
+                    state_dir: None,
+                    secret_env: vec![WorkerSecretEnvVar {
+                        env: "EXO_TELEGRAM_BOT_TOKEN".to_string(),
+                        secret_id: config.bot_token_secret_id,
+                    }],
                 })
             }
             Self::AgentCli(config) => {

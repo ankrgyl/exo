@@ -509,6 +509,57 @@ function adapterConfigSchema(): ToolDefinition["parameters"] {
         type: "object",
         additionalProperties: false,
         properties: {
+          type: { type: "string", enum: ["telegram"] },
+          botTokenSecretId: {
+            type: "string",
+            description:
+              "Secret name or id containing the Telegram bot token. The worker receives it as EXO_TELEGRAM_BOT_TOKEN.",
+          },
+          defaultChatId: {
+            type: ["string", "null"],
+            description:
+              "Optional Telegram chat id used when send_adapter_message target is null.",
+          },
+          trigger: {
+            type: "string",
+            enum: ["all_messages", "mentions_only"],
+            description:
+              "Wake policy. Use all_messages for private bots; mentions_only for group chats.",
+          },
+          allowedChats: {
+            anyOf: [
+              { type: "array", items: { type: "string" } },
+              { type: "null" },
+            ],
+            description:
+              "Optional list of Telegram chat ids to wake on. Use null to allow every chat.",
+          },
+          allowBots: {
+            type: "boolean",
+            description:
+              "When true, messages from other bot accounts wake this adapter. Defaults to false.",
+          },
+          conversationScope: {
+            type: "string",
+            enum: ["adapter", "target"],
+            description:
+              "Conversation routing mode. Use adapter to wake the adapter's root conversation for every message; use target to create a separate conversation per chat. Defaults to adapter.",
+          },
+        },
+        required: [
+          "type",
+          "botTokenSecretId",
+          "defaultChatId",
+          "trigger",
+          "allowedChats",
+          "allowBots",
+          "conversationScope",
+        ],
+      },
+      {
+        type: "object",
+        additionalProperties: false,
+        properties: {
           type: { type: "string", enum: ["exochat"] },
           baseUrl: {
             type: ["string", "null"],
@@ -569,6 +620,7 @@ function validateAdapterSource(source: string, type: string): void {
     (type === "irc" ||
       type === "agent-cli" ||
       type === "exochat" ||
+      type === "telegram" ||
       type === "whatsapp" ||
       type === "signal" ||
       type === "discord" ||
