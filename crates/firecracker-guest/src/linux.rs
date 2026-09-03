@@ -703,7 +703,7 @@ fn open_terminal(size: TerminalSize) -> Result<(File, File), String> {
     if unsafe { libc::unlockpt(master.as_raw_fd()) } != 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
-    let mut path = [0_i8; 128];
+    let mut path: [libc::c_char; 128] = [0; 128];
     let result = unsafe { libc::ptsname_r(master.as_raw_fd(), path.as_mut_ptr(), path.len()) };
     if result != 0 {
         return Err(std::io::Error::from_raw_os_error(result).to_string());
