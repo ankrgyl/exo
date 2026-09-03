@@ -694,14 +694,23 @@ fn drop_command_privileges() -> std::io::Result<()> {
 fn open_terminal(size: TerminalSize) -> Result<(File, File), String> {
     let descriptor = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
     if descriptor < 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+        return Err(format!(
+            "opening PTY master: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     let master = unsafe { OwnedFd::from_raw_fd(descriptor) };
     if unsafe { libc::grantpt(master.as_raw_fd()) } != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+        return Err(format!(
+            "granting PTY slave access: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     if unsafe { libc::unlockpt(master.as_raw_fd()) } != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+        return Err(format!(
+            "unlocking PTY slave: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     let mut path: [libc::c_char; 128] = [0; 128];
     let result = unsafe { libc::ptsname_r(master.as_raw_fd(), path.as_mut_ptr(), path.len()) };
@@ -716,7 +725,11 @@ fn open_terminal(size: TerminalSize) -> Result<(File, File), String> {
         )
     };
     if slave_descriptor < 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+        return Err(format!(
+            "opening PTY slave {}: {}",
+            path.to_string_lossy(),
+            std::io::Error::last_os_error()
+        ));
     }
     set_terminal_size(master.as_raw_fd(), size)?;
     let master = File::from(master);
@@ -1089,6 +1102,14 @@ fn mount_pseudo_filesystems() -> Result<(), String> {
         Some("devtmpfs"),
         libc::MS_NOSUID | libc::MS_NOEXEC,
         Some("mode=0755"),
+    )?;
+    fs::create_dir_all("/dev/pts").map_err(|error| error.to_string())?;
+    mount_filesystem(
+        Some("devpts"),
+        "/dev/pts",
+        Some("devpts"),
+        libc::MS_NOSUID | libc::MS_NOEXEC,
+        Some("mode=0620,ptmxmode=0666"),
     )?;
     Ok(())
 }
