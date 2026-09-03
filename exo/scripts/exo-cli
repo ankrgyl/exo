@@ -33,7 +33,9 @@ die() {
 }
 
 exo() {
-  "$EXO_BIN" --env-file-if-exists "$ENV_FILE" "$@"
+  # The CLI resolves --root relative to the working directory, and exo-cli is
+  # meant to run from any repo, so point it at the checkout's state.
+  "$EXO_BIN" --root "$ROOT_DIR/.exo" --env-file-if-exists "$ENV_FILE" "$@"
 }
 
 adapter_runner_running() {
