@@ -224,6 +224,14 @@ pub trait ManagedSandboxHandle: Send + Sync {
 
     async fn start_process(&self, command: &SandboxCommand) -> Result<crate::SandboxProcessParts>;
 
+    async fn start_terminal(
+        &self,
+        _command: &SandboxCommand,
+        _size: crate::SandboxTerminalSize,
+    ) -> Result<crate::SandboxTerminalParts> {
+        bail!("sandbox backend does not support terminal sessions")
+    }
+
     fn supports_tcp(&self) -> bool {
         false
     }
