@@ -1041,10 +1041,14 @@ send_startup_prompt() {
     return
   fi
 
+  # bash 3.2, which macOS ships as /bin/bash, rejects "${array[@]}" for an
+  # empty array under `set -u`, and --template minimal adds no adapter.
   local adapter
-  for adapter in "${SETUP_ADAPTERS[@]}"; do
-    send_adapter_setup_prompt "$adapter"
-  done
+  if [[ "${#SETUP_ADAPTERS[@]}" -gt 0 ]]; then
+    for adapter in "${SETUP_ADAPTERS[@]}"; do
+      send_adapter_setup_prompt "$adapter"
+    done
+  fi
 
   if [[ -n "$INITIAL_PROMPT_FILE" ]]; then
     send_prompt_from_files "$(startup_prompt_file "$INITIAL_PROMPT_FILE")"
