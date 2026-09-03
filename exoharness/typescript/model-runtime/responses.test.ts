@@ -6,6 +6,7 @@ import {
   ChatCompletionsRuntime,
   isAnthropicModel,
   isOpenRouterBinding,
+  messagesToChatMessages,
   modelRequiresResponsesApi,
   responseToLinguaEvents,
   responseToolCalls,
@@ -148,5 +149,97 @@ describe("response tool-call parsing", () => {
         error: expect.stringContaining("Invalid JSON arguments for shell"),
       },
     });
+  });
+});
+
+describe("chat-completions history replay", () => {
+  // A model that answers with text and two tool calls at once produces one
+  // reply, but the conversation stores it as three assistant messages. Sent
+  // through as three, the provider rejects the whole request because the
+  // result for the first call no longer follows that call.
+  it("replays parallel tool calls as the single reply the model made", () => {
+    const chatMessages = messagesToChatMessages([
+      { role: "assistant", content: [{ type: "text", text: "checking" }] },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_call",
+            tool_call_id: "call_a",
+            tool_name: "search_memory",
+            arguments: { query: "exo" },
+          },
+        ],
+      },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_call",
+            tool_call_id: "call_b",
+            tool_name: "shell",
+            arguments: { command: "ls" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          { type: "tool_result", tool_call_id: "call_a", output: "ok" },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          { type: "tool_result", tool_call_id: "call_b", output: "ok" },
+        ],
+      },
+    ]);
+
+    expect(chatMessages.map((message) => message.role)).toEqual([
+      "assistant",
+      "tool",
+      "tool",
+    ]);
+    const [assistant] = chatMessages;
+    expect(assistant.role === "assistant" && assistant.content).toBe(
+      "checking",
+    );
+    expect(
+      assistant.role === "assistant" &&
+        assistant.tool_calls?.map((call) => call.id),
+    ).toEqual(["call_a", "call_b"]);
+  });
+
+  it("keeps separate tool-calling rounds separate", () => {
+    const round = (id: string) => [
+      {
+        role: "assistant" as const,
+        content: [
+          {
+            type: "tool_call",
+            tool_call_id: id,
+            tool_name: "shell",
+            arguments: { command: "ls" },
+          },
+        ],
+      },
+      {
+        role: "tool" as const,
+        content: [{ type: "tool_result", tool_call_id: id, output: "ok" }],
+      },
+    ];
+
+    const chatMessages = messagesToChatMessages([
+      ...round("call_a"),
+      ...round("call_b"),
+    ]);
+
+    expect(chatMessages.map((message) => message.role)).toEqual([
+      "assistant",
+      "tool",
+      "assistant",
+      "tool",
+    ]);
   });
 });

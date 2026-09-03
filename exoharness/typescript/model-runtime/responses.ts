@@ -42,6 +42,7 @@ import type {
   ChatCompletionChunk,
   ChatCompletionCreateParamsNonStreaming,
   ChatCompletionCreateParamsStreaming,
+  ChatCompletionAssistantMessageParam,
   ChatCompletionMessageParam,
   ChatCompletionMessageToolCall,
   ChatCompletionTool,
@@ -853,10 +854,47 @@ function buildChatStreamingBody(
   };
 }
 
-function messagesToChatMessages(
+export function messagesToChatMessages(
   messages: Message[],
 ): ChatCompletionMessageParam[] {
-  return messages.map(messageToChatMessage);
+  return coalesceAssistantMessages(messages.map(messageToChatMessage));
+}
+
+// One model reply that calls several tools at once is stored as several
+// assistant messages — the text in one, each tool call in another. Mapped 1:1
+// that reaches the provider as assistant([A]), assistant([B]), tool(A),
+// tool(B), and the provider rejects the whole request: the result for A does
+// not follow the call to A. Consecutive assistant messages can only ever be
+// one reply that was split apart — nothing else may sit between an assistant
+// message and the next one — so put them back together.
+function coalesceAssistantMessages(
+  messages: ChatCompletionMessageParam[],
+): ChatCompletionMessageParam[] {
+  const coalesced: ChatCompletionMessageParam[] = [];
+  for (const message of messages) {
+    const previous = coalesced[coalesced.length - 1];
+    if (message.role !== "assistant" || previous?.role !== "assistant") {
+      coalesced.push(message);
+      continue;
+    }
+    coalesced[coalesced.length - 1] = mergeAssistantMessages(previous, message);
+  }
+  return coalesced;
+}
+
+function mergeAssistantMessages(
+  first: ChatCompletionAssistantMessageParam,
+  second: ChatCompletionAssistantMessageParam,
+): ChatCompletionAssistantMessageParam {
+  const toolCalls = [...(first.tool_calls ?? []), ...(second.tool_calls ?? [])];
+  const text = [first.content, second.content]
+    .filter((content): content is string => typeof content === "string")
+    .join("");
+  return {
+    role: "assistant",
+    content: text === "" ? null : text,
+    tool_calls: toolCalls.length === 0 ? undefined : toolCalls,
+  };
 }
 
 function messageToChatMessage(message: Message): ChatCompletionMessageParam {
