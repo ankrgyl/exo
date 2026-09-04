@@ -29,22 +29,23 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use executor::{
-    AgentHandle, AgentHarnessKind, AttachSandboxRequest, BasicExoHarness, BasicExoHarnessConfig,
-    BasicHarness, BasicToolRuntime, Binding, BraintrustProject, BraintrustRuntimeConfig,
-    BraintrustTracingConfig, ConversationModelConfig, CreateAgentRequest,
-    CreateConversationRequest, CreateSandboxRequest, DEFAULT_SANDBOX_MEMORY_MIB,
-    DEFAULT_SANDBOX_VCPU_COUNT, DaytonaBackendSpec, DurableFileSystem, E2bBackendSpec, EventKind,
-    EventQuery, EventQueryDirection, ExoHarness, ExoHarnessHttpServeOptions, ExoToolRuntime,
-    FileSystemMount, FileSystemMountMode, FirecrackerBackendSpec, ForkConversationRequest,
-    HOST_EVENT_REBUILD_AND_RESTART, HTTP_EXOHARNESS_TRACING_TARGET, Harness, HarnessAgent,
-    HarnessConversation, HttpExoHarness, LocalSandboxExoHarness, NewAgentRequest, PutSecretRequest,
-    RlmHarness, RunInSandboxRequest, SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment,
-    SandboxBackendRegistration, SandboxProcess, SandboxProvider, SandboxProviderConfig,
-    SandboxResourceShape, SandboxScope, Secret, SecretBackendChoice, SpritesBackendSpec,
-    ToolRequest, ToolRuntime, TypeScriptHarness, TypeScriptHarnessConfig, Uuid7, VercelBackendSpec,
-    default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
-    default_firecracker_image, default_vercel_image, effective_sandbox_scope,
-    finalize_rebuild_update_file, load_agent_config, record_host_event, send_conversation_wakeup,
+    AGENT_SERVER_TRACING_TARGET, AgentHandle, AgentHarnessKind, AttachSandboxRequest,
+    BasicExoHarness, BasicExoHarnessConfig, BasicHarness, BasicToolRuntime, Binding,
+    BraintrustProject, BraintrustRuntimeConfig, BraintrustTracingConfig, ConversationModelConfig,
+    CreateAgentRequest, CreateConversationRequest, CreateSandboxRequest,
+    DEFAULT_SANDBOX_MEMORY_MIB, DEFAULT_SANDBOX_VCPU_COUNT, DaytonaBackendSpec, DurableFileSystem,
+    E2bBackendSpec, EventKind, EventQuery, EventQueryDirection, ExoHarness,
+    ExoHarnessHttpServeOptions, ExoToolRuntime, FileSystemMount, FileSystemMountMode,
+    FirecrackerBackendSpec, ForkConversationRequest, HOST_EVENT_REBUILD_AND_RESTART,
+    HTTP_EXOHARNESS_TRACING_TARGET, Harness, HarnessAgent, HarnessConversation, HttpExoHarness,
+    LocalSandboxExoHarness, NewAgentRequest, PutSecretRequest, RlmHarness, RunInSandboxRequest,
+    SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment, SandboxBackendRegistration, SandboxProcess,
+    SandboxProvider, SandboxProviderConfig, SandboxResourceShape, SandboxScope, Secret,
+    SecretBackendChoice, SpritesBackendSpec, ToolRequest, ToolRuntime, TypeScriptHarness,
+    TypeScriptHarnessConfig, Uuid7, VercelBackendSpec, default_aws_agentcore_image,
+    default_daytona_image, default_docker_image, default_e2b_template, default_firecracker_image,
+    default_vercel_image, effective_sandbox_scope, finalize_rebuild_update_file, load_agent_config,
+    record_host_event, send_conversation_wakeup, serve_agent_server_stdio,
     serve_exoharness_http_listener_with_options,
 };
 use serde::Deserialize;
@@ -626,6 +627,11 @@ enum Commands {
         #[command(flatten, next_help_heading = "Firecracker backend options")]
         firecracker: FirecrackerArgs,
     },
+    /// Start the executor-facing JSON-RPC server on stdin/stdout.
+    AgentServer {
+        #[arg(short, long, action = ArgAction::Count)]
+        verbose: u8,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1199,6 +1205,9 @@ async fn main() -> Result<()> {
         }
         #[cfg(not(feature = "firecracker"))]
         bail!("Firecracker bridge support requires building Exo with --features firecracker");
+    }
+    if let Commands::AgentServer { verbose } = &cli.command {
+        init_server_tracing(AGENT_SERVER_TRACING_TARGET, *verbose);
     }
     let exo_config = build_exo_config(&cli)?;
     let env = CliEnvironment::load(cli.env_file_if_exists.as_deref(), cli.env_file.as_deref())?;
@@ -2575,6 +2584,10 @@ async fn main() -> Result<()> {
                 println!("configured sandbox provider {binding_name} ({id})");
             }
         },
+        Commands::AgentServer { .. } => {
+            serve_agent_server_stdio(Arc::clone(&harness), to_agent_harness_kind(harness_kind))
+                .await?;
+        }
         Commands::Serve { .. } => {
             unreachable!("serve commands are handled before harness instantiation")
         }
@@ -2971,6 +2984,7 @@ fn command_agent_ref(command: &Commands) -> Option<&str> {
         | Commands::Provider { .. }
         | Commands::Adapters { .. }
         | Commands::Tools { .. }
+        | Commands::AgentServer { .. }
         | Commands::Serve { .. } => None,
     }
 }
@@ -3007,7 +3021,7 @@ async fn serve_exoharness_http(
     exo_config: &BasicExoHarnessConfig,
     config: ServeConfig,
 ) -> Result<()> {
-    init_serve_tracing(config.verbosity);
+    init_server_tracing(HTTP_EXOHARNESS_TRACING_TARGET, config.verbosity);
     if !config.bind.ip().is_loopback() {
         anyhow::bail!(
             "exo serve only binds loopback addresses; got {}",
@@ -3033,17 +3047,13 @@ async fn serve_exoharness_http(
     Ok(())
 }
 
-fn init_serve_tracing(verbosity: u8) {
-    if verbosity == 0 {
-        return;
-    }
-    let level = if verbosity > 1 {
-        tracing_subscriber::filter::LevelFilter::DEBUG
-    } else {
-        tracing_subscriber::filter::LevelFilter::INFO
+fn init_server_tracing(target: &'static str, verbosity: u8) {
+    let level = match verbosity {
+        0 => tracing_subscriber::filter::LevelFilter::ERROR,
+        1 => tracing_subscriber::filter::LevelFilter::INFO,
+        _ => tracing_subscriber::filter::LevelFilter::DEBUG,
     };
-    let filter = tracing_subscriber::filter::Targets::new()
-        .with_target(HTTP_EXOHARNESS_TRACING_TARGET, level);
+    let filter = tracing_subscriber::filter::Targets::new().with_target(target, level);
     let layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .without_time()
