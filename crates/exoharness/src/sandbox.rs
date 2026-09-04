@@ -22,7 +22,10 @@ use tokio::time;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
-use crate::{DurableFileSystem, SandboxAttachment};
+use crate::{
+    DurableFileSystem, EgressCapabilities, EgressPolicy, SandboxAttachment,
+    validate_egress_policy_capabilities,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SandboxKey {
@@ -76,12 +79,26 @@ pub enum SandboxNetworkPolicy {
     Disabled,
 }
 
+/// Converts the legacy coarse `SandboxNetworkPolicy` type into
+/// a richer `EgressPolicy`.
+impl From<SandboxNetworkPolicy> for EgressPolicy {
+    fn from(policy: SandboxNetworkPolicy) -> Self {
+        match policy {
+            SandboxNetworkPolicy::Enabled => Self {
+                default_deny: false,
+                ..Self::default()
+            },
+            SandboxNetworkPolicy::Disabled => Self::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SandboxSpec {
     pub image: String,
     pub mounts: Vec<SandboxMount>,
     pub durable_file_systems: Vec<DurableFileSystem>,
-    pub network: SandboxNetworkPolicy,
+    pub egress_policy: EgressPolicy,
     pub default_workdir: String,
 }
 
@@ -249,6 +266,14 @@ pub type BoxSandboxTcpStream = Pin<Box<dyn SandboxTcpStream>>;
 #[async_trait]
 pub trait ManagedSandboxBackend: Send + Sync {
     fn is_local(&self) -> bool;
+
+    fn egress_capabilities(&self) -> EgressCapabilities {
+        EgressCapabilities::default()
+    }
+
+    fn validate_egress_policy(&self, _policy: &EgressPolicy) -> Result<()> {
+        bail!("sandbox backend does not support egress policies")
+    }
 
     /// Formats this backend can consume in `acquire_from_snapshot`.
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat];
@@ -561,7 +586,7 @@ impl CliContainerSandboxBackend {
             &request.spec.durable_file_systems,
         )?;
         self.ensure_system_started().await?;
-        if matches!(request.spec.network, SandboxNetworkPolicy::Enabled) {
+        if request.spec.egress_policy.permits_unrestricted_egress() {
             self.ensure_default_network_created().await?;
         }
 
@@ -596,7 +621,7 @@ impl CliContainerSandboxBackend {
                 },
                 mounts,
                 durable_file_systems: request.spec.durable_file_systems,
-                network: request.spec.network,
+                egress_policy: request.spec.egress_policy,
                 default_workdir: request.spec.default_workdir,
             },
             lifecycle: request.lifecycle,
@@ -642,6 +667,17 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
         true
     }
 
+    fn egress_capabilities(&self) -> EgressCapabilities {
+        EgressCapabilities {
+            default_deny: true,
+            ..EgressCapabilities::default()
+        }
+    }
+
+    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
+        validate_egress_policy_capabilities(policy, self.egress_capabilities())
+    }
+
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
         match self.cli {
             ContainerCliFlavor::Docker => &DOCKER_CONSUMABLE_SNAPSHOT_FORMATS,
@@ -650,6 +686,7 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        self.validate_egress_policy(&request.spec.egress_policy)?;
         let request = self.prepare_request(request).await?;
 
         if request.lifecycle.idle_ttl.is_none() {
@@ -855,7 +892,7 @@ impl ManagedSandboxHandle for OneShotSandboxHandle {
         exec_one_shot(
             &self.container_bin,
             &self.request.spec,
-            network_name_for_policy(self.request.spec.network),
+            network_name_for_policy(&self.request.spec.egress_policy),
             command,
         )
         .await
@@ -865,7 +902,7 @@ impl ManagedSandboxHandle for OneShotSandboxHandle {
         start_one_shot_process(
             &self.container_bin,
             &self.request.spec,
-            network_name_for_policy(self.request.spec.network),
+            network_name_for_policy(&self.request.spec.egress_policy),
             command,
         )
         .await
@@ -1007,11 +1044,20 @@ impl ManagedSandboxBackend for LocalProcessSandboxBackend {
         true
     }
 
+    fn egress_capabilities(&self) -> EgressCapabilities {
+        EgressCapabilities::default()
+    }
+
+    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
+        validate_egress_policy_capabilities(policy, self.egress_capabilities())
+    }
+
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
         &[]
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        self.validate_egress_policy(&request.spec.egress_policy)?;
         if !request.spec.durable_file_systems.is_empty() {
             bail!("local-process sandbox backend does not support durable file systems");
         }
@@ -1294,7 +1340,7 @@ async fn create_named_warm_sandbox(
 
     configure_network_args(
         &mut process,
-        request.spec.network,
+        &request.spec.egress_policy,
         Some(DEFAULT_ENABLED_NETWORK_NAME),
     );
     configure_mount_args(&mut process, &request.spec.mounts);
@@ -1592,7 +1638,7 @@ async fn exec_one_shot(
 
     let mut process = Command::new(container_bin);
     process.arg("run").arg("--rm").arg("--workdir").arg(&cwd);
-    configure_network_args(&mut process, spec.network, network_name);
+    configure_network_args(&mut process, &spec.egress_policy, network_name);
     configure_mount_args(&mut process, &spec.mounts);
     configure_env_args(&mut process, &command.env);
     process.arg(&spec.image);
@@ -1624,7 +1670,7 @@ async fn start_one_shot_process(
         .arg("--interactive")
         .arg("--workdir")
         .arg(&cwd);
-    configure_network_args(&mut process, spec.network, network_name);
+    configure_network_args(&mut process, &spec.egress_policy, network_name);
     configure_mount_args(&mut process, &spec.mounts);
     configure_env_args(&mut process, &command.env);
     process.arg(&spec.image);
@@ -1774,18 +1820,13 @@ fn wait_for_child(mut child: Child) -> BoxFuture<'static, crate::Result<i32>> {
 
 fn configure_network_args(
     process: &mut Command,
-    policy: SandboxNetworkPolicy,
+    policy: &EgressPolicy,
     network_name: Option<&str>,
 ) {
-    match policy {
-        SandboxNetworkPolicy::Disabled => {
-            process.arg("--network").arg("none");
-        }
-        SandboxNetworkPolicy::Enabled => {
-            if let Some(network_name) = network_name {
-                process.arg("--network").arg(network_name);
-            }
-        }
+    if !policy.permits_unrestricted_egress() {
+        process.arg("--network").arg("none");
+    } else if let Some(network_name) = network_name {
+        process.arg("--network").arg(network_name);
     }
 }
 
@@ -2125,8 +2166,10 @@ fn render_command_error(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr).trim().to_string()
 }
 
-fn network_name_for_policy(policy: SandboxNetworkPolicy) -> Option<&'static str> {
-    matches!(policy, SandboxNetworkPolicy::Enabled).then_some(DEFAULT_ENABLED_NETWORK_NAME)
+fn network_name_for_policy(policy: &EgressPolicy) -> Option<&'static str> {
+    policy
+        .permits_unrestricted_egress()
+        .then_some(DEFAULT_ENABLED_NETWORK_NAME)
 }
 
 fn new_warm_container_name(key: &SandboxKey) -> String {
@@ -2277,6 +2320,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_networking_maps_to_egress_policy() {
+        let enabled: EgressPolicy = SandboxNetworkPolicy::Enabled.into();
+        assert!(!enabled.default_deny);
+        assert!(enabled.allowed_domains.is_empty());
+        assert!(enabled.allowed_cidrs.is_empty());
+        assert!(enabled.denied_domains.is_empty());
+        assert!(enabled.denied_cidrs.is_empty());
+
+        let disabled: EgressPolicy = SandboxNetworkPolicy::Disabled.into();
+        assert_eq!(disabled, EgressPolicy::default());
+    }
+
+    #[test]
     fn apple_container_list_item_reads_current_status_shape() {
         let container: ContainerListItem = serde_json::from_value(serde_json::json!({
             "configuration": {
@@ -2395,7 +2451,7 @@ mod tests {
                 image: "docker.io/library/ubuntu:24.04".to_string(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Disabled,
+                egress_policy: SandboxNetworkPolicy::Disabled.into(),
                 default_workdir: "/".to_string(),
             },
             lifecycle: SandboxLifecycleConfig {
@@ -2471,7 +2527,7 @@ mod tests {
                 image: "docker.io/library/ubuntu:24.04".to_string(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Disabled,
+                egress_policy: SandboxNetworkPolicy::Disabled.into(),
                 default_workdir: "/".to_string(),
             },
             lifecycle: SandboxLifecycleConfig {
@@ -2563,7 +2619,7 @@ esac
                 image: "docker.io/library/ubuntu:24.04".to_string(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Disabled,
+                egress_policy: SandboxNetworkPolicy::Disabled.into(),
                 default_workdir: "/".to_string(),
             },
             lifecycle: SandboxLifecycleConfig {
@@ -2674,7 +2730,7 @@ esac
                 image: "task-image".to_string(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Enabled,
+                egress_policy: SandboxNetworkPolicy::Enabled.into(),
                 default_workdir: "/task".to_string(),
             },
             lifecycle: SandboxLifecycleConfig::default(),

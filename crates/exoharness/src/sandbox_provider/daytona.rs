@@ -30,13 +30,15 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
-use crate::SandboxAttachment;
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput,
-    SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
-    WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
+    SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload, WARM_SANDBOX_KEY_LABEL,
+    WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
 };
 use crate::sandbox_provider::shell_quote;
+use crate::{
+    EgressCapabilities, EgressPolicy, SandboxAttachment, validate_egress_policy_capabilities,
+};
 
 pub const DEFAULT_DAYTONA_API_URL: &str = "https://app.daytona.io/api";
 
@@ -170,7 +172,7 @@ impl DaytonaSandboxBackend {
             labels,
             env: HashMap::new(),
             auto_stop_interval: auto_stop_minutes,
-            network_block_all: matches!(request.spec.network, SandboxNetworkPolicy::Disabled),
+            network_block_all: request.spec.egress_policy.default_deny,
         };
 
         let response = self
@@ -251,11 +253,23 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
         false
     }
 
+    fn egress_capabilities(&self) -> EgressCapabilities {
+        EgressCapabilities {
+            default_deny: true,
+            ..EgressCapabilities::default()
+        }
+    }
+
+    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
+        validate_egress_policy_capabilities(policy, self.egress_capabilities())
+    }
+
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
         &CONSUMABLE_SNAPSHOT_FORMATS
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        self.validate_egress_policy(&request.spec.egress_policy)?;
         reject_unsupported_mounts(&request)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
 

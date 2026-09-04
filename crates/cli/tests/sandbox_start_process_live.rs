@@ -43,7 +43,7 @@ fn make_e2b_request(conversation_id: &str, sandbox_id: &str) -> SandboxRequest {
             image: e2b_template_id(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            network: SandboxNetworkPolicy::Enabled,
+            egress_policy: SandboxNetworkPolicy::Enabled.into(),
             default_workdir: "/home/user".into(),
         },
         lifecycle: SandboxLifecycleConfig {
@@ -92,7 +92,7 @@ fn make_sprites_request(conversation_id: &str, sandbox_id: &str) -> SandboxReque
             image: "default".into(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            network: SandboxNetworkPolicy::Enabled,
+            egress_policy: SandboxNetworkPolicy::Enabled.into(),
             default_workdir: "/home/sprite".into(),
         },
         lifecycle: SandboxLifecycleConfig {

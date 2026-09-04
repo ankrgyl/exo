@@ -8,13 +8,15 @@ use aws_sdk_bedrockagentcore::Client;
 use aws_sdk_bedrockagentcore::primitives::Blob;
 use serde::{Deserialize, Serialize};
 
-use crate::SandboxAttachment;
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput,
-    SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
-    sandbox_spec_hash, validate_durable_file_systems,
+    SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload, sandbox_spec_hash,
+    validate_durable_file_systems,
 };
 use crate::sandbox_provider::process_bridge;
+use crate::{
+    EgressCapabilities, EgressPolicy, SandboxAttachment, validate_egress_policy_capabilities,
+};
 
 pub fn default_aws_agentcore_image() -> String {
     String::new()
@@ -96,11 +98,20 @@ impl ManagedSandboxBackend for AwsAgentCoreSandboxBackend {
         false
     }
 
+    fn egress_capabilities(&self) -> EgressCapabilities {
+        EgressCapabilities::default()
+    }
+
+    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
+        validate_egress_policy_capabilities(policy, self.egress_capabilities())
+    }
+
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
         &[]
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        self.validate_egress_policy(&request.spec.egress_policy)?;
         reject_unsupported_request(&request, self.session_storage_mount_path.as_deref())?;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let runtime_session_id = agentcore_runtime_session_id(&request, &spec_hash);
@@ -409,7 +420,7 @@ fn reject_unsupported_request(
             bail!("AgentCore sandbox backend supports at most one durable file system");
         }
     }
-    if matches!(request.spec.network, SandboxNetworkPolicy::Disabled) {
+    if request.spec.egress_policy.default_deny {
         bail!("AgentCore sandbox backend cannot enforce disabled networking");
     }
     Ok(())
@@ -566,7 +577,7 @@ mod tests {
                     mount_path: mount_path.to_string(),
                     mode,
                 }],
-                network: SandboxNetworkPolicy::Enabled,
+                egress_policy: SandboxNetworkPolicy::Enabled.into(),
                 default_workdir: "/mnt/workspace".to_string(),
             },
             lifecycle: SandboxLifecycleConfig::default(),

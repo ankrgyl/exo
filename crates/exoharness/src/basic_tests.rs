@@ -677,7 +677,7 @@ async fn local_process_contract_handle(
                 image: "local-process".to_string(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Enabled,
+                egress_policy: SandboxNetworkPolicy::Enabled.into(),
                 default_workdir: tempdir.path().display().to_string(),
             },
             lifecycle: SandboxLifecycleConfig::default(),
@@ -877,7 +877,7 @@ fn provider_contract_request(
             image,
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            network: SandboxNetworkPolicy::Enabled,
+            egress_policy: SandboxNetworkPolicy::Enabled.into(),
             default_workdir: default_workdir.to_string(),
         },
         lifecycle: SandboxLifecycleConfig {

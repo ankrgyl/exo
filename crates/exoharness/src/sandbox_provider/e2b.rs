@@ -23,11 +23,13 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
-use crate::SandboxAttachment;
 use crate::sandbox::{
     DEFAULT_SANDBOX_IMAGE, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
-    SandboxCommandOutput, SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat,
-    SnapshotPayload, WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
+    SandboxCommandOutput, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
+    WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
+};
+use crate::{
+    EgressCapabilities, EgressPolicy, SandboxAttachment, validate_egress_policy_capabilities,
 };
 
 pub const DEFAULT_E2B_API_URL: &str = "https://api.e2b.app";
@@ -156,7 +158,7 @@ impl E2bSandboxBackend {
             timeout: timeout_secs,
             auto_pause,
             secure: self.secure,
-            allow_internet_access: !matches!(request.spec.network, SandboxNetworkPolicy::Disabled),
+            allow_internet_access: request.spec.egress_policy.permits_unrestricted_egress(),
             metadata,
         };
 
@@ -223,11 +225,23 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
         false
     }
 
+    fn egress_capabilities(&self) -> EgressCapabilities {
+        EgressCapabilities {
+            default_deny: true,
+            ..EgressCapabilities::default()
+        }
+    }
+
+    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
+        validate_egress_policy_capabilities(policy, self.egress_capabilities())
+    }
+
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
         &CONSUMABLE_SNAPSHOT_FORMATS
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        self.validate_egress_policy(&request.spec.egress_policy)?;
         reject_host_mounts(&request)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let key_label = request.key.to_string();

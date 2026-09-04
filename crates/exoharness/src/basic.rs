@@ -4434,11 +4434,12 @@ fn sandbox_request(
                 })
                 .collect(),
             durable_file_systems: sandbox.durable_file_systems.clone(),
-            network: if sandbox.enable_networking {
+            egress_policy: if sandbox.enable_networking {
                 SandboxNetworkPolicy::Enabled
             } else {
                 SandboxNetworkPolicy::Disabled
-            },
+            }
+            .into(),
             default_workdir: sandbox
                 .default_workdir
                 .clone()

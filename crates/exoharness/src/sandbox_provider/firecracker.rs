@@ -44,11 +44,14 @@ use uuid::Uuid;
 
 use crate::sandbox::{
     BoxSandboxTcpStream, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
-    SandboxCommandOutput, SandboxKey, SandboxNetworkPolicy, SandboxRequest, SandboxSpec,
-    SnapshotFormat, SnapshotPayload, sandbox_spec_hash,
+    SandboxCommandOutput, SandboxKey, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
+    sandbox_spec_hash,
 };
 use crate::sandbox_provider::process_bridge;
-use crate::{FileSystemMountMode, SandboxAttachment, SandboxProcessParts};
+use crate::{
+    EgressCapabilities, EgressPolicy, FileSystemMountMode, SandboxAttachment, SandboxProcessParts,
+    validate_egress_policy_capabilities,
+};
 
 use super::firecracker_image::resolve_image;
 #[cfg(test)]
@@ -144,7 +147,7 @@ static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 /// Controls whether Firecracker attaches a network device. The sandbox's
-/// [`SandboxNetworkPolicy`] independently controls what egress the firewall permits.
+/// [`EgressPolicy`] independently controls what egress the firewall permits.
 pub enum FirecrackerNetworkDevicePolicy {
     /// Attach a network device only when the sandbox requests enabled networking.
     EnabledSandboxes,
@@ -1033,11 +1036,23 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         true
     }
 
+    fn egress_capabilities(&self) -> EgressCapabilities {
+        EgressCapabilities {
+            default_deny: true,
+            ..EgressCapabilities::default()
+        }
+    }
+
+    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
+        validate_egress_policy_capabilities(policy, self.egress_capabilities())
+    }
+
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
         &CONSUMABLE_SNAPSHOT_FORMATS
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        self.validate_egress_policy(&request.spec.egress_policy)?;
         self.reap_stale_machines().await?;
         self.reap_expired_machines().await?;
         self.shared.reap_orphaned_fork_snapshot_templates().await;
@@ -1533,7 +1548,7 @@ impl Shared {
         let machine_id = machine_id.to_string();
         let spec_hash = spec_hash.to_string();
         let resolved_image = request.spec.image.clone();
-        let network_enabled = network_device_enabled(&self.config, request.spec.network);
+        let network_enabled = network_device_enabled(&self.config, &request.spec.egress_policy);
         let workspace_id = if snapshot.is_none() {
             request
                 .spec
@@ -1604,7 +1619,7 @@ impl Shared {
                     prepare_network(
                         &config,
                         &network,
-                        request.spec.network,
+                        &request.spec.egress_policy,
                         jailer_uid(&config, &record)?,
                     )?;
                 }
@@ -2159,11 +2174,8 @@ fn hash_runtime_fingerprint(hasher: &mut Sha256, runtime: &FirecrackerRuntimeFin
     );
 }
 
-fn network_device_enabled(
-    config: &FirecrackerConfig,
-    sandbox_policy: SandboxNetworkPolicy,
-) -> bool {
-    sandbox_policy == SandboxNetworkPolicy::Enabled
+fn network_device_enabled(config: &FirecrackerConfig, egress_policy: &EgressPolicy) -> bool {
+    egress_policy.permits_unrestricted_egress()
         || config.network_device_policy == FirecrackerNetworkDevicePolicy::AllSandboxes
 }
 
@@ -2506,7 +2518,7 @@ fn ipv4_add(address: Ipv4Addr, offset: u32) -> Ipv4Addr {
 fn prepare_network(
     config: &FirecrackerConfig,
     network: &NetworkConfig,
-    policy: SandboxNetworkPolicy,
+    policy: &EgressPolicy,
     jailer_uid: u32,
 ) -> Result<()> {
     // Firecracker intentionally delegates TAP routing and firewalling to the host.
@@ -2690,7 +2702,7 @@ fn prepare_network(
 fn install_network_firewall(
     config: &FirecrackerConfig,
     network: &NetworkConfig,
-    policy: SandboxNetworkPolicy,
+    policy: &EgressPolicy,
 ) -> Result<()> {
     let rules = network_firewall_rules(config, network, policy)?;
     run_checked_input("nft", &["-f", "-"], rules.as_bytes())
@@ -2699,7 +2711,7 @@ fn install_network_firewall(
 fn network_firewall_rules(
     config: &FirecrackerConfig,
     network: &NetworkConfig,
-    policy: SandboxNetworkPolicy,
+    policy: &EgressPolicy,
 ) -> Result<String> {
     let mut rules = String::new();
     let table = &network.nft_table;
@@ -2753,7 +2765,7 @@ fn network_firewall_rules(
         "add rule inet {table} forward iifname {interface} ip daddr {{ {} }} counter reject",
         BLOCKED_EGRESS_CIDRS.join(", ")
     )?;
-    let final_egress_verdict = if policy == SandboxNetworkPolicy::Enabled {
+    let final_egress_verdict = if policy.permits_unrestricted_egress() {
         "accept"
     } else {
         "reject"

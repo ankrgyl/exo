@@ -26,12 +26,14 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio::sync::OnceCell;
 
-use crate::SandboxAttachment;
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput, SandboxKey,
-    SandboxMountAccess, SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat,
-    SnapshotPayload, WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_OWNER_PID_LABEL, owner_pid_is_alive,
-    run_command, spawn_sandbox_process,
+    SandboxMountAccess, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
+    WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_OWNER_PID_LABEL, owner_pid_is_alive, run_command,
+    spawn_sandbox_process,
+};
+use crate::{
+    EgressCapabilities, EgressPolicy, SandboxAttachment, validate_egress_policy_capabilities,
 };
 
 /// Default binary name; overridable with `SMOLVM_BIN` for a non-PATH install.
@@ -416,11 +418,23 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
         true
     }
 
+    fn egress_capabilities(&self) -> EgressCapabilities {
+        EgressCapabilities {
+            default_deny: true,
+            ..EgressCapabilities::default()
+        }
+    }
+
+    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
+        validate_egress_policy_capabilities(policy, self.egress_capabilities())
+    }
+
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
         &CONSUMABLE_SNAPSHOT_FORMATS
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        self.validate_egress_policy(&request.spec.egress_policy)?;
         reject_unsupported_spec(&request.spec)?;
         match self.resolve_mode(&request).await {
             SmolvmExecutionMode::Warm => {
@@ -735,7 +749,7 @@ fn resolve_cwd(command: &SandboxCommand, spec: &SandboxSpec) -> String {
 
 /// Mounts and network policy, shared by the create/run paths.
 fn configure_spec_args(process: &mut Command, spec: &SandboxSpec) {
-    if spec.network == SandboxNetworkPolicy::Enabled {
+    if spec.egress_policy.permits_unrestricted_egress() {
         process.arg("--net");
     }
     for mount in &spec.mounts {
@@ -835,11 +849,11 @@ fn reject_unsupported_spec(spec: &SandboxSpec) -> Result<()> {
     // smolvm resolves registry references over the machine's own network and
     // refuses this combination even for a cached image. Caught here so the caller
     // gets the two real remedies, not a failure deep in the CLI output.
-    if spec.network == SandboxNetworkPolicy::Disabled && !is_local_image_ref(&spec.image) {
+    if spec.egress_policy.default_deny && !is_local_image_ref(&spec.image) {
         bail!(
             "smolvm cannot use registry image '{}' in a network-disabled sandbox: \
              it resolves registry references over the machine's network, even for \
-             cached images. Either set SandboxNetworkPolicy::Enabled, or supply the \
+             cached images. Either enable unrestricted egress, or supply the \
              image locally (a `docker save` tar path or an unpacked rootfs dir), \
              which keeps the sandbox fully network-isolated.",
             spec.image
@@ -937,7 +951,7 @@ async fn run_checked(mut process: Command, what: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::SandboxLifecycleConfig;
+    use crate::sandbox::{SandboxLifecycleConfig, SandboxNetworkPolicy};
 
     /// A configured boot binary is used as given. The point is what does *not*
     /// happen: no `PATH` walk, no `stat`, so a path that exists only on the host
@@ -1024,7 +1038,7 @@ mod tests {
                 image: "alpine".into(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Disabled,
+                egress_policy: SandboxNetworkPolicy::Disabled.into(),
                 default_workdir: "/".into(),
             },
             lifecycle: SandboxLifecycleConfig { idle_ttl },
@@ -1092,16 +1106,16 @@ mod tests {
     fn registry_image_without_network_is_rejected() {
         let mut spec = test_request(None).spec;
         spec.image = "docker.io/library/ubuntu:24.04".into();
-        spec.network = SandboxNetworkPolicy::Disabled;
+        spec.egress_policy = SandboxNetworkPolicy::Disabled.into();
         let err = reject_unsupported_spec(&spec).unwrap_err().to_string();
         assert!(err.contains("network-disabled"), "unexpected error: {err}");
 
         // Fine once the sandbox is allowed network...
-        spec.network = SandboxNetworkPolicy::Enabled;
+        spec.egress_policy = SandboxNetworkPolicy::Enabled.into();
         assert!(reject_unsupported_spec(&spec).is_ok());
 
         // ...and a local archive is fine while staying isolated.
-        spec.network = SandboxNetworkPolicy::Disabled;
+        spec.egress_policy = SandboxNetworkPolicy::Disabled.into();
         spec.image = "/tmp/alpine.tar".into();
         assert!(reject_unsupported_spec(&spec).is_ok());
     }
@@ -1174,7 +1188,7 @@ mod tests {
                 },
             ],
             durable_file_systems: Vec::new(),
-            network: SandboxNetworkPolicy::Disabled,
+            egress_policy: SandboxNetworkPolicy::Disabled.into(),
             default_workdir: "/work".into(),
         };
 

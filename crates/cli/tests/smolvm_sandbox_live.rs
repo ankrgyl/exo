@@ -98,7 +98,7 @@ fn request(
                 internal: false,
             }],
             durable_file_systems: Vec::new(),
-            network,
+            egress_policy: network.into(),
             default_workdir: "/".into(),
         },
         lifecycle: SandboxLifecycleConfig { idle_ttl },

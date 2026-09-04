@@ -1,4 +1,5 @@
 use super::*;
+use crate::SandboxNetworkPolicy;
 use tokio::net::UnixListener;
 
 fn test_runtime() -> FirecrackerRuntimeFingerprint {
@@ -21,21 +22,21 @@ fn network_device_policy_can_keep_disabled_sandboxes_host_reachable() {
     let mut config = FirecrackerConfig::default();
     assert!(network_device_enabled(
         &config,
-        SandboxNetworkPolicy::Enabled
+        &SandboxNetworkPolicy::Enabled.into()
     ));
     assert!(!network_device_enabled(
         &config,
-        SandboxNetworkPolicy::Disabled
+        &SandboxNetworkPolicy::Disabled.into()
     ));
 
     config.network_device_policy = FirecrackerNetworkDevicePolicy::AllSandboxes;
     assert!(network_device_enabled(
         &config,
-        SandboxNetworkPolicy::Enabled
+        &SandboxNetworkPolicy::Enabled.into()
     ));
     assert!(network_device_enabled(
         &config,
-        SandboxNetworkPolicy::Disabled
+        &SandboxNetworkPolicy::Disabled.into()
     ));
 }
 
@@ -44,7 +45,8 @@ fn disabled_sandbox_network_rejects_unconfigured_egress() {
     let mut config = FirecrackerConfig::default();
     config.allowed_egress_cidrs = vec!["192.0.2.0/24".parse().unwrap()];
     let network = network_config(1);
-    let rules = network_firewall_rules(&config, &network, SandboxNetworkPolicy::Disabled).unwrap();
+    let rules =
+        network_firewall_rules(&config, &network, &SandboxNetworkPolicy::Disabled.into()).unwrap();
 
     assert!(rules.contains("ip daddr 192.0.2.0/24 counter accept"));
     assert!(rules.contains(&format!(
@@ -61,7 +63,8 @@ fn disabled_sandbox_network_rejects_unconfigured_egress() {
 fn enabled_sandbox_network_accepts_public_egress() {
     let config = FirecrackerConfig::default();
     let network = network_config(1);
-    let rules = network_firewall_rules(&config, &network, SandboxNetworkPolicy::Enabled).unwrap();
+    let rules =
+        network_firewall_rules(&config, &network, &SandboxNetworkPolicy::Enabled.into()).unwrap();
 
     assert!(rules.contains(&format!(
         "forward iifname {} counter accept\n",

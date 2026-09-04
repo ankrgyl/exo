@@ -23,7 +23,7 @@ fn make_request(conversation_id: &str, sandbox_id: &str) -> SandboxRequest {
             image: "node24".into(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            network: SandboxNetworkPolicy::Enabled,
+            egress_policy: SandboxNetworkPolicy::Enabled.into(),
             default_workdir: "/vercel/sandbox".into(),
         },
         lifecycle: SandboxLifecycleConfig {

@@ -19,13 +19,15 @@ use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
-use crate::SandboxAttachment;
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput,
-    SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
-    WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
+    SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload, WARM_SANDBOX_KEY_LABEL,
+    WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
 };
 use crate::sandbox_provider::{process_bridge, shell_quote};
+use crate::{
+    EgressCapabilities, EgressPolicy, SandboxAttachment, validate_egress_policy_capabilities,
+};
 
 pub const DEFAULT_VERCEL_API_URL: &str = "https://vercel.com/api";
 
@@ -121,11 +123,12 @@ impl VercelSandboxBackend {
             timeout: request.lifecycle.idle_ttl.map(duration_to_millis),
             env: HashMap::new(),
             tags,
-            network_policy: match request.spec.network {
-                SandboxNetworkPolicy::Enabled => None,
-                SandboxNetworkPolicy::Disabled => Some(VercelNetworkPolicy {
+            network_policy: if request.spec.egress_policy.default_deny {
+                Some(VercelNetworkPolicy {
                     mode: "deny-all".to_string(),
-                }),
+                })
+            } else {
+                None
             },
         };
 
@@ -155,11 +158,23 @@ impl ManagedSandboxBackend for VercelSandboxBackend {
         false
     }
 
+    fn egress_capabilities(&self) -> EgressCapabilities {
+        EgressCapabilities {
+            default_deny: true,
+            ..EgressCapabilities::default()
+        }
+    }
+
+    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
+        validate_egress_policy_capabilities(policy, self.egress_capabilities())
+    }
+
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
         &[]
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        self.validate_egress_policy(&request.spec.egress_policy)?;
         reject_unsupported_mounts(&request)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let sandbox_name = vercel_sandbox_name(&request, &spec_hash);
@@ -743,4 +758,44 @@ enum VercelLogLine {
 struct VercelLogError {
     code: String,
     message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reports_and_validates_egress_policy_capabilities() {
+        let backend = VercelSandboxBackend::new(VercelConfig {
+            api_token: "test-token".to_string(),
+            api_url: DEFAULT_VERCEL_API_URL.to_string(),
+            team_id: "team".to_string(),
+            project_id: "project".to_string(),
+        })
+        .expect("create Vercel backend");
+
+        assert_eq!(
+            backend.egress_capabilities(),
+            EgressCapabilities {
+                default_deny: true,
+                ..EgressCapabilities::default()
+            }
+        );
+        assert!(
+            backend
+                .validate_egress_policy(&EgressPolicy::default())
+                .is_ok()
+        );
+        assert!(
+            backend
+                .validate_egress_policy(&EgressPolicy {
+                    default_deny: true,
+                    allowed_domains: vec!["api.github.com".to_string()],
+                    allowed_cidrs: Vec::new(),
+                    denied_domains: Vec::new(),
+                    denied_cidrs: Vec::new(),
+                })
+                .is_err()
+        );
+    }
 }

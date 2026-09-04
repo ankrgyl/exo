@@ -8,6 +8,7 @@ mod basic_tests;
     feature = "basic-backend"
 ))]
 pub mod contract_tests;
+mod egress_policy;
 mod error;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 mod http;
@@ -30,6 +31,7 @@ mod uuid7;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use basic::*;
+pub use egress_policy::*;
 pub use error::*;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use http::*;

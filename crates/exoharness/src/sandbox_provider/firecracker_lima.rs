@@ -33,7 +33,10 @@ use crate::sandbox::{
     BoxSandboxTcpStream, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
     SandboxCommandOutput, SandboxRequest, SnapshotFormat, SnapshotPayload,
 };
-use crate::{SandboxAttachment, SandboxProcessParts};
+use crate::{
+    EgressCapabilities, EgressPolicy, SandboxAttachment, SandboxProcessParts,
+    validate_egress_policy_capabilities,
+};
 
 use super::FirecrackerLimaConfig;
 use super::firecracker::FirecrackerConfig;
@@ -111,11 +114,23 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         true
     }
 
+    fn egress_capabilities(&self) -> EgressCapabilities {
+        EgressCapabilities {
+            default_deny: true,
+            ..EgressCapabilities::default()
+        }
+    }
+
+    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
+        validate_egress_policy_capabilities(policy, self.egress_capabilities())
+    }
+
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
         &CONSUMABLE_SNAPSHOT_FORMATS
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        self.validate_egress_policy(&request.spec.egress_policy)?;
         // A one-shot Firecracker handle destroys its VM after the command. Do
         // not eagerly acquire it here and then acquire a second VM when the
         // command crosses the bridge.
