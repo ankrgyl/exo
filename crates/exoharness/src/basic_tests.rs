@@ -21,17 +21,18 @@ use tokio::time::{sleep, timeout};
 
 use crate::test_support::{local_test_config, local_test_config_with_daytona};
 use crate::{
-    Artifact, ArtifactVersion, BasicExoHarness, BeginTurnRequest, Binding, BoxAsyncRead,
-    BoxAsyncWrite, CloseSandboxProcessInputRequest, CreateSandboxRequest, DurableFileSystem,
-    EgressPolicy, EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness,
-    FileSystemMountMode, ForkConversationRequest, ManagedSandboxBackend, ManagedSandboxHandle,
-    NewAgentRequest, NewConversationRequest, PutSecretRequest, RestoreSandboxRequest,
-    RunInSandboxRequest, SandboxAttachment, SandboxBackendRegistration, SandboxCommand,
-    SandboxCommandOutput, SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy,
-    SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
-    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec,
-    Secret, SnapshotFormat, SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest,
-    Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    Artifact, ArtifactVersion, AttachSandboxRequest, BasicExoHarness, BeginTurnRequest, Binding,
+    BoxAsyncRead, BoxAsyncWrite, CloseSandboxProcessInputRequest, CreateSandboxRequest,
+    DurableFileSystem, EgressPolicy, EventData, EventKind, EventQuery, EventQueryDirection,
+    ExoHarness, FileSystemMountMode, ForkConversationRequest, ForkSandboxRequest,
+    ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest, NewConversationRequest,
+    PutSecretRequest, RestoreSandboxRequest, RunInSandboxRequest, SandboxAttachment,
+    SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput, SandboxKey,
+    SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent, SandboxProcessEventQuery,
+    SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin, SandboxProvider,
+    SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotFormat, SnapshotPayload,
+    StartSandboxProcessRequest, StartSandboxRequest, Uuid7, WaitSandboxProcessRequest,
+    WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const DEFAULT_DURABLE_CONTRACT_MOUNT_PATH: &str = "/home/exo/workspace";
@@ -616,6 +617,26 @@ async fn docker_sandbox_contract_durable_file_system_survives_stop_and_reacquire
     )
     .await
     .expect("Docker sandbox durable filesystem contract");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "uses a real Docker sandbox and host TCP endpoint; run this test explicitly"]
+async fn docker_sandbox_contract_enforces_egress_policy_through_lifecycle() {
+    let backend: Arc<dyn ManagedSandboxBackend> =
+        Arc::new(crate::CliContainerSandboxBackend::docker());
+    let image = env_or("DOCKER_IMAGE", &crate::default_docker_image());
+    let unrestricted =
+        provider_contract_request("docker", "egress-unrestricted", image.clone(), "/");
+    let mut default_deny = provider_contract_request("docker", "egress-default-deny", image, "/");
+    default_deny.spec.egress_policy = SandboxNetworkPolicy::Disabled.into();
+
+    crate::contract_tests::sandbox_backend_enforces_egress_policy_through_lifecycle(
+        backend,
+        unrestricted,
+        default_deny,
+    )
+    .await
+    .expect("Docker sandbox egress lifecycle contract");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2328,6 +2349,7 @@ fn provider_state_test_create_request() -> CreateSandboxRequest {
 struct TestProviderStateBackend {
     state: Value,
     requests: Arc<AsyncMutex<Vec<Option<Value>>>>,
+    egress_policies: Arc<AsyncMutex<Vec<EgressPolicy>>>,
     cleanup_count: Arc<AsyncMutex<usize>>,
 }
 
@@ -2336,6 +2358,7 @@ impl TestProviderStateBackend {
         Self {
             state,
             requests: Arc::new(AsyncMutex::new(Vec::new())),
+            egress_policies: Arc::new(AsyncMutex::new(Vec::new())),
             cleanup_count: Arc::new(AsyncMutex::new(0)),
         }
     }
@@ -2355,6 +2378,10 @@ impl ManagedSandboxBackend for TestProviderStateBackend {
         &self,
         request: SandboxRequest,
     ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        self.egress_policies
+            .lock()
+            .await
+            .push(request.spec.egress_policy.clone());
         self.requests.lock().await.push(request.provider_state);
         Ok(Arc::new(TestProviderStateHandle {
             state: self.state.clone(),
@@ -2364,10 +2391,17 @@ impl ManagedSandboxBackend for TestProviderStateBackend {
 
     async fn attach(
         &self,
-        _request: SandboxRequest,
+        request: SandboxRequest,
         _attachment: SandboxAttachment,
     ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
-        bail!("test provider-state backend does not support attachment")
+        self.egress_policies
+            .lock()
+            .await
+            .push(request.spec.egress_policy);
+        Ok(Arc::new(TestProviderStateHandle {
+            state: self.state.clone(),
+            cleanup_count: Arc::clone(&self.cleanup_count),
+        }))
     }
 
     async fn terminate(&self, request: SandboxRequest) -> crate::Result<()> {
@@ -2750,6 +2784,82 @@ async fn create_sandbox_rejects_unsupported_egress_before_backend_acquisition() 
             .contains("cannot enforce default-deny egress")
     );
     assert!(backend.requests.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fork_sandbox_validates_both_policies_before_calling_the_backend() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let backend = Arc::new(TestProviderStateBackend::new(Value::Null));
+    let harness = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        backend.clone(),
+    )
+    .await
+    .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let source_id = agent
+        .create_sandbox(provider_state_test_create_request())
+        .await
+        .expect("source sandbox");
+    backend.requests.lock().await.clear();
+
+    let mut target = provider_state_test_create_request();
+    target.name = Some("target".to_string());
+    target.enable_networking = None;
+    target.egress_policy = Some(EgressPolicy::default());
+    let error = agent
+        .fork_sandbox(ForkSandboxRequest {
+            source_id,
+            sandbox: target,
+        })
+        .await
+        .expect_err("unsupported target policy should fail before fork");
+
+    assert!(
+        error
+            .to_string()
+            .contains("cannot enforce default-deny egress")
+    );
+    assert!(backend.requests.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn attach_sandbox_persists_explicit_unrestricted_egress_policy() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let mut config = local_test_config(tempdir.path());
+    config.sandbox_default = SandboxProvider::Docker;
+    config.sandbox_backends = vec![SandboxBackendRegistration::docker()];
+    let backend = Arc::new(TestProviderStateBackend::new(Value::Null));
+    let harness = BasicExoHarness::new_with_sandbox_backend(config, backend.clone())
+        .await
+        .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    agent
+        .attach_sandbox(AttachSandboxRequest {
+            attachment: SandboxAttachment::DockerContainer {
+                container_id: "container".to_string(),
+            },
+            default_workdir: None,
+        })
+        .await
+        .expect("attach sandbox");
+
+    assert_eq!(
+        backend.egress_policies.lock().await.as_slice(),
+        &[SandboxNetworkPolicy::Enabled.into()]
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

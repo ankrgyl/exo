@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
@@ -6,6 +7,7 @@ use futures::io::{AsyncReadExt, AsyncWriteExt};
 use lingua::Message;
 use lingua::universal::{AssistantContent, UserContent};
 use tokio::time::timeout;
+use tokio::{io::AsyncWriteExt as TokioAsyncWriteExt, net::TcpListener, task::JoinHandle};
 use tracing::info;
 
 use crate::{
@@ -537,6 +539,182 @@ pub async fn sandbox_backend_durable_file_system_survives_stop_and_reacquire(
         "stop sandbox after durable filesystem read",
     )
     .await
+}
+
+/// Verifies that a local backend applies its egress policy when starting a
+/// sandbox, reusing it after a stop, and restoring it from a snapshot when the
+/// backend supports snapshots.
+pub async fn sandbox_backend_enforces_egress_policy_through_lifecycle(
+    backend: Arc<dyn ManagedSandboxBackend>,
+    unrestricted_request: SandboxRequest,
+    default_deny_request: SandboxRequest,
+) -> crate::Result<()> {
+    let endpoint = LocalHttpEndpoint::start().await?;
+    let supports_snapshots = !backend.consumable_snapshot_formats().is_empty();
+
+    exercise_egress_lifecycle(
+        Arc::clone(&backend),
+        unrestricted_request,
+        &endpoint,
+        true,
+        supports_snapshots,
+    )
+    .await?;
+    exercise_egress_lifecycle(
+        Arc::clone(&backend),
+        default_deny_request,
+        &endpoint,
+        false,
+        supports_snapshots,
+    )
+    .await
+}
+
+async fn exercise_egress_lifecycle(
+    backend: Arc<dyn ManagedSandboxBackend>,
+    request: SandboxRequest,
+    endpoint: &LocalHttpEndpoint,
+    should_connect: bool,
+    supports_snapshots: bool,
+) -> crate::Result<()> {
+    let first = backend
+        .acquire(request.clone())
+        .await
+        .context("acquire sandbox for egress check")?;
+    assert_endpoint_connectivity(Arc::clone(&first), endpoint, should_connect).await?;
+
+    let snapshot = if supports_snapshots {
+        Some(
+            first
+                .snapshot()
+                .await
+                .context("snapshot sandbox for egress check")?,
+        )
+    } else {
+        None
+    };
+    first
+        .stop()
+        .await
+        .context("stop sandbox after egress check")?;
+
+    let reacquired = backend
+        .acquire(request.clone())
+        .await
+        .context("reacquire sandbox for egress check")?;
+    assert_endpoint_connectivity(Arc::clone(&reacquired), endpoint, should_connect).await?;
+    reacquired
+        .stop()
+        .await
+        .context("stop reacquired sandbox after egress check")?;
+
+    if let Some(snapshot) = snapshot {
+        let restored = backend
+            .acquire_from_snapshot(request.clone(), snapshot)
+            .await
+            .context("restore sandbox for egress check")?;
+        assert_endpoint_connectivity(restored.clone(), endpoint, should_connect).await?;
+        restored
+            .stop()
+            .await
+            .context("stop restored sandbox after egress check")?;
+    }
+
+    backend
+        .terminate(request)
+        .await
+        .context("terminate sandbox after egress contract")
+}
+
+async fn assert_endpoint_connectivity(
+    handle: Arc<dyn ManagedSandboxHandle>,
+    endpoint: &LocalHttpEndpoint,
+    should_connect: bool,
+) -> crate::Result<()> {
+    let output = handle
+        .exec(&SandboxCommand {
+            argv: vec![
+                "bash".to_string(),
+                "-c".to_string(),
+                "exec 3<>/dev/tcp/\"$EXO_EGRESS_TEST_HOST\"/\"$EXO_EGRESS_TEST_PORT\"; printf 'GET / HTTP/1.1\\r\\nHost: exo\\r\\nConnection: close\\r\\n\\r\\n' >&3; IFS= read -r status <&3; case \"$status\" in 'HTTP/1.1 200 OK'*) exit 0;; *) exit 1;; esac".to_string(),
+            ],
+            display_argv: None,
+            env: std::collections::HashMap::from([
+                ("EXO_EGRESS_TEST_HOST".to_string(), endpoint.host.clone()),
+                ("EXO_EGRESS_TEST_PORT".to_string(), endpoint.port.to_string()),
+            ]),
+            cwd: None,
+            timeout: Some(Duration::from_secs(15)),
+        })
+        .await
+        .context("run controlled HTTP egress check")?;
+
+    if output.ok == should_connect {
+        return Ok(());
+    }
+    bail!(
+        "expected sandbox egress connection to be {expected}, but command {actual}: {stdout}{stderr}",
+        expected = if should_connect { "allowed" } else { "blocked" },
+        actual = if output.ok { "succeeded" } else { "failed" },
+        stdout = output.stdout,
+        stderr = output.stderr,
+    )
+}
+
+struct LocalHttpEndpoint {
+    host: String,
+    port: u16,
+    requests: Arc<AtomicUsize>,
+    task: JoinHandle<()>,
+}
+
+impl LocalHttpEndpoint {
+    async fn start() -> crate::Result<Self> {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .context("bind local HTTP egress fixture")?;
+        let port = listener
+            .local_addr()
+            .context("read local HTTP egress fixture address")?
+            .port();
+        let host = std::env::var("EXO_EGRESS_TEST_HOST")
+            .unwrap_or_else(|_| "host.docker.internal".to_string());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let task_requests = Arc::clone(&requests);
+        let task = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((mut stream, _)) => {
+                        task_requests.fetch_add(1, Ordering::Relaxed);
+                        if stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        Ok(Self {
+            host,
+            port,
+            requests,
+            task,
+        })
+    }
+}
+
+impl Drop for LocalHttpEndpoint {
+    fn drop(&mut self) {
+        self.task.abort();
+        assert!(
+            self.requests.load(Ordering::Relaxed) > 0,
+            "the egress fixture was never reached"
+        );
+    }
 }
 
 pub async fn sandbox_backend_workdir_survives_stop_and_reacquire(

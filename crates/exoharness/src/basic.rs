@@ -2019,23 +2019,11 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {
         self.ensure_full_sandbox_scope("attach_sandbox")?;
         let sandbox_id = format!("sandbox-{}", Uuid7::now());
-        let provider = request.attachment.provider();
-        let sandbox = StoredSandbox {
-            id: sandbox_id.clone(),
-            name: None,
-            provider,
-            image: String::new(),
-            requested_image: None,
-            default_workdir: Some(request.default_workdir.unwrap_or_default()),
-            file_system_mounts: Vec::new(),
-            durable_file_systems: Vec::new(),
-            enable_networking: true,
-            egress_policy: Some(SandboxNetworkPolicy::Enabled.into()),
-            idle_seconds: 0,
-            running: true,
-            latest_snapshot_id: None,
-            attachment: Some(request.attachment),
-        };
+        let sandbox = StoredSandbox::attached(
+            sandbox_id.clone(),
+            request.attachment,
+            request.default_workdir.unwrap_or_default(),
+        );
         let (sandbox_handle, provider_state_event) = create_sandbox_handle(
             self.harness,
             &self.owner_dir,
@@ -3967,6 +3955,28 @@ impl From<StoredSandbox> for SandboxRecord {
             provider: sandbox.provider,
             image: sandbox.image,
             running: sandbox.running,
+        }
+    }
+}
+
+impl StoredSandbox {
+    fn attached(id: SandboxId, attachment: SandboxAttachment, default_workdir: String) -> Self {
+        Self {
+            id,
+            name: None,
+            provider: attachment.provider(),
+            image: String::new(),
+            requested_image: None,
+            default_workdir: Some(default_workdir),
+            file_system_mounts: Vec::new(),
+            durable_file_systems: Vec::new(),
+            // Explicitly enabling network harness
+            enable_networking: true,
+            egress_policy: Some(SandboxNetworkPolicy::Enabled.into()),
+            idle_seconds: 0,
+            running: true,
+            latest_snapshot_id: None,
+            attachment: Some(attachment),
         }
     }
 }
