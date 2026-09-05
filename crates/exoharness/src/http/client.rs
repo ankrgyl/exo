@@ -208,6 +208,7 @@ async fn http_create_sandbox(
     scope: SandboxScope,
     request: CreateSandboxRequest,
 ) -> Result<SandboxId> {
+    let request = request.with_legacy_networking_projection()?;
     match harness
         .request(Request::CreateSandbox { scope, request })
         .await?
@@ -222,6 +223,10 @@ async fn http_fork_sandbox(
     scope: SandboxScope,
     request: ForkSandboxRequest,
 ) -> Result<SandboxId> {
+    let request = ForkSandboxRequest {
+        sandbox: request.sandbox.with_legacy_networking_projection()?,
+        ..request
+    };
     match harness
         .request(Request::ForkSandbox { scope, request })
         .await?
@@ -236,6 +241,10 @@ async fn http_restore_sandbox(
     scope: SandboxScope,
     request: RestoreSandboxRequest,
 ) -> Result<SandboxId> {
+    let request = RestoreSandboxRequest {
+        sandbox: request.sandbox.with_legacy_networking_projection()?,
+        ..request
+    };
     match harness
         .request(Request::RestoreSandbox { scope, request })
         .await?

@@ -175,6 +175,8 @@ pub struct FirecrackerConfig {
     pub workspace_size_gib: u64,
     pub jailer_uid_base: u32,
     pub dns_server: Ipv4Addr,
+    /// Operator-configured destinations permitted only for unrestricted
+    /// sandboxes. A sandbox-level deny-all policy always overrides these.
     pub allowed_egress_cidrs: Vec<Ipv4Net>,
     #[serde(default)]
     pub network_device_policy: FirecrackerNetworkDevicePolicy,
@@ -2756,11 +2758,16 @@ fn network_firewall_rules(
         rules,
         "add rule inet {table} forward iifname {interface} ip daddr {EXO_NETWORK_CIDR} counter reject"
     )?;
-    for cidr in &config.allowed_egress_cidrs {
-        writeln!(
-            rules,
-            "add rule inet {table} forward iifname {interface} ip daddr {cidr} counter accept"
-        )?;
+    // Host-configured exceptions extend unrestricted sandboxes only. An
+    // explicit sandbox deny-all policy must remain deny-all even when a
+    // network device is present for host reachability.
+    if policy.allows_all() {
+        for cidr in &config.allowed_egress_cidrs {
+            writeln!(
+                rules,
+                "add rule inet {table} forward iifname {interface} ip daddr {cidr} counter accept"
+            )?;
+        }
     }
     writeln!(
         rules,

@@ -971,6 +971,11 @@ pub(crate) async fn ensure_shell_sandbox(
     let requested_image = config.effective_sandbox_image(agent_config);
     let desired_image = requested_image.map(str::to_string).unwrap_or_default();
     let desired_enable_networking = agent_config.sandbox.enable_networking;
+    let desired_network_policy = if desired_enable_networking {
+        exoharness::SandboxNetworkPolicy::allow_all()
+    } else {
+        exoharness::SandboxNetworkPolicy::deny_all()
+    };
 
     if let Some(sandbox) = latest_shell_sandbox(conversation, &desired_provider).await? {
         // When no image was requested, the stored sandbox holds the provider's
@@ -980,7 +985,7 @@ pub(crate) async fn ensure_shell_sandbox(
             && sandbox.default_workdir == desired_default_workdir
             && sandbox.file_system_mounts == desired_mounts
             && sandbox.durable_file_systems == desired_durable_file_systems
-            && sandbox.enable_networking == desired_enable_networking
+            && sandbox.network_policy == desired_network_policy
             && sandbox.idle_seconds == 300;
 
         if config_matches {
@@ -1010,7 +1015,7 @@ pub(crate) async fn ensure_shell_sandbox(
             file_system_mounts: Some(desired_mounts),
             durable_file_systems: Some(desired_durable_file_systems),
             enable_networking: Some(desired_enable_networking),
-            network_policy: None,
+            network_policy: Some(desired_network_policy),
             idle_seconds: Some(300),
         })
         .await
@@ -1038,7 +1043,7 @@ struct ShellSandboxInfo {
     default_workdir: String,
     file_system_mounts: Vec<FileSystemMount>,
     durable_file_systems: Vec<exoharness::DurableFileSystem>,
-    enable_networking: bool,
+    network_policy: exoharness::SandboxNetworkPolicy,
     idle_seconds: u64,
 }
 
@@ -1060,7 +1065,7 @@ async fn latest_shell_sandbox(
         default_workdir: sandbox.default_workdir,
         file_system_mounts: sandbox.file_system_mounts,
         durable_file_systems: sandbox.durable_file_systems,
-        enable_networking: sandbox.enable_networking,
+        network_policy: sandbox.network_policy,
         idle_seconds: sandbox.idle_seconds,
     }))
 }

@@ -661,6 +661,37 @@ pub struct CreateSandboxRequest {
     pub idle_seconds: Option<u64>,
 }
 
+impl CreateSandboxRequest {
+    /// Gets the actual network policy this request is asking for.
+    ///
+    /// `enable_networking` is the old coarse version of the same setting. We
+    /// allow both during a rolling deploy, but they need to agree: it is true
+    /// only when the policy allows unrestricted networking.
+    pub fn resolved_network_policy(&self) -> Result<SandboxNetworkPolicy> {
+        match (&self.network_policy, self.enable_networking) {
+            (Some(policy), Some(enable_networking)) if enable_networking != policy.allows_all() => {
+                anyhow::bail!(
+                    "network_policy and enable_networking specify different network access"
+                );
+            }
+            (Some(policy), _) => Ok(policy.clone()),
+            (None, Some(true)) | (None, None) => Ok(SandboxNetworkPolicy::allow_all()),
+            (None, Some(false)) => Ok(SandboxNetworkPolicy::deny_all()),
+        }
+    }
+
+    /// Includes the old boolean alongside an explicit policy for older Exo
+    /// servers. Restricted policies become `false`, so an old server fails
+    /// closed instead of accidentally allowing network access.
+    pub(crate) fn with_legacy_networking_projection(mut self) -> Result<Self> {
+        let policy = self.resolved_network_policy()?;
+        if self.network_policy.is_some() {
+            self.enable_networking = Some(policy.allows_all());
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ForkSandboxRequest {
     pub source_id: SandboxId,

@@ -579,11 +579,11 @@ async fn http_exoharness_threads_network_policy_through_create_fork_and_restore(
             Some(true),
         ))
         .await
-        .expect_err("ambiguous request should fail over HTTP");
+        .expect_err("conflicting request should fail over HTTP");
     assert!(
         error
             .to_string()
-            .contains("both network_policy and enable_networking")
+            .contains("network_policy and enable_networking specify different network access")
     );
 }
 

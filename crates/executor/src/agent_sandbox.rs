@@ -1,6 +1,6 @@
 use exoharness::{
     AgentHandle, Artifact, ArtifactVersion, CreateSandboxRequest, ReadArtifactRequest, Result,
-    SandboxProvider, Uuid7, WriteArtifactRequest,
+    SandboxNetworkPolicy, SandboxProvider, Uuid7, WriteArtifactRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +31,8 @@ struct AgentSandboxRecord {
     #[serde(default)]
     durable_file_systems: Vec<exoharness::DurableFileSystem>,
     enable_networking: bool,
+    #[serde(default)]
+    network_policy: Option<SandboxNetworkPolicy>,
     idle_seconds: u64,
 }
 
@@ -42,7 +44,13 @@ impl AgentSandboxRecord {
             default_workdir: self.default_workdir.clone(),
             file_system_mounts: self.file_system_mounts.clone(),
             durable_file_systems: self.durable_file_systems.clone(),
-            enable_networking: self.enable_networking,
+            network_policy: self.network_policy.clone().unwrap_or_else(|| {
+                if self.enable_networking {
+                    SandboxNetworkPolicy::allow_all()
+                } else {
+                    SandboxNetworkPolicy::deny_all()
+                }
+            }),
             idle_seconds: self.idle_seconds,
         }
     }
@@ -55,7 +63,8 @@ impl AgentSandboxRecord {
             default_workdir: spec.default_workdir,
             file_system_mounts: spec.file_system_mounts,
             durable_file_systems: spec.durable_file_systems,
-            enable_networking: spec.enable_networking,
+            enable_networking: spec.network_policy.allows_all(),
+            network_policy: Some(spec.network_policy),
             idle_seconds: spec.idle_seconds,
         }
     }
@@ -117,8 +126,8 @@ async fn attach_agent_sandbox(
             default_workdir: Some(spec.default_workdir.clone()),
             file_system_mounts: Some(spec.file_system_mounts.clone()),
             durable_file_systems: Some(spec.durable_file_systems.clone()),
-            enable_networking: Some(spec.enable_networking),
-            network_policy: None,
+            enable_networking: Some(spec.network_policy.allows_all()),
+            network_policy: Some(spec.network_policy.clone()),
             idle_seconds: Some(spec.idle_seconds),
         })
         .await?;
@@ -211,7 +220,7 @@ mod tests {
             image: image.map(str::to_string),
             provider: SandboxProvider::LocalProcess,
             mounts: vec![],
-            enable_networking: false,
+            enable_networking: true,
             scope: SandboxScope::Agent,
         }
     }

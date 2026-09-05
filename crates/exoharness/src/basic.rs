@@ -2537,7 +2537,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 || default_workdir != request.default_workdir.clone().unwrap_or_default()
                 || file_system_mounts != request.file_system_mounts
                 || durable_file_systems != request.durable_file_systems
-                || select_network_policy(network_policy, Some(enable_networking))
+                || stored_network_policy(network_policy, enable_networking)
                     != request.network_policy
                 || idle_seconds != request.idle_seconds
             {
@@ -3457,6 +3457,7 @@ async fn prepare_sandbox_request(
     harness: &BasicExoHarness,
     request: CreateSandboxRequest,
 ) -> Result<PreparedSandboxRequest> {
+    let network_policy = request.resolved_network_policy()?;
     let image = if !request.image.trim().is_empty() {
         request.image.clone()
     } else if let Some(default) = harness
@@ -3476,41 +3477,25 @@ async fn prepare_sandbox_request(
         default_workdir: request.default_workdir,
         file_system_mounts: request.file_system_mounts.unwrap_or_default(),
         durable_file_systems: request.durable_file_systems.unwrap_or_default(),
-        network_policy: resolve_network_policy(request.network_policy, request.enable_networking)?,
+        network_policy,
         idle_seconds: request.idle_seconds.unwrap_or(60),
     })
 }
 
-/// Still convert legacy enable_networking boolean to newer SandboxNetworkPolicy interface
-fn legacy_network_policy(enable_networking: bool) -> SandboxNetworkPolicy {
-    if enable_networking {
-        SandboxNetworkPolicy::allow_all()
-    } else {
-        SandboxNetworkPolicy::deny_all()
-    }
-}
-
-/// Handles a new client request
-///
-/// Throws if there is a network policy inconsistency
-fn resolve_network_policy(
+/// Returns the policy for stored state. Policy-aware records retain
+/// the legacy boolean projection, while records committed before this feature
+/// contain only `enable_networking`.
+fn stored_network_policy(
     network_policy: Option<SandboxNetworkPolicy>,
-    enable_networking: Option<bool>,
-) -> Result<SandboxNetworkPolicy> {
-    if network_policy.is_some() && enable_networking.is_some() {
-        bail!("sandbox request cannot specify both network_policy and enable_networking")
-    }
-    Ok(select_network_policy(network_policy, enable_networking))
-}
-
-/// Reads a stored network policy from sandbox JSON
-///
-/// Reads the legacy network policy for backwards compatibility but prefers newer network_policy
-fn select_network_policy(
-    network_policy: Option<SandboxNetworkPolicy>,
-    enable_networking: Option<bool>,
+    enable_networking: bool,
 ) -> SandboxNetworkPolicy {
-    network_policy.unwrap_or_else(|| legacy_network_policy(enable_networking.unwrap_or(true)))
+    network_policy.unwrap_or_else(|| {
+        if enable_networking {
+            SandboxNetworkPolicy::allow_all()
+        } else {
+            SandboxNetworkPolicy::deny_all()
+        }
+    })
 }
 
 async fn find_matching_stored_sandbox(
@@ -3541,10 +3526,8 @@ async fn find_matching_stored_sandbox(
             || sandbox.default_workdir != request.default_workdir
             || sandbox.file_system_mounts != request.file_system_mounts
             || sandbox.durable_file_systems != request.durable_file_systems
-            || select_network_policy(
-                sandbox.network_policy.clone(),
-                Some(sandbox.enable_networking),
-            ) != request.network_policy
+            || stored_network_policy(sandbox.network_policy.clone(), sandbox.enable_networking)
+                != request.network_policy
             || sandbox.idle_seconds != request.idle_seconds
         {
             bail!("sandbox name {name:?} already exists with a different configuration");
@@ -4008,6 +3991,8 @@ impl PreparedSandboxRequest {
             default_workdir: self.default_workdir.clone(),
             file_system_mounts: self.file_system_mounts.clone(),
             durable_file_systems: self.durable_file_systems.clone(),
+            // A lossy legacy projection retained for records written by main.
+            // `network_policy` below is the canonical persisted value.
             enable_networking: self.network_policy.allows_all(),
             network_policy: Some(self.network_policy.clone()),
             idle_seconds: self.idle_seconds,
@@ -4490,9 +4475,9 @@ fn sandbox_request(
                 })
                 .collect(),
             durable_file_systems: sandbox.durable_file_systems.clone(),
-            network_policy: select_network_policy(
+            network_policy: stored_network_policy(
                 sandbox.network_policy.clone(),
-                Some(sandbox.enable_networking),
+                sandbox.enable_networking,
             ),
             default_workdir: sandbox
                 .default_workdir
@@ -4876,27 +4861,61 @@ mod network_policy_tests {
             ..SandboxNetworkPolicy::default()
         };
 
+        let explicit = CreateSandboxRequest {
+            name: None,
+            provider: SandboxProvider::LocalProcess,
+            image: String::new(),
+            default_workdir: None,
+            file_system_mounts: None,
+            durable_file_systems: None,
+            enable_networking: None,
+            network_policy: Some(policy.clone()),
+            idle_seconds: None,
+        };
+        assert_eq!(explicit.resolved_network_policy().unwrap(), policy);
         assert_eq!(
-            resolve_network_policy(Some(policy.clone()), None).expect("explicit policy"),
+            CreateSandboxRequest {
+                enable_networking: Some(false),
+                ..explicit.clone()
+            }
+            .resolved_network_policy()
+            .unwrap(),
             policy
         );
         assert_eq!(
-            select_network_policy(None, Some(true)),
-            legacy_network_policy(true)
+            explicit
+                .clone()
+                .with_legacy_networking_projection()
+                .unwrap()
+                .enable_networking,
+            Some(false)
         );
         assert_eq!(
-            select_network_policy(None, Some(false)),
-            legacy_network_policy(false)
+            stored_network_policy(None, true),
+            SandboxNetworkPolicy::allow_all()
         );
         assert_eq!(
-            select_network_policy(Some(policy.clone()), Some(true)),
-            policy
+            stored_network_policy(None, false),
+            SandboxNetworkPolicy::deny_all()
         );
+        assert_eq!(stored_network_policy(Some(policy.clone()), true), policy);
         assert_eq!(
-            resolve_network_policy(None, None).unwrap(),
-            legacy_network_policy(true)
+            CreateSandboxRequest {
+                network_policy: None,
+                ..explicit.clone()
+            }
+            .resolved_network_policy()
+            .unwrap(),
+            SandboxNetworkPolicy::allow_all()
         );
-        assert!(resolve_network_policy(Some(policy), Some(true)).is_err());
+        assert!(
+            CreateSandboxRequest {
+                enable_networking: Some(true),
+                ..explicit
+            }
+            .resolved_network_policy()
+            .is_err()
+        );
     }
 }
 

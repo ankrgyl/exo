@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::{AgentConfig, ConversationConfig};
 use exoharness::{
     ConversationHandle, CreateSandboxRequest, DEFAULT_SANDBOX_IMAGE, EventData, EventKind,
-    EventQuery, EventQueryDirection, FileSystemMount, FileSystemMountMode, Result, SandboxProvider,
+    EventQuery, EventQueryDirection, FileSystemMount, FileSystemMountMode, Result,
+    SandboxNetworkPolicy, SandboxProvider,
 };
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -16,7 +17,7 @@ pub(crate) struct ConversationSandboxInfo {
     pub(crate) default_workdir: String,
     pub(crate) file_system_mounts: Vec<FileSystemMount>,
     pub(crate) durable_file_systems: Vec<exoharness::DurableFileSystem>,
-    pub(crate) enable_networking: bool,
+    pub(crate) network_policy: SandboxNetworkPolicy,
     pub(crate) idle_seconds: u64,
 }
 
@@ -27,7 +28,7 @@ impl ConversationSandboxInfo {
             && self.default_workdir == spec.default_workdir
             && self.file_system_mounts == spec.file_system_mounts
             && self.durable_file_systems == spec.durable_file_systems
-            && self.enable_networking == spec.enable_networking
+            && self.network_policy == spec.network_policy
             && self.idle_seconds == spec.idle_seconds
     }
 }
@@ -39,7 +40,7 @@ pub(crate) struct ConversationSandboxSpec {
     pub(crate) default_workdir: String,
     pub(crate) file_system_mounts: Vec<FileSystemMount>,
     pub(crate) durable_file_systems: Vec<exoharness::DurableFileSystem>,
-    pub(crate) enable_networking: bool,
+    pub(crate) network_policy: SandboxNetworkPolicy,
     pub(crate) idle_seconds: u64,
 }
 
@@ -135,6 +136,7 @@ async fn conversation_sandbox_candidates(
                 file_system_mounts,
                 durable_file_systems,
                 enable_networking,
+                network_policy,
                 idle_seconds,
                 ..
             } => {
@@ -146,7 +148,13 @@ async fn conversation_sandbox_candidates(
                         default_workdir,
                         file_system_mounts,
                         durable_file_systems,
-                        enable_networking,
+                        network_policy: network_policy.unwrap_or_else(|| {
+                            if enable_networking {
+                                SandboxNetworkPolicy::allow_all()
+                            } else {
+                                SandboxNetworkPolicy::deny_all()
+                            }
+                        }),
                         idle_seconds,
                     },
                 ));
@@ -182,8 +190,8 @@ pub(crate) async fn create_conversation_sandbox(
             default_workdir: Some(spec.default_workdir),
             file_system_mounts: Some(spec.file_system_mounts),
             durable_file_systems: Some(spec.durable_file_systems),
-            enable_networking: Some(spec.enable_networking),
-            network_policy: None,
+            enable_networking: Some(spec.network_policy.allows_all()),
+            network_policy: Some(spec.network_policy),
             idle_seconds: Some(spec.idle_seconds),
         })
         .await
@@ -221,7 +229,7 @@ pub(crate) fn agent_sandbox_spec(agent_config: &AgentConfig) -> ConversationSand
             .unwrap_or_else(|| "/".to_string()),
         file_system_mounts: normalize_mounts(&agent_config.sandbox.mounts),
         durable_file_systems: Vec::new(),
-        enable_networking: agent_config.sandbox.enable_networking,
+        network_policy: legacy_network_policy(agent_config.sandbox.enable_networking),
         idle_seconds: 300,
     }
 }
@@ -249,8 +257,16 @@ pub(crate) fn conversation_sandbox_spec(
             .unwrap_or_else(|| "/".to_string()),
         file_system_mounts: normalize_mounts(&config.mounts),
         durable_file_systems: config.durable_file_systems.clone(),
-        enable_networking: agent_config.sandbox.enable_networking,
+        network_policy: legacy_network_policy(agent_config.sandbox.enable_networking),
         idle_seconds: 300,
+    }
+}
+
+fn legacy_network_policy(enable_networking: bool) -> SandboxNetworkPolicy {
+    if enable_networking {
+        SandboxNetworkPolicy::allow_all()
+    } else {
+        SandboxNetworkPolicy::deny_all()
     }
 }
 

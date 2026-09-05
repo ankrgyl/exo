@@ -41,14 +41,14 @@ fn network_device_policy_can_keep_disabled_sandboxes_host_reachable() {
 }
 
 #[test]
-fn disabled_sandbox_network_rejects_unconfigured_egress() {
+fn deny_all_sandbox_rejects_configured_egress() {
     let mut config = FirecrackerConfig::default();
     config.allowed_egress_cidrs = vec!["192.0.2.0/24".parse().unwrap()];
     let network = network_config(1);
     let rules =
         network_firewall_rules(&config, &network, &SandboxNetworkPolicy::deny_all()).unwrap();
 
-    assert!(rules.contains("ip daddr 192.0.2.0/24 counter accept"));
+    assert!(!rules.contains("ip daddr 192.0.2.0/24 counter accept"));
     assert!(rules.contains(&format!(
         "forward iifname {} counter reject",
         network.host_veth

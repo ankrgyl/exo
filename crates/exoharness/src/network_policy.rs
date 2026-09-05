@@ -58,9 +58,18 @@ impl SandboxNetworkPolicy {
             && self.denied_domains.is_empty()
             && self.denied_cidrs.is_empty()
     }
+
+    pub(crate) fn legacy_enable_networking(&self) -> Option<bool> {
+        (self.allowed_domains.is_empty()
+            && self.allowed_cidrs.is_empty()
+            && self.denied_domains.is_empty()
+            && self.denied_cidrs.is_empty())
+        .then_some(!self.default_deny)
+    }
 }
 
-/// Network policy features a backend can enforce.
+/// Network policy features a backend can enforce, not merely accept in its
+/// provider API
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NetworkPolicyCapabilities {
     pub default_deny: bool,
