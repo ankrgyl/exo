@@ -630,7 +630,7 @@ async fn docker_sandbox_contract_enforces_egress_policy_through_lifecycle() {
     let mut default_deny = provider_contract_request("docker", "egress-default-deny", image, "/");
     default_deny.spec.egress_policy = SandboxNetworkPolicy::Disabled.into();
 
-    crate::contract_tests::sandbox_backend_enforces_egress_policy_through_lifecycle(
+    crate::contract_tests::docker_sandbox_backend_enforces_egress_policy_through_lifecycle(
         backend,
         unrestricted,
         default_deny,
