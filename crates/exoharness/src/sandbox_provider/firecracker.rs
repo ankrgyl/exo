@@ -3477,6 +3477,10 @@ fn reap_orphaned_fork_snapshot_templates_blocking(
             continue;
         }
 
+        // Restores hold a shared lock, while reclamation proceeds only after a
+        // non-blocking exclusive lock. A restore that races this reference scan
+        // either acquires its shared lease before removal or observes that the
+        // template disappeared and fails without starting a VM.
         let lease_path = entry.path().join(SNAPSHOT_LEASE_FILE);
         let lease = File::open(&lease_path).with_context(|| {
             format!(
