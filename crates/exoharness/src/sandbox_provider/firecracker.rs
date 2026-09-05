@@ -587,6 +587,32 @@ impl FirecrackerSandboxBackend {
             .context("joining Firecracker backend construction")?
     }
 
+    pub async fn terminate_all(&self) -> Result<usize> {
+        let config = self.shared.config.clone();
+        let capacity = tokio::task::spawn_blocking(move || {
+            machine_capacity_state(&config.state_root, |candidate| {
+                process_running(&jail_root(&config, candidate).join("firecracker.pid"))
+            })
+        })
+        .await
+        .context("joining Firecracker machine scan")??;
+        let machine_ids = capacity
+            .live_machine_ids
+            .into_iter()
+            .chain(capacity.dead_machine_ids)
+            .collect::<Vec<_>>();
+        for machine_id in &machine_ids {
+            let _lifecycle_guard = self.shared.lifecycle_locks.lock_machine(machine_id).await;
+            self.shared
+                .warm_machines
+                .lock()
+                .await
+                .retain(|_, entry| entry.machine_id != *machine_id);
+            self.shared.cleanup_machine(machine_id, true).await?;
+        }
+        Ok(machine_ids.len())
+    }
+
     fn new_blocking(mut config: FirecrackerConfig) -> Result<Self> {
         let firecracker_version = validate_host_blocking(&config)?;
         fs::create_dir_all(&config.state_root).with_context(|| {
