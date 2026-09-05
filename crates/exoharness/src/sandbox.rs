@@ -249,6 +249,10 @@ pub trait ManagedSandboxHandle: Send + Sync {
     /// Capture the sandbox's current state as an opaque blob. Returns an
     /// error if this backend doesn't (yet) support snapshotting.
     async fn snapshot(&self) -> Result<SnapshotPayload>;
+
+    async fn delete_snapshot(&self, _payload: SnapshotPayload) -> Result<()> {
+        bail!("sandbox handle does not support snapshot deletion")
+    }
 }
 
 pub trait SandboxTcpStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
@@ -286,6 +290,10 @@ pub trait ManagedSandboxBackend: Send + Sync {
     /// backend state. Unlike stopping a handle, termination must be idempotent.
     async fn terminate(&self, _request: SandboxRequest) -> Result<()> {
         bail!("sandbox backend does not support explicit termination")
+    }
+
+    async fn delete_snapshot(&self, _payload: SnapshotPayload) -> Result<()> {
+        bail!("sandbox backend does not support snapshot deletion")
     }
 
     /// Copy the current state of `source` to `target`.

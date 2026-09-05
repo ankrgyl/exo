@@ -60,6 +60,11 @@ pub enum FirecrackerBridgeRequest {
         format: SnapshotFormat,
         payload: String,
     },
+    DeleteSnapshot {
+        config: FirecrackerConfig,
+        format: SnapshotFormat,
+        payload: String,
+    },
     Snapshot {
         config: FirecrackerConfig,
         request: SandboxRequest,
@@ -365,6 +370,21 @@ async fn handle_request(
                 format: snapshot.format,
                 payload: BASE64.encode(snapshot.bytes),
             })
+        }
+        FirecrackerBridgeRequest::DeleteSnapshot {
+            config,
+            format,
+            payload,
+        } => {
+            backends
+                .backend(config)
+                .await?
+                .delete_snapshot(SnapshotPayload {
+                    format,
+                    bytes: BASE64.decode(payload)?.into(),
+                })
+                .await?;
+            Ok(FirecrackerBridgeResponse::Unit)
         }
         FirecrackerBridgeRequest::Terminate { config, request } => {
             backends.backend(config).await?.terminate(request).await?;
