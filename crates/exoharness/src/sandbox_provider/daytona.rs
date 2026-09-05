@@ -1661,7 +1661,45 @@ impl DaytonaSandbox {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_utf8_prefix_len;
+    use super::*;
+
+    fn test_backend() -> DaytonaSandboxBackend {
+        DaytonaSandboxBackend::new(DaytonaConfig {
+            api_key: "test-key".to_string(),
+            api_url: DEFAULT_DAYTONA_API_URL.to_string(),
+            toolbox_url: DEFAULT_DAYTONA_TOOLBOX_URL.to_string(),
+            target: None,
+            organization_id: None,
+        })
+        .expect("create Daytona backend")
+    }
+
+    #[test]
+    fn compiles_supported_egress_policy_to_network_block_all() {
+        let backend = test_backend();
+
+        assert!(
+            backend
+                .compile_egress_policy(&EgressPolicy::default())
+                .expect("compile default-deny policy")
+        );
+        assert!(
+            !backend
+                .compile_egress_policy(&EgressPolicy {
+                    default_deny: false,
+                    ..EgressPolicy::default()
+                })
+                .expect("compile unrestricted policy")
+        );
+        assert!(
+            backend
+                .compile_egress_policy(&EgressPolicy {
+                    allowed_domains: vec!["api.github.com".to_string()],
+                    ..EgressPolicy::default()
+                })
+                .is_err()
+        );
+    }
 
     #[test]
     fn utf8_prefix_waits_for_split_multibyte_character() {

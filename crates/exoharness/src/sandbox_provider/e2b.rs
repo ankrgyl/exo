@@ -1181,3 +1181,47 @@ struct E2bSnapshotInfo {
     #[serde(rename = "snapshotID")]
     snapshot_id: String,
 }
+
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+
+    fn test_backend() -> E2bSandboxBackend {
+        E2bSandboxBackend::new(E2bConfig {
+            api_key: "test-key".to_string(),
+            api_url: DEFAULT_E2B_API_URL.to_string(),
+            template_id: "template".to_string(),
+            envd_port: DEFAULT_E2B_ENVD_PORT,
+            envd_base_url: None,
+            secure: true,
+        })
+        .expect("create E2B backend")
+    }
+
+    #[test]
+    fn compiles_supported_egress_policy_to_allow_internet_access() {
+        let backend = test_backend();
+
+        assert!(
+            !backend
+                .compile_egress_policy(&EgressPolicy::default())
+                .expect("compile default-deny policy")
+        );
+        assert!(
+            backend
+                .compile_egress_policy(&EgressPolicy {
+                    default_deny: false,
+                    ..EgressPolicy::default()
+                })
+                .expect("compile unrestricted policy")
+        );
+        assert!(
+            backend
+                .compile_egress_policy(&EgressPolicy {
+                    allowed_domains: vec!["api.github.com".to_string()],
+                    ..EgressPolicy::default()
+                })
+                .is_err()
+        );
+    }
+}

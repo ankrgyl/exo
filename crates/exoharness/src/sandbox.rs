@@ -2335,6 +2335,44 @@ mod tests {
     }
 
     #[test]
+    fn local_backends_fail_closed_for_unsupported_egress_rules() {
+        let docker = CliContainerSandboxBackend::docker();
+        let apple_container = CliContainerSandboxBackend::apple_container();
+        let local_process = LocalProcessSandboxBackend::new();
+        let backends: [(&str, &dyn ManagedSandboxBackend); 3] = [
+            ("Docker", &docker),
+            ("Apple Container", &apple_container),
+            ("Local Process", &local_process),
+        ];
+        let domain_allowlist = EgressPolicy {
+            allowed_domains: vec!["api.github.com".to_string()],
+            ..EgressPolicy::default()
+        };
+
+        assert!(
+            docker
+                .validate_egress_policy(&EgressPolicy::default())
+                .is_ok()
+        );
+        assert!(
+            apple_container
+                .validate_egress_policy(&EgressPolicy::default())
+                .is_ok()
+        );
+        assert!(
+            local_process
+                .validate_egress_policy(&EgressPolicy::default())
+                .is_err()
+        );
+        for (name, backend) in backends {
+            assert!(
+                backend.validate_egress_policy(&domain_allowlist).is_err(),
+                "{name} must reject unsupported domain allowlists"
+            );
+        }
+    }
+
+    #[test]
     fn apple_container_list_item_reads_current_status_shape() {
         let container: ContainerListItem = serde_json::from_value(serde_json::json!({
             "configuration": {

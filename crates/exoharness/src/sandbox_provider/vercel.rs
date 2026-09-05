@@ -893,5 +893,15 @@ mod tests {
             serde_json::to_value(deny_all).expect("serialize Vercel policy"),
             serde_json::json!({ "mode": "deny-all" })
         );
+
+        assert!(
+            backend
+                .compile_egress_policy(&EgressPolicy {
+                    default_deny: false,
+                    ..EgressPolicy::default()
+                })
+                .expect("compile unrestricted Vercel policy")
+                .is_none()
+        );
     }
 }
