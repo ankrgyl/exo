@@ -60,6 +60,10 @@ impl HttpExoHarness {
     }
 
     pub(super) async fn request(&self, request: Request) -> Result<Response> {
+        // A request may be passed with network_policy but enable_networking: None
+        // We must handle this by filling in both fields at the network boundary when
+        // we recieve a request so new clients and easily send to old servers
+        let request = add_legacy_networking_projection(request)?;
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let message = ClientMessage::Request { id, request };
         let mut request = self.client.post(self.endpoint.clone()).json(&message);
@@ -99,6 +103,33 @@ impl HttpExoHarness {
             "{}",
             error.unwrap_or_else(|| "HTTP exoharness request failed".to_string())
         )
+    }
+}
+
+/// A request may be passed with network_policy: Some(...), enable_networking: None
+/// We must handle this by filling in both fields at the network boundary when
+/// we recieve a request so new clients and easily send to old servers
+fn add_legacy_networking_projection(request: Request) -> Result<Request> {
+    match request {
+        Request::CreateSandbox { scope, request } => Ok(Request::CreateSandbox {
+            scope,
+            request: request.with_legacy_networking_projection()?,
+        }),
+        Request::ForkSandbox { scope, request } => Ok(Request::ForkSandbox {
+            scope,
+            request: ForkSandboxRequest {
+                sandbox: request.sandbox.with_legacy_networking_projection()?,
+                ..request
+            },
+        }),
+        Request::RestoreSandbox { scope, request } => Ok(Request::RestoreSandbox {
+            scope,
+            request: RestoreSandboxRequest {
+                sandbox: request.sandbox.with_legacy_networking_projection()?,
+                ..request
+            },
+        }),
+        request => Ok(request),
     }
 }
 
@@ -208,7 +239,6 @@ async fn http_create_sandbox(
     scope: SandboxScope,
     request: CreateSandboxRequest,
 ) -> Result<SandboxId> {
-    let request = request.with_legacy_networking_projection()?;
     match harness
         .request(Request::CreateSandbox { scope, request })
         .await?
@@ -223,10 +253,6 @@ async fn http_fork_sandbox(
     scope: SandboxScope,
     request: ForkSandboxRequest,
 ) -> Result<SandboxId> {
-    let request = ForkSandboxRequest {
-        sandbox: request.sandbox.with_legacy_networking_projection()?,
-        ..request
-    };
     match harness
         .request(Request::ForkSandbox { scope, request })
         .await?
@@ -241,10 +267,6 @@ async fn http_restore_sandbox(
     scope: SandboxScope,
     request: RestoreSandboxRequest,
 ) -> Result<SandboxId> {
-    let request = RestoreSandboxRequest {
-        sandbox: request.sandbox.with_legacy_networking_projection()?,
-        ..request
-    };
     match harness
         .request(Request::RestoreSandbox { scope, request })
         .await?
