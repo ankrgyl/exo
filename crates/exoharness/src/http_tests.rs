@@ -10,10 +10,10 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::test_support::local_test_config;
 use crate::{
-    BasicExoHarness, BeginTurnRequest, CreateSandboxRequest, EgressCapabilities, EgressPolicy,
-    EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness, ForkSandboxRequest,
-    HttpExoHarness, ManagedSandboxBackend, ManagedSandboxHandle, RestoreSandboxRequest,
-    RunInSandboxRequest, SandboxAttachment, SandboxCommand, SandboxCommandOutput,
+    BasicExoHarness, BeginTurnRequest, CreateSandboxRequest, EgressCapabilities, EventData,
+    EventKind, EventQuery, EventQueryDirection, ExoHarness, ForkSandboxRequest, HttpExoHarness,
+    ManagedSandboxBackend, ManagedSandboxHandle, RestoreSandboxRequest, RunInSandboxRequest,
+    SandboxAttachment, SandboxCommand, SandboxCommandOutput, SandboxNetworkPolicy,
     SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
     SandboxProcessStdin, SandboxProvider, SandboxRequest, SnapshotFormat, SnapshotPayload,
     StartSandboxProcessRequest, StartSandboxRequest, WaitSandboxProcessRequest,
@@ -510,14 +510,8 @@ async fn http_exoharness_restores_a_snapshot_into_a_new_sandbox() {
     assert_eq!(
         backend.egress_policies.lock().await.as_slice(),
         &[
-            EgressPolicy {
-                default_deny: false,
-                ..EgressPolicy::default()
-            },
-            EgressPolicy {
-                default_deny: false,
-                ..EgressPolicy::default()
-            },
+            SandboxNetworkPolicy::allow_all(),
+            SandboxNetworkPolicy::allow_all(),
         ]
     );
 }
@@ -538,9 +532,9 @@ async fn http_exoharness_threads_egress_policy_through_create_fork_and_restore()
         .new_conversation(crate::NewConversationRequest::default())
         .await
         .expect("conversation");
-    let policy = EgressPolicy {
+    let policy = SandboxNetworkPolicy {
         allowed_domains: vec!["api.github.com".to_string()],
-        ..EgressPolicy::default()
+        ..SandboxNetworkPolicy::default()
     };
     let source_id = conversation
         .create_sandbox(egress_test_sandbox_request(
@@ -595,7 +589,7 @@ async fn http_exoharness_threads_egress_policy_through_create_fork_and_restore()
 
 fn egress_test_sandbox_request(
     name: &str,
-    egress_policy: Option<EgressPolicy>,
+    egress_policy: Option<SandboxNetworkPolicy>,
     enable_networking: Option<bool>,
 ) -> CreateSandboxRequest {
     CreateSandboxRequest {
@@ -613,7 +607,7 @@ fn egress_test_sandbox_request(
 
 #[derive(Default)]
 struct SnapshotTestSandboxBackend {
-    egress_policies: Arc<AsyncMutex<Vec<EgressPolicy>>>,
+    egress_policies: Arc<AsyncMutex<Vec<SandboxNetworkPolicy>>>,
 }
 
 impl SnapshotTestSandboxBackend {

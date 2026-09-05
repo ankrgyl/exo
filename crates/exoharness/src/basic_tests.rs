@@ -23,16 +23,15 @@ use crate::test_support::{local_test_config, local_test_config_with_daytona};
 use crate::{
     Artifact, ArtifactVersion, AttachSandboxRequest, BasicExoHarness, BeginTurnRequest, Binding,
     BoxAsyncRead, BoxAsyncWrite, CloseSandboxProcessInputRequest, CreateSandboxRequest,
-    DurableFileSystem, EgressPolicy, EventData, EventKind, EventQuery, EventQueryDirection,
-    ExoHarness, FileSystemMountMode, ForkConversationRequest, ForkSandboxRequest,
-    ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest, NewConversationRequest,
-    PutSecretRequest, RestoreSandboxRequest, RunInSandboxRequest, SandboxAttachment,
-    SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput, SandboxKey,
-    SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent, SandboxProcessEventQuery,
-    SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin, SandboxProvider,
-    SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotFormat, SnapshotPayload,
-    StartSandboxProcessRequest, StartSandboxRequest, Uuid7, WaitSandboxProcessRequest,
-    WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    DurableFileSystem, EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness,
+    FileSystemMountMode, ForkConversationRequest, ForkSandboxRequest, ManagedSandboxBackend,
+    ManagedSandboxHandle, NewAgentRequest, NewConversationRequest, PutSecretRequest,
+    RestoreSandboxRequest, RunInSandboxRequest, SandboxAttachment, SandboxBackendRegistration,
+    SandboxCommand, SandboxCommandOutput, SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy,
+    SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
+    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec,
+    Secret, SnapshotFormat, SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest,
+    Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const DEFAULT_DURABLE_CONTRACT_MOUNT_PATH: &str = "/home/exo/workspace";
@@ -628,7 +627,7 @@ async fn docker_sandbox_contract_enforces_egress_policy_through_lifecycle() {
     let unrestricted =
         provider_contract_request("docker", "egress-unrestricted", image.clone(), "/");
     let mut default_deny = provider_contract_request("docker", "egress-default-deny", image, "/");
-    default_deny.spec.egress_policy = SandboxNetworkPolicy::Disabled.into();
+    default_deny.spec.egress_policy = SandboxNetworkPolicy::deny_all();
 
     crate::contract_tests::docker_sandbox_backend_enforces_egress_policy_through_lifecycle(
         backend,
@@ -698,7 +697,7 @@ async fn local_process_contract_handle(
                 image: "local-process".to_string(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                egress_policy: SandboxNetworkPolicy::Enabled.into(),
+                egress_policy: SandboxNetworkPolicy::allow_all(),
                 default_workdir: tempdir.path().display().to_string(),
             },
             lifecycle: SandboxLifecycleConfig::default(),
@@ -898,7 +897,7 @@ fn provider_contract_request(
             image,
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            egress_policy: SandboxNetworkPolicy::Enabled.into(),
+            egress_policy: SandboxNetworkPolicy::allow_all(),
             default_workdir: default_workdir.to_string(),
         },
         lifecycle: SandboxLifecycleConfig {
@@ -2349,7 +2348,7 @@ fn provider_state_test_create_request() -> CreateSandboxRequest {
 struct TestProviderStateBackend {
     state: Value,
     requests: Arc<AsyncMutex<Vec<Option<Value>>>>,
-    egress_policies: Arc<AsyncMutex<Vec<EgressPolicy>>>,
+    egress_policies: Arc<AsyncMutex<Vec<SandboxNetworkPolicy>>>,
     cleanup_count: Arc<AsyncMutex<usize>>,
     fork_calls: std::sync::atomic::AtomicUsize,
 }
@@ -2708,9 +2707,9 @@ async fn create_sandbox_persists_and_reuses_egress_policy() {
         .await
         .expect("agent");
     let agent_id = agent.record().id;
-    let egress_policy = EgressPolicy {
+    let egress_policy = SandboxNetworkPolicy {
         allowed_domains: vec!["api.github.com".to_string()],
-        ..EgressPolicy::default()
+        ..SandboxNetworkPolicy::default()
     };
     let request = CreateSandboxRequest {
         name: Some("policy-test".to_string()),
@@ -2785,7 +2784,7 @@ async fn create_sandbox_rejects_unsupported_egress_before_backend_acquisition() 
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: None,
-            egress_policy: Some(EgressPolicy::default()),
+            egress_policy: Some(SandboxNetworkPolicy::default()),
             idle_seconds: Some(60),
         })
         .await
@@ -2817,9 +2816,9 @@ async fn fork_sandbox_validates_both_policies_before_calling_the_backend() {
             .await
             .expect("agent");
         let agent_id = agent.record().id;
-        let restricted = EgressPolicy {
+        let restricted = SandboxNetworkPolicy {
             allowed_domains: vec!["api.github.com".into()],
-            ..EgressPolicy::default()
+            ..SandboxNetworkPolicy::default()
         };
         let mut source = provider_state_test_create_request();
         if invalid_source {
@@ -2892,11 +2891,11 @@ async fn attach_sandbox_persists_explicit_unrestricted_egress_policy() {
 
     assert_eq!(
         backend.egress_policies.lock().await.as_slice(),
-        &[SandboxNetworkPolicy::Enabled.into()]
+        &[SandboxNetworkPolicy::allow_all()]
     );
     #[derive(serde::Deserialize)]
     struct StoredPolicy {
-        egress_policy: EgressPolicy,
+        egress_policy: SandboxNetworkPolicy,
     }
     let bytes = fs::read(
         tempdir
@@ -2909,7 +2908,7 @@ async fn attach_sandbox_persists_explicit_unrestricted_egress_policy() {
     .await
     .unwrap();
     let stored: StoredPolicy = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(stored.egress_policy, SandboxNetworkPolicy::Enabled.into());
+    assert_eq!(stored.egress_policy, SandboxNetworkPolicy::allow_all());
     let backend = Arc::new(TestProviderStateBackend::new(Value::Null));
     let reloaded = BasicExoHarness::new_with_sandbox_backend(config, backend.clone())
         .await
@@ -2919,7 +2918,7 @@ async fn attach_sandbox_persists_explicit_unrestricted_egress_policy() {
     assert!(!agent.sandbox_supports_tcp(sandbox_id).await.unwrap());
     assert_eq!(
         backend.egress_policies.lock().await.as_slice(),
-        &[SandboxNetworkPolicy::Enabled.into()]
+        &[SandboxNetworkPolicy::allow_all()]
     );
 }
 
@@ -3009,7 +3008,7 @@ async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
 #[derive(Default)]
 struct RestoreImageTestBackend {
     acquired_images: Arc<AsyncMutex<Vec<String>>>,
-    acquired_egress_policies: Arc<AsyncMutex<Vec<EgressPolicy>>>,
+    acquired_egress_policies: Arc<AsyncMutex<Vec<SandboxNetworkPolicy>>>,
 }
 
 #[async_trait]

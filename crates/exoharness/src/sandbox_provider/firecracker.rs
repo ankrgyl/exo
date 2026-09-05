@@ -49,7 +49,8 @@ use crate::sandbox::{
 };
 use crate::sandbox_provider::process_bridge;
 use crate::{
-    EgressCapabilities, EgressPolicy, FileSystemMountMode, SandboxAttachment, SandboxProcessParts,
+    EgressCapabilities, FileSystemMountMode, SandboxAttachment, SandboxNetworkPolicy,
+    SandboxProcessParts,
 };
 
 use super::firecracker_image::resolve_image;
@@ -146,7 +147,7 @@ static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 /// Controls whether Firecracker attaches a network device. The sandbox's
-/// [`EgressPolicy`] independently controls what egress the firewall permits.
+/// [`SandboxNetworkPolicy`] independently controls what egress the firewall permits.
 pub enum FirecrackerNetworkDevicePolicy {
     /// Attach a network device only when the sandbox requests enabled networking.
     EnabledSandboxes,
@@ -2172,7 +2173,10 @@ fn hash_runtime_fingerprint(hasher: &mut Sha256, runtime: &FirecrackerRuntimeFin
     );
 }
 
-fn network_device_enabled(config: &FirecrackerConfig, egress_policy: &EgressPolicy) -> bool {
+fn network_device_enabled(
+    config: &FirecrackerConfig,
+    egress_policy: &SandboxNetworkPolicy,
+) -> bool {
     egress_policy.permits_unrestricted_egress()
         || config.network_device_policy == FirecrackerNetworkDevicePolicy::AllSandboxes
 }
@@ -2516,7 +2520,7 @@ fn ipv4_add(address: Ipv4Addr, offset: u32) -> Ipv4Addr {
 fn prepare_network(
     config: &FirecrackerConfig,
     network: &NetworkConfig,
-    policy: &EgressPolicy,
+    policy: &SandboxNetworkPolicy,
     jailer_uid: u32,
 ) -> Result<()> {
     // Firecracker intentionally delegates TAP routing and firewalling to the host.
@@ -2700,7 +2704,7 @@ fn prepare_network(
 fn install_network_firewall(
     config: &FirecrackerConfig,
     network: &NetworkConfig,
-    policy: &EgressPolicy,
+    policy: &SandboxNetworkPolicy,
 ) -> Result<()> {
     let rules = network_firewall_rules(config, network, policy)?;
     run_checked_input("nft", &["-f", "-"], rules.as_bytes())
@@ -2709,7 +2713,7 @@ fn install_network_firewall(
 fn network_firewall_rules(
     config: &FirecrackerConfig,
     network: &NetworkConfig,
-    policy: &EgressPolicy,
+    policy: &SandboxNetworkPolicy,
 ) -> Result<String> {
     let mut rules = String::new();
     let table = &network.nft_table;

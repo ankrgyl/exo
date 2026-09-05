@@ -28,7 +28,7 @@ use crate::sandbox::{
     SandboxCommandOutput, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
     WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
 };
-use crate::{EgressCapabilities, EgressPolicy, SandboxAttachment};
+use crate::{EgressCapabilities, SandboxAttachment, SandboxNetworkPolicy};
 
 pub const DEFAULT_E2B_API_URL: &str = "https://api.e2b.app";
 pub const DEFAULT_E2B_ENVD_PORT: u16 = 49_983;
@@ -95,7 +95,7 @@ impl E2bSandboxBackend {
         format!("{}{}", self.api_url, path)
     }
 
-    fn compile_egress_policy(&self, policy: &EgressPolicy) -> Result<bool> {
+    fn compile_egress_policy(&self, policy: &SandboxNetworkPolicy) -> Result<bool> {
         self.validate_egress_policy(policy)?;
         Ok(policy.permits_unrestricted_egress())
     }
@@ -1194,22 +1194,19 @@ mod egress_tests {
 
         assert!(
             !backend
-                .compile_egress_policy(&EgressPolicy::default())
+                .compile_egress_policy(&SandboxNetworkPolicy::default())
                 .expect("compile default-deny policy")
         );
         assert!(
             backend
-                .compile_egress_policy(&EgressPolicy {
-                    default_deny: false,
-                    ..EgressPolicy::default()
-                })
+                .compile_egress_policy(&SandboxNetworkPolicy::allow_all())
                 .expect("compile unrestricted policy")
         );
         assert!(
             backend
-                .compile_egress_policy(&EgressPolicy {
+                .compile_egress_policy(&SandboxNetworkPolicy {
                     allowed_domains: vec!["api.github.com".to_string()],
-                    ..EgressPolicy::default()
+                    ..SandboxNetworkPolicy::default()
                 })
                 .is_err()
         );

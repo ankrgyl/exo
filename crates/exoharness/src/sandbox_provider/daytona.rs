@@ -36,7 +36,7 @@ use crate::sandbox::{
     WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
 };
 use crate::sandbox_provider::shell_quote;
-use crate::{EgressCapabilities, EgressPolicy, SandboxAttachment};
+use crate::{EgressCapabilities, SandboxAttachment, SandboxNetworkPolicy};
 
 pub const DEFAULT_DAYTONA_API_URL: &str = "https://app.daytona.io/api";
 
@@ -105,7 +105,7 @@ impl DaytonaSandboxBackend {
         format!("{}{}", self.api_url, path)
     }
 
-    fn compile_egress_policy(&self, policy: &EgressPolicy) -> Result<bool> {
+    fn compile_egress_policy(&self, policy: &SandboxNetworkPolicy) -> Result<bool> {
         self.validate_egress_policy(policy)?;
         Ok(policy.default_deny)
     }
@@ -1670,22 +1670,19 @@ mod tests {
 
         assert!(
             backend
-                .compile_egress_policy(&EgressPolicy::default())
+                .compile_egress_policy(&SandboxNetworkPolicy::default())
                 .expect("compile default-deny policy")
         );
         assert!(
             !backend
-                .compile_egress_policy(&EgressPolicy {
-                    default_deny: false,
-                    ..EgressPolicy::default()
-                })
+                .compile_egress_policy(&SandboxNetworkPolicy::allow_all())
                 .expect("compile unrestricted policy")
         );
         assert!(
             backend
-                .compile_egress_policy(&EgressPolicy {
+                .compile_egress_policy(&SandboxNetworkPolicy {
                     allowed_domains: vec!["api.github.com".to_string()],
-                    ..EgressPolicy::default()
+                    ..SandboxNetworkPolicy::default()
                 })
                 .is_err()
         );

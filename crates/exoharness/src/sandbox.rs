@@ -23,7 +23,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
 use crate::{
-    DurableFileSystem, EgressCapabilities, EgressPolicy, SandboxAttachment,
+    DurableFileSystem, EgressCapabilities, SandboxAttachment, SandboxNetworkPolicy,
     validate_egress_policy_capabilities,
 };
 
@@ -73,32 +73,12 @@ pub struct SandboxMount {
     pub internal: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum SandboxNetworkPolicy {
-    Enabled,
-    Disabled,
-}
-
-/// Converts the legacy coarse `SandboxNetworkPolicy` type into
-/// a richer `EgressPolicy`.
-impl From<SandboxNetworkPolicy> for EgressPolicy {
-    fn from(policy: SandboxNetworkPolicy) -> Self {
-        match policy {
-            SandboxNetworkPolicy::Enabled => Self {
-                default_deny: false,
-                ..Self::default()
-            },
-            SandboxNetworkPolicy::Disabled => Self::default(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SandboxSpec {
     pub image: String,
     pub mounts: Vec<SandboxMount>,
     pub durable_file_systems: Vec<DurableFileSystem>,
-    pub egress_policy: EgressPolicy,
+    pub egress_policy: SandboxNetworkPolicy,
     pub default_workdir: String,
 }
 
@@ -271,7 +251,7 @@ pub trait ManagedSandboxBackend: Send + Sync {
         EgressCapabilities::default()
     }
 
-    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
+    fn validate_egress_policy(&self, policy: &SandboxNetworkPolicy) -> Result<()> {
         validate_egress_policy_capabilities(policy, self.egress_capabilities())
     }
 
@@ -1810,7 +1790,7 @@ fn wait_for_child(mut child: Child) -> BoxFuture<'static, crate::Result<i32>> {
 
 fn configure_network_args(
     process: &mut Command,
-    policy: &EgressPolicy,
+    policy: &SandboxNetworkPolicy,
     network_name: Option<&str>,
 ) {
     if !policy.permits_unrestricted_egress() {
@@ -2156,7 +2136,7 @@ fn render_command_error(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr).trim().to_string()
 }
 
-fn network_name_for_policy(policy: &EgressPolicy) -> Option<&'static str> {
+fn network_name_for_policy(policy: &SandboxNetworkPolicy) -> Option<&'static str> {
     policy
         .permits_unrestricted_egress()
         .then_some(DEFAULT_ENABLED_NETWORK_NAME)
@@ -2310,16 +2290,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_networking_maps_to_egress_policy() {
-        let enabled: EgressPolicy = SandboxNetworkPolicy::Enabled.into();
-        assert!(!enabled.default_deny);
-        assert!(enabled.allowed_domains.is_empty());
-        assert!(enabled.allowed_cidrs.is_empty());
-        assert!(enabled.denied_domains.is_empty());
-        assert!(enabled.denied_cidrs.is_empty());
+    fn network_policy_constructors_and_default_are_unambiguous() {
+        let allow_all = SandboxNetworkPolicy::allow_all();
+        assert!(allow_all.permits_unrestricted_egress());
 
-        let disabled: EgressPolicy = SandboxNetworkPolicy::Disabled.into();
-        assert_eq!(disabled, EgressPolicy::default());
+        let deny_all = SandboxNetworkPolicy::deny_all();
+        assert_eq!(deny_all, SandboxNetworkPolicy::default());
+        assert!(deny_all.default_deny);
+        let decoded: SandboxNetworkPolicy =
+            serde_json::from_str("{}").expect("deserialize default policy");
+        assert_eq!(decoded, deny_all);
+
+        for policy in [
+            SandboxNetworkPolicy {
+                allowed_domains: vec!["example.com".into()],
+                ..allow_all.clone()
+            },
+            SandboxNetworkPolicy {
+                denied_domains: vec!["example.com".into()],
+                ..allow_all.clone()
+            },
+            SandboxNetworkPolicy {
+                allowed_cidrs: vec!["192.0.2.0/24".parse().expect("valid CIDR")],
+                ..allow_all.clone()
+            },
+            SandboxNetworkPolicy {
+                denied_cidrs: vec!["192.0.2.0/24".parse().expect("valid CIDR")],
+                ..allow_all
+            },
+        ] {
+            assert!(!policy.permits_unrestricted_egress(), "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn network_policy_rejects_rules_a_backend_cannot_enforce() {
+        let capabilities = EgressCapabilities {
+            default_deny: true,
+            ..EgressCapabilities::default()
+        };
+
+        validate_egress_policy_capabilities(&SandboxNetworkPolicy::deny_all(), capabilities)
+            .expect("default deny is supported");
+        assert!(
+            validate_egress_policy_capabilities(
+                &SandboxNetworkPolicy {
+                    allowed_domains: vec!["api.github.com".to_string()],
+                    ..SandboxNetworkPolicy::default()
+                },
+                capabilities,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_egress_policy_capabilities(
+                &SandboxNetworkPolicy {
+                    default_deny: false,
+                    denied_cidrs: vec!["192.0.2.0/24".parse().expect("valid CIDR")],
+                    ..SandboxNetworkPolicy::default()
+                },
+                capabilities,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2332,24 +2365,24 @@ mod tests {
             ("Apple Container", &apple_container),
             ("Local Process", &local_process),
         ];
-        let domain_allowlist = EgressPolicy {
+        let domain_allowlist = SandboxNetworkPolicy {
             allowed_domains: vec!["api.github.com".to_string()],
-            ..EgressPolicy::default()
+            ..SandboxNetworkPolicy::default()
         };
 
         assert!(
             docker
-                .validate_egress_policy(&EgressPolicy::default())
+                .validate_egress_policy(&SandboxNetworkPolicy::default())
                 .is_ok()
         );
         assert!(
             apple_container
-                .validate_egress_policy(&EgressPolicy::default())
+                .validate_egress_policy(&SandboxNetworkPolicy::default())
                 .is_ok()
         );
         assert!(
             local_process
-                .validate_egress_policy(&EgressPolicy::default())
+                .validate_egress_policy(&SandboxNetworkPolicy::default())
                 .is_err()
         );
         for (name, backend) in backends {
@@ -2479,7 +2512,7 @@ mod tests {
                 image: "docker.io/library/ubuntu:24.04".to_string(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                egress_policy: SandboxNetworkPolicy::Disabled.into(),
+                egress_policy: SandboxNetworkPolicy::deny_all(),
                 default_workdir: "/".to_string(),
             },
             lifecycle: SandboxLifecycleConfig {
@@ -2555,7 +2588,7 @@ mod tests {
                 image: "docker.io/library/ubuntu:24.04".to_string(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                egress_policy: SandboxNetworkPolicy::Disabled.into(),
+                egress_policy: SandboxNetworkPolicy::deny_all(),
                 default_workdir: "/".to_string(),
             },
             lifecycle: SandboxLifecycleConfig {
@@ -2647,7 +2680,7 @@ esac
                 image: "docker.io/library/ubuntu:24.04".to_string(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                egress_policy: SandboxNetworkPolicy::Disabled.into(),
+                egress_policy: SandboxNetworkPolicy::deny_all(),
                 default_workdir: "/".to_string(),
             },
             lifecycle: SandboxLifecycleConfig {
@@ -2758,7 +2791,7 @@ esac
                 image: "task-image".to_string(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                egress_policy: SandboxNetworkPolicy::Enabled.into(),
+                egress_policy: SandboxNetworkPolicy::allow_all(),
                 default_workdir: "/task".to_string(),
             },
             lifecycle: SandboxLifecycleConfig::default(),

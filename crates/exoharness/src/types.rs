@@ -16,7 +16,7 @@ use lingua::{Message, universal::UniversalStreamChunk};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::{EgressPolicy, Result, Uuid7};
+use crate::{Result, SandboxNetworkPolicy, Uuid7};
 
 #[async_trait]
 pub trait ExoHarness: Send + Sync {
@@ -486,7 +486,7 @@ pub enum EventData {
         durable_file_systems: Vec<DurableFileSystem>,
         enable_networking: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        egress_policy: Option<EgressPolicy>,
+        egress_policy: Option<SandboxNetworkPolicy>,
         idle_seconds: u64,
     },
     SandboxStarted {
@@ -657,7 +657,7 @@ pub struct CreateSandboxRequest {
     /// Explicit egress restrictions. Cannot be combined with `enable_networking`.
     /// Omitting both retains the legacy unrestricted default; an empty policy denies egress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub egress_policy: Option<EgressPolicy>,
+    pub egress_policy: Option<SandboxNetworkPolicy>,
     pub idle_seconds: Option<u64>,
 }
 

@@ -567,7 +567,7 @@ mod tests {
                     mount_path: mount_path.to_string(),
                     mode,
                 }],
-                egress_policy: SandboxNetworkPolicy::Enabled.into(),
+                egress_policy: SandboxNetworkPolicy::allow_all(),
                 default_workdir: "/mnt/workspace".to_string(),
             },
             lifecycle: SandboxLifecycleConfig::default(),

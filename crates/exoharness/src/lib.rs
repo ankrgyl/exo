@@ -8,12 +8,12 @@ mod basic_tests;
     feature = "basic-backend"
 ))]
 pub mod contract_tests;
-mod egress_policy;
 mod error;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 mod http;
 #[cfg(all(test, not(target_arch = "wasm32"), feature = "basic-backend"))]
 mod http_tests;
+mod network_policy;
 pub mod protocol;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 mod sandbox;
@@ -31,10 +31,10 @@ mod uuid7;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use basic::*;
-pub use egress_policy::*;
 pub use error::*;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use http::*;
+pub use network_policy::*;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use sandbox::*;
 pub use sandbox_provider::*;

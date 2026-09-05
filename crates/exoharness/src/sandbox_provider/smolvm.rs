@@ -946,7 +946,8 @@ async fn run_checked(mut process: Command, what: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::{SandboxLifecycleConfig, SandboxNetworkPolicy};
+    use crate::SandboxNetworkPolicy;
+    use crate::sandbox::SandboxLifecycleConfig;
 
     /// A configured boot binary is used as given. The point is what does *not*
     /// happen: no `PATH` walk, no `stat`, so a path that exists only on the host
@@ -1033,7 +1034,7 @@ mod tests {
                 image: "alpine".into(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                egress_policy: SandboxNetworkPolicy::Disabled.into(),
+                egress_policy: SandboxNetworkPolicy::deny_all(),
                 default_workdir: "/".into(),
             },
             lifecycle: SandboxLifecycleConfig { idle_ttl },
@@ -1101,16 +1102,16 @@ mod tests {
     fn registry_image_without_network_is_rejected() {
         let mut spec = test_request(None).spec;
         spec.image = "docker.io/library/ubuntu:24.04".into();
-        spec.egress_policy = SandboxNetworkPolicy::Disabled.into();
+        spec.egress_policy = SandboxNetworkPolicy::deny_all();
         let err = reject_unsupported_spec(&spec).unwrap_err().to_string();
         assert!(err.contains("network-disabled"), "unexpected error: {err}");
 
         // Fine once the sandbox is allowed network...
-        spec.egress_policy = SandboxNetworkPolicy::Enabled.into();
+        spec.egress_policy = SandboxNetworkPolicy::allow_all();
         assert!(reject_unsupported_spec(&spec).is_ok());
 
         // ...and a local archive is fine while staying isolated.
-        spec.egress_policy = SandboxNetworkPolicy::Disabled.into();
+        spec.egress_policy = SandboxNetworkPolicy::deny_all();
         spec.image = "/tmp/alpine.tar".into();
         assert!(reject_unsupported_spec(&spec).is_ok());
     }
@@ -1183,7 +1184,7 @@ mod tests {
                 },
             ],
             durable_file_systems: Vec::new(),
-            egress_policy: SandboxNetworkPolicy::Disabled.into(),
+            egress_policy: SandboxNetworkPolicy::deny_all(),
             default_workdir: "/work".into(),
         };
 

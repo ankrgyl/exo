@@ -1,0 +1,105 @@
+use anyhow::{Result, bail};
+use ipnet::IpNet;
+use serde::{Deserialize, Serialize};
+
+/// A provider-specific domain pattern, such as `api.github.com` or
+/// `*.github.com`.
+pub type DomainPattern = String;
+
+/// Provider-neutral outbound network policy for a sandbox.
+///
+/// This policy is limited to rules every supported provider can either enforce
+/// or explicitly reject. Provider adapters compile it to their native firewall
+/// configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxNetworkPolicy {
+    #[serde(default = "default_deny")]
+    pub default_deny: bool,
+    #[serde(default)]
+    pub allowed_domains: Vec<DomainPattern>,
+    #[serde(default)]
+    pub allowed_cidrs: Vec<IpNet>,
+    #[serde(default)]
+    pub denied_domains: Vec<DomainPattern>,
+    #[serde(default)]
+    pub denied_cidrs: Vec<IpNet>,
+}
+
+impl Default for SandboxNetworkPolicy {
+    fn default() -> Self {
+        Self {
+            default_deny: true,
+            allowed_domains: Vec::new(),
+            allowed_cidrs: Vec::new(),
+            denied_domains: Vec::new(),
+            denied_cidrs: Vec::new(),
+        }
+    }
+}
+
+impl SandboxNetworkPolicy {
+    pub fn allow_all() -> Self {
+        Self {
+            default_deny: false,
+            ..Self::default()
+        }
+    }
+
+    pub fn deny_all() -> Self {
+        Self::default()
+    }
+
+    /// Whether this policy permits unrestricted outbound access.
+    pub fn permits_unrestricted_egress(&self) -> bool {
+        !self.default_deny
+            && self.allowed_domains.is_empty()
+            && self.allowed_cidrs.is_empty()
+            && self.denied_domains.is_empty()
+            && self.denied_cidrs.is_empty()
+    }
+}
+
+/// Egress-policy features a backend can enforce.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EgressCapabilities {
+    pub default_deny: bool,
+    pub domain_allowlist: bool,
+    pub cidr_allowlist: bool,
+    pub domain_denylist: bool,
+    pub cidr_denylist: bool,
+}
+
+/// Validates that `policy` asks only for restrictions the backend can enforce.
+pub fn validate_egress_policy_capabilities(
+    policy: &SandboxNetworkPolicy,
+    capabilities: EgressCapabilities,
+) -> Result<()> {
+    if !policy.default_deny
+        && (!policy.allowed_domains.is_empty() || !policy.allowed_cidrs.is_empty())
+    {
+        bail!("an egress allowlist requires default_deny");
+    }
+
+    if policy.default_deny && !capabilities.default_deny {
+        bail!("sandbox backend cannot enforce default-deny egress");
+    }
+    if !policy.allowed_domains.is_empty() && !capabilities.domain_allowlist {
+        bail!("sandbox backend cannot enforce domain egress allowlists");
+    }
+    if !policy.allowed_cidrs.is_empty() && !capabilities.cidr_allowlist {
+        bail!("sandbox backend cannot enforce CIDR egress allowlists");
+    }
+    if !policy.denied_domains.is_empty() && !capabilities.domain_denylist {
+        bail!("sandbox backend cannot enforce domain egress denylists");
+    }
+    if !policy.denied_cidrs.is_empty() && !capabilities.cidr_denylist {
+        bail!("sandbox backend cannot enforce CIDR egress denylists");
+    }
+
+    Ok(())
+}
+
+fn default_deny() -> bool {
+    true
+}

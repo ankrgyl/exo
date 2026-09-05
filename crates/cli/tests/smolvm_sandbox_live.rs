@@ -146,7 +146,7 @@ async fn smolvm_exec_runs_under_a_guest_kernel() {
         .acquire(request(
             image,
             &workspace,
-            SandboxNetworkPolicy::Disabled,
+            SandboxNetworkPolicy::deny_all(),
             "kernel",
             None,
         ))
@@ -197,7 +197,7 @@ async fn smolvm_workspace_mount_round_trips_between_execs() {
         .acquire(request(
             image,
             &workspace,
-            SandboxNetworkPolicy::Disabled,
+            SandboxNetworkPolicy::deny_all(),
             "mount",
             None,
         ))
@@ -240,7 +240,7 @@ async fn smolvm_start_process_streams_and_exits() {
         .acquire(request(
             image,
             &workspace,
-            SandboxNetworkPolicy::Disabled,
+            SandboxNetworkPolicy::deny_all(),
             "stream",
             None,
         ))
@@ -298,7 +298,7 @@ async fn timed_out_exec_leaves_no_orphaned_vm() {
         .acquire(request(
             image,
             &workspace,
-            SandboxNetworkPolicy::Disabled,
+            SandboxNetworkPolicy::deny_all(),
             "timeout",
             None,
         ))
@@ -387,7 +387,7 @@ async fn snapshot_round_trip_preserves_guest_state() {
         .acquire(request(
             image.clone(),
             &workspace,
-            SandboxNetworkPolicy::Enabled,
+            SandboxNetworkPolicy::allow_all(),
             "snap-source",
             ttl,
         ))
@@ -413,7 +413,7 @@ async fn snapshot_round_trip_preserves_guest_state() {
             request(
                 image,
                 &workspace,
-                SandboxNetworkPolicy::Enabled,
+                SandboxNetworkPolicy::allow_all(),
                 "snap-restored",
                 ttl,
             ),
@@ -485,7 +485,7 @@ async fn abandoned_machines_are_reaped_by_a_later_backend() {
         .acquire(request(
             image,
             &workspace,
-            SandboxNetworkPolicy::Disabled,
+            SandboxNetworkPolicy::deny_all(),
             "abandoned-sweeper",
             Some(Duration::from_secs(600)),
         ))
@@ -546,7 +546,7 @@ async fn smolvm_warm_mode_persists_guest_local_state() {
         .acquire(request(
             image,
             &workspace,
-            SandboxNetworkPolicy::Disabled,
+            SandboxNetworkPolicy::deny_all(),
             "warm",
             Some(Duration::from_secs(600)),
         ))
@@ -589,7 +589,7 @@ async fn smolvm_network_is_denied_unless_requested() {
         .acquire(request(
             image,
             &workspace,
-            SandboxNetworkPolicy::Disabled,
+            SandboxNetworkPolicy::deny_all(),
             "net",
             None,
         ))
@@ -623,6 +623,6 @@ async fn smolvm_network_is_denied_unless_requested() {
     );
     assert!(
         !output.ok,
-        "network reached the internet with SandboxNetworkPolicy::Disabled"
+        "network reached the internet with SandboxNetworkPolicy::deny_all()"
     );
 }

@@ -1255,7 +1255,7 @@ fn sandbox_created_events(sandbox_id: &SandboxId, request: CreateSandboxRequest)
             durable_file_systems: request.durable_file_systems.unwrap_or_default(),
             enable_networking: request.egress_policy.as_ref().map_or(
                 request.enable_networking.unwrap_or(true),
-                exoharness::EgressPolicy::permits_unrestricted_egress,
+                exoharness::SandboxNetworkPolicy::permits_unrestricted_egress,
             ),
             egress_policy: request.egress_policy,
             idle_seconds: request.idle_seconds.unwrap_or(60),
@@ -1396,7 +1396,7 @@ mod tests {
                 file_system_mounts: Some(Vec::new()),
                 durable_file_systems: None,
                 enable_networking: None,
-                egress_policy: Some(exoharness::EgressPolicy {
+                egress_policy: Some(exoharness::SandboxNetworkPolicy {
                     default_deny: false,
                     ..Default::default()
                 }),

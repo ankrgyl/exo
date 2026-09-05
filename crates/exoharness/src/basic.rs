@@ -21,8 +21,8 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::sandbox::{
     BoxSandboxTcpStream, CliContainerSandboxBackend, LocalProcessSandboxBackend,
     ManagedSandboxBackend, ManagedSandboxHandle, SANDBOX_MAIN_MOUNT_DIR, SandboxCommand,
-    SandboxKey, SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxNetworkPolicy,
-    SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload, sandbox_spec_hash,
+    SandboxKey, SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxRequest,
+    SandboxSpec, SnapshotFormat, SnapshotPayload, sandbox_spec_hash,
 };
 #[cfg(feature = "apple-keychain")]
 use crate::secrets::AppleKeychainSecretKeyProvider;
@@ -36,12 +36,12 @@ use crate::{
     ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
     BindingType, BoxAsyncRead, BoxAsyncWrite, CancelSandboxProcessRequest,
     CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, ConversationRecord,
-    CreateSandboxRequest, DurableFileSystem, EgressPolicy, Event, EventData, EventId, EventKind,
-    EventQuery, EventQueryDirection, EventStream, ExoHarness, FileSystemMount,
-    ForkConversationRequest, ForkSandboxRequest, GetEventsResult, GetSandboxProcessEventsResult,
-    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
-    PutSecretRequest, ReadArtifactRequest, RestoreSandboxRequest, Result, RunInSandboxRequest,
-    SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEvent,
+    CreateSandboxRequest, DurableFileSystem, Event, EventData, EventId, EventKind, EventQuery,
+    EventQueryDirection, EventStream, ExoHarness, FileSystemMount, ForkConversationRequest,
+    ForkSandboxRequest, GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
+    ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
+    ReadArtifactRequest, RestoreSandboxRequest, Result, RunInSandboxRequest, SandboxAttachment,
+    SandboxHandle, SandboxId, SandboxNetworkPolicy, SandboxProcess, SandboxProcessEvent,
     SandboxProcessEventQuery, SandboxProcessId, SandboxProcessMode, SandboxProcessParts,
     SandboxProcessRecord, SandboxProcessStatus, SandboxProcessStdin, SandboxProvider,
     SandboxProviderConfig, SandboxRecord, Secret, SecretId, SecretMetadata, SecretType, SessionId,
@@ -3481,18 +3481,18 @@ async fn prepare_sandbox_request(
     })
 }
 
-fn legacy_egress_policy(enable_networking: bool) -> EgressPolicy {
+fn legacy_egress_policy(enable_networking: bool) -> SandboxNetworkPolicy {
     if enable_networking {
-        SandboxNetworkPolicy::Enabled.into()
+        SandboxNetworkPolicy::allow_all()
     } else {
-        SandboxNetworkPolicy::Disabled.into()
+        SandboxNetworkPolicy::deny_all()
     }
 }
 
 fn resolve_egress_policy(
-    egress_policy: Option<EgressPolicy>,
+    egress_policy: Option<SandboxNetworkPolicy>,
     enable_networking: Option<bool>,
-) -> Result<EgressPolicy> {
+) -> Result<SandboxNetworkPolicy> {
     if egress_policy.is_some() && enable_networking.is_some() {
         bail!("sandbox request cannot specify both egress_policy and enable_networking")
     }
@@ -3500,9 +3500,9 @@ fn resolve_egress_policy(
 }
 
 fn select_egress_policy(
-    egress_policy: Option<EgressPolicy>,
+    egress_policy: Option<SandboxNetworkPolicy>,
     enable_networking: Option<bool>,
-) -> EgressPolicy {
+) -> SandboxNetworkPolicy {
     egress_policy.unwrap_or_else(|| legacy_egress_policy(enable_networking.unwrap_or(true)))
 }
 
@@ -3934,7 +3934,7 @@ struct StoredSandbox {
     #[serde(default)]
     durable_file_systems: Vec<DurableFileSystem>,
     #[serde(default)]
-    egress_policy: Option<EgressPolicy>,
+    egress_policy: Option<SandboxNetworkPolicy>,
     enable_networking: bool,
     idle_seconds: u64,
     running: bool,
@@ -3967,7 +3967,7 @@ impl StoredSandbox {
             file_system_mounts: Vec::new(),
             durable_file_systems: Vec::new(),
             enable_networking: true,
-            egress_policy: Some(SandboxNetworkPolicy::Enabled.into()),
+            egress_policy: Some(SandboxNetworkPolicy::allow_all()),
             idle_seconds: 0,
             running: true,
             latest_snapshot_id: None,
@@ -3984,7 +3984,7 @@ struct PreparedSandboxRequest {
     default_workdir: Option<String>,
     file_system_mounts: Vec<FileSystemMount>,
     durable_file_systems: Vec<DurableFileSystem>,
-    egress_policy: EgressPolicy,
+    egress_policy: SandboxNetworkPolicy,
     idle_seconds: u64,
 }
 
@@ -4862,9 +4862,9 @@ mod egress_policy_tests {
 
     #[test]
     fn normalizes_new_and_legacy_egress_configuration() {
-        let policy = EgressPolicy {
+        let policy = SandboxNetworkPolicy {
             allowed_domains: vec!["api.github.com".to_string()],
-            ..EgressPolicy::default()
+            ..SandboxNetworkPolicy::default()
         };
 
         assert_eq!(
