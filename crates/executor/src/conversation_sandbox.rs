@@ -149,11 +149,7 @@ async fn conversation_sandbox_candidates(
                         file_system_mounts,
                         durable_file_systems,
                         network_policy: network_policy.unwrap_or_else(|| {
-                            if enable_networking {
-                                SandboxNetworkPolicy::allow_all()
-                            } else {
-                                SandboxNetworkPolicy::deny_all()
-                            }
+                            SandboxNetworkPolicy::from_legacy_enable_networking(enable_networking)
                         }),
                         idle_seconds,
                     },
@@ -230,7 +226,9 @@ pub(crate) fn agent_sandbox_spec(agent_config: &AgentConfig) -> ConversationSand
             .unwrap_or_else(|| "/".to_string()),
         file_system_mounts: normalize_mounts(&agent_config.sandbox.mounts),
         durable_file_systems: Vec::new(),
-        network_policy: legacy_network_policy(agent_config.sandbox.enable_networking),
+        network_policy: SandboxNetworkPolicy::from_legacy_enable_networking(
+            agent_config.sandbox.enable_networking,
+        ),
         idle_seconds: 300,
     }
 }
@@ -258,16 +256,10 @@ pub(crate) fn conversation_sandbox_spec(
             .unwrap_or_else(|| "/".to_string()),
         file_system_mounts: normalize_mounts(&config.mounts),
         durable_file_systems: config.durable_file_systems.clone(),
-        network_policy: legacy_network_policy(agent_config.sandbox.enable_networking),
+        network_policy: SandboxNetworkPolicy::from_legacy_enable_networking(
+            agent_config.sandbox.enable_networking,
+        ),
         idle_seconds: 300,
-    }
-}
-
-fn legacy_network_policy(enable_networking: bool) -> SandboxNetworkPolicy {
-    if enable_networking {
-        SandboxNetworkPolicy::allow_all()
-    } else {
-        SandboxNetworkPolicy::deny_all()
     }
 }
 

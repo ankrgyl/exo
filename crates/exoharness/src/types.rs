@@ -689,7 +689,8 @@ pub struct CreateSandboxRequest {
     pub file_system_mounts: Option<Vec<FileSystemMount>>,
     pub durable_file_systems: Option<Vec<DurableFileSystem>>,
     pub enable_networking: Option<bool>,
-    /// Explicit network restrictions. Cannot be combined with `enable_networking`.
+    /// Explicit network restrictions. If `enable_networking` is also provided,
+    /// both values must describe the same level of access.
     /// Omitting both retains the legacy unrestricted default; an empty policy denies network.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_policy: Option<SandboxNetworkPolicy>,

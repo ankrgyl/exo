@@ -39,6 +39,14 @@ impl Default for SandboxNetworkPolicy {
 }
 
 impl SandboxNetworkPolicy {
+    pub fn from_legacy_enable_networking(enabled: bool) -> Self {
+        if enabled {
+            Self::allow_all()
+        } else {
+            Self::deny_all()
+        }
+    }
+
     pub fn allow_all() -> Self {
         Self {
             default_deny: false,

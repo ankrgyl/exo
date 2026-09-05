@@ -62,7 +62,7 @@ impl HttpExoHarness {
     pub(super) async fn request(&self, request: Request) -> Result<Response> {
         // A request may be passed with network_policy but enable_networking: None
         // We must handle this by filling in both fields at the network boundary when
-        // we recieve a request so new clients and easily send to old servers
+        // we receive a request so new clients can safely send to old servers.
         let request = add_legacy_networking_projection(request)?;
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let message = ClientMessage::Request { id, request };
@@ -108,7 +108,7 @@ impl HttpExoHarness {
 
 /// A request may be passed with network_policy: Some(...), enable_networking: None
 /// We must handle this by filling in both fields at the network boundary when
-/// we recieve a request so new clients and easily send to old servers
+/// we receive a request so new clients can safely send to old servers.
 fn add_legacy_networking_projection(request: Request) -> Result<Request> {
     match request {
         Request::CreateSandbox { scope, request } => Ok(Request::CreateSandbox {

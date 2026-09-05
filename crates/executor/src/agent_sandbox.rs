@@ -45,11 +45,7 @@ impl AgentSandboxRecord {
             file_system_mounts: self.file_system_mounts.clone(),
             durable_file_systems: self.durable_file_systems.clone(),
             network_policy: self.network_policy.clone().unwrap_or_else(|| {
-                if self.enable_networking {
-                    SandboxNetworkPolicy::allow_all()
-                } else {
-                    SandboxNetworkPolicy::deny_all()
-                }
+                SandboxNetworkPolicy::from_legacy_enable_networking(self.enable_networking)
             }),
             idle_seconds: self.idle_seconds,
         }

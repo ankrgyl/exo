@@ -3490,13 +3490,8 @@ fn stored_network_policy(
     network_policy: Option<SandboxNetworkPolicy>,
     enable_networking: bool,
 ) -> SandboxNetworkPolicy {
-    network_policy.unwrap_or_else(|| {
-        if enable_networking {
-            SandboxNetworkPolicy::allow_all()
-        } else {
-            SandboxNetworkPolicy::deny_all()
-        }
-    })
+    network_policy
+        .unwrap_or_else(|| SandboxNetworkPolicy::from_legacy_enable_networking(enable_networking))
 }
 
 async fn find_matching_stored_sandbox(
