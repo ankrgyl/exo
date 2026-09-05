@@ -28,7 +28,7 @@ use crate::sandbox::{
     SandboxCommandOutput, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
     WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
 };
-use crate::{EgressCapabilities, SandboxAttachment, SandboxNetworkPolicy};
+use crate::{NetworkPolicyCapabilities, SandboxAttachment, SandboxNetworkPolicy};
 
 pub const DEFAULT_E2B_API_URL: &str = "https://api.e2b.app";
 pub const DEFAULT_E2B_ENVD_PORT: u16 = 49_983;
@@ -95,9 +95,9 @@ impl E2bSandboxBackend {
         format!("{}{}", self.api_url, path)
     }
 
-    fn compile_egress_policy(&self, policy: &SandboxNetworkPolicy) -> Result<bool> {
-        self.validate_egress_policy(policy)?;
-        Ok(policy.permits_unrestricted_egress())
+    fn compile_network_policy(&self, policy: &SandboxNetworkPolicy) -> Result<bool> {
+        self.validate_network_policy(policy)?;
+        Ok(policy.allows_all())
     }
 
     async fn find_sandbox_by_metadata(
@@ -229,10 +229,10 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
         false
     }
 
-    fn egress_capabilities(&self) -> EgressCapabilities {
-        EgressCapabilities {
+    fn network_policy_capabilities(&self) -> NetworkPolicyCapabilities {
+        NetworkPolicyCapabilities {
             default_deny: true,
-            ..EgressCapabilities::default()
+            ..NetworkPolicyCapabilities::default()
         }
     }
 
@@ -242,7 +242,7 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_host_mounts(&request)?;
-        let allow_internet_access = self.compile_egress_policy(&request.spec.egress_policy)?;
+        let allow_internet_access = self.compile_network_policy(&request.spec.network_policy)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let key_label = request.key.to_string();
         let template_id = resolve_template_id(&request.spec, &self.template_id);
@@ -303,7 +303,7 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
         }
         let manifest: E2bSnapshotManifest =
             serde_json::from_slice(&payload.bytes).context("decoding E2bSnapshot manifest")?;
-        let allow_internet_access = self.compile_egress_policy(&request.spec.egress_policy)?;
+        let allow_internet_access = self.compile_network_policy(&request.spec.network_policy)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let sandbox = self
             .create_sandbox(
@@ -1173,7 +1173,7 @@ struct E2bSnapshotInfo {
 }
 
 #[cfg(test)]
-mod egress_tests {
+mod network_tests {
     use super::*;
 
     fn test_backend() -> E2bSandboxBackend {
@@ -1189,22 +1189,22 @@ mod egress_tests {
     }
 
     #[test]
-    fn compiles_supported_egress_policy_to_allow_internet_access() {
+    fn compiles_supported_network_policy_to_allow_internet_access() {
         let backend = test_backend();
 
         assert!(
             !backend
-                .compile_egress_policy(&SandboxNetworkPolicy::default())
+                .compile_network_policy(&SandboxNetworkPolicy::default())
                 .expect("compile default-deny policy")
         );
         assert!(
             backend
-                .compile_egress_policy(&SandboxNetworkPolicy::allow_all())
+                .compile_network_policy(&SandboxNetworkPolicy::allow_all())
                 .expect("compile unrestricted policy")
         );
         assert!(
             backend
-                .compile_egress_policy(&SandboxNetworkPolicy {
+                .compile_network_policy(&SandboxNetworkPolicy {
                     allowed_domains: vec!["api.github.com".to_string()],
                     ..SandboxNetworkPolicy::default()
                 })

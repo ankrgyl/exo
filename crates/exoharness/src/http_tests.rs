@@ -10,9 +10,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::test_support::local_test_config;
 use crate::{
-    BasicExoHarness, BeginTurnRequest, CreateSandboxRequest, EgressCapabilities, EventData,
-    EventKind, EventQuery, EventQueryDirection, ExoHarness, ForkSandboxRequest, HttpExoHarness,
-    ManagedSandboxBackend, ManagedSandboxHandle, RestoreSandboxRequest, RunInSandboxRequest,
+    BasicExoHarness, BeginTurnRequest, CreateSandboxRequest, EventData, EventKind, EventQuery,
+    EventQueryDirection, ExoHarness, ForkSandboxRequest, HttpExoHarness, ManagedSandboxBackend,
+    ManagedSandboxHandle, NetworkPolicyCapabilities, RestoreSandboxRequest, RunInSandboxRequest,
     SandboxAttachment, SandboxCommand, SandboxCommandOutput, SandboxNetworkPolicy,
     SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
     SandboxProcessStdin, SandboxProvider, SandboxRequest, SnapshotFormat, SnapshotPayload,
@@ -151,7 +151,7 @@ async fn http_exoharness_runs_noninteractive_sandbox_commands() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
-            egress_policy: None,
+            network_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -204,7 +204,7 @@ async fn http_exoharness_runs_agent_scoped_sandbox_commands() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
-            egress_policy: None,
+            network_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -276,7 +276,7 @@ async fn http_exoharness_supports_sandbox_process_events() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
-            egress_policy: None,
+            network_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -365,7 +365,7 @@ async fn http_exoharness_supports_turn_scoped_sandbox_snapshot_and_start() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
-            egress_policy: None,
+            network_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -458,7 +458,7 @@ async fn http_exoharness_restores_a_snapshot_into_a_new_sandbox() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
-            egress_policy: None,
+            network_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -478,7 +478,7 @@ async fn http_exoharness_restores_a_snapshot_into_a_new_sandbox() {
                 file_system_mounts: None,
                 durable_file_systems: None,
                 enable_networking: Some(true),
-                egress_policy: None,
+                network_policy: None,
                 idle_seconds: Some(60),
             },
         })
@@ -508,7 +508,7 @@ async fn http_exoharness_restores_a_snapshot_into_a_new_sandbox() {
         )
     }));
     assert_eq!(
-        backend.egress_policies.lock().await.as_slice(),
+        backend.network_policies.lock().await.as_slice(),
         &[
             SandboxNetworkPolicy::allow_all(),
             SandboxNetworkPolicy::allow_all(),
@@ -517,7 +517,7 @@ async fn http_exoharness_restores_a_snapshot_into_a_new_sandbox() {
 }
 
 #[actix_web::test]
-async fn http_exoharness_threads_egress_policy_through_create_fork_and_restore() {
+async fn http_exoharness_threads_network_policy_through_create_fork_and_restore() {
     let backend = Arc::new(SnapshotTestSandboxBackend::default());
     let fixture = http_harness_with_sandbox_backend(backend.clone()).await;
     let agent = fixture
@@ -537,7 +537,7 @@ async fn http_exoharness_threads_egress_policy_through_create_fork_and_restore()
         ..SandboxNetworkPolicy::default()
     };
     let source_id = conversation
-        .create_sandbox(egress_test_sandbox_request(
+        .create_sandbox(network_test_sandbox_request(
             "source",
             Some(policy.clone()),
             None,
@@ -547,7 +547,7 @@ async fn http_exoharness_threads_egress_policy_through_create_fork_and_restore()
     conversation
         .fork_sandbox(ForkSandboxRequest {
             source_id: source_id.clone(),
-            sandbox: egress_test_sandbox_request("fork", Some(policy.clone()), None),
+            sandbox: network_test_sandbox_request("fork", Some(policy.clone()), None),
         })
         .await
         .expect("fork sandbox");
@@ -558,13 +558,13 @@ async fn http_exoharness_threads_egress_policy_through_create_fork_and_restore()
     conversation
         .restore_sandbox(RestoreSandboxRequest {
             snapshot_id,
-            sandbox: egress_test_sandbox_request("restore", Some(policy.clone()), None),
+            sandbox: network_test_sandbox_request("restore", Some(policy.clone()), None),
         })
         .await
         .expect("restore sandbox");
 
     assert_eq!(
-        backend.egress_policies.lock().await.as_slice(),
+        backend.network_policies.lock().await.as_slice(),
         &[
             policy.clone(),
             policy.clone(),
@@ -573,7 +573,7 @@ async fn http_exoharness_threads_egress_policy_through_create_fork_and_restore()
         ]
     );
     let error = conversation
-        .create_sandbox(egress_test_sandbox_request(
+        .create_sandbox(network_test_sandbox_request(
             "conflict",
             Some(policy),
             Some(true),
@@ -583,13 +583,13 @@ async fn http_exoharness_threads_egress_policy_through_create_fork_and_restore()
     assert!(
         error
             .to_string()
-            .contains("both egress_policy and enable_networking")
+            .contains("both network_policy and enable_networking")
     );
 }
 
-fn egress_test_sandbox_request(
+fn network_test_sandbox_request(
     name: &str,
-    egress_policy: Option<SandboxNetworkPolicy>,
+    network_policy: Option<SandboxNetworkPolicy>,
     enable_networking: Option<bool>,
 ) -> CreateSandboxRequest {
     CreateSandboxRequest {
@@ -600,22 +600,22 @@ fn egress_test_sandbox_request(
         file_system_mounts: None,
         durable_file_systems: None,
         enable_networking,
-        egress_policy,
+        network_policy,
         idle_seconds: Some(60),
     }
 }
 
 #[derive(Default)]
 struct SnapshotTestSandboxBackend {
-    egress_policies: Arc<AsyncMutex<Vec<SandboxNetworkPolicy>>>,
+    network_policies: Arc<AsyncMutex<Vec<SandboxNetworkPolicy>>>,
 }
 
 impl SnapshotTestSandboxBackend {
-    async fn record_egress_policy(&self, request: &SandboxRequest) {
-        self.egress_policies
+    async fn record_network_policy(&self, request: &SandboxRequest) {
+        self.network_policies
             .lock()
             .await
-            .push(request.spec.egress_policy.clone());
+            .push(request.spec.network_policy.clone());
     }
 }
 
@@ -625,11 +625,11 @@ impl ManagedSandboxBackend for SnapshotTestSandboxBackend {
         false
     }
 
-    fn egress_capabilities(&self) -> EgressCapabilities {
-        EgressCapabilities {
+    fn network_policy_capabilities(&self) -> NetworkPolicyCapabilities {
+        NetworkPolicyCapabilities {
             default_deny: true,
             domain_allowlist: true,
-            ..EgressCapabilities::default()
+            ..NetworkPolicyCapabilities::default()
         }
     }
 
@@ -642,7 +642,7 @@ impl ManagedSandboxBackend for SnapshotTestSandboxBackend {
         &self,
         request: SandboxRequest,
     ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
-        self.record_egress_policy(&request).await;
+        self.record_network_policy(&request).await;
         Ok(Arc::new(SnapshotTestSandboxHandle))
     }
 
@@ -659,8 +659,8 @@ impl ManagedSandboxBackend for SnapshotTestSandboxBackend {
         source: SandboxRequest,
         target: SandboxRequest,
     ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
-        self.record_egress_policy(&source).await;
-        self.record_egress_policy(&target).await;
+        self.record_network_policy(&source).await;
+        self.record_network_policy(&target).await;
         Ok(Arc::new(SnapshotTestSandboxHandle))
     }
 
@@ -670,7 +670,7 @@ impl ManagedSandboxBackend for SnapshotTestSandboxBackend {
         payload: SnapshotPayload,
     ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
         assert_eq!(payload.bytes, Bytes::from_static(b"snapshot"));
-        self.record_egress_policy(&request).await;
+        self.record_network_policy(&request).await;
         Ok(Arc::new(SnapshotTestSandboxHandle))
     }
 }

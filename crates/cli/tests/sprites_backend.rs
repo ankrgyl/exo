@@ -25,7 +25,7 @@ fn make_request(conversation_id: &str, sandbox_id: &str) -> SandboxRequest {
             image: "default".into(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            egress_policy: SandboxNetworkPolicy::allow_all(),
+            network_policy: SandboxNetworkPolicy::allow_all(),
             default_workdir: "/home/sprite".into(),
         },
         lifecycle: SandboxLifecycleConfig {

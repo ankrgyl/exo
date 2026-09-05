@@ -540,80 +540,80 @@ pub async fn sandbox_backend_durable_file_system_survives_stop_and_reacquire(
     .await
 }
 
-/// Verifies that the Docker backend applies its egress policy when starting a
+/// Verifies that the Docker backend applies its network policy when starting a
 /// sandbox, reusing it after a stop, and restoring it from a snapshot.
-pub async fn docker_sandbox_backend_enforces_egress_policy_through_lifecycle(
+pub async fn docker_sandbox_backend_enforces_network_policy_through_lifecycle(
     backend: Arc<dyn ManagedSandboxBackend>,
     unrestricted_request: SandboxRequest,
     default_deny_request: SandboxRequest,
 ) -> crate::Result<()> {
     let endpoint = DockerHostTcpEndpoint::start().await?;
 
-    exercise_docker_egress_lifecycle(
+    exercise_docker_network_lifecycle(
         Arc::clone(&backend),
         unrestricted_request,
         &endpoint,
-        EgressExpectation::Allowed,
+        NetworkExpectation::Allowed,
     )
     .await?;
-    exercise_docker_egress_lifecycle(
+    exercise_docker_network_lifecycle(
         backend,
         default_deny_request,
         &endpoint,
-        EgressExpectation::Blocked,
+        NetworkExpectation::Blocked,
     )
     .await
 }
 
-async fn exercise_docker_egress_lifecycle(
+async fn exercise_docker_network_lifecycle(
     backend: Arc<dyn ManagedSandboxBackend>,
     request: SandboxRequest,
     endpoint: &DockerHostTcpEndpoint,
-    expectation: EgressExpectation,
+    expectation: NetworkExpectation,
 ) -> crate::Result<()> {
     let result = async {
         let first = backend
             .acquire(request.clone())
             .await
-            .context("acquire sandbox for egress check")?;
+            .context("acquire sandbox for network check")?;
         let snapshot_result = async {
             assert_endpoint_connectivity(Arc::clone(&first), endpoint, expectation).await?;
             first
                 .snapshot()
                 .await
-                .context("snapshot sandbox for egress check")
+                .context("snapshot sandbox for network check")
         }
         .await;
         let snapshot = stop_after_contract(
             first,
             snapshot_result,
-            "stop sandbox after egress snapshot check",
+            "stop sandbox after network snapshot check",
         )
         .await?;
 
         let reacquired = backend
             .acquire(request.clone())
             .await
-            .context("reacquire sandbox for egress check")?;
+            .context("reacquire sandbox for network check")?;
         let reacquire_result =
             assert_endpoint_connectivity(Arc::clone(&reacquired), endpoint, expectation).await;
         stop_after_contract(
             reacquired,
             reacquire_result,
-            "stop reacquired sandbox after egress check",
+            "stop reacquired sandbox after network check",
         )
         .await?;
 
         let restored = backend
             .acquire_from_snapshot(request.clone(), snapshot)
             .await
-            .context("restore sandbox for egress check")?;
+            .context("restore sandbox for network check")?;
         let restore_result =
             assert_endpoint_connectivity(Arc::clone(&restored), endpoint, expectation).await;
         stop_after_contract(
             restored,
             restore_result,
-            "stop restored sandbox after egress check",
+            "stop restored sandbox after network check",
         )
         .await
     }
@@ -623,7 +623,7 @@ async fn exercise_docker_egress_lifecycle(
         backend,
         request,
         result,
-        "terminate sandbox after egress contract",
+        "terminate sandbox after network contract",
     )
     .await
 }
@@ -631,20 +631,21 @@ async fn exercise_docker_egress_lifecycle(
 async fn assert_endpoint_connectivity(
     handle: Arc<dyn ManagedSandboxHandle>,
     endpoint: &DockerHostTcpEndpoint,
-    expectation: EgressExpectation,
+    expectation: NetworkExpectation,
 ) -> crate::Result<()> {
     let output = handle
         .exec(&SandboxCommand {
             argv: vec![
                 "bash".to_string(),
                 "-c".to_string(),
-                "exec 3<>/dev/tcp/\"$EXO_EGRESS_TEST_HOST\"/\"$EXO_EGRESS_TEST_PORT\"".to_string(),
+                "exec 3<>/dev/tcp/\"$EXO_NETWORK_TEST_HOST\"/\"$EXO_NETWORK_TEST_PORT\""
+                    .to_string(),
             ],
             display_argv: None,
             env: std::collections::HashMap::from([
-                ("EXO_EGRESS_TEST_HOST".to_string(), endpoint.host.clone()),
+                ("EXO_NETWORK_TEST_HOST".to_string(), endpoint.host.clone()),
                 (
-                    "EXO_EGRESS_TEST_PORT".to_string(),
+                    "EXO_NETWORK_TEST_PORT".to_string(),
                     endpoint.port.to_string(),
                 ),
             ]),
@@ -652,12 +653,12 @@ async fn assert_endpoint_connectivity(
             timeout: Some(Duration::from_secs(15)),
         })
         .await
-        .context("run controlled TCP egress check")?;
+        .context("run controlled TCP network check")?;
 
     match (expectation, output.ok) {
-        (EgressExpectation::Allowed, true) | (EgressExpectation::Blocked, false) => Ok(()),
+        (NetworkExpectation::Allowed, true) | (NetworkExpectation::Blocked, false) => Ok(()),
         (expectation, succeeded) => bail!(
-            "expected sandbox egress connection to be {expectation:?}, but command {actual}: {stdout}{stderr}",
+            "expected sandbox network connection to be {expectation:?}, but command {actual}: {stdout}{stderr}",
             actual = if succeeded { "succeeded" } else { "failed" },
             stdout = output.stdout,
             stderr = output.stderr,
@@ -666,7 +667,7 @@ async fn assert_endpoint_connectivity(
 }
 
 #[derive(Debug, Clone, Copy)]
-enum EgressExpectation {
+enum NetworkExpectation {
     Allowed,
     Blocked,
 }
@@ -681,12 +682,12 @@ impl DockerHostTcpEndpoint {
     async fn start() -> crate::Result<Self> {
         let listener = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
             .await
-            .context("bind local TCP egress fixture")?;
+            .context("bind local TCP network fixture")?;
         let port = listener
             .local_addr()
-            .context("read local TCP egress fixture address")?
+            .context("read local TCP network fixture address")?
             .port();
-        let host = std::env::var("EXO_EGRESS_TEST_HOST")
+        let host = std::env::var("EXO_NETWORK_TEST_HOST")
             .unwrap_or_else(|_| "host.docker.internal".to_string());
         Ok(Self {
             host,

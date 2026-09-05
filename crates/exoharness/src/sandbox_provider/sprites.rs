@@ -178,7 +178,7 @@ impl ManagedSandboxBackend for SpritesSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        self.validate_egress_policy(&request.spec.egress_policy)?;
+        self.validate_network_policy(&request.spec.network_policy)?;
         reject_host_mounts(&request)?;
         let sprite_name = sprite_name_for_request(&request);
         self.ensure_sprite(&sprite_name, &request).await?;
@@ -221,7 +221,7 @@ impl ManagedSandboxBackend for SpritesSandboxBackend {
                 sprite_name
             );
         }
-        self.validate_egress_policy(&request.spec.egress_policy)?;
+        self.validate_network_policy(&request.spec.network_policy)?;
         self.ensure_sprite(&sprite_name, &request).await?;
         restore_checkpoint_via_backend(
             &self.handle_backend(),

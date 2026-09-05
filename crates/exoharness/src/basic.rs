@@ -1919,8 +1919,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .await?;
         let source_request = sandbox_request(self.owner, &request.source_id, &source, None);
         let target_request = sandbox_request(self.owner, &sandbox_id, &sandbox, None);
-        backend.validate_egress_policy(&source_request.spec.egress_policy)?;
-        backend.validate_egress_policy(&target_request.spec.egress_policy)?;
+        backend.validate_network_policy(&source_request.spec.network_policy)?;
+        backend.validate_network_policy(&target_request.spec.network_policy)?;
         let sandbox_handle = backend.fork_sandbox(source_request, target_request).await?;
         let provider_state_event = sandbox_provider_state_event(
             &sandbox_id,
@@ -1949,7 +1949,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .await?;
         ensure_snapshot_format_supported(backend.as_ref(), &sandbox.provider, &payload.format)?;
         let sandbox_request = sandbox_request(self.owner, &sandbox_id, &sandbox, None);
-        backend.validate_egress_policy(&sandbox_request.spec.egress_policy)?;
+        backend.validate_network_policy(&sandbox_request.spec.network_policy)?;
         let sandbox_handle = backend
             .acquire_from_snapshot(sandbox_request, payload)
             .await?;
@@ -2414,7 +2414,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 file_system_mounts: sandbox.file_system_mounts,
                 durable_file_systems: sandbox.durable_file_systems,
                 enable_networking: sandbox.enable_networking,
-                egress_policy: sandbox.egress_policy,
+                network_policy: sandbox.network_policy,
                 idle_seconds: sandbox.idle_seconds,
             },
             EventData::SandboxStarted {
@@ -2518,7 +2518,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 file_system_mounts,
                 durable_file_systems,
                 enable_networking,
-                egress_policy,
+                network_policy,
                 idle_seconds,
                 ..
             } = event.data
@@ -2537,8 +2537,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 || default_workdir != request.default_workdir.clone().unwrap_or_default()
                 || file_system_mounts != request.file_system_mounts
                 || durable_file_systems != request.durable_file_systems
-                || select_egress_policy(egress_policy, Some(enable_networking))
-                    != request.egress_policy
+                || select_network_policy(network_policy, Some(enable_networking))
+                    != request.network_policy
                 || idle_seconds != request.idle_seconds
             {
                 bail!("sandbox name {name:?} already exists with a different configuration");
@@ -3476,12 +3476,12 @@ async fn prepare_sandbox_request(
         default_workdir: request.default_workdir,
         file_system_mounts: request.file_system_mounts.unwrap_or_default(),
         durable_file_systems: request.durable_file_systems.unwrap_or_default(),
-        egress_policy: resolve_egress_policy(request.egress_policy, request.enable_networking)?,
+        network_policy: resolve_network_policy(request.network_policy, request.enable_networking)?,
         idle_seconds: request.idle_seconds.unwrap_or(60),
     })
 }
 
-fn legacy_egress_policy(enable_networking: bool) -> SandboxNetworkPolicy {
+fn legacy_network_policy(enable_networking: bool) -> SandboxNetworkPolicy {
     if enable_networking {
         SandboxNetworkPolicy::allow_all()
     } else {
@@ -3489,21 +3489,21 @@ fn legacy_egress_policy(enable_networking: bool) -> SandboxNetworkPolicy {
     }
 }
 
-fn resolve_egress_policy(
-    egress_policy: Option<SandboxNetworkPolicy>,
+fn resolve_network_policy(
+    network_policy: Option<SandboxNetworkPolicy>,
     enable_networking: Option<bool>,
 ) -> Result<SandboxNetworkPolicy> {
-    if egress_policy.is_some() && enable_networking.is_some() {
-        bail!("sandbox request cannot specify both egress_policy and enable_networking")
+    if network_policy.is_some() && enable_networking.is_some() {
+        bail!("sandbox request cannot specify both network_policy and enable_networking")
     }
-    Ok(select_egress_policy(egress_policy, enable_networking))
+    Ok(select_network_policy(network_policy, enable_networking))
 }
 
-fn select_egress_policy(
-    egress_policy: Option<SandboxNetworkPolicy>,
+fn select_network_policy(
+    network_policy: Option<SandboxNetworkPolicy>,
     enable_networking: Option<bool>,
 ) -> SandboxNetworkPolicy {
-    egress_policy.unwrap_or_else(|| legacy_egress_policy(enable_networking.unwrap_or(true)))
+    network_policy.unwrap_or_else(|| legacy_network_policy(enable_networking.unwrap_or(true)))
 }
 
 async fn find_matching_stored_sandbox(
@@ -3534,10 +3534,10 @@ async fn find_matching_stored_sandbox(
             || sandbox.default_workdir != request.default_workdir
             || sandbox.file_system_mounts != request.file_system_mounts
             || sandbox.durable_file_systems != request.durable_file_systems
-            || select_egress_policy(
-                sandbox.egress_policy.clone(),
+            || select_network_policy(
+                sandbox.network_policy.clone(),
                 Some(sandbox.enable_networking),
-            ) != request.egress_policy
+            ) != request.network_policy
             || sandbox.idle_seconds != request.idle_seconds
         {
             bail!("sandbox name {name:?} already exists with a different configuration");
@@ -3644,7 +3644,7 @@ async fn create_sandbox_handle(
         .sandbox_backend_for_provider(sandbox.provider.clone())
         .await?;
     let request = sandbox_request(owner, sandbox_id, sandbox, previous_state.clone());
-    backend.validate_egress_policy(&request.spec.egress_policy)?;
+    backend.validate_network_policy(&request.spec.network_policy)?;
     let handle = match &sandbox.attachment {
         Some(attachment) => backend.attach(request, attachment.clone()).await?,
         None => backend.acquire(request).await?,
@@ -3934,7 +3934,7 @@ struct StoredSandbox {
     #[serde(default)]
     durable_file_systems: Vec<DurableFileSystem>,
     #[serde(default)]
-    egress_policy: Option<SandboxNetworkPolicy>,
+    network_policy: Option<SandboxNetworkPolicy>,
     enable_networking: bool,
     idle_seconds: u64,
     running: bool,
@@ -3967,7 +3967,7 @@ impl StoredSandbox {
             file_system_mounts: Vec::new(),
             durable_file_systems: Vec::new(),
             enable_networking: true,
-            egress_policy: Some(SandboxNetworkPolicy::allow_all()),
+            network_policy: Some(SandboxNetworkPolicy::allow_all()),
             idle_seconds: 0,
             running: true,
             latest_snapshot_id: None,
@@ -3984,7 +3984,7 @@ struct PreparedSandboxRequest {
     default_workdir: Option<String>,
     file_system_mounts: Vec<FileSystemMount>,
     durable_file_systems: Vec<DurableFileSystem>,
-    egress_policy: SandboxNetworkPolicy,
+    network_policy: SandboxNetworkPolicy,
     idle_seconds: u64,
 }
 
@@ -3999,8 +3999,8 @@ impl PreparedSandboxRequest {
             default_workdir: self.default_workdir.clone(),
             file_system_mounts: self.file_system_mounts.clone(),
             durable_file_systems: self.durable_file_systems.clone(),
-            enable_networking: self.egress_policy.permits_unrestricted_egress(),
-            egress_policy: Some(self.egress_policy.clone()),
+            enable_networking: self.network_policy.allows_all(),
+            network_policy: Some(self.network_policy.clone()),
             idle_seconds: self.idle_seconds,
             running: true,
             latest_snapshot_id: None,
@@ -4481,8 +4481,8 @@ fn sandbox_request(
                 })
                 .collect(),
             durable_file_systems: sandbox.durable_file_systems.clone(),
-            egress_policy: select_egress_policy(
-                sandbox.egress_policy.clone(),
+            network_policy: select_network_policy(
+                sandbox.network_policy.clone(),
                 Some(sandbox.enable_networking),
             ),
             default_workdir: sandbox
@@ -4857,33 +4857,33 @@ fn build_secret_cipher(
 }
 
 #[cfg(test)]
-mod egress_policy_tests {
+mod network_policy_tests {
     use super::*;
 
     #[test]
-    fn normalizes_new_and_legacy_egress_configuration() {
+    fn normalizes_new_and_legacy_network_configuration() {
         let policy = SandboxNetworkPolicy {
             allowed_domains: vec!["api.github.com".to_string()],
             ..SandboxNetworkPolicy::default()
         };
 
         assert_eq!(
-            resolve_egress_policy(Some(policy.clone()), None).expect("explicit policy"),
+            resolve_network_policy(Some(policy.clone()), None).expect("explicit policy"),
             policy
         );
         assert_eq!(
-            select_egress_policy(None, Some(true)),
-            legacy_egress_policy(true)
+            select_network_policy(None, Some(true)),
+            legacy_network_policy(true)
         );
         assert_eq!(
-            select_egress_policy(None, Some(false)),
-            legacy_egress_policy(false)
+            select_network_policy(None, Some(false)),
+            legacy_network_policy(false)
         );
         assert_eq!(
-            resolve_egress_policy(None, None).unwrap(),
-            legacy_egress_policy(true)
+            resolve_network_policy(None, None).unwrap(),
+            legacy_network_policy(true)
         );
-        assert!(resolve_egress_policy(Some(policy), Some(true)).is_err());
+        assert!(resolve_network_policy(Some(policy), Some(true)).is_err());
     }
 }
 

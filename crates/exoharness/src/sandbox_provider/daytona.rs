@@ -36,7 +36,7 @@ use crate::sandbox::{
     WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
 };
 use crate::sandbox_provider::shell_quote;
-use crate::{EgressCapabilities, SandboxAttachment, SandboxNetworkPolicy};
+use crate::{NetworkPolicyCapabilities, SandboxAttachment, SandboxNetworkPolicy};
 
 pub const DEFAULT_DAYTONA_API_URL: &str = "https://app.daytona.io/api";
 
@@ -105,8 +105,8 @@ impl DaytonaSandboxBackend {
         format!("{}{}", self.api_url, path)
     }
 
-    fn compile_egress_policy(&self, policy: &SandboxNetworkPolicy) -> Result<bool> {
-        self.validate_egress_policy(policy)?;
+    fn compile_network_policy(&self, policy: &SandboxNetworkPolicy) -> Result<bool> {
+        self.validate_network_policy(policy)?;
         Ok(policy.default_deny)
     }
 
@@ -257,10 +257,10 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
         false
     }
 
-    fn egress_capabilities(&self) -> EgressCapabilities {
-        EgressCapabilities {
+    fn network_policy_capabilities(&self) -> NetworkPolicyCapabilities {
+        NetworkPolicyCapabilities {
             default_deny: true,
-            ..EgressCapabilities::default()
+            ..NetworkPolicyCapabilities::default()
         }
     }
 
@@ -270,7 +270,7 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_unsupported_mounts(&request)?;
-        let network_block_all = self.compile_egress_policy(&request.spec.egress_policy)?;
+        let network_block_all = self.compile_network_policy(&request.spec.network_policy)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
 
         // Reuse a matching sandbox if one exists (also how we recover across exo
@@ -316,7 +316,7 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_unsupported_mounts(&request)?;
-        let network_block_all = self.compile_egress_policy(&request.spec.egress_policy)?;
+        let network_block_all = self.compile_network_policy(&request.spec.network_policy)?;
         let snapshot_name = if payload.format == SnapshotFormat::DaytonaRef {
             let manifest: DaytonaSnapshotManifest = serde_json::from_slice(&payload.bytes)
                 .context("decoding Daytona snapshot manifest")?;
@@ -1665,22 +1665,22 @@ mod tests {
     }
 
     #[test]
-    fn compiles_supported_egress_policy_to_network_block_all() {
+    fn compiles_supported_network_policy_to_network_block_all() {
         let backend = test_backend();
 
         assert!(
             backend
-                .compile_egress_policy(&SandboxNetworkPolicy::default())
+                .compile_network_policy(&SandboxNetworkPolicy::default())
                 .expect("compile default-deny policy")
         );
         assert!(
             !backend
-                .compile_egress_policy(&SandboxNetworkPolicy::allow_all())
+                .compile_network_policy(&SandboxNetworkPolicy::allow_all())
                 .expect("compile unrestricted policy")
         );
         assert!(
             backend
-                .compile_egress_policy(&SandboxNetworkPolicy {
+                .compile_network_policy(&SandboxNetworkPolicy {
                     allowed_domains: vec!["api.github.com".to_string()],
                     ..SandboxNetworkPolicy::default()
                 })

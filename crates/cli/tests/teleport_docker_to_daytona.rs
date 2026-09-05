@@ -88,7 +88,7 @@ async fn teleport_docker_sandbox_to_daytona_keeps_files() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(false),
-            egress_policy: None,
+            network_policy: None,
             idle_seconds: Some(300),
         })
         .await
@@ -155,7 +155,7 @@ async fn teleport_docker_sandbox_to_daytona_keeps_files() {
             }]),
             durable_file_systems: None,
             enable_networking: Some(false),
-            egress_policy: None,
+            network_policy: None,
             idle_seconds: Some(300),
         })
         .await

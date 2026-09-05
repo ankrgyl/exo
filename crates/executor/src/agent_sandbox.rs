@@ -118,7 +118,7 @@ async fn attach_agent_sandbox(
             file_system_mounts: Some(spec.file_system_mounts.clone()),
             durable_file_systems: Some(spec.durable_file_systems.clone()),
             enable_networking: Some(spec.enable_networking),
-            egress_policy: None,
+            network_policy: None,
             idle_seconds: Some(spec.idle_seconds),
         })
         .await?;

@@ -51,7 +51,7 @@ impl SandboxNetworkPolicy {
     }
 
     /// Whether this policy permits unrestricted outbound access.
-    pub fn permits_unrestricted_egress(&self) -> bool {
+    pub fn allows_all(&self) -> bool {
         !self.default_deny
             && self.allowed_domains.is_empty()
             && self.allowed_cidrs.is_empty()
@@ -60,9 +60,9 @@ impl SandboxNetworkPolicy {
     }
 }
 
-/// Egress-policy features a backend can enforce.
+/// Network policy features a backend can enforce.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct EgressCapabilities {
+pub struct NetworkPolicyCapabilities {
     pub default_deny: bool,
     pub domain_allowlist: bool,
     pub cidr_allowlist: bool,
@@ -71,30 +71,30 @@ pub struct EgressCapabilities {
 }
 
 /// Validates that `policy` asks only for restrictions the backend can enforce.
-pub fn validate_egress_policy_capabilities(
+pub fn validate_network_policy_capabilities(
     policy: &SandboxNetworkPolicy,
-    capabilities: EgressCapabilities,
+    capabilities: NetworkPolicyCapabilities,
 ) -> Result<()> {
     if !policy.default_deny
         && (!policy.allowed_domains.is_empty() || !policy.allowed_cidrs.is_empty())
     {
-        bail!("an egress allowlist requires default_deny");
+        bail!("a network allowlist requires default_deny");
     }
 
     if policy.default_deny && !capabilities.default_deny {
-        bail!("sandbox backend cannot enforce default-deny egress");
+        bail!("sandbox backend cannot enforce default-deny network");
     }
     if !policy.allowed_domains.is_empty() && !capabilities.domain_allowlist {
-        bail!("sandbox backend cannot enforce domain egress allowlists");
+        bail!("sandbox backend cannot enforce domain network allowlists");
     }
     if !policy.allowed_cidrs.is_empty() && !capabilities.cidr_allowlist {
-        bail!("sandbox backend cannot enforce CIDR egress allowlists");
+        bail!("sandbox backend cannot enforce CIDR network allowlists");
     }
     if !policy.denied_domains.is_empty() && !capabilities.domain_denylist {
-        bail!("sandbox backend cannot enforce domain egress denylists");
+        bail!("sandbox backend cannot enforce domain network denylists");
     }
     if !policy.denied_cidrs.is_empty() && !capabilities.cidr_denylist {
-        bail!("sandbox backend cannot enforce CIDR egress denylists");
+        bail!("sandbox backend cannot enforce CIDR network denylists");
     }
 
     Ok(())

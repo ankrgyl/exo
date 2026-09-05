@@ -98,7 +98,7 @@ fn request(
                 internal: false,
             }],
             durable_file_systems: Vec::new(),
-            egress_policy: network.into(),
+            network_policy: network.into(),
             default_workdir: "/".into(),
         },
         lifecycle: SandboxLifecycleConfig { idle_ttl },
@@ -598,7 +598,7 @@ async fn smolvm_network_is_denied_unless_requested() {
 
     // Without this, the denial below passes for the wrong reason on any guest
     // that simply has no `wget`: the command fails, `ok` is false, and the test
-    // reports an egress policy it never exercised.
+    // reports a network policy it never exercised.
     let probe = handle
         .exec(&command(&["sh", "-c", "command -v wget"]))
         .await

@@ -49,7 +49,7 @@ use crate::sandbox::{
 };
 use crate::sandbox_provider::process_bridge;
 use crate::{
-    EgressCapabilities, FileSystemMountMode, SandboxAttachment, SandboxNetworkPolicy,
+    FileSystemMountMode, NetworkPolicyCapabilities, SandboxAttachment, SandboxNetworkPolicy,
     SandboxProcessParts,
 };
 
@@ -1036,10 +1036,10 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         true
     }
 
-    fn egress_capabilities(&self) -> EgressCapabilities {
-        EgressCapabilities {
+    fn network_policy_capabilities(&self) -> NetworkPolicyCapabilities {
+        NetworkPolicyCapabilities {
             default_deny: true,
-            ..EgressCapabilities::default()
+            ..NetworkPolicyCapabilities::default()
         }
     }
 
@@ -1048,7 +1048,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        self.validate_egress_policy(&request.spec.egress_policy)?;
+        self.validate_network_policy(&request.spec.network_policy)?;
         self.reap_stale_machines().await?;
         self.reap_expired_machines().await?;
         self.shared.reap_orphaned_fork_snapshot_templates().await;
@@ -1099,8 +1099,8 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         target: SandboxRequest,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let mut source = prepare_request(source)?;
-        self.validate_egress_policy(&source.spec.egress_policy)?;
-        self.validate_egress_policy(&target.spec.egress_policy)?;
+        self.validate_network_policy(&source.spec.network_policy)?;
+        self.validate_network_policy(&target.spec.network_policy)?;
         let target = self.resolve_request(target).await?;
         if source.key == target.key {
             bail!("Firecracker fork source and target must be different sandboxes")
@@ -1160,7 +1160,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let manifest = FirecrackerSnapshotManifest::from_payload(payload)?;
-        self.validate_egress_policy(&request.spec.egress_policy)?;
+        self.validate_network_policy(&request.spec.network_policy)?;
         let request = self.resolve_request(request).await?;
         self.restore_snapshot(request, manifest, SnapshotTemplateLifecycle::Snapshot, None)
             .await
@@ -1547,7 +1547,7 @@ impl Shared {
         let machine_id = machine_id.to_string();
         let spec_hash = spec_hash.to_string();
         let resolved_image = request.spec.image.clone();
-        let network_enabled = network_device_enabled(&self.config, &request.spec.egress_policy);
+        let network_enabled = network_device_enabled(&self.config, &request.spec.network_policy);
         let workspace_id = if snapshot.is_none() {
             request
                 .spec
@@ -1618,7 +1618,7 @@ impl Shared {
                     prepare_network(
                         &config,
                         &network,
-                        &request.spec.egress_policy,
+                        &request.spec.network_policy,
                         jailer_uid(&config, &record)?,
                     )?;
                 }
@@ -2175,9 +2175,9 @@ fn hash_runtime_fingerprint(hasher: &mut Sha256, runtime: &FirecrackerRuntimeFin
 
 fn network_device_enabled(
     config: &FirecrackerConfig,
-    egress_policy: &SandboxNetworkPolicy,
+    network_policy: &SandboxNetworkPolicy,
 ) -> bool {
-    egress_policy.permits_unrestricted_egress()
+    network_policy.allows_all()
         || config.network_device_policy == FirecrackerNetworkDevicePolicy::AllSandboxes
 }
 
@@ -2767,7 +2767,7 @@ fn network_firewall_rules(
         "add rule inet {table} forward iifname {interface} ip daddr {{ {} }} counter reject",
         BLOCKED_EGRESS_CIDRS.join(", ")
     )?;
-    let final_egress_verdict = if policy.permits_unrestricted_egress() {
+    let final_egress_verdict = if policy.allows_all() {
         "accept"
     } else {
         "reject"

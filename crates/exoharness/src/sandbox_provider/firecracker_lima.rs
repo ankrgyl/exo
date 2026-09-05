@@ -33,7 +33,7 @@ use crate::sandbox::{
     BoxSandboxTcpStream, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
     SandboxCommandOutput, SandboxRequest, SnapshotFormat, SnapshotPayload,
 };
-use crate::{EgressCapabilities, SandboxAttachment, SandboxProcessParts};
+use crate::{NetworkPolicyCapabilities, SandboxAttachment, SandboxProcessParts};
 
 use super::FirecrackerLimaConfig;
 use super::firecracker::FirecrackerConfig;
@@ -111,10 +111,10 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         true
     }
 
-    fn egress_capabilities(&self) -> EgressCapabilities {
-        EgressCapabilities {
+    fn network_policy_capabilities(&self) -> NetworkPolicyCapabilities {
+        NetworkPolicyCapabilities {
             default_deny: true,
-            ..EgressCapabilities::default()
+            ..NetworkPolicyCapabilities::default()
         }
     }
 
@@ -123,7 +123,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        self.validate_egress_policy(&request.spec.egress_policy)?;
+        self.validate_network_policy(&request.spec.network_policy)?;
         // A one-shot Firecracker handle destroys its VM after the command. Do
         // not eagerly acquire it here and then acquire a second VM when the
         // command crosses the bridge.
@@ -183,8 +183,8 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         if target.lifecycle.idle_ttl.is_none() {
             bail!("Firecracker Lima forks require a managed sandbox lifecycle");
         }
-        self.validate_egress_policy(&source.spec.egress_policy)?;
-        self.validate_egress_policy(&target.spec.egress_policy)?;
+        self.validate_network_policy(&source.spec.network_policy)?;
+        self.validate_network_policy(&target.spec.network_policy)?;
         let response = self
             .request(FirecrackerBridgeRequest::Fork {
                 config: self.config.clone(),
@@ -211,7 +211,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         if request.lifecycle.idle_ttl.is_none() {
             bail!("Firecracker Lima snapshot restores require a managed sandbox lifecycle");
         }
-        self.validate_egress_policy(&request.spec.egress_policy)?;
+        self.validate_network_policy(&request.spec.network_policy)?;
         let response = self
             .request(FirecrackerBridgeRequest::AcquireFromSnapshot {
                 config: self.config.clone(),

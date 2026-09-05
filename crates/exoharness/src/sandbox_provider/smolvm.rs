@@ -32,7 +32,7 @@ use crate::sandbox::{
     WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_OWNER_PID_LABEL, owner_pid_is_alive, run_command,
     spawn_sandbox_process,
 };
-use crate::{EgressCapabilities, SandboxAttachment};
+use crate::{NetworkPolicyCapabilities, SandboxAttachment};
 
 /// Default binary name; overridable with `SMOLVM_BIN` for a non-PATH install.
 const SMOLVM_BIN_ENV: &str = "SMOLVM_BIN";
@@ -416,10 +416,10 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
         true
     }
 
-    fn egress_capabilities(&self) -> EgressCapabilities {
-        EgressCapabilities {
+    fn network_policy_capabilities(&self) -> NetworkPolicyCapabilities {
+        NetworkPolicyCapabilities {
             default_deny: true,
-            ..EgressCapabilities::default()
+            ..NetworkPolicyCapabilities::default()
         }
     }
 
@@ -428,7 +428,7 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        self.validate_egress_policy(&request.spec.egress_policy)?;
+        self.validate_network_policy(&request.spec.network_policy)?;
         reject_unsupported_spec(&request.spec)?;
         match self.resolve_mode(&request).await {
             SmolvmExecutionMode::Warm => {
@@ -477,7 +477,7 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
             );
         }
         reject_unsupported_spec(&request.spec)?;
-        self.validate_egress_policy(&request.spec.egress_policy)?;
+        self.validate_network_policy(&request.spec.network_policy)?;
         if self.resolve_mode(&request).await != SmolvmExecutionMode::Warm {
             bail!(
                 "smolvm snapshots require warm mode (one-shot VMs hold no state to restore); \
@@ -744,7 +744,7 @@ fn resolve_cwd(command: &SandboxCommand, spec: &SandboxSpec) -> String {
 
 /// Mounts and network policy, shared by the create/run paths.
 fn configure_spec_args(process: &mut Command, spec: &SandboxSpec) {
-    if spec.egress_policy.permits_unrestricted_egress() {
+    if spec.network_policy.allows_all() {
         process.arg("--net");
     }
     for mount in &spec.mounts {
@@ -844,11 +844,11 @@ fn reject_unsupported_spec(spec: &SandboxSpec) -> Result<()> {
     // smolvm resolves registry references over the machine's own network and
     // refuses this combination even for a cached image. Caught here so the caller
     // gets the two real remedies, not a failure deep in the CLI output.
-    if spec.egress_policy.default_deny && !is_local_image_ref(&spec.image) {
+    if spec.network_policy.default_deny && !is_local_image_ref(&spec.image) {
         bail!(
             "smolvm cannot use registry image '{}' in a network-disabled sandbox: \
              it resolves registry references over the machine's network, even for \
-             cached images. Either enable unrestricted egress, or supply the \
+             cached images. Either enable unrestricted network, or supply the \
              image locally (a `docker save` tar path or an unpacked rootfs dir), \
              which keeps the sandbox fully network-isolated.",
             spec.image
@@ -1034,7 +1034,7 @@ mod tests {
                 image: "alpine".into(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                egress_policy: SandboxNetworkPolicy::deny_all(),
+                network_policy: SandboxNetworkPolicy::deny_all(),
                 default_workdir: "/".into(),
             },
             lifecycle: SandboxLifecycleConfig { idle_ttl },
@@ -1102,16 +1102,16 @@ mod tests {
     fn registry_image_without_network_is_rejected() {
         let mut spec = test_request(None).spec;
         spec.image = "docker.io/library/ubuntu:24.04".into();
-        spec.egress_policy = SandboxNetworkPolicy::deny_all();
+        spec.network_policy = SandboxNetworkPolicy::deny_all();
         let err = reject_unsupported_spec(&spec).unwrap_err().to_string();
         assert!(err.contains("network-disabled"), "unexpected error: {err}");
 
         // Fine once the sandbox is allowed network...
-        spec.egress_policy = SandboxNetworkPolicy::allow_all();
+        spec.network_policy = SandboxNetworkPolicy::allow_all();
         assert!(reject_unsupported_spec(&spec).is_ok());
 
         // ...and a local archive is fine while staying isolated.
-        spec.egress_policy = SandboxNetworkPolicy::deny_all();
+        spec.network_policy = SandboxNetworkPolicy::deny_all();
         spec.image = "/tmp/alpine.tar".into();
         assert!(reject_unsupported_spec(&spec).is_ok());
     }
@@ -1184,7 +1184,7 @@ mod tests {
                 },
             ],
             durable_file_systems: Vec::new(),
-            egress_policy: SandboxNetworkPolicy::deny_all(),
+            network_policy: SandboxNetworkPolicy::deny_all(),
             default_workdir: "/work".into(),
         };
 

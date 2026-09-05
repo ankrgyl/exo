@@ -486,7 +486,7 @@ pub enum EventData {
         durable_file_systems: Vec<DurableFileSystem>,
         enable_networking: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        egress_policy: Option<SandboxNetworkPolicy>,
+        network_policy: Option<SandboxNetworkPolicy>,
         idle_seconds: u64,
     },
     SandboxStarted {
@@ -654,10 +654,10 @@ pub struct CreateSandboxRequest {
     pub file_system_mounts: Option<Vec<FileSystemMount>>,
     pub durable_file_systems: Option<Vec<DurableFileSystem>>,
     pub enable_networking: Option<bool>,
-    /// Explicit egress restrictions. Cannot be combined with `enable_networking`.
-    /// Omitting both retains the legacy unrestricted default; an empty policy denies egress.
+    /// Explicit network restrictions. Cannot be combined with `enable_networking`.
+    /// Omitting both retains the legacy unrestricted default; an empty policy denies network.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub egress_policy: Option<SandboxNetworkPolicy>,
+    pub network_policy: Option<SandboxNetworkPolicy>,
     pub idle_seconds: Option<u64>,
 }
 

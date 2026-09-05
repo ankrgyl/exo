@@ -25,7 +25,7 @@ use crate::sandbox::{
     WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
 };
 use crate::sandbox_provider::{process_bridge, shell_quote};
-use crate::{DomainPattern, EgressCapabilities, SandboxAttachment, SandboxNetworkPolicy};
+use crate::{DomainPattern, NetworkPolicyCapabilities, SandboxAttachment, SandboxNetworkPolicy};
 
 pub const DEFAULT_VERCEL_API_URL: &str = "https://vercel.com/api";
 
@@ -68,11 +68,11 @@ impl VercelSandboxBackend {
         format!("{}{}", self.api_url, path)
     }
 
-    fn compile_egress_policy(
+    fn compile_network_policy(
         &self,
         policy: &SandboxNetworkPolicy,
     ) -> Result<Option<VercelNetworkPolicy>> {
-        self.validate_egress_policy(policy)?;
+        self.validate_network_policy(policy)?;
         if policy.default_deny
             && policy.allowed_domains.is_empty()
             && policy.allowed_cidrs.is_empty()
@@ -192,18 +192,18 @@ impl ManagedSandboxBackend for VercelSandboxBackend {
         false
     }
 
-    fn egress_capabilities(&self) -> EgressCapabilities {
-        EgressCapabilities {
+    fn network_policy_capabilities(&self) -> NetworkPolicyCapabilities {
+        NetworkPolicyCapabilities {
             default_deny: true,
             domain_allowlist: true,
             cidr_allowlist: true,
             cidr_denylist: true,
-            ..EgressCapabilities::default()
+            ..NetworkPolicyCapabilities::default()
         }
     }
 
-    fn validate_egress_policy(&self, policy: &SandboxNetworkPolicy) -> Result<()> {
-        crate::validate_egress_policy_capabilities(policy, self.egress_capabilities())?;
+    fn validate_network_policy(&self, policy: &SandboxNetworkPolicy) -> Result<()> {
+        crate::validate_network_policy_capabilities(policy, self.network_policy_capabilities())?;
         if !policy.default_deny && !policy.denied_cidrs.is_empty() {
             bail!(
                 "Vercel CIDR denylists require default_deny; default-allow with exceptions is not supported"
@@ -218,7 +218,7 @@ impl ManagedSandboxBackend for VercelSandboxBackend {
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_unsupported_mounts(&request)?;
-        let network_policy = self.compile_egress_policy(&request.spec.egress_policy)?;
+        let network_policy = self.compile_network_policy(&request.spec.network_policy)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let sandbox_name = vercel_sandbox_name(&request, &spec_hash);
         let response = match self.get_sandbox_session(&sandbox_name).await? {
@@ -826,7 +826,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reports_and_validates_egress_policy_capabilities() {
+    fn reports_and_validates_network_policy_capabilities() {
         let backend = VercelSandboxBackend::new(VercelConfig {
             api_token: "test-token".to_string(),
             api_url: DEFAULT_VERCEL_API_URL.to_string(),
@@ -836,23 +836,23 @@ mod tests {
         .expect("create Vercel backend");
 
         assert_eq!(
-            backend.egress_capabilities(),
-            EgressCapabilities {
+            backend.network_policy_capabilities(),
+            NetworkPolicyCapabilities {
                 default_deny: true,
                 domain_allowlist: true,
                 cidr_allowlist: true,
                 cidr_denylist: true,
-                ..EgressCapabilities::default()
+                ..NetworkPolicyCapabilities::default()
             }
         );
         assert!(
             backend
-                .validate_egress_policy(&SandboxNetworkPolicy::default())
+                .validate_network_policy(&SandboxNetworkPolicy::default())
                 .is_ok()
         );
         assert!(
             backend
-                .validate_egress_policy(&SandboxNetworkPolicy {
+                .validate_network_policy(&SandboxNetworkPolicy {
                     denied_domains: vec!["api.github.com".to_string()],
                     ..SandboxNetworkPolicy::default()
                 })
@@ -861,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn compiles_supported_egress_rules_to_vercel_network_policy() {
+    fn compiles_supported_network_rules_to_vercel_network_policy() {
         let backend = VercelSandboxBackend::new(VercelConfig {
             api_token: "test-token".to_string(),
             api_url: DEFAULT_VERCEL_API_URL.to_string(),
@@ -876,7 +876,7 @@ mod tests {
         };
         assert!(
             backend
-                .compile_egress_policy(&denylist)
+                .compile_network_policy(&denylist)
                 .unwrap_err()
                 .to_string()
                 .contains("require default_deny")
@@ -885,7 +885,7 @@ mod tests {
             default_deny: true,
             ..denylist
         };
-        assert!(backend.compile_egress_policy(&denylist).is_ok());
+        assert!(backend.compile_network_policy(&denylist).is_ok());
         let policy = SandboxNetworkPolicy {
             allowed_domains: vec!["api.github.com".to_string(), "*.vercel.com".to_string()],
             allowed_cidrs: vec!["192.0.2.0/24".parse().expect("valid CIDR")],
@@ -894,7 +894,7 @@ mod tests {
         };
 
         let compiled = backend
-            .compile_egress_policy(&policy)
+            .compile_network_policy(&policy)
             .expect("compile Vercel policy")
             .expect("restricted policy");
         assert_eq!(
@@ -909,7 +909,7 @@ mod tests {
         );
 
         let deny_all = backend
-            .compile_egress_policy(&SandboxNetworkPolicy::default())
+            .compile_network_policy(&SandboxNetworkPolicy::default())
             .expect("compile default Vercel policy")
             .expect("deny-all policy");
         assert_eq!(
@@ -919,7 +919,7 @@ mod tests {
 
         assert!(
             backend
-                .compile_egress_policy(&SandboxNetworkPolicy::allow_all())
+                .compile_network_policy(&SandboxNetworkPolicy::allow_all())
                 .expect("compile unrestricted Vercel policy")
                 .is_none()
         );
