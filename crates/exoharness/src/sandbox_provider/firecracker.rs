@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use exo_firecracker_protocol::{
     GuestRequest as ProtocolGuestRequest, GuestResponse, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
-    Message, PROTOCOL_VERSION, decode_frame_length,
+    Message, PROTOCOL_VERSION, TerminalSize as GuestTerminalSize, decode_frame_length,
 };
 use ipnet::Ipv4Net;
 #[cfg(target_os = "linux")]
@@ -48,7 +48,10 @@ use crate::sandbox::{
     SnapshotFormat, SnapshotPayload, sandbox_spec_hash,
 };
 use crate::sandbox_provider::process_bridge;
-use crate::{FileSystemMountMode, SandboxAttachment, SandboxProcessParts, SandboxResourceShape};
+use crate::{
+    FileSystemMountMode, SandboxAttachment, SandboxProcessParts, SandboxResourceShape,
+    SandboxTerminalParts, SandboxTerminalSize,
+};
 
 use super::firecracker_image::resolve_image;
 #[cfg(test)]
@@ -1305,6 +1308,34 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
             .await?;
         }
         Ok(process)
+    }
+
+    async fn start_terminal(
+        &self,
+        command: &SandboxCommand,
+        size: SandboxTerminalSize,
+    ) -> Result<SandboxTerminalParts> {
+        let cleanup_machine_id = self
+            .one_shot
+            .then(|| self.machine.record.machine_id.clone());
+        let terminal = GuestClient::new(Arc::clone(&self.shared), self.machine.vsock_path.clone())
+            .start_terminal(&self.request.spec, command, size, cleanup_machine_id)
+            .await?;
+        if !self.one_shot {
+            let _lifecycle_guard = self
+                .shared
+                .lifecycle_locks
+                .lock_machine(&self.machine.record.machine_id)
+                .await;
+            touch_machine(
+                &self.shared,
+                &self.shared.warm_machines,
+                &self.request.key,
+                &self.machine.record.machine_id,
+            )
+            .await?;
+        }
+        Ok(terminal)
     }
 
     fn supports_tcp(&self) -> bool {
@@ -4176,6 +4207,63 @@ impl GuestClient {
                 wait,
                 cleanup: Some(cleanup),
             }),
+        })
+    }
+
+    async fn start_terminal(
+        &self,
+        spec: &SandboxSpec,
+        command: &SandboxCommand,
+        size: SandboxTerminalSize,
+        cleanup_machine_id: Option<String>,
+    ) -> Result<SandboxTerminalParts> {
+        if command.argv.is_empty() {
+            bail!("sandbox terminal command requires at least one argv entry");
+        }
+        let cwd = command
+            .cwd
+            .clone()
+            .unwrap_or_else(|| spec.default_workdir.clone());
+        let response: GuestResponse = self
+            .invoke(&GuestRequest::StartTerminal {
+                argv: command.argv.clone(),
+                env: command.env.clone(),
+                cwd,
+                size: GuestTerminalSize {
+                    rows: size.rows,
+                    cols: size.cols,
+                },
+            })
+            .await?;
+        if let Some(error) = response.error {
+            bail!("Firecracker start_terminal failed: {error}");
+        }
+        let process_id = response
+            .process_id
+            .context("Firecracker start_terminal response did not include process_id")?;
+        let bridge = Arc::new(FirecrackerProcessBridgeClient {
+            guest: self.clone(),
+            process_id: process_id.clone(),
+        });
+        let SandboxTerminalParts {
+            output,
+            input,
+            wait,
+            control,
+        } = process_bridge::terminal_parts(bridge);
+        let cleanup = ProcessCleanup {
+            guest: self.clone(),
+            process_id,
+            machine_id: cleanup_machine_id,
+        };
+        Ok(SandboxTerminalParts {
+            output,
+            input,
+            wait: Box::pin(ProcessWait {
+                wait,
+                cleanup: Some(cleanup),
+            }),
+            control,
         })
     }
 

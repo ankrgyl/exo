@@ -933,6 +933,24 @@ pub struct SandboxProcessParts {
     pub wait: BoxFuture<'static, Result<i32>>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SandboxTerminalSize {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[async_trait]
+pub trait SandboxTerminalControl: Send + Sync {
+    async fn resize(&self, size: SandboxTerminalSize) -> Result<()>;
+}
+
+pub struct SandboxTerminalParts {
+    pub output: BoxAsyncRead,
+    pub input: BoxAsyncWrite,
+    pub wait: BoxFuture<'static, Result<i32>>,
+    pub control: Arc<dyn SandboxTerminalControl>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BindingRecord {
     pub id: BindingId,
