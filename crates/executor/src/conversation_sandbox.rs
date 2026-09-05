@@ -183,6 +183,7 @@ pub(crate) async fn create_conversation_sandbox(
             file_system_mounts: Some(spec.file_system_mounts),
             durable_file_systems: Some(spec.durable_file_systems),
             enable_networking: Some(spec.enable_networking),
+            egress_policy: None,
             idle_seconds: Some(spec.idle_seconds),
         })
         .await

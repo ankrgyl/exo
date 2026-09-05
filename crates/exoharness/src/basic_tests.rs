@@ -2351,6 +2351,7 @@ struct TestProviderStateBackend {
     requests: Arc<AsyncMutex<Vec<Option<Value>>>>,
     egress_policies: Arc<AsyncMutex<Vec<EgressPolicy>>>,
     cleanup_count: Arc<AsyncMutex<usize>>,
+    fork_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl TestProviderStateBackend {
@@ -2360,6 +2361,7 @@ impl TestProviderStateBackend {
             requests: Arc::new(AsyncMutex::new(Vec::new())),
             egress_policies: Arc::new(AsyncMutex::new(Vec::new())),
             cleanup_count: Arc::new(AsyncMutex::new(0)),
+            fork_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -2372,6 +2374,16 @@ impl ManagedSandboxBackend for TestProviderStateBackend {
 
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
         &[]
+    }
+
+    async fn fork_sandbox(
+        &self,
+        _source: SandboxRequest,
+        _target: SandboxRequest,
+    ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        self.fork_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        bail!("sandbox backend does not support forking")
     }
 
     async fn acquire(
@@ -2788,45 +2800,66 @@ async fn create_sandbox_rejects_unsupported_egress_before_backend_acquisition() 
 
 #[tokio::test(flavor = "current_thread")]
 async fn fork_sandbox_validates_both_policies_before_calling_the_backend() {
-    let tempdir = TempDir::new().expect("tempdir");
-    let backend = Arc::new(TestProviderStateBackend::new(Value::Null));
-    let harness = BasicExoHarness::new_with_sandbox_backend(
-        local_test_config(tempdir.path()),
-        backend.clone(),
-    )
-    .await
-    .expect("harness should initialize");
-    let agent = harness
-        .new_agent(NewAgentRequest {
-            slug: "agent".to_string(),
-            name: "Agent".to_string(),
-        })
+    for invalid_source in [true, false] {
+        let tempdir = TempDir::new().expect("tempdir");
+        let config = local_test_config(tempdir.path());
+        let harness = BasicExoHarness::new_with_sandbox_backend(
+            config.clone(),
+            Arc::new(RestoreImageTestBackend::default()),
+        )
         .await
-        .expect("agent");
-    let source_id = agent
-        .create_sandbox(provider_state_test_create_request())
-        .await
-        .expect("source sandbox");
-    backend.requests.lock().await.clear();
-
-    let mut target = provider_state_test_create_request();
-    target.name = Some("target".to_string());
-    target.enable_networking = None;
-    target.egress_policy = Some(EgressPolicy::default());
-    let error = agent
-        .fork_sandbox(ForkSandboxRequest {
-            source_id,
-            sandbox: target,
-        })
-        .await
-        .expect_err("unsupported target policy should fail before fork");
-
-    assert!(
-        error
-            .to_string()
-            .contains("cannot enforce default-deny egress")
-    );
-    assert!(backend.requests.lock().await.is_empty());
+        .expect("harness");
+        let agent = harness
+            .new_agent(NewAgentRequest {
+                slug: "agent".into(),
+                name: "Agent".into(),
+            })
+            .await
+            .expect("agent");
+        let agent_id = agent.record().id;
+        let restricted = EgressPolicy {
+            allowed_domains: vec!["api.github.com".into()],
+            ..EgressPolicy::default()
+        };
+        let mut source = provider_state_test_create_request();
+        if invalid_source {
+            source.enable_networking = None;
+            source.egress_policy = Some(restricted.clone());
+        }
+        let source_id = agent.create_sandbox(source).await.expect("source");
+        // Reload with a provider that cannot enforce the stored source policy.
+        let backend = Arc::new(TestProviderStateBackend::new(Value::Null));
+        let reloaded = BasicExoHarness::new_with_sandbox_backend(config, backend.clone())
+            .await
+            .expect("reload");
+        let agent = reloaded.get_agent(&agent_id).await.unwrap().unwrap();
+        let mut target = provider_state_test_create_request();
+        target.name = Some("target".into());
+        if !invalid_source {
+            target.enable_networking = None;
+            target.egress_policy = Some(restricted);
+        }
+        let error = agent
+            .fork_sandbox(ForkSandboxRequest {
+                source_id,
+                sandbox: target,
+            })
+            .await
+            .expect_err("unsupported policy");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot enforce default-deny egress"),
+            "{error:#}"
+        );
+        assert_eq!(
+            backend
+                .fork_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "invalid_source={invalid_source}: backend fork must not run"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2836,7 +2869,7 @@ async fn attach_sandbox_persists_explicit_unrestricted_egress_policy() {
     config.sandbox_default = SandboxProvider::Docker;
     config.sandbox_backends = vec![SandboxBackendRegistration::docker()];
     let backend = Arc::new(TestProviderStateBackend::new(Value::Null));
-    let harness = BasicExoHarness::new_with_sandbox_backend(config, backend.clone())
+    let harness = BasicExoHarness::new_with_sandbox_backend(config.clone(), backend.clone())
         .await
         .expect("harness should initialize");
     let agent = harness
@@ -2846,7 +2879,8 @@ async fn attach_sandbox_persists_explicit_unrestricted_egress_policy() {
         })
         .await
         .expect("agent");
-    agent
+    let agent_id = agent.record().id;
+    let sandbox_id = agent
         .attach_sandbox(AttachSandboxRequest {
             attachment: SandboxAttachment::DockerContainer {
                 container_id: "container".to_string(),
@@ -2856,6 +2890,33 @@ async fn attach_sandbox_persists_explicit_unrestricted_egress_policy() {
         .await
         .expect("attach sandbox");
 
+    assert_eq!(
+        backend.egress_policies.lock().await.as_slice(),
+        &[SandboxNetworkPolicy::Enabled.into()]
+    );
+    #[derive(serde::Deserialize)]
+    struct StoredPolicy {
+        egress_policy: EgressPolicy,
+    }
+    let bytes = fs::read(
+        tempdir
+            .path()
+            .join("agents")
+            .join(agent_id.to_string())
+            .join("sandboxes")
+            .join(format!("{sandbox_id}.json")),
+    )
+    .await
+    .unwrap();
+    let stored: StoredPolicy = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(stored.egress_policy, SandboxNetworkPolicy::Enabled.into());
+    let backend = Arc::new(TestProviderStateBackend::new(Value::Null));
+    let reloaded = BasicExoHarness::new_with_sandbox_backend(config, backend.clone())
+        .await
+        .unwrap();
+    let agent = reloaded.get_agent(&agent_id).await.unwrap().unwrap();
+    // Querying capabilities in a fresh harness reattaches using stored state.
+    assert!(!agent.sandbox_supports_tcp(sandbox_id).await.unwrap());
     assert_eq!(
         backend.egress_policies.lock().await.as_slice(),
         &[SandboxNetworkPolicy::Enabled.into()]

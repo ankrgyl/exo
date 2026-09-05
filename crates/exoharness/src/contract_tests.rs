@@ -945,12 +945,12 @@ async fn stop_after_contract<T>(
     }
 }
 
-async fn terminate_after_contract<T>(
+async fn terminate_after_contract(
     backend: Arc<dyn ManagedSandboxBackend>,
     request: SandboxRequest,
-    result: crate::Result<T>,
+    result: crate::Result<()>,
     context: &str,
-) -> crate::Result<T> {
+) -> crate::Result<()> {
     let terminate_result = backend
         .terminate(request)
         .await

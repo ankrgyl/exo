@@ -36,9 +36,7 @@ use crate::sandbox::{
     WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
 };
 use crate::sandbox_provider::shell_quote;
-use crate::{
-    EgressCapabilities, EgressPolicy, SandboxAttachment, validate_egress_policy_capabilities,
-};
+use crate::{EgressCapabilities, EgressPolicy, SandboxAttachment};
 
 pub const DEFAULT_DAYTONA_API_URL: &str = "https://app.daytona.io/api";
 
@@ -147,7 +145,7 @@ impl DaytonaSandboxBackend {
         request: &SandboxRequest,
         spec_hash: &str,
         snapshot_name: Option<&str>,
-        network: DaytonaNetworkConfig,
+        network_block_all: bool,
     ) -> Result<DaytonaSandbox> {
         let mut labels = HashMap::new();
         labels.insert(WARM_SANDBOX_KEY_LABEL.to_string(), request.key.to_string());
@@ -178,7 +176,7 @@ impl DaytonaSandboxBackend {
             labels,
             env: HashMap::new(),
             auto_stop_interval: auto_stop_minutes,
-            network_block_all: network.block_all,
+            network_block_all,
         };
 
         let response = self
@@ -266,19 +264,13 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
         }
     }
 
-    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
-        validate_egress_policy_capabilities(policy, self.egress_capabilities())
-    }
-
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
         &CONSUMABLE_SNAPSHOT_FORMATS
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_unsupported_mounts(&request)?;
-        let network = DaytonaNetworkConfig {
-            block_all: self.compile_egress_policy(&request.spec.egress_policy)?,
-        };
+        let network_block_all = self.compile_egress_policy(&request.spec.egress_policy)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
 
         // Reuse a matching sandbox if one exists (also how we recover across exo
@@ -296,7 +288,7 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
                 existing
             }
             _ => {
-                self.create_sandbox(&request, &spec_hash, None, network)
+                self.create_sandbox(&request, &spec_hash, None, network_block_all)
                     .await?
             }
         };
@@ -324,9 +316,7 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_unsupported_mounts(&request)?;
-        let network = DaytonaNetworkConfig {
-            block_all: self.compile_egress_policy(&request.spec.egress_policy)?,
-        };
+        let network_block_all = self.compile_egress_policy(&request.spec.egress_policy)?;
         let snapshot_name = if payload.format == SnapshotFormat::DaytonaRef {
             let manifest: DaytonaSnapshotManifest = serde_json::from_slice(&payload.bytes)
                 .context("decoding Daytona snapshot manifest")?;
@@ -341,7 +331,12 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
         };
         let spec_hash = sandbox_spec_hash(&request.spec);
         let sandbox = self
-            .create_sandbox(&request, &spec_hash, Some(&snapshot_name), network)
+            .create_sandbox(
+                &request,
+                &spec_hash,
+                Some(&snapshot_name),
+                network_block_all,
+            )
             .await?;
         self.wait_until_started(&sandbox.id).await?;
         Ok(Arc::new(DaytonaSandboxHandle {
@@ -1408,11 +1403,6 @@ struct DaytonaCreateRequest {
     auto_stop_interval: u32,
     #[serde(rename = "networkBlockAll")]
     network_block_all: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DaytonaNetworkConfig {
-    block_all: bool,
 }
 
 #[derive(Debug, Serialize)]

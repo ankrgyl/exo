@@ -3503,11 +3503,7 @@ fn select_egress_policy(
     egress_policy: Option<EgressPolicy>,
     enable_networking: Option<bool>,
 ) -> EgressPolicy {
-    egress_policy.unwrap_or_else(|| {
-        enable_networking
-            .map(legacy_egress_policy)
-            .unwrap_or_default()
-    })
+    egress_policy.unwrap_or_else(|| legacy_egress_policy(enable_networking.unwrap_or(true)))
 }
 
 async fn find_matching_stored_sandbox(
@@ -3970,7 +3966,6 @@ impl StoredSandbox {
             default_workdir: Some(default_workdir),
             file_system_mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            // Explicitly enabling network harness
             enable_networking: true,
             egress_policy: Some(SandboxNetworkPolicy::Enabled.into()),
             idle_seconds: 0,
@@ -4884,7 +4879,10 @@ mod egress_policy_tests {
             select_egress_policy(None, Some(false)),
             legacy_egress_policy(false)
         );
-        assert_eq!(select_egress_policy(None, None), EgressPolicy::default());
+        assert_eq!(
+            resolve_egress_policy(None, None).unwrap(),
+            legacy_egress_policy(true)
+        );
         assert!(resolve_egress_policy(Some(policy), Some(true)).is_err());
     }
 }

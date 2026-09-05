@@ -1253,7 +1253,11 @@ fn sandbox_created_events(sandbox_id: &SandboxId, request: CreateSandboxRequest)
             default_workdir: request.default_workdir.unwrap_or_default(),
             file_system_mounts: request.file_system_mounts.unwrap_or_default(),
             durable_file_systems: request.durable_file_systems.unwrap_or_default(),
-            enable_networking: request.enable_networking.unwrap_or(true),
+            enable_networking: request.egress_policy.as_ref().map_or(
+                request.enable_networking.unwrap_or(true),
+                exoharness::EgressPolicy::permits_unrestricted_egress,
+            ),
+            egress_policy: request.egress_policy,
             idle_seconds: request.idle_seconds.unwrap_or(60),
         },
         EventData::SandboxStarted {
@@ -1391,7 +1395,11 @@ mod tests {
                 default_workdir: Some("/workspace".to_string()),
                 file_system_mounts: Some(Vec::new()),
                 durable_file_systems: None,
-                enable_networking: Some(false),
+                enable_networking: None,
+                egress_policy: Some(exoharness::EgressPolicy {
+                    default_deny: false,
+                    ..Default::default()
+                }),
                 idle_seconds: Some(120),
             })
             .await
@@ -1410,6 +1418,11 @@ mod tests {
             .expect("remote events should load")
             .events;
         assert_eq!(remote_events.len(), 2);
+        assert!(matches!(
+            &remote_events[0].data,
+            EventData::SandboxCreated { enable_networking: true, egress_policy: Some(policy), .. }
+                if policy.permits_unrestricted_egress()
+        ));
         let sandboxes = conversation
             .list_sandboxes()
             .await

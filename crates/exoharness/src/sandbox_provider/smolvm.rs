@@ -32,9 +32,7 @@ use crate::sandbox::{
     WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_OWNER_PID_LABEL, owner_pid_is_alive, run_command,
     spawn_sandbox_process,
 };
-use crate::{
-    EgressCapabilities, EgressPolicy, SandboxAttachment, validate_egress_policy_capabilities,
-};
+use crate::{EgressCapabilities, SandboxAttachment};
 
 /// Default binary name; overridable with `SMOLVM_BIN` for a non-PATH install.
 const SMOLVM_BIN_ENV: &str = "SMOLVM_BIN";
@@ -423,10 +421,6 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
             default_deny: true,
             ..EgressCapabilities::default()
         }
-    }
-
-    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
-        validate_egress_policy_capabilities(policy, self.egress_capabilities())
     }
 
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {

@@ -33,10 +33,7 @@ use crate::sandbox::{
     BoxSandboxTcpStream, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
     SandboxCommandOutput, SandboxRequest, SnapshotFormat, SnapshotPayload,
 };
-use crate::{
-    EgressCapabilities, EgressPolicy, SandboxAttachment, SandboxProcessParts,
-    validate_egress_policy_capabilities,
-};
+use crate::{EgressCapabilities, SandboxAttachment, SandboxProcessParts};
 
 use super::FirecrackerLimaConfig;
 use super::firecracker::FirecrackerConfig;
@@ -119,10 +116,6 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
             default_deny: true,
             ..EgressCapabilities::default()
         }
-    }
-
-    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
-        validate_egress_policy_capabilities(policy, self.egress_capabilities())
     }
 
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {

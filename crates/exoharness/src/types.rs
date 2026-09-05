@@ -654,6 +654,8 @@ pub struct CreateSandboxRequest {
     pub file_system_mounts: Option<Vec<FileSystemMount>>,
     pub durable_file_systems: Option<Vec<DurableFileSystem>>,
     pub enable_networking: Option<bool>,
+    /// Explicit egress restrictions. Cannot be combined with `enable_networking`.
+    /// Omitting both retains the legacy unrestricted default; an empty policy denies egress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_policy: Option<EgressPolicy>,
     pub idle_seconds: Option<u64>,

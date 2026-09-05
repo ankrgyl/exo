@@ -9,7 +9,7 @@ pub type DomainPattern = String;
 ///
 /// This network policy is limited to rules every supported provider can either
 /// enforce or explicitly reject. Provider adapters compile it to their native
-/// firewall configuration
+/// firewall configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EgressPolicy {
@@ -41,11 +41,15 @@ impl EgressPolicy {
     /// Whether this policy permits unrestricted outbound access.
     pub fn permits_unrestricted_egress(&self) -> bool {
         !self.default_deny
+            && self.allowed_domains.is_empty()
+            && self.allowed_cidrs.is_empty()
+            && self.denied_domains.is_empty()
+            && self.denied_cidrs.is_empty()
     }
 }
 
 /// Egress-policy features a backend can enforce.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EgressCapabilities {
     /// Enforces `EgressPolicy::default_deny`.
     pub default_deny: bool,
@@ -57,26 +61,11 @@ pub struct EgressCapabilities {
     pub domain_denylist: bool,
     /// Enforces `EgressPolicy::denied_cidrs`.
     pub cidr_denylist: bool,
-    /// Applies changes to a running sandbox.
-    pub live_updates: bool,
-}
-
-impl Default for EgressCapabilities {
-    fn default() -> Self {
-        Self {
-            default_deny: false,
-            domain_allowlist: false,
-            cidr_allowlist: false,
-            domain_denylist: false,
-            cidr_denylist: false,
-            live_updates: false,
-        }
-    }
 }
 
 /// Validates that `policy` asks only for restrictions the backend can enforce.
 ///
-/// An unrestricted policy (`default_deny: false` with no allowlists) is valid
+/// An unrestricted policy (`default_deny: false` with no rules) is valid
 /// for every backend. Backends must reject every other policy unless their
 /// reported capabilities cover it; accepting a policy that is silently weaker
 /// than requested would be a security bug.
@@ -119,9 +108,39 @@ mod tests {
 
     #[test]
     fn defaults_to_denied_egress() {
-        assert_eq!(EgressPolicy::default().default_deny, true);
+        assert!(EgressPolicy::default().default_deny);
         let decoded: EgressPolicy = serde_json::from_str("{}").expect("deserialize policy");
         assert_eq!(decoded, EgressPolicy::default());
+    }
+
+    #[test]
+    fn unrestricted_egress_excludes_every_restriction() {
+        let unrestricted = EgressPolicy {
+            default_deny: false,
+            ..EgressPolicy::default()
+        };
+        assert!(unrestricted.permits_unrestricted_egress());
+        for policy in [
+            EgressPolicy::default(),
+            EgressPolicy {
+                allowed_domains: vec!["example.com".into()],
+                ..unrestricted.clone()
+            },
+            EgressPolicy {
+                denied_domains: vec!["example.com".into()],
+                ..unrestricted.clone()
+            },
+            EgressPolicy {
+                allowed_cidrs: vec!["192.0.2.0/24".parse().unwrap()],
+                ..unrestricted.clone()
+            },
+            EgressPolicy {
+                denied_cidrs: vec!["192.0.2.0/24".parse().unwrap()],
+                ..unrestricted
+            },
+        ] {
+            assert!(!policy.permits_unrestricted_egress(), "{policy:?}");
+        }
     }
 
     #[test]

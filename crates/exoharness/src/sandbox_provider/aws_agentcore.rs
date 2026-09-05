@@ -8,15 +8,13 @@ use aws_sdk_bedrockagentcore::Client;
 use aws_sdk_bedrockagentcore::primitives::Blob;
 use serde::{Deserialize, Serialize};
 
+use crate::SandboxAttachment;
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput,
     SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload, sandbox_spec_hash,
     validate_durable_file_systems,
 };
 use crate::sandbox_provider::process_bridge;
-use crate::{
-    EgressCapabilities, EgressPolicy, SandboxAttachment, validate_egress_policy_capabilities,
-};
 
 pub fn default_aws_agentcore_image() -> String {
     String::new()
@@ -96,14 +94,6 @@ impl AwsAgentCoreSandboxBackend {
 impl ManagedSandboxBackend for AwsAgentCoreSandboxBackend {
     fn is_local(&self) -> bool {
         false
-    }
-
-    fn egress_capabilities(&self) -> EgressCapabilities {
-        EgressCapabilities::default()
-    }
-
-    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
-        validate_egress_policy_capabilities(policy, self.egress_capabilities())
     }
 
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {

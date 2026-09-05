@@ -25,10 +25,7 @@ use crate::sandbox::{
     WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
 };
 use crate::sandbox_provider::{process_bridge, shell_quote};
-use crate::{
-    DomainPattern, EgressCapabilities, EgressPolicy, SandboxAttachment,
-    validate_egress_policy_capabilities,
-};
+use crate::{DomainPattern, EgressCapabilities, EgressPolicy, SandboxAttachment};
 
 pub const DEFAULT_VERCEL_API_URL: &str = "https://vercel.com/api";
 
@@ -203,7 +200,13 @@ impl ManagedSandboxBackend for VercelSandboxBackend {
     }
 
     fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
-        validate_egress_policy_capabilities(policy, self.egress_capabilities())
+        crate::validate_egress_policy_capabilities(policy, self.egress_capabilities())?;
+        if !policy.default_deny && !policy.denied_cidrs.is_empty() {
+            bail!(
+                "Vercel CIDR denylists require default_deny; default-allow with exceptions is not supported"
+            );
+        }
+        Ok(())
     }
 
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
@@ -863,6 +866,23 @@ mod tests {
             project_id: "project".to_string(),
         })
         .expect("create Vercel backend");
+        let denylist = EgressPolicy {
+            default_deny: false,
+            denied_cidrs: vec!["198.51.100.0/24".parse().unwrap()],
+            ..EgressPolicy::default()
+        };
+        assert!(
+            backend
+                .compile_egress_policy(&denylist)
+                .unwrap_err()
+                .to_string()
+                .contains("require default_deny")
+        );
+        let denylist = EgressPolicy {
+            default_deny: true,
+            ..denylist
+        };
+        assert!(backend.compile_egress_policy(&denylist).is_ok());
         let policy = EgressPolicy {
             allowed_domains: vec!["api.github.com".to_string(), "*.vercel.com".to_string()],
             allowed_cidrs: vec!["192.0.2.0/24".parse().expect("valid CIDR")],

@@ -75,6 +75,7 @@ async fn agent_runs_a_command_in_a_smolvm_microvm() {
             durable_file_systems: None,
             // Off, so reaching the guest kernel proves the VM boundary.
             enable_networking: Some(false),
+            egress_policy: None,
             idle_seconds: Some(120),
         })
         .await
@@ -198,6 +199,7 @@ async fn agent_runs_the_default_sandbox_shape() {
             durable_file_systems: None,
             // Left unset on purpose: this is the whole point of the test.
             enable_networking: None,
+            egress_policy: None,
             idle_seconds: None,
         })
         .await

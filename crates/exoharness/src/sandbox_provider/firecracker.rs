@@ -50,7 +50,6 @@ use crate::sandbox::{
 use crate::sandbox_provider::process_bridge;
 use crate::{
     EgressCapabilities, EgressPolicy, FileSystemMountMode, SandboxAttachment, SandboxProcessParts,
-    validate_egress_policy_capabilities,
 };
 
 use super::firecracker_image::resolve_image;
@@ -1041,10 +1040,6 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
             default_deny: true,
             ..EgressCapabilities::default()
         }
-    }
-
-    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
-        validate_egress_policy_capabilities(policy, self.egress_capabilities())
     }
 
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {

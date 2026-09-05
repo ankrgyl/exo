@@ -674,10 +674,6 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
         }
     }
 
-    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
-        validate_egress_policy_capabilities(policy, self.egress_capabilities())
-    }
-
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
         match self.cli {
             ContainerCliFlavor::Docker => &DOCKER_CONSUMABLE_SNAPSHOT_FORMATS,
@@ -1044,14 +1040,6 @@ impl LocalProcessSandboxBackend {
 impl ManagedSandboxBackend for LocalProcessSandboxBackend {
     fn is_local(&self) -> bool {
         true
-    }
-
-    fn egress_capabilities(&self) -> EgressCapabilities {
-        EgressCapabilities::default()
-    }
-
-    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
-        validate_egress_policy_capabilities(policy, self.egress_capabilities())
     }
 
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {

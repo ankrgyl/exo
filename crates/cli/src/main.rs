@@ -2836,6 +2836,7 @@ async fn start_sandbox(
             durable_file_systems: (!durable_file_systems.is_empty())
                 .then_some(durable_file_systems),
             enable_networking: networking.map(EnabledDisabled::enabled),
+            egress_policy: None,
             idle_seconds,
         })
         .await?;

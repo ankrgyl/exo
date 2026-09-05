@@ -26,13 +26,11 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use url::Url;
 
+use crate::SandboxAttachment;
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput,
     SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload, WARM_SANDBOX_KEY_LABEL,
     WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
-};
-use crate::{
-    EgressCapabilities, EgressPolicy, SandboxAttachment, validate_egress_policy_capabilities,
 };
 
 pub const DEFAULT_SPRITES_API_URL: &str = "https://api.sprites.dev";
@@ -173,14 +171,6 @@ impl SpritesSandboxBackend {
 impl ManagedSandboxBackend for SpritesSandboxBackend {
     fn is_local(&self) -> bool {
         false
-    }
-
-    fn egress_capabilities(&self) -> EgressCapabilities {
-        EgressCapabilities::default()
-    }
-
-    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
-        validate_egress_policy_capabilities(policy, self.egress_capabilities())
     }
 
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
