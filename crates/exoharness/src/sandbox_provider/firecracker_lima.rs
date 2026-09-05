@@ -154,6 +154,20 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         bail!("Firecracker sandboxes do not support external attachments")
     }
 
+    async fn delete_snapshot(&self, payload: SnapshotPayload) -> Result<()> {
+        match self
+            .request(FirecrackerBridgeRequest::DeleteSnapshot {
+                config: self.config.clone(),
+                format: payload.format,
+                payload: BASE64.encode(payload.bytes),
+            })
+            .await?
+        {
+            FirecrackerBridgeResponse::Unit => Ok(()),
+            _ => bail!("Firecracker Lima bridge returned the wrong response to delete snapshot"),
+        }
+    }
+
     async fn terminate(&self, request: SandboxRequest) -> Result<()> {
         match self
             .request(FirecrackerBridgeRequest::Terminate {
@@ -308,6 +322,10 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
 
     async fn detach(&self) -> Result<SandboxAttachment> {
         bail!("Firecracker sandboxes cannot be detached")
+    }
+
+    async fn delete_snapshot(&self, payload: SnapshotPayload) -> Result<()> {
+        self.backend.delete_snapshot(payload).await
     }
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {

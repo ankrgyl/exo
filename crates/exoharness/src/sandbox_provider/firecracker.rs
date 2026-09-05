@@ -117,6 +117,10 @@ const JAILED_VSOCK: &str = "/run/exo.vsock";
 const FIRECRACKER_API_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 const FIRECRACKER_API_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRECRACKER_SNAPSHOT_CREATE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const SNAPSHOT_DELETE_FILE: &str = "deleted";
+const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const SNAPSHOT_STATE_RESERVE_BYTES: u64 = 16 * 1024 * 1024;
 const SNAPSHOT_LEASE_FILE: &str = "lease";
 const SNAPSHOT_FORK_TEMPLATE_FILE: &str = "fork-template";
 // Firecracker forwards guest packets without filtering them. Keep special-use,
@@ -1116,6 +1120,10 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         bail!("Firecracker sandboxes do not support external attachments")
     }
 
+    async fn delete_snapshot(&self, payload: SnapshotPayload) -> Result<()> {
+        self.shared.delete_snapshot(payload).await
+    }
+
     async fn terminate(&self, request: SandboxRequest) -> Result<()> {
         let persisted_machine_id = request
             .provider_state
@@ -1382,6 +1390,10 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
         bail!("Firecracker sandboxes cannot be detached")
     }
 
+    async fn delete_snapshot(&self, payload: SnapshotPayload) -> Result<()> {
+        self.shared.delete_snapshot(payload).await
+    }
+
     async fn snapshot(&self) -> Result<SnapshotPayload> {
         let _lifecycle_guard = self
             .shared
@@ -1408,6 +1420,22 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
 }
 
 impl Shared {
+    async fn delete_snapshot(&self, payload: SnapshotPayload) -> Result<()> {
+        let manifest = FirecrackerSnapshotManifest::from_payload(payload)?;
+        let config = self.config.clone();
+        tokio::task::spawn_blocking(move || {
+            let directory = snapshot_template_dir(&config, &manifest.template_key)?;
+            if !directory.try_exists()? {
+                return Ok(());
+            }
+            File::create(directory.join(SNAPSHOT_DELETE_FILE))?.sync_all()?;
+            reap_orphaned_fork_snapshot_templates_blocking(&config)?;
+            Ok(())
+        })
+        .await
+        .context("joining Firecracker snapshot deletion")?
+    }
+
     async fn reap_orphaned_fork_snapshot_templates(&self) {
         let config = self.config.clone();
         match tokio::task::spawn_blocking(move || {
@@ -1810,6 +1838,7 @@ impl Shared {
             })
             .await
             .context("joining Firecracker file cleanup")??;
+            self.reap_orphaned_fork_snapshot_templates().await;
         }
         Ok(())
     }
@@ -3380,7 +3409,18 @@ fn open_snapshot_template_lease(config: &FirecrackerConfig, key: &str) -> Result
     }
     flock(&file, FlockOperation::LockShared)
         .with_context(|| format!("locking Firecracker snapshot lease {}", path.display()))?;
+    if snapshot_is_deleted_or_expired(&snapshot_template_dir(config, key)?)? {
+        bail!("Firecracker snapshot is deleted or expired");
+    }
     Ok(file)
+}
+
+fn snapshot_is_deleted_or_expired(directory: &Path) -> Result<bool> {
+    if directory.join(SNAPSHOT_DELETE_FILE).try_exists()? {
+        return Ok(true);
+    }
+    let created = fs::metadata(directory.join(SNAPSHOT_LEASE_FILE))?.modified()?;
+    Ok(created.elapsed().unwrap_or(Duration::ZERO) >= SNAPSHOT_MAX_AGE)
 }
 
 fn referenced_snapshot_template_keys(state_root: &Path) -> Result<HashSet<String>> {
@@ -3431,7 +3471,8 @@ fn reap_orphaned_fork_snapshot_templates_blocking(
         };
         if validate_snapshot_key(&key).is_err()
             || referenced.contains(&key)
-            || !is_fork_snapshot_template(&entry.path())
+            || !(is_fork_snapshot_template(&entry.path())
+                || snapshot_is_deleted_or_expired(&entry.path())?)
         {
             continue;
         }
@@ -3462,8 +3503,10 @@ fn reap_orphaned_fork_snapshot_templates_blocking(
                 });
             }
         }
-        remove_directory_if_present(&entry.path())?;
-        removed.push(key);
+        if !referenced_snapshot_template_keys(&config.state_root)?.contains(&key) {
+            remove_directory_if_present(&entry.path())?;
+            removed.push(key);
+        }
     }
     Ok(removed)
 }
@@ -3708,12 +3751,64 @@ fn remove_directory_if_present(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn snapshot_directory_bytes(directory: &Path) -> Result<u64> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let bytes = if kind.is_dir() {
+            snapshot_directory_bytes(&entry.path())?
+        } else if kind.is_file() {
+            entry.metadata()?.len()
+        } else {
+            bail!("unexpected file in Firecracker snapshot storage");
+        };
+        total = total.checked_add(bytes).context("snapshot size overflow")?;
+    }
+    Ok(total)
+}
+
+fn enforce_snapshot_budget(config: &FirecrackerConfig, capture_bytes: u64) -> Result<()> {
+    let retained = snapshot_directory_bytes(&config.state_root.join("snapshots"))?;
+    if retained
+        .checked_add(capture_bytes)
+        .is_none_or(|total| total > MAX_SNAPSHOT_BYTES)
+    {
+        bail!("Firecracker snapshot storage budget exhausted");
+    }
+    Ok(())
+}
+
 fn capture_snapshot_template(
     config: &FirecrackerConfig,
     source: &MachineRecord,
     template_key: &str,
     lifecycle: SnapshotTemplateLifecycle,
 ) -> Result<File> {
+    let capture_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(config.state_root.join("snapshot-capture.lock"))?;
+    flock(&capture_lock, FlockOperation::LockExclusive)?;
+    reap_orphaned_fork_snapshot_templates_blocking(config)?;
+    let root = jail_root(config, &source.machine_id);
+    let disk_bytes = fs::metadata(root.join("overlay.ext4"))?.len();
+    let capture_bytes = u64::from(source.runtime.memory_mib)
+        .checked_mul(1024 * 1024)
+        .and_then(|bytes| bytes.checked_add(SNAPSHOT_STATE_RESERVE_BYTES))
+        .and_then(|bytes| bytes.checked_mul(2))
+        .and_then(|bytes| bytes.checked_add(disk_bytes))
+        .context("computing Firecracker snapshot capture size")?;
+    enforce_snapshot_budget(config, capture_bytes)?;
+    let filesystem = rustix::fs::statvfs(&config.state_root)?;
+    let available = filesystem.f_bavail.saturating_mul(filesystem.f_frsize);
+    let reserve =
+        (filesystem.f_blocks.saturating_mul(filesystem.f_frsize) / 10).max(1024 * 1024 * 1024);
+    if capture_bytes > available.saturating_sub(reserve) {
+        bail!("insufficient free disk space for Firecracker snapshot and host reserve");
+    }
     let destination = snapshot_template_dir(config, template_key)?;
     if destination.try_exists()? {
         remove_directory_if_present(&destination)?;
