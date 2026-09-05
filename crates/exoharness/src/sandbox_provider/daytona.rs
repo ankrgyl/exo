@@ -107,6 +107,11 @@ impl DaytonaSandboxBackend {
         format!("{}{}", self.api_url, path)
     }
 
+    fn compile_egress_policy(&self, policy: &EgressPolicy) -> Result<bool> {
+        self.validate_egress_policy(policy)?;
+        Ok(policy.default_deny)
+    }
+
     async fn find_sandbox_by_labels(
         &self,
         key_label: &str,
@@ -142,6 +147,7 @@ impl DaytonaSandboxBackend {
         request: &SandboxRequest,
         spec_hash: &str,
         snapshot_name: Option<&str>,
+        network: DaytonaNetworkConfig,
     ) -> Result<DaytonaSandbox> {
         let mut labels = HashMap::new();
         labels.insert(WARM_SANDBOX_KEY_LABEL.to_string(), request.key.to_string());
@@ -172,7 +178,7 @@ impl DaytonaSandboxBackend {
             labels,
             env: HashMap::new(),
             auto_stop_interval: auto_stop_minutes,
-            network_block_all: request.spec.egress_policy.default_deny,
+            network_block_all: network.block_all,
         };
 
         let response = self
@@ -269,8 +275,10 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        self.validate_egress_policy(&request.spec.egress_policy)?;
         reject_unsupported_mounts(&request)?;
+        let network = DaytonaNetworkConfig {
+            block_all: self.compile_egress_policy(&request.spec.egress_policy)?,
+        };
         let spec_hash = sandbox_spec_hash(&request.spec);
 
         // Reuse a matching sandbox if one exists (also how we recover across exo
@@ -287,7 +295,10 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
                 }
                 existing
             }
-            _ => self.create_sandbox(&request, &spec_hash, None).await?,
+            _ => {
+                self.create_sandbox(&request, &spec_hash, None, network)
+                    .await?
+            }
         };
 
         self.wait_until_started(&sandbox.id).await?;
@@ -313,6 +324,9 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_unsupported_mounts(&request)?;
+        let network = DaytonaNetworkConfig {
+            block_all: self.compile_egress_policy(&request.spec.egress_policy)?,
+        };
         let snapshot_name = if payload.format == SnapshotFormat::DaytonaRef {
             let manifest: DaytonaSnapshotManifest = serde_json::from_slice(&payload.bytes)
                 .context("decoding Daytona snapshot manifest")?;
@@ -327,7 +341,7 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
         };
         let spec_hash = sandbox_spec_hash(&request.spec);
         let sandbox = self
-            .create_sandbox(&request, &spec_hash, Some(&snapshot_name))
+            .create_sandbox(&request, &spec_hash, Some(&snapshot_name), network)
             .await?;
         self.wait_until_started(&sandbox.id).await?;
         Ok(Arc::new(DaytonaSandboxHandle {
@@ -1394,6 +1408,11 @@ struct DaytonaCreateRequest {
     auto_stop_interval: u32,
     #[serde(rename = "networkBlockAll")]
     network_block_all: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DaytonaNetworkConfig {
+    block_all: bool,
 }
 
 #[derive(Debug, Serialize)]

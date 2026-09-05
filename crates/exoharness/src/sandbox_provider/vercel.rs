@@ -26,7 +26,8 @@ use crate::sandbox::{
 };
 use crate::sandbox_provider::{process_bridge, shell_quote};
 use crate::{
-    EgressCapabilities, EgressPolicy, SandboxAttachment, validate_egress_policy_capabilities,
+    DomainPattern, EgressCapabilities, EgressPolicy, SandboxAttachment,
+    validate_egress_policy_capabilities,
 };
 
 pub const DEFAULT_VERCEL_API_URL: &str = "https://vercel.com/api";
@@ -70,6 +71,44 @@ impl VercelSandboxBackend {
         format!("{}{}", self.api_url, path)
     }
 
+    fn compile_egress_policy(&self, policy: &EgressPolicy) -> Result<Option<VercelNetworkPolicy>> {
+        self.validate_egress_policy(policy)?;
+        if policy.default_deny
+            && policy.allowed_domains.is_empty()
+            && policy.allowed_cidrs.is_empty()
+            && policy.denied_cidrs.is_empty()
+        {
+            return Ok(Some(VercelNetworkPolicy::DenyAll { mode: "deny-all" }));
+        }
+
+        if !policy.default_deny
+            && policy.allowed_domains.is_empty()
+            && policy.allowed_cidrs.is_empty()
+            && policy.denied_cidrs.is_empty()
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(VercelNetworkPolicy::Restricted(
+            VercelRestrictedNetworkPolicy {
+                allow: policy.allowed_domains.clone(),
+                subnets: (!policy.allowed_cidrs.is_empty() || !policy.denied_cidrs.is_empty())
+                    .then(|| VercelSubnetPolicy {
+                        allow: policy
+                            .allowed_cidrs
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect(),
+                        deny: policy
+                            .denied_cidrs
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect(),
+                    }),
+            },
+        )))
+    }
+
     async fn get_sandbox_session(
         &self,
         name: &str,
@@ -103,6 +142,7 @@ impl VercelSandboxBackend {
         request: &SandboxRequest,
         name: &str,
         spec_hash: &str,
+        network_policy: Option<VercelNetworkPolicy>,
     ) -> Result<VercelSandboxSessionResponse> {
         let mut tags = HashMap::new();
         tags.insert(WARM_SANDBOX_KEY_LABEL.to_string(), request.key.to_string());
@@ -123,13 +163,7 @@ impl VercelSandboxBackend {
             timeout: request.lifecycle.idle_ttl.map(duration_to_millis),
             env: HashMap::new(),
             tags,
-            network_policy: if request.spec.egress_policy.default_deny {
-                Some(VercelNetworkPolicy {
-                    mode: "deny-all".to_string(),
-                })
-            } else {
-                None
-            },
+            network_policy,
         };
 
         let response = self
@@ -161,6 +195,9 @@ impl ManagedSandboxBackend for VercelSandboxBackend {
     fn egress_capabilities(&self) -> EgressCapabilities {
         EgressCapabilities {
             default_deny: true,
+            domain_allowlist: true,
+            cidr_allowlist: true,
+            cidr_denylist: true,
             ..EgressCapabilities::default()
         }
     }
@@ -174,14 +211,14 @@ impl ManagedSandboxBackend for VercelSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        self.validate_egress_policy(&request.spec.egress_policy)?;
         reject_unsupported_mounts(&request)?;
+        let network_policy = self.compile_egress_policy(&request.spec.egress_policy)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let sandbox_name = vercel_sandbox_name(&request, &spec_hash);
         let response = match self.get_sandbox_session(&sandbox_name).await? {
             Some(existing) => existing,
             None => {
-                self.create_sandbox(&request, &sandbox_name, &spec_hash)
+                self.create_sandbox(&request, &sandbox_name, &spec_hash, network_policy)
                     .await?
             }
         };
@@ -697,8 +734,26 @@ struct VercelCreateSandboxRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct VercelNetworkPolicy {
-    mode: String,
+#[serde(untagged)]
+enum VercelNetworkPolicy {
+    DenyAll { mode: &'static str },
+    Restricted(VercelRestrictedNetworkPolicy),
+}
+
+#[derive(Debug, Serialize)]
+struct VercelRestrictedNetworkPolicy {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    allow: Vec<DomainPattern>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subnets: Option<VercelSubnetPolicy>,
+}
+
+#[derive(Debug, Serialize)]
+struct VercelSubnetPolicy {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    allow: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    deny: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -778,6 +833,9 @@ mod tests {
             backend.egress_capabilities(),
             EgressCapabilities {
                 default_deny: true,
+                domain_allowlist: true,
+                cidr_allowlist: true,
+                cidr_denylist: true,
                 ..EgressCapabilities::default()
             }
         );
@@ -789,13 +847,51 @@ mod tests {
         assert!(
             backend
                 .validate_egress_policy(&EgressPolicy {
-                    default_deny: true,
-                    allowed_domains: vec!["api.github.com".to_string()],
-                    allowed_cidrs: Vec::new(),
-                    denied_domains: Vec::new(),
-                    denied_cidrs: Vec::new(),
+                    denied_domains: vec!["api.github.com".to_string()],
+                    ..EgressPolicy::default()
                 })
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn compiles_supported_egress_rules_to_vercel_network_policy() {
+        let backend = VercelSandboxBackend::new(VercelConfig {
+            api_token: "test-token".to_string(),
+            api_url: DEFAULT_VERCEL_API_URL.to_string(),
+            team_id: "team".to_string(),
+            project_id: "project".to_string(),
+        })
+        .expect("create Vercel backend");
+        let policy = EgressPolicy {
+            allowed_domains: vec!["api.github.com".to_string(), "*.vercel.com".to_string()],
+            allowed_cidrs: vec!["192.0.2.0/24".parse().expect("valid CIDR")],
+            denied_cidrs: vec!["198.51.100.0/24".parse().expect("valid CIDR")],
+            ..EgressPolicy::default()
+        };
+
+        let compiled = backend
+            .compile_egress_policy(&policy)
+            .expect("compile Vercel policy")
+            .expect("restricted policy");
+        assert_eq!(
+            serde_json::to_value(compiled).expect("serialize Vercel policy"),
+            serde_json::json!({
+                "allow": ["api.github.com", "*.vercel.com"],
+                "subnets": {
+                    "allow": ["192.0.2.0/24"],
+                    "deny": ["198.51.100.0/24"],
+                },
+            })
+        );
+
+        let deny_all = backend
+            .compile_egress_policy(&EgressPolicy::default())
+            .expect("compile default Vercel policy")
+            .expect("deny-all policy");
+        assert_eq!(
+            serde_json::to_value(deny_all).expect("serialize Vercel policy"),
+            serde_json::json!({ "mode": "deny-all" })
         );
     }
 }

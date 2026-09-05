@@ -190,6 +190,8 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         if target.lifecycle.idle_ttl.is_none() {
             bail!("Firecracker Lima forks require a managed sandbox lifecycle");
         }
+        self.validate_egress_policy(&source.spec.egress_policy)?;
+        self.validate_egress_policy(&target.spec.egress_policy)?;
         let response = self
             .request(FirecrackerBridgeRequest::Fork {
                 config: self.config.clone(),
@@ -216,6 +218,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         if request.lifecycle.idle_ttl.is_none() {
             bail!("Firecracker Lima snapshot restores require a managed sandbox lifecycle");
         }
+        self.validate_egress_policy(&request.spec.egress_policy)?;
         let response = self
             .request(FirecrackerBridgeRequest::AcquireFromSnapshot {
                 config: self.config.clone(),

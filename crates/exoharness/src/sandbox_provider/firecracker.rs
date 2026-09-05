@@ -1103,6 +1103,8 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         target: SandboxRequest,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let mut source = prepare_request(source)?;
+        self.validate_egress_policy(&source.spec.egress_policy)?;
+        self.validate_egress_policy(&target.spec.egress_policy)?;
         let target = self.resolve_request(target).await?;
         if source.key == target.key {
             bail!("Firecracker fork source and target must be different sandboxes")
@@ -1162,6 +1164,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let manifest = FirecrackerSnapshotManifest::from_payload(payload)?;
+        self.validate_egress_policy(&request.spec.egress_policy)?;
         let request = self.resolve_request(request).await?;
         self.restore_snapshot(request, manifest, SnapshotTemplateLifecycle::Snapshot, None)
             .await

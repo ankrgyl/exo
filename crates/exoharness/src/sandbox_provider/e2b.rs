@@ -97,6 +97,11 @@ impl E2bSandboxBackend {
         format!("{}{}", self.api_url, path)
     }
 
+    fn compile_egress_policy(&self, policy: &EgressPolicy) -> Result<bool> {
+        self.validate_egress_policy(policy)?;
+        Ok(policy.permits_unrestricted_egress())
+    }
+
     async fn find_sandbox_by_metadata(
         &self,
         key_label: &str,
@@ -143,6 +148,7 @@ impl E2bSandboxBackend {
         request: &SandboxRequest,
         spec_hash: &str,
         template_id: &str,
+        network: E2bNetworkConfig,
     ) -> Result<E2bSandboxCreated> {
         let mut metadata = HashMap::new();
         metadata.insert(WARM_SANDBOX_KEY_LABEL.to_string(), request.key.to_string());
@@ -158,7 +164,7 @@ impl E2bSandboxBackend {
             timeout: timeout_secs,
             auto_pause,
             secure: self.secure,
-            allow_internet_access: request.spec.egress_policy.permits_unrestricted_egress(),
+            allow_internet_access: network.allow_internet_access,
             metadata,
         };
 
@@ -241,8 +247,10 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        self.validate_egress_policy(&request.spec.egress_policy)?;
         reject_host_mounts(&request)?;
+        let network = E2bNetworkConfig {
+            allow_internet_access: self.compile_egress_policy(&request.spec.egress_policy)?,
+        };
         let spec_hash = sandbox_spec_hash(&request.spec);
         let key_label = request.key.to_string();
         let template_id = resolve_template_id(&request.spec, &self.template_id);
@@ -269,7 +277,7 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
         }
 
         let sandbox = self
-            .create_sandbox(&request, &spec_hash, &template_id)
+            .create_sandbox(&request, &spec_hash, &template_id, network)
             .await?;
         Ok(Arc::new(E2bSandboxHandle {
             id: format!("e2b:{}", request.key),
@@ -303,9 +311,12 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
         }
         let manifest: E2bSnapshotManifest =
             serde_json::from_slice(&payload.bytes).context("decoding E2bSnapshot manifest")?;
+        let network = E2bNetworkConfig {
+            allow_internet_access: self.compile_egress_policy(&request.spec.egress_policy)?,
+        };
         let spec_hash = sandbox_spec_hash(&request.spec);
         let sandbox = self
-            .create_sandbox(&request, &spec_hash, &manifest.snapshot_id)
+            .create_sandbox(&request, &spec_hash, &manifest.snapshot_id, network)
             .await?;
         Ok(Arc::new(E2bSandboxHandle {
             id: format!("e2b-restored:{}", request.key),
@@ -1130,6 +1141,11 @@ struct E2bCreateRequest {
     secure: bool,
     allow_internet_access: bool,
     metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct E2bNetworkConfig {
+    allow_internet_access: bool,
 }
 
 #[derive(Debug, Serialize)]

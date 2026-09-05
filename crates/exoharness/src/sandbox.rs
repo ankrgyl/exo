@@ -783,6 +783,8 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
             bail!("restore-from-snapshot is not yet implemented for the apple-container backend");
         }
 
+        self.validate_egress_policy(&request.spec.egress_policy)?;
+
         let image_tag = docker_load_image(&self.container_bin, &payload.bytes).await?;
 
         // Build a fresh request that points at the loaded image. Mounts,

@@ -231,6 +231,7 @@ impl ManagedSandboxBackend for SpritesSandboxBackend {
                 sprite_name
             );
         }
+        self.validate_egress_policy(&request.spec.egress_policy)?;
         self.ensure_sprite(&sprite_name, &request).await?;
         restore_checkpoint_via_backend(
             &self.handle_backend(),

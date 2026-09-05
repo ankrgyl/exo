@@ -483,6 +483,7 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
             );
         }
         reject_unsupported_spec(&request.spec)?;
+        self.validate_egress_policy(&request.spec.egress_policy)?;
         if self.resolve_mode(&request).await != SmolvmExecutionMode::Warm {
             bail!(
                 "smolvm snapshots require warm mode (one-shot VMs hold no state to restore); \
