@@ -38,6 +38,7 @@ import {
   MessageScrollerViewport,
 } from "@/components/ui/message-scroller";
 import { Textarea } from "@/components/ui/textarea";
+import { createReconnectingWebSocket } from "@/reconnecting-websocket";
 import "./chat.css";
 
 function ChatApp() {
@@ -73,7 +74,7 @@ function ChatApp() {
   const remoteSeenRef = React.useRef(false);
   const seqRef = React.useRef(0);
   const textareaRef = React.useRef(null);
-  const wsRef = React.useRef(null);
+  const connectionRef = React.useRef(null);
 
   const addEvent = React.useCallback((event) => {
     setEvents((current) => [
@@ -136,7 +137,8 @@ function ChatApp() {
 
     return () => {
       disposed = true;
-      wsRef.current?.close();
+      connectionRef.current?.stop();
+      connectionRef.current = null;
     };
 
     async function start() {
@@ -149,76 +151,106 @@ function ChatApp() {
       }
 
       setStatusPart("data", { tone: "success", value: "ready" });
-      wsRef.current = connectRelay();
+      const connection = connectRelay();
+      connectionRef.current = connection;
+      connection.start();
     }
 
     function connectRelay() {
-      const wsUrl = new URL(`/chat/ws/${session.channelId}`, location.href);
-      wsUrl.protocol = location.protocol === "https:" ? "wss:" : "ws:";
-      wsUrl.searchParams.set("role", session.role);
+      return createReconnectingWebSocket({
+        createSocket() {
+          const wsUrl = new URL(`/chat/ws/${session.channelId}`, location.href);
+          wsUrl.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+          wsUrl.searchParams.set("role", session.role);
+          return new WebSocket(wsUrl);
+        },
+        onConnecting({ attempt }) {
+          if (attempt === 0) {
+            return;
+          }
+          setStatusPart("signal", {
+            tone: "warning",
+            value: "reconnecting",
+          });
+          setStatusPart("peer", { tone: "warning", value: "waiting" });
+          setComposer({ enabled: false, label: "Reconnecting" });
+        },
+        onOpen({ reconnected }) {
+          setStatusPart("signal", { tone: "success", value: "open" });
+          addNotice(
+            reconnected
+              ? "Connection restored. Waiting for the other peer..."
+              : session.role === "user"
+                ? "Waiting for the desktop peer..."
+                : "Waiting for the phone peer...",
+            reconnected ? "success" : "neutral",
+          );
+        },
+        onReconnectScheduled({ attempt, delayMs }) {
+          setStatusPart("signal", {
+            tone: "warning",
+            value: "reconnecting",
+          });
+          setStatusPart("peer", { tone: "warning", value: "waiting" });
+          setComposer({ enabled: false, label: "Reconnecting" });
+          if (attempt === 1) {
+            addNotice(
+              `Connection lost. Reconnecting in ${formatDelay(delayMs)}...`,
+            );
+          }
+        },
+        onTerminalClose() {
+          setStatusPart("signal", { tone: "danger", value: "replaced" });
+          setStatusPart("peer", { tone: "warning", value: "waiting" });
+          setComposer({ enabled: false, label: "Opened elsewhere" });
+          addNotice(
+            "This session was opened in a newer tab. Continue there instead.",
+            "danger",
+          );
+        },
+        onError() {
+          console.warn("ExoChat WebSocket error");
+        },
+        onMessage(event) {
+          void handleRelayMessage(event);
+        },
+      });
+    }
 
-      const ws = new WebSocket(wsUrl);
+    async function handleRelayMessage(event) {
+      let message;
+      try {
+        message = JSON.parse(event.data);
+      } catch (error) {
+        console.warn("Unable to parse relay message", error);
+        addNotice("Rejected a malformed relay message.", "danger");
+        return;
+      }
 
-      ws.addEventListener("open", () => {
-        setStatusPart("signal", { tone: "success", value: "open" });
+      if (!isRecord(message)) {
+        addNotice("Rejected a relay message that was not an object.", "danger");
+        return;
+      }
+
+      if (message.channel === "rendezvous" && message.type === "presence") {
+        handlePresence(Array.isArray(message.roles) ? message.roles : []);
+        return;
+      }
+
+      const frame = await decryptRelayFrame(
+        message,
+        relayKeyRef.current,
+        session.channelId,
+      );
+      if (!frame) {
         addNotice(
-          session.role === "user"
-            ? "Waiting for the desktop peer..."
-            : "Waiting for the phone peer...",
+          "Rejected a relay message that could not be decrypted.",
+          "danger",
         );
-      });
+        return;
+      }
 
-      ws.addEventListener("close", () => {
-        setStatusPart("signal", { tone: "danger", value: "closed" });
-        setStatusPart("peer", { tone: "warning", value: "waiting" });
-        setComposer({ enabled: false, label: "Closed" });
-      });
-
-      ws.addEventListener("error", () => {
-        setStatusPart("signal", { tone: "danger", value: "error" });
-        setComposer({ enabled: false, label: "Error" });
-      });
-
-      ws.addEventListener("message", async (event) => {
-        let message;
-        try {
-          message = JSON.parse(event.data);
-        } catch (error) {
-          console.warn("Unable to parse relay message", error);
-          addNotice("Rejected a malformed relay message.", "danger");
-          return;
-        }
-
-        if (!isRecord(message)) {
-          addNotice(
-            "Rejected a relay message that was not an object.",
-            "danger",
-          );
-          return;
-        }
-
-        if (message.channel === "rendezvous" && message.type === "presence") {
-          handlePresence(Array.isArray(message.roles) ? message.roles : []);
-          return;
-        }
-
-        const frame = await decryptRelayFrame(
-          message,
-          relayKeyRef.current,
-          session.channelId,
-        );
-        if (!frame) {
-          addNotice(
-            "Rejected a relay message that could not be decrypted.",
-            "danger",
-          );
-          return;
-        }
-
-        renderFrame(frame, false);
-      });
-
-      return ws;
+      renderFrame(frame, false);
     }
 
     function handlePresence(roles) {
@@ -314,8 +346,8 @@ function ChatApp() {
       return;
     }
 
-    const socket = wsRef.current;
-    if (!text || !socket || socket.readyState !== WebSocket.OPEN) {
+    const connection = connectionRef.current;
+    if (!text || !connection) {
       return;
     }
 
@@ -333,7 +365,13 @@ function ChatApp() {
         session,
         ++seqRef.current,
       );
-      socket.send(JSON.stringify(envelope));
+      if (!connection.send(JSON.stringify(envelope))) {
+        addNotice(
+          "The connection changed before this message could be sent. Please try again.",
+          "danger",
+        );
+        return;
+      }
     } catch (error) {
       console.warn("Unable to encrypt relay message", error);
       addNotice("Could not encrypt the message for the relay.", "danger");
@@ -777,6 +815,11 @@ function formatTime(value) {
     hour: "numeric",
     minute: "2-digit",
   }).format(value);
+}
+
+function formatDelay(delayMs) {
+  const seconds = delayMs / 1000;
+  return `${seconds} second${seconds === 1 ? "" : "s"}`;
 }
 
 function stripCodeLanguage(value) {
