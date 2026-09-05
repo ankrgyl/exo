@@ -1393,6 +1393,7 @@ mod tests {
                 name: None,
                 provider: SandboxProvider::LocalProcess,
                 image: "local-image".to_string(),
+                resources: Default::default(),
                 default_workdir: Some("/workspace".to_string()),
                 file_system_mounts: Some(Vec::new()),
                 durable_file_systems: None,

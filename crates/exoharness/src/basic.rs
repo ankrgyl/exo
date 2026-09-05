@@ -3474,6 +3474,7 @@ async fn prepare_sandbox_request(
         name: request.name,
         provider: request.provider,
         image,
+        resources: request.resources,
         default_workdir: request.default_workdir,
         file_system_mounts: request.file_system_mounts.unwrap_or_default(),
         durable_file_systems: request.durable_file_systems.unwrap_or_default(),
@@ -3523,6 +3524,7 @@ async fn find_matching_stored_sandbox(
         let comparable_image = sandbox.requested_image.as_ref().unwrap_or(&sandbox.image);
         if sandbox.provider != request.provider
             || comparable_image != &request.image
+            || sandbox.resources != request.resources
             || sandbox.default_workdir != request.default_workdir
             || sandbox.file_system_mounts != request.file_system_mounts
             || sandbox.durable_file_systems != request.durable_file_systems
@@ -3913,6 +3915,8 @@ struct StoredSandbox {
     name: Option<String>,
     provider: SandboxProvider,
     image: String,
+    #[serde(default)]
+    resources: crate::SandboxResourceShape,
     /// The image originally requested at creation, kept when a snapshot
     /// restore rewrites `image` to the restored tag. Named-sandbox matching
     /// compares against this so config-derived requests still resolve to the
@@ -3952,6 +3956,7 @@ impl StoredSandbox {
             name: None,
             provider: attachment.provider(),
             image: String::new(),
+            resources: Default::default(),
             requested_image: None,
             default_workdir: Some(default_workdir),
             file_system_mounts: Vec::new(),
@@ -3973,6 +3978,7 @@ struct PreparedSandboxRequest {
     name: Option<String>,
     provider: SandboxProvider,
     image: String,
+    resources: crate::SandboxResourceShape,
     default_workdir: Option<String>,
     file_system_mounts: Vec<FileSystemMount>,
     durable_file_systems: Vec<DurableFileSystem>,
@@ -3987,6 +3993,7 @@ impl PreparedSandboxRequest {
             name: self.name.clone(),
             provider: self.provider.clone(),
             image: self.image.clone(),
+            resources: self.resources,
             requested_image: None,
             default_workdir: self.default_workdir.clone(),
             file_system_mounts: self.file_system_mounts.clone(),
@@ -4454,13 +4461,14 @@ fn sandbox_request(
                 agent_id: agent_id.to_string(),
                 sandbox_id: sandbox_id.to_string(),
             },
-            SandboxOwner::Conversation(conversation_id) => SandboxKey::ConversationSandbox {
-                conversation_id: conversation_id.to_string(),
+            SandboxOwner::Conversation(thread_id) => SandboxKey::ConversationSandbox {
+                thread_id: thread_id.to_string(),
                 sandbox_id: sandbox_id.to_string(),
             },
         },
         spec: SandboxSpec {
             image: sandbox.image.clone(),
+            resources: sandbox.resources,
             mounts: sandbox
                 .file_system_mounts
                 .iter()
@@ -4865,6 +4873,7 @@ mod network_policy_tests {
             name: None,
             provider: SandboxProvider::LocalProcess,
             image: String::new(),
+            resources: Default::default(),
             default_workdir: None,
             file_system_mounts: None,
             durable_file_systems: None,

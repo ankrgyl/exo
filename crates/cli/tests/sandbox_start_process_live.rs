@@ -33,14 +33,15 @@ fn live_provider_secret(provider: &str, secret_name: &str) -> Option<String> {
     }
 }
 
-fn make_e2b_request(conversation_id: &str, sandbox_id: &str) -> SandboxRequest {
+fn make_e2b_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
         key: SandboxKey::ConversationSandbox {
-            conversation_id: conversation_id.into(),
+            thread_id: thread_id.into(),
             sandbox_id: sandbox_id.into(),
         },
         spec: SandboxSpec {
             image: e2b_template_id(),
+            resources: Default::default(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
             network_policy: SandboxNetworkPolicy::allow_all(),
@@ -82,14 +83,15 @@ fn sprites_config_from_env() -> Option<SpritesConfig> {
     })
 }
 
-fn make_sprites_request(conversation_id: &str, sandbox_id: &str) -> SandboxRequest {
+fn make_sprites_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
         key: SandboxKey::ConversationSandbox {
-            conversation_id: conversation_id.into(),
+            thread_id: thread_id.into(),
             sandbox_id: sandbox_id.into(),
         },
         spec: SandboxSpec {
             image: "default".into(),
+            resources: Default::default(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
             network_policy: SandboxNetworkPolicy::allow_all(),

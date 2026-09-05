@@ -2,8 +2,8 @@ use super::*;
 use crate::SandboxNetworkPolicy;
 use tokio::net::UnixListener;
 
-fn test_runtime() -> FirecrackerRuntimeFingerprint {
-    FirecrackerRuntimeFingerprint {
+fn test_host_runtime() -> FirecrackerHostFingerprint {
+    FirecrackerHostFingerprint {
         architecture: "x86_64".to_string(),
         protocol_version: PROTOCOL_VERSION,
         firecracker_version: "v1.16.1".to_string(),
@@ -11,10 +11,27 @@ fn test_runtime() -> FirecrackerRuntimeFingerprint {
         jailer_sha256: "jailer".to_string(),
         kernel_sha256: "kernel".to_string(),
         initramfs_sha256: "initramfs".to_string(),
-        vcpu_count: 2,
-        memory_mib: 4096,
         network_device_policy: FirecrackerNetworkDevicePolicy::default(),
     }
+}
+
+fn test_runtime() -> FirecrackerRuntimeFingerprint {
+    test_host_runtime().for_resources(SandboxResourceShape::default())
+}
+
+#[test]
+fn runtime_fingerprint_uses_requested_resources() {
+    let resources = SandboxResourceShape::new(8, 16_384).unwrap();
+    let runtime = test_host_runtime().for_resources(resources);
+    assert_eq!(runtime.vcpu_count, 8);
+    assert_eq!(runtime.memory_mib, 16_384);
+}
+
+#[test]
+fn firecracker_validates_provider_specific_resource_limits() {
+    validate_resource_shape(SandboxResourceShape::new(1, 128).unwrap()).unwrap();
+    assert!(validate_resource_shape(SandboxResourceShape::new(33, 4096).unwrap()).is_err());
+    assert!(validate_resource_shape(SandboxResourceShape::new(1, 127).unwrap()).is_err());
 }
 
 #[test]
@@ -448,7 +465,7 @@ fn snapshot_gc_reaps_only_unreferenced_fork_templates() {
             workspace_id: None,
             idle_ttl_seconds: Some(60),
             snapshot_template: Some(SnapshotTemplateReference {
-                key: referenced_key,
+                key: referenced_key.clone(),
                 lifecycle: SnapshotTemplateLifecycle::Machine,
             }),
             snapshot_network_slot: Some(0),
@@ -463,6 +480,22 @@ fn snapshot_gc_reaps_only_unreferenced_fork_templates() {
     assert!(!orphaned_fork.exists());
     assert!(explicit.exists());
     assert!(referenced.exists());
+    File::create(referenced.join(SNAPSHOT_DELETE_FILE)).unwrap();
+    assert!(
+        reap_orphaned_fork_snapshot_templates_blocking(&config)
+            .unwrap()
+            .is_empty()
+    );
+    fs::remove_file(manifest_path(
+        directory.path(),
+        "fc-0123456789abcdef-01234567",
+    ))
+    .unwrap();
+    assert_eq!(
+        reap_orphaned_fork_snapshot_templates_blocking(&config).unwrap(),
+        vec![referenced_key]
+    );
+    assert!(!referenced.exists());
 }
 
 #[test]
@@ -628,4 +661,79 @@ async fn vsock_request_uses_firecracker_handshake_and_framing() {
     let response = vsock_request(&socket, br#"{"type":"ping"}"#).await.unwrap();
     assert_eq!(response, br#"{"ok":true}"#);
     server.await.unwrap();
+}
+
+#[test]
+fn deleted_snapshot_waits_for_restore_lease_and_refuses_new_restores() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("snapshots")).unwrap();
+    fs::create_dir(directory.path().join("manifests")).unwrap();
+    let config = FirecrackerConfig {
+        state_root: directory.path().to_path_buf(),
+        ..Default::default()
+    };
+    let key = "f".repeat(64);
+    let snapshot =
+        create_snapshot_template(directory.path(), &key, SnapshotTemplateLifecycle::Snapshot);
+    let lease = open_snapshot_template_lease(&config, &key).unwrap();
+    File::create(snapshot.join(SNAPSHOT_DELETE_FILE)).unwrap();
+    assert!(open_snapshot_template_lease(&config, &key).is_err());
+    assert!(
+        reap_orphaned_fork_snapshot_templates_blocking(&config)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(snapshot.exists());
+    drop(lease);
+    assert_eq!(
+        reap_orphaned_fork_snapshot_templates_blocking(&config).unwrap(),
+        vec![key]
+    );
+    assert!(!snapshot.exists());
+}
+
+#[test]
+fn persistent_snapshot_expiry_reclaims_files() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("snapshots")).unwrap();
+    fs::create_dir(directory.path().join("manifests")).unwrap();
+    let config = FirecrackerConfig {
+        state_root: directory.path().to_path_buf(),
+        ..Default::default()
+    };
+    let key = "f".repeat(64);
+    let snapshot =
+        create_snapshot_template(directory.path(), &key, SnapshotTemplateLifecycle::Snapshot);
+    let lease = File::open(snapshot.join(SNAPSHOT_LEASE_FILE)).unwrap();
+    lease
+        .set_times(std::fs::FileTimes::new().set_modified(SystemTime::now() - SNAPSHOT_MAX_AGE))
+        .unwrap();
+    assert!(open_snapshot_template_lease(&config, &key).is_err());
+    assert_eq!(
+        reap_orphaned_fork_snapshot_templates_blocking(&config).unwrap(),
+        vec![key]
+    );
+    assert!(!snapshot.exists());
+}
+
+#[test]
+fn snapshot_budget_counts_retained_logical_bytes_and_pending_capture() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("snapshots")).unwrap();
+    let config = FirecrackerConfig {
+        state_root: directory.path().to_path_buf(),
+        ..Default::default()
+    };
+    let snapshot = create_snapshot_template(
+        directory.path(),
+        &"a".repeat(64),
+        SnapshotTemplateLifecycle::Snapshot,
+    );
+    File::create(snapshot.join("memory"))
+        .unwrap()
+        .set_len(1024)
+        .unwrap();
+    assert!(enforce_snapshot_budget(&config, MAX_SNAPSHOT_BYTES - 1024).is_ok());
+    assert!(enforce_snapshot_budget(&config, MAX_SNAPSHOT_BYTES - 1023).is_err());
+    assert!(enforce_snapshot_budget(&config, u64::MAX).is_err());
 }

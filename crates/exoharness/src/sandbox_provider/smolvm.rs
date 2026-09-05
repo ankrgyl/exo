@@ -1032,6 +1032,7 @@ mod tests {
             },
             spec: SandboxSpec {
                 image: "alpine".into(),
+                resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
                 network_policy: SandboxNetworkPolicy::deny_all(),
@@ -1151,7 +1152,7 @@ mod tests {
             sandbox_id: "sandbox-1".into(),
         };
         let b = SandboxKey::ConversationSandbox {
-            conversation_id: "agent-1".into(),
+            thread_id: "agent-1".into(),
             sandbox_id: "sandbox-1".into(),
         };
         assert_eq!(machine_name(&a), machine_name(&a));
@@ -1169,6 +1170,7 @@ mod tests {
     fn read_only_mounts_get_the_ro_suffix() {
         let spec = SandboxSpec {
             image: "alpine".into(),
+            resources: Default::default(),
             mounts: vec![
                 crate::sandbox::SandboxMount {
                     host_path: PathBuf::from("/host/rw"),

@@ -84,6 +84,7 @@ async fn teleport_docker_sandbox_to_daytona_keeps_files() {
             name: None,
             provider: SandboxProvider::Docker,
             image: "docker.io/library/ubuntu:24.04".into(),
+            resources: Default::default(),
             default_workdir: Some("/".into()),
             file_system_mounts: None,
             durable_file_systems: None,
@@ -146,6 +147,7 @@ async fn teleport_docker_sandbox_to_daytona_keeps_files() {
             name: None,
             provider: SandboxProvider::Docker,
             image: "docker.io/library/ubuntu:24.04".into(),
+            resources: Default::default(),
             default_workdir: Some("/".into()),
             file_system_mounts: Some(vec![FileSystemMount {
                 host_path: mount_dir.path().display().to_string(),

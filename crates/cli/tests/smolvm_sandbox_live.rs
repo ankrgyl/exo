@@ -91,6 +91,7 @@ fn request(
         },
         spec: SandboxSpec {
             image,
+            resources: Default::default(),
             mounts: vec![SandboxMount {
                 host_path: workspace.to_path_buf(),
                 guest_path: "/workspace".into(),

@@ -13,14 +13,15 @@ use serde_json::{Value, json};
 use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-fn make_request(conversation_id: &str, sandbox_id: &str) -> SandboxRequest {
+fn make_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
         key: SandboxKey::ConversationSandbox {
-            conversation_id: conversation_id.into(),
+            thread_id: thread_id.into(),
             sandbox_id: sandbox_id.into(),
         },
         spec: SandboxSpec {
             image: "node24".into(),
+            resources: Default::default(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
             network_policy: SandboxNetworkPolicy::allow_all(),

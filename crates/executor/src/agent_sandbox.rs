@@ -123,6 +123,7 @@ async fn attach_agent_sandbox(
             name: Some(sandbox_name),
             provider: spec.provider.clone(),
             image: spec.image.clone(),
+            resources: Default::default(),
             default_workdir: Some(spec.default_workdir.clone()),
             file_system_mounts: Some(spec.file_system_mounts.clone()),
             durable_file_systems: Some(spec.durable_file_systems.clone()),

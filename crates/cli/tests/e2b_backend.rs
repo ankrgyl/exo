@@ -14,14 +14,15 @@ use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
-fn make_request(conversation_id: &str, sandbox_id: &str) -> SandboxRequest {
+fn make_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
         key: SandboxKey::ConversationSandbox {
-            conversation_id: conversation_id.into(),
+            thread_id: thread_id.into(),
             sandbox_id: sandbox_id.into(),
         },
         spec: SandboxSpec {
             image: "base".into(),
+            resources: Default::default(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
             network_policy: SandboxNetworkPolicy::allow_all(),
@@ -159,7 +160,7 @@ async fn acquire_reuses_running_sandbox_without_connect() {
         .await
         .expect("acquire should reuse running sandbox");
 
-    assert_eq!(handle.id(), "e2b:conversation:conv-3:sandbox-3");
+    assert_eq!(handle.id(), "e2b:thread:conv-3:sandbox-3");
 
     let requests = server.received_requests().await.unwrap_or_default();
     assert!(
@@ -224,8 +225,8 @@ async fn acquire_list_metadata_query_is_not_double_url_encoded() {
         "metadata filter must not double-encode ':' in sandbox keys; got {query}"
     );
     assert!(
-        query.contains("conversation%3Aconv-colons%3Asandbox-colons")
-            || query.contains("conversation:conv-colons:sandbox-colons"),
+        query.contains("thread%3Aconv-colons%3Asandbox-colons")
+            || query.contains("thread:conv-colons:sandbox-colons"),
         "expected sandbox key in metadata query; got {query}"
     );
     assert!(

@@ -230,6 +230,8 @@ pub struct Request {
     data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timeout_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<crate::SandboxTerminalSize>,
 }
 
 impl Request {
@@ -238,6 +240,7 @@ impl Request {
             kind: "ping",
             data: None,
             timeout_seconds: None,
+            size: None,
         }
     }
 
@@ -246,6 +249,7 @@ impl Request {
             kind: "recv",
             data: None,
             timeout_seconds: Some(RECV_TIMEOUT.as_secs_f64()),
+            size: None,
         }
     }
 
@@ -254,6 +258,7 @@ impl Request {
             kind: "write",
             data: Some(STANDARD.encode(data)),
             timeout_seconds: None,
+            size: None,
         }
     }
 
@@ -262,6 +267,16 @@ impl Request {
             kind: "close_stdin",
             data: None,
             timeout_seconds: None,
+            size: None,
+        }
+    }
+
+    fn resize(size: crate::SandboxTerminalSize) -> Self {
+        Self {
+            kind: "resize",
+            data: None,
+            timeout_seconds: None,
+            size: Some(size),
         }
     }
 }
@@ -363,6 +378,40 @@ pub fn process_parts(client: Arc<dyn Client>) -> crate::SandboxProcessParts {
         stderr: Box::pin(stderr_reader.compat()),
         stdin: Box::pin(stdin_writer.compat_write()),
         wait,
+    }
+}
+
+pub fn terminal_parts(client: Arc<dyn Client>) -> crate::SandboxTerminalParts {
+    let crate::SandboxProcessParts {
+        stdout,
+        stderr,
+        stdin,
+        wait,
+    } = process_parts(Arc::clone(&client));
+    drop(stderr);
+    crate::SandboxTerminalParts {
+        output: stdout,
+        input: stdin,
+        wait,
+        control: Arc::new(ProcessBridgeTerminalControl { client }),
+    }
+}
+
+struct ProcessBridgeTerminalControl {
+    client: Arc<dyn Client>,
+}
+
+#[async_trait]
+impl crate::SandboxTerminalControl for ProcessBridgeTerminalControl {
+    async fn resize(&self, size: crate::SandboxTerminalSize) -> crate::Result<()> {
+        let response = self.client.request(Request::resize(size)).await?;
+        if response.ok {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "resizing sandbox terminal failed: {}",
+            response.error.as_deref().unwrap_or("unknown error")
+        )
     }
 }
 
@@ -538,6 +587,15 @@ mod tests {
     struct BridgeFixture {
         _temp: TempDir,
         script_path: PathBuf,
+    }
+
+    #[test]
+    fn resize_request_matches_guest_protocol() {
+        let request = Request::resize(crate::SandboxTerminalSize { rows: 24, cols: 80 });
+        assert_eq!(
+            serde_json::to_value(request).expect("serialize resize request"),
+            json!({"type": "resize", "size": {"rows": 24, "cols": 80}})
+        );
     }
 
     #[tokio::test]

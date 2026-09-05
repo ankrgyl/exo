@@ -34,7 +34,8 @@ pub enum SandboxKey {
         sandbox_id: String,
     },
     ConversationSandbox {
-        conversation_id: String,
+        #[serde(alias = "conversation_id")]
+        thread_id: String,
         sandbox_id: String,
     },
 }
@@ -47,9 +48,9 @@ impl fmt::Display for SandboxKey {
                 sandbox_id,
             } => write!(f, "agent:{agent_id}:{sandbox_id}"),
             Self::ConversationSandbox {
-                conversation_id,
+                thread_id,
                 sandbox_id,
-            } => write!(f, "conversation:{conversation_id}:{sandbox_id}"),
+            } => write!(f, "thread:{thread_id}:{sandbox_id}"),
         }
     }
 }
@@ -76,6 +77,8 @@ pub struct SandboxMount {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SandboxSpec {
     pub image: String,
+    #[serde(default)]
+    pub resources: crate::SandboxResourceShape,
     pub mounts: Vec<SandboxMount>,
     pub durable_file_systems: Vec<DurableFileSystem>,
     pub network_policy: SandboxNetworkPolicy,
@@ -218,6 +221,14 @@ pub trait ManagedSandboxHandle: Send + Sync {
 
     async fn start_process(&self, command: &SandboxCommand) -> Result<crate::SandboxProcessParts>;
 
+    async fn start_terminal(
+        &self,
+        _command: &SandboxCommand,
+        _size: crate::SandboxTerminalSize,
+    ) -> Result<crate::SandboxTerminalParts> {
+        bail!("sandbox backend does not support terminal sessions")
+    }
+
     fn supports_tcp(&self) -> bool {
         false
     }
@@ -235,6 +246,10 @@ pub trait ManagedSandboxHandle: Send + Sync {
     /// Capture the sandbox's current state as an opaque blob. Returns an
     /// error if this backend doesn't (yet) support snapshotting.
     async fn snapshot(&self) -> Result<SnapshotPayload>;
+
+    async fn delete_snapshot(&self, _payload: SnapshotPayload) -> Result<()> {
+        bail!("sandbox handle does not support snapshot deletion")
+    }
 }
 
 pub trait SandboxTcpStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
@@ -280,6 +295,10 @@ pub trait ManagedSandboxBackend: Send + Sync {
     /// backend state. Unlike stopping a handle, termination must be idempotent.
     async fn terminate(&self, _request: SandboxRequest) -> Result<()> {
         bail!("sandbox backend does not support explicit termination")
+    }
+
+    async fn delete_snapshot(&self, _payload: SnapshotPayload) -> Result<()> {
+        bail!("sandbox backend does not support snapshot deletion")
     }
 
     /// Copy the current state of `source` to `target`.
@@ -599,6 +618,7 @@ impl CliContainerSandboxBackend {
                 } else {
                     request.spec.image
                 },
+                resources: request.spec.resources,
                 mounts,
                 durable_file_systems: request.spec.durable_file_systems,
                 network_policy: request.spec.network_policy,
@@ -2365,6 +2385,7 @@ mod tests {
     fn legacy_network_policies_keep_main_sandbox_hashes() {
         let spec = SandboxSpec {
             image: "example".to_string(),
+            resources: Default::default(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
             network_policy: SandboxNetworkPolicy::allow_all(),
@@ -2490,6 +2511,35 @@ mod tests {
     }
 
     #[test]
+    fn conversation_sandbox_key_uses_thread_id_and_reads_conversation_id() {
+        let key = SandboxKey::ConversationSandbox {
+            thread_id: "thread-1".to_string(),
+            sandbox_id: "sandbox-1".to_string(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&key).unwrap(),
+            serde_json::json!({
+                "ConversationSandbox": {
+                    "thread_id": "thread-1",
+                    "sandbox_id": "sandbox-1"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<SandboxKey>(serde_json::json!({
+                "ConversationSandbox": {
+                    "conversation_id": "thread-1",
+                    "sandbox_id": "sandbox-1"
+                }
+            }))
+            .unwrap(),
+            key
+        );
+        assert_eq!(key.to_string(), "thread:thread-1:sandbox-1");
+    }
+
+    #[test]
     fn apple_container_list_item_reads_current_status_shape() {
         let container: ContainerListItem = serde_json::from_value(serde_json::json!({
             "configuration": {
@@ -2601,11 +2651,12 @@ mod tests {
 
         let request = SandboxRequest {
             key: SandboxKey::ConversationSandbox {
-                conversation_id: "conversation".to_string(),
+                thread_id: "thread".to_string(),
                 sandbox_id: "sandbox".to_string(),
             },
             spec: SandboxSpec {
                 image: "docker.io/library/ubuntu:24.04".to_string(),
+                resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
                 network_policy: SandboxNetworkPolicy::deny_all(),
@@ -2677,11 +2728,12 @@ mod tests {
         };
         let request = SandboxRequest {
             key: SandboxKey::ConversationSandbox {
-                conversation_id: "conversation".to_string(),
+                thread_id: "thread".to_string(),
                 sandbox_id: "sandbox".to_string(),
             },
             spec: SandboxSpec {
                 image: "docker.io/library/ubuntu:24.04".to_string(),
+                resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
                 network_policy: SandboxNetworkPolicy::deny_all(),
@@ -2769,11 +2821,12 @@ esac
         };
         let request = SandboxRequest {
             key: SandboxKey::ConversationSandbox {
-                conversation_id: "conversation".to_string(),
+                thread_id: "thread".to_string(),
                 sandbox_id: "sandbox".to_string(),
             },
             spec: SandboxSpec {
                 image: "docker.io/library/ubuntu:24.04".to_string(),
+                resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
                 network_policy: SandboxNetworkPolicy::deny_all(),
@@ -2880,11 +2933,12 @@ esac
         };
         let request = SandboxRequest {
             key: SandboxKey::ConversationSandbox {
-                conversation_id: "conversation".to_string(),
+                thread_id: "thread".to_string(),
                 sandbox_id: "sandbox".to_string(),
             },
             spec: SandboxSpec {
                 image: "task-image".to_string(),
+                resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
                 network_policy: SandboxNetworkPolicy::allow_all(),

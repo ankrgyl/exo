@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -37,6 +37,12 @@ pub enum GuestRequest<B> {
         env: HashMap<String, String>,
         cwd: String,
     },
+    StartTerminal {
+        argv: Vec<String>,
+        env: HashMap<String, String>,
+        cwd: String,
+        size: TerminalSize,
+    },
     ProcessBridge {
         process_id: String,
         request: B,
@@ -61,6 +67,13 @@ pub enum GuestProcessRequest {
     Write { data: String },
     CloseStdin,
     Recv { timeout_seconds: Option<f64> },
+    Resize { size: TerminalSize },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TerminalSize {
+    pub rows: u16,
+    pub cols: u16,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

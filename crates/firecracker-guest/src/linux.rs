@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::Ipv4Addr;
@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::chown;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -19,7 +19,7 @@ use base64::engine::general_purpose::STANDARD;
 use exo_firecracker_protocol::{
     GuestIdentity, GuestProcessEvent as ProcessEvent, GuestProcessRequest as BridgeRequest,
     GuestRequest, GuestResponse as Response, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, Message,
-    PROTOCOL_VERSION, decode_frame_length,
+    PROTOCOL_VERSION, TerminalSize, decode_frame_length,
 };
 
 const AGENT_PORT: u32 = 10_052;
@@ -231,7 +231,8 @@ fn reap_orphans() {
 
 struct ManagedProcess {
     process_group: i32,
-    stdin: Mutex<Option<ChildStdin>>,
+    stdin: Mutex<Option<Box<dyn Write + Send>>>,
+    terminal: Option<File>,
     events: Arc<EventQueue>,
     exited: AtomicBool,
 }
@@ -254,7 +255,8 @@ impl ManagedProcess {
         let stderr = child.stderr.take().ok_or("missing child stderr")?;
         let process = Arc::new(Self {
             process_group,
-            stdin: Mutex::new(Some(stdin)),
+            stdin: Mutex::new(Some(Box::new(stdin))),
+            terminal: None,
             events: Arc::new(EventQueue::default()),
             exited: AtomicBool::new(false),
         });
@@ -284,6 +286,58 @@ impl ManagedProcess {
         Ok(process)
     }
 
+    fn spawn_terminal(
+        argv: &[String],
+        cwd: &str,
+        env: &HashMap<String, String>,
+        size: TerminalSize,
+    ) -> Result<Arc<Self>, String> {
+        validate_command(argv, cwd)?;
+        validate_terminal_size(size)?;
+        let (master, slave) = open_terminal(size)?;
+        let mut command = terminal_command(argv, cwd, env);
+        command
+            .stdin(Stdio::from(
+                slave.try_clone().map_err(|error| error.to_string())?,
+            ))
+            .stdout(Stdio::from(
+                slave.try_clone().map_err(|error| error.to_string())?,
+            ))
+            .stderr(Stdio::from(slave));
+        let (mut child, process_group, registration) = spawn_direct_child(&mut command)?;
+        let output = master.try_clone().map_err(|error| error.to_string())?;
+        let terminal = master.try_clone().map_err(|error| error.to_string())?;
+        let process = Arc::new(Self {
+            process_group,
+            stdin: Mutex::new(Some(Box::new(master))),
+            terminal: Some(terminal),
+            events: Arc::new(EventQueue::default()),
+            exited: AtomicBool::new(false),
+        });
+        let output_thread = terminal_stream_thread(output, Arc::clone(&process.events));
+        let wait_process = Arc::clone(&process);
+        thread::spawn(move || {
+            let result = child.wait();
+            drop(registration);
+            let output_result = output_thread.join();
+            wait_process.exited.store(true, Ordering::Release);
+            match result {
+                Ok(status) if output_result.is_ok() => {
+                    wait_process.events.push(ProcessEvent::Exit {
+                        exit_code: exit_code(status),
+                    });
+                }
+                Ok(_) => wait_process.events.push(ProcessEvent::Error {
+                    message: "terminal output thread panicked".to_string(),
+                }),
+                Err(error) => wait_process.events.push(ProcessEvent::Error {
+                    message: format!("waiting for terminal process failed: {error}"),
+                }),
+            }
+        });
+        Ok(process)
+    }
+
     fn write(&self, encoded: &str) -> Result<(), String> {
         if self.exited.load(Ordering::Acquire) {
             return Err("process is not running".to_string());
@@ -299,6 +353,25 @@ impl ManagedProcess {
 
     fn close_stdin(&self) -> Result<(), String> {
         self.stdin.lock().map_err(|_| "stdin lock poisoned")?.take();
+        Ok(())
+    }
+
+    fn resize(&self, size: TerminalSize) -> Result<(), String> {
+        validate_terminal_size(size)?;
+        let terminal = self
+            .terminal
+            .as_ref()
+            .ok_or("process does not have a terminal")?;
+        set_terminal_size(terminal.as_raw_fd(), size)?;
+        if !self.exited.load(Ordering::Acquire) {
+            let result = unsafe { libc::kill(-self.process_group, libc::SIGWINCH) };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error.to_string());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -352,6 +425,12 @@ impl AgentState {
                 timeout_ms,
             } => exec(&argv, &cwd, &env, timeout_ms),
             Request::StartProcess { argv, env, cwd } => self.start_process(&argv, &cwd, &env),
+            Request::StartTerminal {
+                argv,
+                env,
+                cwd,
+                size,
+            } => self.start_terminal(&argv, &cwd, &env, size),
             Request::ProcessBridge {
                 process_id,
                 request,
@@ -367,6 +446,23 @@ impl AgentState {
     }
 
     fn start_process(&self, argv: &[String], cwd: &str, env: &HashMap<String, String>) -> Response {
+        self.insert_process(|| ManagedProcess::spawn(argv, cwd, env))
+    }
+
+    fn start_terminal(
+        &self,
+        argv: &[String],
+        cwd: &str,
+        env: &HashMap<String, String>,
+        size: TerminalSize,
+    ) -> Response {
+        self.insert_process(|| ManagedProcess::spawn_terminal(argv, cwd, env, size))
+    }
+
+    fn insert_process(
+        &self,
+        spawn: impl FnOnce() -> Result<Arc<ManagedProcess>, String>,
+    ) -> Response {
         let mut processes = match self.processes.lock() {
             Ok(processes) => processes,
             Err(_) => return Response::error("process map lock poisoned"),
@@ -374,7 +470,7 @@ impl AgentState {
         if processes.len() >= MAX_PROCESSES {
             return Response::error("too many managed processes");
         }
-        let process = match ManagedProcess::spawn(argv, cwd, env) {
+        let process = match spawn() {
             Ok(process) => process,
             Err(error) => return Response::error(error),
         };
@@ -431,6 +527,10 @@ impl AgentState {
                     Err(error) => Response::error(error),
                 }
             }
+            BridgeRequest::Resize { size } => match process.resize(size) {
+                Ok(()) => Response::ok(),
+                Err(error) => Response::error(error),
+            },
         }
     }
 
@@ -537,6 +637,31 @@ fn exec(
 }
 
 fn command(argv: &[String], cwd: &str, env: &HashMap<String, String>) -> Command {
+    let mut command = base_command(argv, cwd, env);
+    command.process_group(0);
+    unsafe {
+        command.pre_exec(drop_command_privileges);
+    }
+    command
+}
+
+fn terminal_command(argv: &[String], cwd: &str, env: &HashMap<String, String>) -> Command {
+    let mut command = base_command(argv, cwd, env);
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            drop_command_privileges()
+        });
+    }
+    command
+}
+
+fn base_command(argv: &[String], cwd: &str, env: &HashMap<String, String>) -> Command {
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
@@ -546,26 +671,92 @@ fn command(argv: &[String], cwd: &str, env: &HashMap<String, String>) -> Command
             "PATH",
             "/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin",
         )
-        .envs(env)
-        .process_group(0);
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setgroups(0, ptr::null()) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::setresgid(GUEST_GID, GUEST_GID, GUEST_GID) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::setresuid(GUEST_UID, GUEST_UID, GUEST_UID) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+        .envs(env);
     command
+}
+
+fn drop_command_privileges() -> std::io::Result<()> {
+    if unsafe { libc::setgroups(0, ptr::null()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::setresgid(GUEST_GID, GUEST_GID, GUEST_GID) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::setresuid(GUEST_UID, GUEST_UID, GUEST_UID) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn open_terminal(size: TerminalSize) -> Result<(File, File), String> {
+    let descriptor = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    if descriptor < 0 {
+        return Err(format!(
+            "opening PTY master: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let master = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    if unsafe { libc::grantpt(master.as_raw_fd()) } != 0 {
+        return Err(format!(
+            "granting PTY slave access: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::unlockpt(master.as_raw_fd()) } != 0 {
+        return Err(format!(
+            "unlocking PTY slave: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut path: [libc::c_char; 128] = [0; 128];
+    let result = unsafe { libc::ptsname_r(master.as_raw_fd(), path.as_mut_ptr(), path.len()) };
+    if result != 0 {
+        return Err(std::io::Error::from_raw_os_error(result).to_string());
+    }
+    let path = unsafe { CStr::from_ptr(path.as_ptr()) };
+    let slave_descriptor = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if slave_descriptor < 0 {
+        return Err(format!(
+            "opening PTY slave {}: {}",
+            path.to_string_lossy(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    set_terminal_size(master.as_raw_fd(), size)?;
+    let master = File::from(master);
+    let slave = File::from(unsafe { OwnedFd::from_raw_fd(slave_descriptor) });
+    Ok((master, slave))
+}
+
+fn validate_terminal_size(size: TerminalSize) -> Result<(), String> {
+    if size.rows == 0 || size.cols == 0 {
+        return Err("terminal rows and columns must be positive".to_string());
+    }
+    Ok(())
+}
+
+fn set_terminal_size(descriptor: i32, size: TerminalSize) -> Result<(), String> {
+    let dimensions = libc::winsize {
+        ws_row: size.rows,
+        ws_col: size.cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let result = unsafe { libc::ioctl(descriptor, libc::TIOCSWINSZ, &dimensions) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    }
 }
 
 fn validate_command(argv: &[String], cwd: &str) -> Result<(), String> {
@@ -631,6 +822,31 @@ where
             } else {
                 events.push(ProcessEvent::Stderr { data });
             }
+        }
+    })
+}
+
+fn terminal_stream_thread<R>(mut stream: R, events: Arc<EventQueue>) -> thread::JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = match stream.read(&mut buffer) {
+                Ok(0) => return,
+                Ok(count) => count,
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => return,
+                Err(error) => {
+                    events.push(ProcessEvent::Error {
+                        message: format!("reading terminal output failed: {error}"),
+                    });
+                    return;
+                }
+            };
+            events.push(ProcessEvent::Stdout {
+                data: STANDARD.encode(&buffer[..count]),
+            });
         }
     })
 }
@@ -886,6 +1102,14 @@ fn mount_pseudo_filesystems() -> Result<(), String> {
         Some("devtmpfs"),
         libc::MS_NOSUID | libc::MS_NOEXEC,
         Some("mode=0755"),
+    )?;
+    fs::create_dir_all("/dev/pts").map_err(|error| error.to_string())?;
+    mount_filesystem(
+        Some("devpts"),
+        "/dev/pts",
+        Some("devpts"),
+        libc::MS_NOSUID | libc::MS_NOEXEC,
+        Some("mode=0620,ptmxmode=0666"),
     )?;
     Ok(())
 }
@@ -1230,7 +1454,7 @@ mod tests {
     #[test]
     fn parses_typed_requests() {
         let request = serde_json::from_str::<Message<Request>>(
-            r#"{"protocol_version":1,"payload":{"type":"exec","argv":["/bin/echo","hi"],"env":{},"cwd":"/","timeout_ms":1000}}"#,
+            r#"{"protocol_version":2,"payload":{"type":"exec","argv":["/bin/echo","hi"],"env":{},"cwd":"/","timeout_ms":1000}}"#,
         )
         .unwrap();
         assert!(matches!(request.payload, Request::Exec { .. }));
@@ -1255,5 +1479,28 @@ mod tests {
             queue.recv(Duration::ZERO).unwrap_err(),
             "process output exceeded the guest queue limit"
         );
+    }
+
+    #[test]
+    fn terminal_size_can_be_read_and_changed() {
+        let (master, slave) = open_terminal(TerminalSize { rows: 24, cols: 80 }).unwrap();
+        assert_eq!(terminal_size(slave.as_raw_fd()), (24, 80));
+
+        set_terminal_size(
+            master.as_raw_fd(),
+            TerminalSize {
+                rows: 50,
+                cols: 120,
+            },
+        )
+        .unwrap();
+        assert_eq!(terminal_size(slave.as_raw_fd()), (50, 120));
+    }
+
+    fn terminal_size(descriptor: i32) -> (u16, u16) {
+        let mut dimensions = unsafe { std::mem::zeroed::<libc::winsize>() };
+        let result = unsafe { libc::ioctl(descriptor, libc::TIOCGWINSZ, &mut dimensions) };
+        assert_eq!(result, 0);
+        (dimensions.ws_row, dimensions.ws_col)
     }
 }

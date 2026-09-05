@@ -23,14 +23,15 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Standard sandbox request used across tests. Conversation-keyed so the label
 /// format matches what the find-by-label query expects to see.
-fn make_request(conversation_id: &str, sandbox_id: &str) -> SandboxRequest {
+fn make_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
         key: SandboxKey::ConversationSandbox {
-            conversation_id: conversation_id.into(),
+            thread_id: thread_id.into(),
             sandbox_id: sandbox_id.into(),
         },
         spec: SandboxSpec {
             image: "docker.io/library/ubuntu:24.04".into(),
+            resources: Default::default(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
             network_policy: SandboxNetworkPolicy::allow_all(),
