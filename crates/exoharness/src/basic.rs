@@ -36,17 +36,18 @@ use crate::{
     ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
     BindingType, BoxAsyncRead, BoxAsyncWrite, CancelSandboxProcessRequest,
     CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, ConversationRecord,
-    CreateSandboxRequest, DurableFileSystem, Event, EventData, EventId, EventKind, EventQuery,
-    EventQueryDirection, EventStream, ExoHarness, FileSystemMount, ForkConversationRequest,
-    ForkSandboxRequest, GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
-    ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
-    ReadArtifactRequest, RestoreSandboxRequest, Result, RunInSandboxRequest, SandboxAttachment,
-    SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery,
-    SandboxProcessId, SandboxProcessMode, SandboxProcessParts, SandboxProcessRecord,
-    SandboxProcessStatus, SandboxProcessStdin, SandboxProvider, SandboxProviderConfig,
-    SandboxRecord, Secret, SecretId, SecretMetadata, SecretType, SessionId, SnapshotHandle,
-    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord,
-    Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    CreateSandboxRequest, DurableFileSystem, EgressPolicy, Event, EventData, EventId, EventKind,
+    EventQuery, EventQueryDirection, EventStream, ExoHarness, FileSystemMount,
+    ForkConversationRequest, ForkSandboxRequest, GetEventsResult, GetSandboxProcessEventsResult,
+    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
+    PutSecretRequest, ReadArtifactRequest, RestoreSandboxRequest, Result, RunInSandboxRequest,
+    SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEvent,
+    SandboxProcessEventQuery, SandboxProcessId, SandboxProcessMode, SandboxProcessParts,
+    SandboxProcessRecord, SandboxProcessStatus, SandboxProcessStdin, SandboxProvider,
+    SandboxProviderConfig, SandboxRecord, Secret, SecretId, SecretMetadata, SecretType, SessionId,
+    SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle,
+    TurnId, TurnRecord, Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest,
+    WriteSandboxProcessInputRequest,
 };
 
 const SANDBOX_PROVIDER_STATE_EVENT: &str = "sandbox_provider_state";
@@ -1918,6 +1919,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .await?;
         let source_request = sandbox_request(self.owner, &request.source_id, &source, None);
         let target_request = sandbox_request(self.owner, &sandbox_id, &sandbox, None);
+        backend.validate_egress_policy(&source_request.spec.egress_policy)?;
+        backend.validate_egress_policy(&target_request.spec.egress_policy)?;
         let sandbox_handle = backend.fork_sandbox(source_request, target_request).await?;
         let provider_state_event = sandbox_provider_state_event(
             &sandbox_id,
@@ -1945,11 +1948,10 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .sandbox_backend_for_provider(sandbox.provider.clone())
             .await?;
         ensure_snapshot_format_supported(backend.as_ref(), &sandbox.provider, &payload.format)?;
+        let sandbox_request = sandbox_request(self.owner, &sandbox_id, &sandbox, None);
+        backend.validate_egress_policy(&sandbox_request.spec.egress_policy)?;
         let sandbox_handle = backend
-            .acquire_from_snapshot(
-                sandbox_request(self.owner, &sandbox_id, &sandbox, None),
-                payload,
-            )
+            .acquire_from_snapshot(sandbox_request, payload)
             .await?;
         if let Some(effective_image) = sandbox_handle.effective_image()
             && effective_image != sandbox.image
@@ -2028,6 +2030,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             file_system_mounts: Vec::new(),
             durable_file_systems: Vec::new(),
             enable_networking: true,
+            egress_policy: Some(SandboxNetworkPolicy::Enabled.into()),
             idle_seconds: 0,
             running: true,
             latest_snapshot_id: None,
@@ -2423,6 +2426,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 file_system_mounts: sandbox.file_system_mounts,
                 durable_file_systems: sandbox.durable_file_systems,
                 enable_networking: sandbox.enable_networking,
+                egress_policy: sandbox.egress_policy,
                 idle_seconds: sandbox.idle_seconds,
             },
             EventData::SandboxStarted {
@@ -2526,6 +2530,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 file_system_mounts,
                 durable_file_systems,
                 enable_networking,
+                egress_policy,
                 idle_seconds,
                 ..
             } = event.data
@@ -2544,7 +2549,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 || default_workdir != request.default_workdir.clone().unwrap_or_default()
                 || file_system_mounts != request.file_system_mounts
                 || durable_file_systems != request.durable_file_systems
-                || enable_networking != request.enable_networking
+                || select_egress_policy(egress_policy, Some(enable_networking))
+                    != request.egress_policy
                 || idle_seconds != request.idle_seconds
             {
                 bail!("sandbox name {name:?} already exists with a different configuration");
@@ -3482,8 +3488,37 @@ async fn prepare_sandbox_request(
         default_workdir: request.default_workdir,
         file_system_mounts: request.file_system_mounts.unwrap_or_default(),
         durable_file_systems: request.durable_file_systems.unwrap_or_default(),
-        enable_networking: request.enable_networking.unwrap_or(true),
+        egress_policy: resolve_egress_policy(request.egress_policy, request.enable_networking)?,
         idle_seconds: request.idle_seconds.unwrap_or(60),
+    })
+}
+
+fn legacy_egress_policy(enable_networking: bool) -> EgressPolicy {
+    if enable_networking {
+        SandboxNetworkPolicy::Enabled.into()
+    } else {
+        SandboxNetworkPolicy::Disabled.into()
+    }
+}
+
+fn resolve_egress_policy(
+    egress_policy: Option<EgressPolicy>,
+    enable_networking: Option<bool>,
+) -> Result<EgressPolicy> {
+    if egress_policy.is_some() && enable_networking.is_some() {
+        bail!("sandbox request cannot specify both egress_policy and enable_networking")
+    }
+    Ok(select_egress_policy(egress_policy, enable_networking))
+}
+
+fn select_egress_policy(
+    egress_policy: Option<EgressPolicy>,
+    enable_networking: Option<bool>,
+) -> EgressPolicy {
+    egress_policy.unwrap_or_else(|| {
+        enable_networking
+            .map(legacy_egress_policy)
+            .unwrap_or_default()
     })
 }
 
@@ -3515,7 +3550,10 @@ async fn find_matching_stored_sandbox(
             || sandbox.default_workdir != request.default_workdir
             || sandbox.file_system_mounts != request.file_system_mounts
             || sandbox.durable_file_systems != request.durable_file_systems
-            || sandbox.enable_networking != request.enable_networking
+            || select_egress_policy(
+                sandbox.egress_policy.clone(),
+                Some(sandbox.enable_networking),
+            ) != request.egress_policy
             || sandbox.idle_seconds != request.idle_seconds
         {
             bail!("sandbox name {name:?} already exists with a different configuration");
@@ -3622,6 +3660,7 @@ async fn create_sandbox_handle(
         .sandbox_backend_for_provider(sandbox.provider.clone())
         .await?;
     let request = sandbox_request(owner, sandbox_id, sandbox, previous_state.clone());
+    backend.validate_egress_policy(&request.spec.egress_policy)?;
     let handle = match &sandbox.attachment {
         Some(attachment) => backend.attach(request, attachment.clone()).await?,
         None => backend.acquire(request).await?,
@@ -3910,6 +3949,8 @@ struct StoredSandbox {
     file_system_mounts: Vec<FileSystemMount>,
     #[serde(default)]
     durable_file_systems: Vec<DurableFileSystem>,
+    #[serde(default)]
+    egress_policy: Option<EgressPolicy>,
     enable_networking: bool,
     idle_seconds: u64,
     running: bool,
@@ -3938,7 +3979,7 @@ struct PreparedSandboxRequest {
     default_workdir: Option<String>,
     file_system_mounts: Vec<FileSystemMount>,
     durable_file_systems: Vec<DurableFileSystem>,
-    enable_networking: bool,
+    egress_policy: EgressPolicy,
     idle_seconds: u64,
 }
 
@@ -3953,7 +3994,8 @@ impl PreparedSandboxRequest {
             default_workdir: self.default_workdir.clone(),
             file_system_mounts: self.file_system_mounts.clone(),
             durable_file_systems: self.durable_file_systems.clone(),
-            enable_networking: self.enable_networking,
+            enable_networking: self.egress_policy.permits_unrestricted_egress(),
+            egress_policy: Some(self.egress_policy.clone()),
             idle_seconds: self.idle_seconds,
             running: true,
             latest_snapshot_id: None,
@@ -4434,12 +4476,10 @@ fn sandbox_request(
                 })
                 .collect(),
             durable_file_systems: sandbox.durable_file_systems.clone(),
-            egress_policy: if sandbox.enable_networking {
-                SandboxNetworkPolicy::Enabled
-            } else {
-                SandboxNetworkPolicy::Disabled
-            }
-            .into(),
+            egress_policy: select_egress_policy(
+                sandbox.egress_policy.clone(),
+                Some(sandbox.enable_networking),
+            ),
             default_workdir: sandbox
                 .default_workdir
                 .clone()
@@ -4809,6 +4849,34 @@ fn build_secret_cipher(
         SecretBackendChoice::Static(key) => Arc::new(StaticSecretKeyProvider::new(key)),
     };
     Ok(SecretCipher::new(provider))
+}
+
+#[cfg(test)]
+mod egress_policy_tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_new_and_legacy_egress_configuration() {
+        let policy = EgressPolicy {
+            allowed_domains: vec!["api.github.com".to_string()],
+            ..EgressPolicy::default()
+        };
+
+        assert_eq!(
+            resolve_egress_policy(Some(policy.clone()), None).expect("explicit policy"),
+            policy
+        );
+        assert_eq!(
+            select_egress_policy(None, Some(true)),
+            legacy_egress_policy(true)
+        );
+        assert_eq!(
+            select_egress_policy(None, Some(false)),
+            legacy_egress_policy(false)
+        );
+        assert_eq!(select_egress_policy(None, None), EgressPolicy::default());
+        assert!(resolve_egress_policy(Some(policy), Some(true)).is_err());
+    }
 }
 
 #[cfg(test)]

@@ -271,8 +271,8 @@ pub trait ManagedSandboxBackend: Send + Sync {
         EgressCapabilities::default()
     }
 
-    fn validate_egress_policy(&self, _policy: &EgressPolicy) -> Result<()> {
-        bail!("sandbox backend does not support egress policies")
+    fn validate_egress_policy(&self, policy: &EgressPolicy) -> Result<()> {
+        validate_egress_policy_capabilities(policy, self.egress_capabilities())
     }
 
     /// Formats this backend can consume in `acquire_from_snapshot`.

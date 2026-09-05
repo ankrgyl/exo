@@ -149,6 +149,7 @@ async fn http_exoharness_runs_noninteractive_sandbox_commands() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            egress_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -201,6 +202,7 @@ async fn http_exoharness_runs_agent_scoped_sandbox_commands() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            egress_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -272,6 +274,7 @@ async fn http_exoharness_supports_sandbox_process_events() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            egress_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -359,6 +362,7 @@ async fn http_exoharness_supports_turn_scoped_sandbox_snapshot_and_start() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            egress_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -450,6 +454,7 @@ async fn http_exoharness_restores_a_snapshot_into_a_new_sandbox() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            egress_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -469,6 +474,7 @@ async fn http_exoharness_restores_a_snapshot_into_a_new_sandbox() {
                 file_system_mounts: None,
                 durable_file_systems: None,
                 enable_networking: Some(true),
+                egress_policy: None,
                 idle_seconds: Some(60),
             },
         })

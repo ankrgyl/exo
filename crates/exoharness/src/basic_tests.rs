@@ -23,15 +23,15 @@ use crate::test_support::{local_test_config, local_test_config_with_daytona};
 use crate::{
     Artifact, ArtifactVersion, BasicExoHarness, BeginTurnRequest, Binding, BoxAsyncRead,
     BoxAsyncWrite, CloseSandboxProcessInputRequest, CreateSandboxRequest, DurableFileSystem,
-    EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness, FileSystemMountMode,
-    ForkConversationRequest, ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest,
-    NewConversationRequest, PutSecretRequest, RestoreSandboxRequest, RunInSandboxRequest,
-    SandboxAttachment, SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput,
-    SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent,
-    SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin,
-    SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotFormat,
-    SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    EgressPolicy, EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness,
+    FileSystemMountMode, ForkConversationRequest, ManagedSandboxBackend, ManagedSandboxHandle,
+    NewAgentRequest, NewConversationRequest, PutSecretRequest, RestoreSandboxRequest,
+    RunInSandboxRequest, SandboxAttachment, SandboxBackendRegistration, SandboxCommand,
+    SandboxCommandOutput, SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy,
+    SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
+    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec,
+    Secret, SnapshotFormat, SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest,
+    Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const DEFAULT_DURABLE_CONTRACT_MOUNT_PATH: &str = "/home/exo/workspace";
@@ -1351,6 +1351,7 @@ async fn basic_backend_runs_commands_in_created_sandbox() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            egress_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -1447,6 +1448,7 @@ async fn agent_scoped_sandbox_is_shared_without_conversation_ownership() {
         file_system_mounts: None,
         durable_file_systems: None,
         enable_networking: Some(true),
+        egress_policy: None,
         idle_seconds: Some(60),
     };
     let sandbox_id = agent
@@ -1567,6 +1569,7 @@ async fn conversation_create_sandbox_is_not_turn_scoped() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            egress_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -1620,6 +1623,7 @@ async fn basic_backend_reuses_named_sandbox() {
         file_system_mounts: None,
         durable_file_systems: None,
         enable_networking: Some(true),
+        egress_policy: None,
         idle_seconds: Some(60),
     };
 
@@ -1671,6 +1675,7 @@ async fn basic_backend_reattaches_running_sandbox_in_new_harness_process() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            egress_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -1750,6 +1755,7 @@ async fn basic_backend_exposes_process_events_and_input() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            egress_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -1875,6 +1881,7 @@ async fn basic_backend_records_process_name_metadata() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            egress_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -2082,6 +2089,7 @@ async fn test_sandbox(conversation: &Arc<dyn crate::ConversationHandle>) -> Stri
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            egress_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -2129,6 +2137,7 @@ async fn basic_backend_rejects_daytona_provider() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            egress_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -2168,6 +2177,7 @@ async fn advertised_daytona_without_secret_errors_at_first_use() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            egress_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -2310,6 +2320,7 @@ fn provider_state_test_create_request() -> CreateSandboxRequest {
         file_system_mounts: None,
         durable_file_systems: None,
         enable_networking: Some(true),
+        egress_policy: None,
         idle_seconds: Some(60),
     }
 }
@@ -2584,6 +2595,7 @@ async fn restored_sandbox_image_persists_for_cross_process_reattach() {
         file_system_mounts: None,
         durable_file_systems: None,
         enable_networking: Some(true),
+        egress_policy: None,
         idle_seconds: Some(60),
     };
     let sandbox_id = agent
@@ -2633,6 +2645,114 @@ async fn restored_sandbox_image_persists_for_cross_process_reattach() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn create_sandbox_persists_and_reuses_egress_policy() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let backend = Arc::new(RestoreImageTestBackend::default());
+    let harness = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        backend.clone(),
+    )
+    .await
+    .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let agent_id = agent.record().id;
+    let egress_policy = EgressPolicy {
+        allowed_domains: vec!["api.github.com".to_string()],
+        ..EgressPolicy::default()
+    };
+    let request = CreateSandboxRequest {
+        name: Some("policy-test".to_string()),
+        provider: SandboxProvider::LocalProcess,
+        image: "original-image".to_string(),
+        default_workdir: Some("/".to_string()),
+        file_system_mounts: None,
+        durable_file_systems: None,
+        enable_networking: None,
+        egress_policy: Some(egress_policy.clone()),
+        idle_seconds: Some(60),
+    };
+
+    let sandbox_id = agent
+        .create_sandbox(request.clone())
+        .await
+        .expect("sandbox should be created");
+    assert_eq!(
+        backend.acquired_egress_policies.lock().await.as_slice(),
+        &[egress_policy.clone()]
+    );
+
+    backend.acquired_egress_policies.lock().await.clear();
+    let reloaded = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        backend.clone(),
+    )
+    .await
+    .expect("reloaded harness should initialize");
+    let reloaded_agent = reloaded
+        .get_agent(&agent_id)
+        .await
+        .expect("agent lookup should succeed")
+        .expect("agent should exist");
+    assert_eq!(
+        reloaded_agent
+            .create_sandbox(request)
+            .await
+            .expect("named sandbox should be reused"),
+        sandbox_id
+    );
+    assert_eq!(
+        backend.acquired_egress_policies.lock().await.as_slice(),
+        &[egress_policy]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn create_sandbox_rejects_unsupported_egress_before_backend_acquisition() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let backend = Arc::new(TestProviderStateBackend::new(Value::Null));
+    let harness = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        backend.clone(),
+    )
+    .await
+    .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+
+    let error = agent
+        .create_sandbox(CreateSandboxRequest {
+            name: None,
+            provider: SandboxProvider::LocalProcess,
+            image: "test-sandbox".to_string(),
+            default_workdir: Some("/".to_string()),
+            file_system_mounts: None,
+            durable_file_systems: None,
+            enable_networking: None,
+            egress_policy: Some(EgressPolicy::default()),
+            idle_seconds: Some(60),
+        })
+        .await
+        .expect_err("unsupported egress policy should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot enforce default-deny egress")
+    );
+    assert!(backend.requests.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
     let tempdir = TempDir::new().expect("tempdir");
     let first_backend = Arc::new(RestoreImageTestBackend::default());
@@ -2660,6 +2780,7 @@ async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            egress_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -2678,6 +2799,7 @@ async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
         file_system_mounts: None,
         durable_file_systems: None,
         enable_networking: Some(true),
+        egress_policy: None,
         idle_seconds: Some(60),
     };
     let target_id = agent
@@ -2716,12 +2838,21 @@ async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
 #[derive(Default)]
 struct RestoreImageTestBackend {
     acquired_images: Arc<AsyncMutex<Vec<String>>>,
+    acquired_egress_policies: Arc<AsyncMutex<Vec<EgressPolicy>>>,
 }
 
 #[async_trait]
 impl ManagedSandboxBackend for RestoreImageTestBackend {
     fn is_local(&self) -> bool {
         false
+    }
+
+    fn egress_capabilities(&self) -> crate::EgressCapabilities {
+        crate::EgressCapabilities {
+            default_deny: true,
+            domain_allowlist: true,
+            ..crate::EgressCapabilities::default()
+        }
     }
 
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
@@ -2733,6 +2864,10 @@ impl ManagedSandboxBackend for RestoreImageTestBackend {
         &self,
         request: SandboxRequest,
     ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        self.acquired_egress_policies
+            .lock()
+            .await
+            .push(request.spec.egress_policy.clone());
         self.acquired_images
             .lock()
             .await
