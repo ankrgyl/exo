@@ -3481,6 +3481,7 @@ async fn prepare_sandbox_request(
     })
 }
 
+/// Still convert legacy enable_networking boolean to newer SandboxNetworkPolicy interface
 fn legacy_network_policy(enable_networking: bool) -> SandboxNetworkPolicy {
     if enable_networking {
         SandboxNetworkPolicy::allow_all()
@@ -3489,6 +3490,9 @@ fn legacy_network_policy(enable_networking: bool) -> SandboxNetworkPolicy {
     }
 }
 
+/// Handles a new client request
+///
+/// Throws if there is a network policy inconsistency
 fn resolve_network_policy(
     network_policy: Option<SandboxNetworkPolicy>,
     enable_networking: Option<bool>,
@@ -3499,6 +3503,9 @@ fn resolve_network_policy(
     Ok(select_network_policy(network_policy, enable_networking))
 }
 
+/// Reads a stored network policy from sandbox JSON
+///
+/// Reads the legacy network policy for backwards compatibility but prefers newer network_policy
 fn select_network_policy(
     network_policy: Option<SandboxNetworkPolicy>,
     enable_networking: Option<bool>,
@@ -3967,7 +3974,9 @@ impl StoredSandbox {
             file_system_mounts: Vec::new(),
             durable_file_systems: Vec::new(),
             enable_networking: true,
-            network_policy: Some(SandboxNetworkPolicy::allow_all()),
+            // The attachment identifies an existing sandbox; Exo cannot inspect or
+            // enforce its network configuration, so its policy is unknown.
+            network_policy: None,
             idle_seconds: 0,
             running: true,
             latest_snapshot_id: None,
@@ -4878,6 +4887,10 @@ mod network_policy_tests {
         assert_eq!(
             select_network_policy(None, Some(false)),
             legacy_network_policy(false)
+        );
+        assert_eq!(
+            select_network_policy(Some(policy.clone()), Some(true)),
+            policy
         );
         assert_eq!(
             resolve_network_policy(None, None).unwrap(),

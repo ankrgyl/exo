@@ -2862,7 +2862,7 @@ async fn fork_sandbox_validates_both_policies_before_calling_the_backend() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn attach_sandbox_persists_explicit_unrestricted_network_policy() {
+async fn attach_sandbox_persists_unknown_network_policy() {
     let tempdir = TempDir::new().expect("tempdir");
     let mut config = local_test_config(tempdir.path());
     config.sandbox_default = SandboxProvider::Docker;
@@ -2895,7 +2895,7 @@ async fn attach_sandbox_persists_explicit_unrestricted_network_policy() {
     );
     #[derive(serde::Deserialize)]
     struct StoredPolicy {
-        network_policy: SandboxNetworkPolicy,
+        network_policy: Option<SandboxNetworkPolicy>,
     }
     let bytes = fs::read(
         tempdir
@@ -2908,7 +2908,7 @@ async fn attach_sandbox_persists_explicit_unrestricted_network_policy() {
     .await
     .unwrap();
     let stored: StoredPolicy = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(stored.network_policy, SandboxNetworkPolicy::allow_all());
+    assert_eq!(stored.network_policy, None);
     let backend = Arc::new(TestProviderStateBackend::new(Value::Null));
     let reloaded = BasicExoHarness::new_with_sandbox_backend(config, backend.clone())
         .await
