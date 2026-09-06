@@ -22,7 +22,7 @@ const GUARDIAN_SCRIPT = new URL(
   import.meta.url,
 ).pathname;
 const DEFERRED_SCRIPT = new URL(
-  "./scripts/deferred-rebuild-and-restart",
+  "../scripts/deferred-rebuild-and-restart",
   import.meta.url,
 ).pathname;
 const ROOT_DIR = new URL("../..", import.meta.url).pathname;
