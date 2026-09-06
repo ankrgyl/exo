@@ -113,14 +113,7 @@ fn resource_names_and_addresses_are_distinct() {
 fn validates_machine_ids() {
     assert!(valid_machine_id("fc-0123456789abcdef-01234567"));
     assert!(!valid_machine_id("../firecracker"));
-    let one_shot = one_shot_machine_id(
-        &SandboxKey::AgentSandbox {
-            agent_id: "agent".to_string(),
-            sandbox_id: "sandbox".to_string(),
-        },
-        "0123456789abcdef",
-        u64::MAX,
-    );
+    let one_shot = one_shot_machine_id(&"sandbox".to_string(), "0123456789abcdef", u64::MAX);
     assert!(valid_machine_id(&one_shot));
     assert_eq!(one_shot.len(), MAX_MACHINE_ID.len());
 }
@@ -154,10 +147,7 @@ async fn lifecycle_locks_serialize_a_machine_family_but_not_other_machines() {
     .await
     .expect("the machine-family lock must be released with its guard");
 
-    let key = SandboxKey::AgentSandbox {
-        agent_id: "agent".to_string(),
-        sandbox_id: "sandbox".to_string(),
-    };
+    let key = "sandbox".to_string();
     let machine_id = machine_id(&key, "0123456789abcdef");
     let sandbox_guard = locks.lock_sandbox(&key).await;
     assert!(
@@ -167,10 +157,7 @@ async fn lifecycle_locks_serialize_a_machine_family_but_not_other_machines() {
     );
     drop(sandbox_guard);
 
-    let other_key = SandboxKey::AgentSandbox {
-        agent_id: "agent".to_string(),
-        sandbox_id: "other".to_string(),
-    };
+    let other_key = "other".to_string();
     let (first_pair_guard, second_pair_guard) = locks.lock_sandbox_pair(&key, &other_key).await;
     assert!(second_pair_guard.is_some());
     assert!(

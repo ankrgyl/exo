@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use exoharness::{
-    ManagedSandboxBackend, SandboxKey, SandboxLifecycleConfig, SandboxMount, SandboxMountAccess,
+    ManagedSandboxBackend, SandboxLifecycleConfig, SandboxMount, SandboxMountAccess,
     SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
     SpritesConfig, SpritesSandboxBackend,
 };
@@ -17,10 +17,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn make_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
-        key: SandboxKey::ConversationSandbox {
-            thread_id: thread_id.into(),
-            sandbox_id: sandbox_id.into(),
-        },
+        key: sandbox_id.into(),
         spec: SandboxSpec {
             image: "default".into(),
             resources: Default::default(),

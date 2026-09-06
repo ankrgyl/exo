@@ -511,8 +511,8 @@ struct AgentCoreExecResponse {
 mod tests {
     use super::*;
     use crate::{
-        DurableFileSystem, FileSystemMountMode, SandboxKey, SandboxLifecycleConfig,
-        SandboxNetworkPolicy, SandboxSpec,
+        DurableFileSystem, FileSystemMountMode, SandboxLifecycleConfig, SandboxNetworkPolicy,
+        SandboxSpec,
     };
 
     #[test]
@@ -554,10 +554,7 @@ mod tests {
 
     fn durable_request(mount_path: &str, mode: FileSystemMountMode) -> SandboxRequest {
         SandboxRequest {
-            key: SandboxKey::ConversationSandbox {
-                thread_id: "thread".to_string(),
-                sandbox_id: "sandbox".to_string(),
-            },
+            key: "sandbox".to_string(),
             spec: SandboxSpec {
                 image: "agentcore".to_string(),
                 resources: Default::default(),

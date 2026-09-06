@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use exoharness::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxBackendRegistration, SandboxCommand,
-    SandboxKey, SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxNetworkPolicy,
+    SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxNetworkPolicy,
     SandboxProvider, SandboxRequest, SandboxSpec, SmolvmExecutionMode, SmolvmSandboxBackend,
 };
 use futures::io::AsyncReadExt;
@@ -85,10 +85,7 @@ fn request(
     idle_ttl: Option<Duration>,
 ) -> SandboxRequest {
     SandboxRequest {
-        key: SandboxKey::AgentSandbox {
-            agent_id: "smolvm-live".into(),
-            sandbox_id: tag.into(),
-        },
+        key: tag.into(),
         spec: SandboxSpec {
             image,
             resources: Default::default(),

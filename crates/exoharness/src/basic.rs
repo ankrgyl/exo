@@ -21,8 +21,8 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::sandbox::{
     BoxSandboxTcpStream, CliContainerSandboxBackend, LocalProcessSandboxBackend,
     ManagedSandboxBackend, ManagedSandboxHandle, SANDBOX_MAIN_MOUNT_DIR, SandboxCommand,
-    SandboxKey, SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxNetworkPolicy,
-    SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload, sandbox_spec_hash,
+    SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxNetworkPolicy, SandboxRequest,
+    SandboxSpec, SnapshotFormat, SnapshotPayload, sandbox_spec_hash,
 };
 #[cfg(feature = "apple-keychain")]
 use crate::secrets::AppleKeychainSecretKeyProvider;
@@ -1916,8 +1916,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .inner
             .sandbox_backend_for_provider(sandbox.provider.clone())
             .await?;
-        let source_request = sandbox_request(self.owner, &request.source_id, &source, None);
-        let target_request = sandbox_request(self.owner, &sandbox_id, &sandbox, None);
+        let source_request = sandbox_request(&request.source_id, &source, None);
+        let target_request = sandbox_request(&sandbox_id, &sandbox, None);
         let sandbox_handle = backend.fork_sandbox(source_request, target_request).await?;
         let provider_state_event = sandbox_provider_state_event(
             &sandbox_id,
@@ -1946,10 +1946,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .await?;
         ensure_snapshot_format_supported(backend.as_ref(), &sandbox.provider, &payload.format)?;
         let sandbox_handle = backend
-            .acquire_from_snapshot(
-                sandbox_request(self.owner, &sandbox_id, &sandbox, None),
-                payload,
-            )
+            .acquire_from_snapshot(sandbox_request(&sandbox_id, &sandbox, None), payload)
             .await?;
         if let Some(effective_image) = sandbox_handle.effective_image()
             && effective_image != sandbox.image
@@ -1993,7 +1990,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             )
             .await?;
             backend
-                .terminate(sandbox_request(self.owner, &id, &sandbox, provider_state))
+                .terminate(sandbox_request(&id, &sandbox, provider_state))
                 .await?;
             self.harness
                 .inner
@@ -3323,7 +3320,7 @@ async fn start_sandbox_side_effect(
     //     warm-cache entry (both handles share the same SandboxKey).
     let sandbox_handle = if cross_provider {
         let sandbox_handle = backend
-            .acquire_from_snapshot(sandbox_request(owner, &request.id, &sandbox, None), payload)
+            .acquire_from_snapshot(sandbox_request(&request.id, &sandbox, None), payload)
             .await?;
         let previous_handle = harness
             .inner
@@ -3355,7 +3352,7 @@ async fn start_sandbox_side_effect(
             previous_handle.stop().await?;
         }
         backend
-            .acquire_from_snapshot(sandbox_request(owner, &request.id, &sandbox, None), payload)
+            .acquire_from_snapshot(sandbox_request(&request.id, &sandbox, None), payload)
             .await?
     };
 
@@ -3624,7 +3621,7 @@ async fn create_sandbox_handle(
         .inner
         .sandbox_backend_for_provider(sandbox.provider.clone())
         .await?;
-    let request = sandbox_request(owner, sandbox_id, sandbox, previous_state.clone());
+    let request = sandbox_request(sandbox_id, sandbox, previous_state.clone());
     let handle = match &sandbox.attachment {
         Some(attachment) => backend.attach(request, attachment.clone()).await?,
         None => backend.acquire(request).await?,
@@ -3644,7 +3641,7 @@ fn sandbox_provider_state_key(
     sandbox_id: &SandboxId,
     sandbox: &StoredSandbox,
 ) -> String {
-    let request = sandbox_request(owner, sandbox_id, sandbox, None);
+    let request = sandbox_request(sandbox_id, sandbox, None);
     format!("{}\n{}", request.key, sandbox_spec_hash(&request.spec))
 }
 
@@ -4409,22 +4406,12 @@ impl SandboxProcess for LiveSandboxProcess {
 }
 
 fn sandbox_request(
-    owner: SandboxOwner,
     sandbox_id: &str,
     sandbox: &StoredSandbox,
     provider_state: Option<Value>,
 ) -> SandboxRequest {
     SandboxRequest {
-        key: match owner {
-            SandboxOwner::Agent(agent_id) => SandboxKey::AgentSandbox {
-                agent_id: agent_id.to_string(),
-                sandbox_id: sandbox_id.to_string(),
-            },
-            SandboxOwner::Conversation(thread_id) => SandboxKey::ConversationSandbox {
-                thread_id: thread_id.to_string(),
-                sandbox_id: sandbox_id.to_string(),
-            },
-        },
+        key: sandbox_id.to_string(),
         spec: SandboxSpec {
             image: sandbox.image.clone(),
             resources: sandbox.resources,

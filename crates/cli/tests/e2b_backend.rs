@@ -16,10 +16,7 @@ use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
 fn make_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
-        key: SandboxKey::ConversationSandbox {
-            thread_id: thread_id.into(),
-            sandbox_id: sandbox_id.into(),
-        },
+        key: sandbox_id.into(),
         spec: SandboxSpec {
             image: "base".into(),
             resources: Default::default(),

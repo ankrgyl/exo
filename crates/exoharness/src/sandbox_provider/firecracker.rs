@@ -796,6 +796,7 @@ impl FirecrackerSandboxBackend {
 
     // The caller holds the source machine's lifecycle lock until capture has
     // resumed the VM and published the immutable template.
+    #[tracing::instrument(name = "firecracker.snapshot_capture", skip_all)]
     async fn capture_snapshot_locked(
         shared: &Arc<Shared>,
         request: &SandboxRequest,
@@ -840,7 +841,9 @@ impl FirecrackerSandboxBackend {
         let config = shared.config.clone();
         let source_for_snapshot = source.clone();
         let key_for_snapshot = template_key.clone();
+        let span = tracing::Span::current();
         let lease = tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
             capture_snapshot_template(&config, &source_for_snapshot, &key_for_snapshot, lifecycle)
         })
         .await
@@ -1104,6 +1107,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         &CONSUMABLE_SNAPSHOT_FORMATS
     }
 
+    #[tracing::instrument(name = "firecracker.acquire", skip_all)]
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         self.reap_stale_machines().await?;
         self.reap_expired_machines().await?;
@@ -1124,6 +1128,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         self.shared.delete_snapshot(payload).await
     }
 
+    #[tracing::instrument(name = "firecracker.terminate", skip_all)]
     async fn terminate(&self, request: SandboxRequest) -> Result<()> {
         let persisted_machine_id = request
             .provider_state
@@ -1212,6 +1217,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         .await
     }
 
+    #[tracing::instrument(name = "firecracker.restore", skip_all)]
     async fn acquire_from_snapshot(
         &self,
         request: SandboxRequest,
@@ -1350,6 +1356,7 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
         true
     }
 
+    #[tracing::instrument(name = "firecracker.connect_tcp", skip_all)]
     async fn connect_tcp(&self, port: u16) -> Result<Option<BoxSandboxTcpStream>> {
         if !self.machine.record.network_enabled {
             bail!("Firecracker sandbox does not have networking enabled");
@@ -1358,6 +1365,7 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
         Ok(Some(Box::pin(TcpStream::connect(address).await?)))
     }
 
+    #[tracing::instrument(name = "firecracker.stop", skip_all)]
     async fn stop(&self) -> Result<()> {
         let _lifecycle_guard = self
             .shared
@@ -1466,6 +1474,7 @@ impl Shared {
         }
     }
 
+    #[tracing::instrument(name = "firecracker.capacity", skip_all)]
     async fn reserve_machine_capacity(
         &self,
         machine_id: &str,
@@ -1523,6 +1532,7 @@ impl Shared {
         Ok(())
     }
 
+    #[tracing::instrument(name = "firecracker.ensure_machine", skip_all)]
     async fn ensure_machine(
         self: &Arc<Self>,
         request: &SandboxRequest,
@@ -1604,6 +1614,7 @@ impl Shared {
         Ok(machine)
     }
 
+    #[tracing::instrument(name = "firecracker.restore_network", skip_all)]
     async fn reconfigure_restored_network(self: &Arc<Self>, machine: &Machine) -> Result<()> {
         // Snapshot memory contains the source guest's configured IP, while each
         // clone gets a distinct host TAP/resource slot. Reset the address before
@@ -1640,6 +1651,7 @@ impl Shared {
             .context("joining Firecracker lease update")?
     }
 
+    #[tracing::instrument(name = "firecracker.allocate_machine", skip_all)]
     async fn new_machine_record(
         &self,
         request: &SandboxRequest,
@@ -1707,6 +1719,7 @@ impl Shared {
         .context("joining Firecracker machine allocation")?
     }
 
+    #[tracing::instrument(name = "firecracker.prepare_launch", skip_all)]
     async fn prepare_and_launch(
         &self,
         request: &SandboxRequest,
@@ -1715,7 +1728,9 @@ impl Shared {
         let config = self.config.clone();
         let request = request.clone();
         let record = record.clone();
+        let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
             let network = record.network();
             let result = (|| {
                 if record.network_enabled {
@@ -1737,6 +1752,7 @@ impl Shared {
         .context("joining Firecracker launch task")?
     }
 
+    #[tracing::instrument(name = "firecracker.stop_process", skip_all)]
     async fn stop_machine_process(&self, machine_id: &str) -> Result<()> {
         let pid_path = self.pid_path(machine_id);
         let machine_id = machine_id.to_string();
@@ -1745,6 +1761,7 @@ impl Shared {
             .context("joining Firecracker stop task")?
     }
 
+    #[tracing::instrument(name = "firecracker.cleanup_network", skip_all)]
     async fn cleanup_network(&self, network: &NetworkConfig) {
         let network = network.clone();
         if let Err(error) =
@@ -1754,6 +1771,7 @@ impl Shared {
         }
     }
 
+    #[tracing::instrument(name = "firecracker.cleanup", skip_all)]
     async fn cleanup_machine(&self, machine_id: &str, delete_rootfs: bool) -> Result<()> {
         if !valid_machine_id(machine_id) {
             bail!("invalid Firecracker machine id: {machine_id}");
@@ -2187,6 +2205,7 @@ pub(super) fn copy_sparse_full(source: &Path, destination: &Path) -> Result<()> 
     copy_sparse_with_mode(source, destination, SparseCopyMode::Full)
 }
 
+#[tracing::instrument(name = "firecracker.copy_snapshot_file", skip_all)]
 fn copy_sparse_reflink(source: &Path, destination: &Path) -> Result<()> {
     copy_sparse_with_mode(source, destination, SparseCopyMode::ReflinkRequired)
 }
@@ -2624,6 +2643,7 @@ fn ipv4_add(address: Ipv4Addr, offset: u32) -> Ipv4Addr {
     Ipv4Addr::from(u32::from(address) + offset)
 }
 
+#[tracing::instrument(name = "firecracker.network_setup", skip_all)]
 fn prepare_network(
     config: &FirecrackerConfig,
     network: &NetworkConfig,
@@ -3049,6 +3069,7 @@ fn remove_firecracker_cgroup(path: &Path) -> Result<()> {
     }
 }
 
+#[tracing::instrument(name = "firecracker.prepare_vm", skip_all)]
 fn prepare_and_launch_blocking(
     config: &FirecrackerConfig,
     request: &SandboxRequest,
@@ -3165,6 +3186,7 @@ fn prepare_and_launch_blocking(
     Ok(GuestReadiness::Signal(ready_listener))
 }
 
+#[tracing::instrument(name = "firecracker.launch_vmm", skip_all)]
 fn spawn_jailed_firecracker(
     config: &FirecrackerConfig,
     record: &MachineRecord,
@@ -3524,6 +3546,7 @@ fn replace_hard_link(source: &Path, destination: &Path) -> Result<()> {
     })
 }
 
+#[tracing::instrument(name = "firecracker.prepare_snapshot_files", skip_all)]
 fn prepare_snapshot_jail_files(
     config: &FirecrackerConfig,
     request: &SandboxRequest,
@@ -3596,6 +3619,7 @@ fn firecracker_api_patch<T: Serialize>(socket: &Path, path: &str, body: &T) -> R
     firecracker_api_request(socket, "PATCH", path, body, FIRECRACKER_API_TIMEOUT)
 }
 
+#[tracing::instrument(name = "firecracker.api", skip_all, fields(method, path))]
 fn firecracker_api_request<T: Serialize>(
     socket: &Path,
     method: &str,
@@ -3771,6 +3795,7 @@ fn enforce_snapshot_budget(config: &FirecrackerConfig, capture_bytes: u64) -> Re
     Ok(())
 }
 
+#[tracing::instrument(name = "firecracker.capture_template", skip_all)]
 fn capture_snapshot_template(
     config: &FirecrackerConfig,
     source: &MachineRecord,
@@ -3926,6 +3951,7 @@ fn capture_snapshot_template(
     open_snapshot_template_lease(config, template_key)
 }
 
+#[tracing::instrument(name = "firecracker.prepare_snapshot_overlay", skip_all)]
 fn prepare_snapshot_overlay(
     config: &FirecrackerConfig,
     record: &MachineRecord,
@@ -4517,6 +4543,7 @@ impl Drop for ProcessWait {
     }
 }
 
+#[tracing::instrument(name = "firecracker.guest_ready", skip_all)]
 async fn wait_for_guest(
     shared: &Shared,
     machine_id: &str,
@@ -4529,6 +4556,7 @@ async fn wait_for_guest(
         .context("joining Firecracker guest-ready wait")?
 }
 
+#[tracing::instrument(name = "firecracker.restored_guest_ready", skip_all)]
 async fn wait_for_restored_guest(shared: &Arc<Shared>, machine: &Machine) -> Result<()> {
     let started = Instant::now();
     let pid_path = shared.pid_path(&machine.record.machine_id);

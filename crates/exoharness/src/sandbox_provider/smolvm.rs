@@ -1016,10 +1016,7 @@ mod tests {
 
     fn test_request(idle_ttl: Option<Duration>) -> SandboxRequest {
         SandboxRequest {
-            key: SandboxKey::AgentSandbox {
-                agent_id: "a".into(),
-                sandbox_id: "s".into(),
-            },
+            key: "s".into(),
             spec: SandboxSpec {
                 image: "alpine".into(),
                 resources: Default::default(),
@@ -1137,14 +1134,8 @@ mod tests {
 
     #[test]
     fn machine_name_is_stable_and_key_specific() {
-        let a = SandboxKey::AgentSandbox {
-            agent_id: "agent-1".into(),
-            sandbox_id: "sandbox-1".into(),
-        };
-        let b = SandboxKey::ConversationSandbox {
-            thread_id: "agent-1".into(),
-            sandbox_id: "sandbox-1".into(),
-        };
+        let a = "sandbox-1".into();
+        let b = "sandbox-2".into();
         assert_eq!(machine_name(&a), machine_name(&a));
         assert_ne!(machine_name(&a), machine_name(&b));
         assert!(machine_name(&a).starts_with("exo-"));
