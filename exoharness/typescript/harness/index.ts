@@ -44,8 +44,18 @@ export interface AgentSandboxConfig {
   image?: string | null;
   provider: "daytona" | "apple_container" | "docker" | "local_process";
   mounts: FileSystemMount[];
-  enableNetworking: boolean;
+  /** @deprecated Use `networkPolicy` instead. */
+  enableNetworking?: boolean;
+  networkPolicy?: SandboxNetworkPolicy | null;
   scope: "agent" | "conversation";
+}
+
+export interface SandboxNetworkPolicy {
+  defaultDeny?: boolean;
+  allowedDomains?: string[];
+  allowedCidrs?: string[];
+  deniedDomains?: string[];
+  deniedCidrs?: string[];
 }
 
 export type Binding =

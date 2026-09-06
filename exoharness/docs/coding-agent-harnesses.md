@@ -17,6 +17,36 @@ The examples below use `./target/debug/exo`. If you have the binary on your
 The `codex`, `claude-code`, and `cursor` harness presets select the matching
 TypeScript module, sandbox image, and networking defaults.
 
+To give an agent more precise network access, pass one policy as inline JSON or
+as a JSON file. The policy replaces the old on/off choice for this request. If
+`--networking` is also supplied, both values must describe the same access
+level.
+
+```bash
+./target/debug/exo --harness codex agent create "Restricted Codex" \
+  --model gpt-5.5 \
+  --network-policy '{"defaultDeny":true,"allowedDomains":["api.github.com"]}'
+```
+
+The same policy can be stored in a file:
+
+```json
+{
+  "defaultDeny": true,
+  "allowedDomains": ["api.github.com"],
+  "allowedCidrs": []
+}
+```
+
+```bash
+./target/debug/exo --harness codex agent create "Restricted Codex" \
+  --model gpt-5.5 \
+  --network-policy ./network-policy.json
+```
+
+`--network-policy` accepts only one value. Use `--networking enabled` or
+`--networking disabled` when the coarse legacy setting is sufficient.
+
 For `secret set`, `--env` takes the variable name literally. For example, use
 `--env OPENAI_API_KEY`, not `--env $OPENAI_API_KEY`.
 

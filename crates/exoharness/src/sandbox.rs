@@ -22,7 +22,10 @@ use tokio::time;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
-use crate::{DurableFileSystem, SandboxAttachment};
+use crate::{
+    DurableFileSystem, NetworkPolicyCapabilities, SandboxAttachment, SandboxNetworkPolicy,
+    validate_network_policy_capabilities,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SandboxKey {
@@ -71,12 +74,6 @@ pub struct SandboxMount {
     pub internal: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum SandboxNetworkPolicy {
-    Enabled,
-    Disabled,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SandboxSpec {
     pub image: String,
@@ -84,7 +81,7 @@ pub struct SandboxSpec {
     pub resources: crate::SandboxResourceShape,
     pub mounts: Vec<SandboxMount>,
     pub durable_file_systems: Vec<DurableFileSystem>,
-    pub network: SandboxNetworkPolicy,
+    pub network_policy: SandboxNetworkPolicy,
     pub default_workdir: String,
 }
 
@@ -264,6 +261,14 @@ pub type BoxSandboxTcpStream = Pin<Box<dyn SandboxTcpStream>>;
 #[async_trait]
 pub trait ManagedSandboxBackend: Send + Sync {
     fn is_local(&self) -> bool;
+
+    fn network_policy_capabilities(&self) -> NetworkPolicyCapabilities {
+        NetworkPolicyCapabilities::default()
+    }
+
+    fn validate_network_policy(&self, policy: &SandboxNetworkPolicy) -> Result<()> {
+        validate_network_policy_capabilities(policy, self.network_policy_capabilities())
+    }
 
     /// Formats this backend can consume in `acquire_from_snapshot`.
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat];
@@ -580,7 +585,7 @@ impl CliContainerSandboxBackend {
             &request.spec.durable_file_systems,
         )?;
         self.ensure_system_started().await?;
-        if matches!(request.spec.network, SandboxNetworkPolicy::Enabled) {
+        if request.spec.network_policy.allows_all() {
             self.ensure_default_network_created().await?;
         }
 
@@ -616,7 +621,7 @@ impl CliContainerSandboxBackend {
                 resources: request.spec.resources,
                 mounts,
                 durable_file_systems: request.spec.durable_file_systems,
-                network: request.spec.network,
+                network_policy: request.spec.network_policy,
                 default_workdir: request.spec.default_workdir,
             },
             lifecycle: request.lifecycle,
@@ -662,6 +667,13 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
         true
     }
 
+    fn network_policy_capabilities(&self) -> NetworkPolicyCapabilities {
+        NetworkPolicyCapabilities {
+            default_deny: true,
+            ..NetworkPolicyCapabilities::default()
+        }
+    }
+
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
         match self.cli {
             ContainerCliFlavor::Docker => &DOCKER_CONSUMABLE_SNAPSHOT_FORMATS,
@@ -670,6 +682,7 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        self.validate_network_policy(&request.spec.network_policy)?;
         let request = self.prepare_request(request).await?;
 
         if request.lifecycle.idle_ttl.is_none() {
@@ -765,6 +778,8 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
         if self.cli == ContainerCliFlavor::AppleContainer {
             bail!("restore-from-snapshot is not yet implemented for the apple-container backend");
         }
+
+        self.validate_network_policy(&request.spec.network_policy)?;
 
         let image_tag = docker_load_image(&self.container_bin, &payload.bytes).await?;
 
@@ -875,7 +890,7 @@ impl ManagedSandboxHandle for OneShotSandboxHandle {
         exec_one_shot(
             &self.container_bin,
             &self.request.spec,
-            network_name_for_policy(self.request.spec.network),
+            network_name_for_policy(&self.request.spec.network_policy),
             command,
         )
         .await
@@ -885,7 +900,7 @@ impl ManagedSandboxHandle for OneShotSandboxHandle {
         start_one_shot_process(
             &self.container_bin,
             &self.request.spec,
-            network_name_for_policy(self.request.spec.network),
+            network_name_for_policy(&self.request.spec.network_policy),
             command,
         )
         .await
@@ -1032,6 +1047,7 @@ impl ManagedSandboxBackend for LocalProcessSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        self.validate_network_policy(&request.spec.network_policy)?;
         if !request.spec.durable_file_systems.is_empty() {
             bail!("local-process sandbox backend does not support durable file systems");
         }
@@ -1314,7 +1330,7 @@ async fn create_named_warm_sandbox(
 
     configure_network_args(
         &mut process,
-        request.spec.network,
+        &request.spec.network_policy,
         Some(DEFAULT_ENABLED_NETWORK_NAME),
     );
     configure_mount_args(&mut process, &request.spec.mounts);
@@ -1612,7 +1628,7 @@ async fn exec_one_shot(
 
     let mut process = Command::new(container_bin);
     process.arg("run").arg("--rm").arg("--workdir").arg(&cwd);
-    configure_network_args(&mut process, spec.network, network_name);
+    configure_network_args(&mut process, &spec.network_policy, network_name);
     configure_mount_args(&mut process, &spec.mounts);
     configure_env_args(&mut process, &command.env);
     process.arg(&spec.image);
@@ -1644,7 +1660,7 @@ async fn start_one_shot_process(
         .arg("--interactive")
         .arg("--workdir")
         .arg(&cwd);
-    configure_network_args(&mut process, spec.network, network_name);
+    configure_network_args(&mut process, &spec.network_policy, network_name);
     configure_mount_args(&mut process, &spec.mounts);
     configure_env_args(&mut process, &command.env);
     process.arg(&spec.image);
@@ -1794,18 +1810,13 @@ fn wait_for_child(mut child: Child) -> BoxFuture<'static, crate::Result<i32>> {
 
 fn configure_network_args(
     process: &mut Command,
-    policy: SandboxNetworkPolicy,
+    policy: &SandboxNetworkPolicy,
     network_name: Option<&str>,
 ) {
-    match policy {
-        SandboxNetworkPolicy::Disabled => {
-            process.arg("--network").arg("none");
-        }
-        SandboxNetworkPolicy::Enabled => {
-            if let Some(network_name) = network_name {
-                process.arg("--network").arg(network_name);
-            }
-        }
+    if !policy.allows_all() {
+        process.arg("--network").arg("none");
+    } else if let Some(network_name) = network_name {
+        process.arg("--network").arg(network_name);
     }
 }
 
@@ -2145,8 +2156,8 @@ fn render_command_error(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr).trim().to_string()
 }
 
-fn network_name_for_policy(policy: SandboxNetworkPolicy) -> Option<&'static str> {
-    matches!(policy, SandboxNetworkPolicy::Enabled).then_some(DEFAULT_ENABLED_NETWORK_NAME)
+fn network_name_for_policy(policy: &SandboxNetworkPolicy) -> Option<&'static str> {
+    policy.allows_all().then_some(DEFAULT_ENABLED_NETWORK_NAME)
 }
 
 fn new_warm_container_name(key: &SandboxKey) -> String {
@@ -2297,6 +2308,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn network_policy_rejects_rules_a_backend_cannot_enforce() {
+        let capabilities = NetworkPolicyCapabilities {
+            default_deny: true,
+            ..NetworkPolicyCapabilities::default()
+        };
+
+        validate_network_policy_capabilities(&SandboxNetworkPolicy::deny_all(), capabilities)
+            .expect("default deny is supported");
+        assert!(
+            validate_network_policy_capabilities(
+                &SandboxNetworkPolicy {
+                    allowed_domains: vec!["api.github.com".to_string()],
+                    ..SandboxNetworkPolicy::default()
+                },
+                capabilities,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_network_policy_capabilities(
+                &SandboxNetworkPolicy {
+                    default_deny: false,
+                    denied_cidrs: vec!["192.0.2.0/24".parse().expect("valid CIDR")],
+                    ..SandboxNetworkPolicy::default()
+                },
+                capabilities,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn local_backends_fail_closed_for_unsupported_network_rules() {
+        let docker = CliContainerSandboxBackend::docker();
+        let apple_container = CliContainerSandboxBackend::apple_container();
+        let local_process = LocalProcessSandboxBackend::new();
+        let backends: [(&dyn ManagedSandboxBackend, bool); 3] = [
+            (&docker, true),
+            (&apple_container, true),
+            (&local_process, false),
+        ];
+        let domain_allowlist = SandboxNetworkPolicy {
+            allowed_domains: vec!["api.github.com".to_string()],
+            ..SandboxNetworkPolicy::default()
+        };
+
+        for (backend, supports_default_deny) in backends {
+            assert_eq!(
+                backend
+                    .validate_network_policy(&SandboxNetworkPolicy::default())
+                    .is_ok(),
+                supports_default_deny
+            );
+            assert!(
+                backend.validate_network_policy(&domain_allowlist).is_err(),
+                "backend must reject unsupported domain allowlists"
+            );
+        }
+    }
+
+    #[test]
     fn conversation_sandbox_key_uses_thread_id_and_reads_conversation_id() {
         let key = SandboxKey::ConversationSandbox {
             thread_id: "thread-1".to_string(),
@@ -2445,7 +2517,7 @@ mod tests {
                 resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Disabled,
+                network_policy: SandboxNetworkPolicy::deny_all(),
                 default_workdir: "/".to_string(),
             },
             lifecycle: SandboxLifecycleConfig {
@@ -2522,7 +2594,7 @@ mod tests {
                 resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Disabled,
+                network_policy: SandboxNetworkPolicy::deny_all(),
                 default_workdir: "/".to_string(),
             },
             lifecycle: SandboxLifecycleConfig {
@@ -2615,7 +2687,7 @@ esac
                 resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Disabled,
+                network_policy: SandboxNetworkPolicy::deny_all(),
                 default_workdir: "/".to_string(),
             },
             lifecycle: SandboxLifecycleConfig {
@@ -2727,7 +2799,7 @@ esac
                 resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Enabled,
+                network_policy: SandboxNetworkPolicy::allow_all(),
                 default_workdir: "/task".to_string(),
             },
             lifecycle: SandboxLifecycleConfig::default(),

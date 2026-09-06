@@ -23,12 +23,12 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
-use crate::SandboxAttachment;
 use crate::sandbox::{
     DEFAULT_SANDBOX_IMAGE, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
-    SandboxCommandOutput, SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat,
-    SnapshotPayload, WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
+    SandboxCommandOutput, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
+    WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
 };
+use crate::{NetworkPolicyCapabilities, SandboxAttachment, SandboxNetworkPolicy};
 
 pub const DEFAULT_E2B_API_URL: &str = "https://api.e2b.app";
 pub const DEFAULT_E2B_ENVD_PORT: u16 = 49_983;
@@ -95,6 +95,11 @@ impl E2bSandboxBackend {
         format!("{}{}", self.api_url, path)
     }
 
+    fn compile_network_policy(&self, policy: &SandboxNetworkPolicy) -> Result<bool> {
+        self.validate_network_policy(policy)?;
+        Ok(policy.allows_all())
+    }
+
     async fn find_sandbox_by_metadata(
         &self,
         key_label: &str,
@@ -141,6 +146,7 @@ impl E2bSandboxBackend {
         request: &SandboxRequest,
         spec_hash: &str,
         template_id: &str,
+        allow_internet_access: bool,
     ) -> Result<E2bSandboxCreated> {
         let mut metadata = HashMap::new();
         metadata.insert(WARM_SANDBOX_KEY_LABEL.to_string(), request.key.to_string());
@@ -156,7 +162,7 @@ impl E2bSandboxBackend {
             timeout: timeout_secs,
             auto_pause,
             secure: self.secure,
-            allow_internet_access: !matches!(request.spec.network, SandboxNetworkPolicy::Disabled),
+            allow_internet_access,
             metadata,
         };
 
@@ -223,12 +229,20 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
         false
     }
 
+    fn network_policy_capabilities(&self) -> NetworkPolicyCapabilities {
+        NetworkPolicyCapabilities {
+            default_deny: true,
+            ..NetworkPolicyCapabilities::default()
+        }
+    }
+
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
         &CONSUMABLE_SNAPSHOT_FORMATS
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_host_mounts(&request)?;
+        let allow_internet_access = self.compile_network_policy(&request.spec.network_policy)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let key_label = request.key.to_string();
         let template_id = resolve_template_id(&request.spec, &self.template_id);
@@ -255,7 +269,7 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
         }
 
         let sandbox = self
-            .create_sandbox(&request, &spec_hash, &template_id)
+            .create_sandbox(&request, &spec_hash, &template_id, allow_internet_access)
             .await?;
         Ok(Arc::new(E2bSandboxHandle {
             id: format!("e2b:{}", request.key),
@@ -289,9 +303,15 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
         }
         let manifest: E2bSnapshotManifest =
             serde_json::from_slice(&payload.bytes).context("decoding E2bSnapshot manifest")?;
+        let allow_internet_access = self.compile_network_policy(&request.spec.network_policy)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let sandbox = self
-            .create_sandbox(&request, &spec_hash, &manifest.snapshot_id)
+            .create_sandbox(
+                &request,
+                &spec_hash,
+                &manifest.snapshot_id,
+                allow_internet_access,
+            )
             .await?;
         Ok(Arc::new(E2bSandboxHandle {
             id: format!("e2b-restored:{}", request.key),
@@ -972,17 +992,13 @@ mod connect_tests {
     use super::*;
 
     #[test]
-    fn round_trip_envelope_header() {
+    fn process_stream_encoding_handles_envelopes_and_base64() {
         let payload = br#"{"event":{"data":{"stdout":"hi"}}}"#;
         let encoded = connect_encode_envelope(0, payload).unwrap();
         let decoded = connect_decode_envelopes(&encoded).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].0, 0);
         assert_eq!(decoded[0].1, payload);
-    }
-
-    #[test]
-    fn decode_process_bytes_handles_base64_stdout() {
         assert_eq!(
             super::decode_process_bytes("ZXhvLWUyYi1saXZlCg=="),
             "exo-e2b-live\n"
@@ -1150,4 +1166,45 @@ struct E2bListedSandbox {
 struct E2bSnapshotInfo {
     #[serde(rename = "snapshotID")]
     snapshot_id: String,
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    fn test_backend() -> E2bSandboxBackend {
+        E2bSandboxBackend::new(E2bConfig {
+            api_key: "test-key".to_string(),
+            api_url: DEFAULT_E2B_API_URL.to_string(),
+            template_id: "template".to_string(),
+            envd_port: DEFAULT_E2B_ENVD_PORT,
+            envd_base_url: None,
+            secure: true,
+        })
+        .expect("create E2B backend")
+    }
+
+    #[test]
+    fn compiles_supported_network_policy_to_allow_internet_access() {
+        let backend = test_backend();
+
+        assert!(
+            !backend
+                .compile_network_policy(&SandboxNetworkPolicy::default())
+                .expect("compile default-deny policy")
+        );
+        assert!(
+            backend
+                .compile_network_policy(&SandboxNetworkPolicy::allow_all())
+                .expect("compile unrestricted policy")
+        );
+        assert!(
+            backend
+                .compile_network_policy(&SandboxNetworkPolicy {
+                    allowed_domains: vec!["api.github.com".to_string()],
+                    ..SandboxNetworkPolicy::default()
+                })
+                .is_err()
+        );
+    }
 }

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use anyhow::bail;
+use anyhow::{Context as AnyhowContext, bail};
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, Cursor};
@@ -21,17 +21,17 @@ use tokio::time::{sleep, timeout};
 
 use crate::test_support::{local_test_config, local_test_config_with_daytona};
 use crate::{
-    Artifact, ArtifactVersion, BasicExoHarness, BeginTurnRequest, Binding, BoxAsyncRead,
-    BoxAsyncWrite, CloseSandboxProcessInputRequest, CreateSandboxRequest, DurableFileSystem,
-    EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness, FileSystemMountMode,
-    ForkConversationRequest, ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest,
-    NewConversationRequest, PutSecretRequest, RestoreSandboxRequest, RunInSandboxRequest,
-    SandboxAttachment, SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput,
-    SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent,
-    SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin,
-    SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotFormat,
-    SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    Artifact, ArtifactVersion, AttachSandboxRequest, BasicExoHarness, BeginTurnRequest, Binding,
+    BoxAsyncRead, BoxAsyncWrite, CloseSandboxProcessInputRequest, CreateSandboxRequest,
+    DurableFileSystem, EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness,
+    FileSystemMountMode, ForkConversationRequest, ForkSandboxRequest, ManagedSandboxBackend,
+    ManagedSandboxHandle, NewAgentRequest, NewConversationRequest, PutSecretRequest,
+    RestoreSandboxRequest, RunInSandboxRequest, SandboxAttachment, SandboxBackendRegistration,
+    SandboxCommand, SandboxCommandOutput, SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy,
+    SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
+    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec,
+    Secret, SnapshotFormat, SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest,
+    Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const DEFAULT_DURABLE_CONTRACT_MOUNT_PATH: &str = "/home/exo/workspace";
@@ -597,6 +597,118 @@ async fn vercel_sandbox_contract_start_process_long_running_protocol() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "uses a real Daytona sandbox; source sandbox-vars.sh and run this test explicitly"]
+async fn daytona_sandbox_contract_enforces_network_policy() {
+    let Some(backend) = daytona_contract_backend().await else {
+        return;
+    };
+
+    for (name, policy, should_connect) in [
+        ("network-allow-all", SandboxNetworkPolicy::allow_all(), true),
+        ("network-deny-all", SandboxNetworkPolicy::deny_all(), false),
+    ] {
+        let request = provider_contract_request(
+            "daytona",
+            name,
+            env_or("DAYTONA_IMAGE", &crate::default_daytona_image()),
+            "/",
+        );
+        let request = SandboxRequest {
+            spec: SandboxSpec {
+                network_policy: policy,
+                ..request.spec
+            },
+            ..request
+        };
+        assert_remote_network_policy(Arc::clone(&backend), request, should_connect)
+            .await
+            .expect("Daytona network policy contract");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "uses a real Vercel sandbox; source sandbox-vars.sh and run this test explicitly"]
+async fn vercel_sandbox_contract_enforces_domain_network_policy() {
+    let Some(backend) = vercel_contract_backend().await else {
+        return;
+    };
+
+    let request = provider_contract_request(
+        "vercel",
+        "network-domain-allowlist",
+        env_or("VERCEL_IMAGE", &crate::default_vercel_image()),
+        "/vercel/sandbox",
+    );
+    let request = SandboxRequest {
+        spec: SandboxSpec {
+            network_policy: SandboxNetworkPolicy {
+                allowed_domains: vec!["api.github.com".to_string()],
+                ..SandboxNetworkPolicy::default()
+            },
+            ..request.spec
+        },
+        ..request
+    };
+
+    assert_remote_network_policy(Arc::clone(&backend), request.clone(), true)
+        .await
+        .expect("Vercel domain allowlist should permit api.github.com");
+    assert_remote_network_policy(backend, request, false)
+        .await
+        .expect("Vercel domain allowlist should block example.com");
+}
+
+async fn assert_remote_network_policy(
+    backend: Arc<dyn ManagedSandboxBackend>,
+    request: SandboxRequest,
+    should_connect: bool,
+) -> crate::Result<()> {
+    let result = async {
+        let handle = backend
+            .acquire(request.clone())
+            .await
+            .context("acquire sandbox for network policy contract")?;
+        let command = if should_connect {
+            "curl --fail --silent --show-error --max-time 15 https://api.github.com/ >/dev/null"
+        } else {
+            "curl --fail --silent --show-error --max-time 15 https://example.com/ >/dev/null"
+        };
+        let output = handle
+            .exec(&SandboxCommand {
+                argv: vec!["bash".to_string(), "-lc".to_string(), command.to_string()],
+                env: Default::default(),
+                display_argv: None,
+                cwd: None,
+                timeout: Some(Duration::from_secs(30)),
+            })
+            .await
+            .context("run outbound network policy check")?;
+        if output.ok != should_connect {
+            bail!(
+                "expected outbound request to be {}, got {}: {}{}",
+                if should_connect { "allowed" } else { "blocked" },
+                if output.ok { "allowed" } else { "blocked" },
+                output.stdout,
+                output.stderr,
+            );
+        }
+        handle
+            .stop()
+            .await
+            .context("stop sandbox after network check")?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let terminate_result = backend
+        .terminate(request)
+        .await
+        .context("terminate sandbox after network check");
+    result?;
+    terminate_result
+}
+
+#[tokio::test(flavor = "current_thread")]
 #[ignore = "uses a real Docker sandbox; run this test explicitly"]
 async fn docker_sandbox_contract_durable_file_system_survives_stop_and_reacquire() {
     let tempdir = TempDir::new().expect("tempdir");
@@ -616,6 +728,26 @@ async fn docker_sandbox_contract_durable_file_system_survives_stop_and_reacquire
     )
     .await
     .expect("Docker sandbox durable filesystem contract");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "uses a real Docker sandbox and host TCP endpoint; run this test explicitly"]
+async fn docker_sandbox_contract_enforces_network_policy_through_lifecycle() {
+    let backend: Arc<dyn ManagedSandboxBackend> =
+        Arc::new(crate::CliContainerSandboxBackend::docker());
+    let image = env_or("DOCKER_IMAGE", &crate::default_docker_image());
+    let unrestricted =
+        provider_contract_request("docker", "network-unrestricted", image.clone(), "/");
+    let mut default_deny = provider_contract_request("docker", "network-default-deny", image, "/");
+    default_deny.spec.network_policy = SandboxNetworkPolicy::deny_all();
+
+    crate::contract_tests::docker_sandbox_backend_enforces_network_policy_through_lifecycle(
+        backend,
+        unrestricted,
+        default_deny,
+    )
+    .await
+    .expect("Docker sandbox network lifecycle contract");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -678,7 +810,7 @@ async fn local_process_contract_handle(
                 resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Enabled,
+                network_policy: SandboxNetworkPolicy::allow_all(),
                 default_workdir: tempdir.path().display().to_string(),
             },
             lifecycle: SandboxLifecycleConfig::default(),
@@ -736,6 +868,21 @@ fn firecracker_durable_contract_request(contract: &str) -> SandboxRequest {
 }
 
 async fn daytona_contract_handle(contract: &str) -> Option<Arc<dyn ManagedSandboxHandle>> {
+    let backend = daytona_contract_backend().await?;
+    Some(
+        backend
+            .acquire(provider_contract_request(
+                "daytona",
+                contract,
+                env_or("DAYTONA_IMAGE", &crate::default_daytona_image()),
+                "/",
+            ))
+            .await
+            .expect("acquire Daytona sandbox"),
+    )
+}
+
+async fn daytona_contract_backend() -> Option<Arc<dyn ManagedSandboxBackend>> {
     let Some(api_key) = nonempty_env("DAYTONA_API_KEY") else {
         eprintln!("skipping real Daytona sandbox contract: DAYTONA_API_KEY is not set");
         return None;
@@ -750,20 +897,25 @@ async fn daytona_contract_handle(contract: &str) -> Option<Arc<dyn ManagedSandbo
         })
         .expect("DaytonaSandboxBackend::new"),
     );
-    Some(
-        backend
-            .acquire(provider_contract_request(
-                "daytona",
-                contract,
-                env_or("DAYTONA_IMAGE", &crate::default_daytona_image()),
-                "/",
-            ))
-            .await
-            .expect("acquire Daytona sandbox"),
-    )
+    Some(backend)
 }
 
 async fn vercel_contract_handle(contract: &str) -> Option<Arc<dyn ManagedSandboxHandle>> {
+    let backend = vercel_contract_backend().await?;
+    Some(
+        backend
+            .acquire(provider_contract_request(
+                "vercel",
+                contract,
+                env_or("VERCEL_IMAGE", &crate::default_vercel_image()),
+                "/vercel/sandbox",
+            ))
+            .await
+            .expect("acquire Vercel sandbox"),
+    )
+}
+
+async fn vercel_contract_backend() -> Option<Arc<dyn ManagedSandboxBackend>> {
     let Some(api_token) = nonempty_env("VERCEL_API_TOKEN").or_else(|| nonempty_env("VERCEL_TOKEN"))
     else {
         eprintln!(
@@ -788,17 +940,7 @@ async fn vercel_contract_handle(contract: &str) -> Option<Arc<dyn ManagedSandbox
         })
         .expect("VercelSandboxBackend::new"),
     );
-    Some(
-        backend
-            .acquire(provider_contract_request(
-                "vercel",
-                contract,
-                env_or("VERCEL_IMAGE", &crate::default_vercel_image()),
-                "/vercel/sandbox",
-            ))
-            .await
-            .expect("acquire Vercel sandbox"),
-    )
+    Some(backend)
 }
 
 #[cfg(feature = "aws-agentcore")]
@@ -879,7 +1021,7 @@ fn provider_contract_request(
             resources: Default::default(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            network: SandboxNetworkPolicy::Enabled,
+            network_policy: SandboxNetworkPolicy::allow_all(),
             default_workdir: default_workdir.to_string(),
         },
         lifecycle: SandboxLifecycleConfig {
@@ -1354,6 +1496,7 @@ async fn basic_backend_runs_commands_in_created_sandbox() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            network_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -1451,6 +1594,7 @@ async fn agent_scoped_sandbox_is_shared_without_conversation_ownership() {
         file_system_mounts: None,
         durable_file_systems: None,
         enable_networking: Some(true),
+        network_policy: None,
         idle_seconds: Some(60),
     };
     let sandbox_id = agent
@@ -1572,6 +1716,7 @@ async fn conversation_create_sandbox_is_not_turn_scoped() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            network_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -1626,6 +1771,7 @@ async fn basic_backend_reuses_named_sandbox() {
         file_system_mounts: None,
         durable_file_systems: None,
         enable_networking: Some(true),
+        network_policy: None,
         idle_seconds: Some(60),
     };
 
@@ -1678,6 +1824,7 @@ async fn basic_backend_reattaches_running_sandbox_in_new_harness_process() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            network_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -1758,6 +1905,7 @@ async fn basic_backend_exposes_process_events_and_input() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            network_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -1884,6 +2032,7 @@ async fn basic_backend_records_process_name_metadata() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            network_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -2092,6 +2241,7 @@ async fn test_sandbox(conversation: &Arc<dyn crate::ConversationHandle>) -> Stri
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            network_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -2140,6 +2290,7 @@ async fn basic_backend_rejects_daytona_provider() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            network_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -2180,6 +2331,7 @@ async fn advertised_daytona_without_secret_errors_at_first_use() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            network_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -2323,6 +2475,7 @@ fn provider_state_test_create_request() -> CreateSandboxRequest {
         file_system_mounts: None,
         durable_file_systems: None,
         enable_networking: Some(true),
+        network_policy: None,
         idle_seconds: Some(60),
     }
 }
@@ -2330,7 +2483,9 @@ fn provider_state_test_create_request() -> CreateSandboxRequest {
 struct TestProviderStateBackend {
     state: Value,
     requests: Arc<AsyncMutex<Vec<Option<Value>>>>,
+    network_policies: Arc<AsyncMutex<Vec<SandboxNetworkPolicy>>>,
     cleanup_count: Arc<AsyncMutex<usize>>,
+    fork_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl TestProviderStateBackend {
@@ -2338,7 +2493,9 @@ impl TestProviderStateBackend {
         Self {
             state,
             requests: Arc::new(AsyncMutex::new(Vec::new())),
+            network_policies: Arc::new(AsyncMutex::new(Vec::new())),
             cleanup_count: Arc::new(AsyncMutex::new(0)),
+            fork_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -2353,10 +2510,24 @@ impl ManagedSandboxBackend for TestProviderStateBackend {
         &[]
     }
 
+    async fn fork_sandbox(
+        &self,
+        _source: SandboxRequest,
+        _target: SandboxRequest,
+    ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        self.fork_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        bail!("sandbox backend does not support forking")
+    }
+
     async fn acquire(
         &self,
         request: SandboxRequest,
     ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        self.network_policies
+            .lock()
+            .await
+            .push(request.spec.network_policy.clone());
         self.requests.lock().await.push(request.provider_state);
         Ok(Arc::new(TestProviderStateHandle {
             state: self.state.clone(),
@@ -2366,10 +2537,17 @@ impl ManagedSandboxBackend for TestProviderStateBackend {
 
     async fn attach(
         &self,
-        _request: SandboxRequest,
+        request: SandboxRequest,
         _attachment: SandboxAttachment,
     ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
-        bail!("test provider-state backend does not support attachment")
+        self.network_policies
+            .lock()
+            .await
+            .push(request.spec.network_policy);
+        Ok(Arc::new(TestProviderStateHandle {
+            state: self.state.clone(),
+            cleanup_count: Arc::clone(&self.cleanup_count),
+        }))
     }
 
     async fn terminate(&self, request: SandboxRequest) -> crate::Result<()> {
@@ -2598,6 +2776,7 @@ async fn restored_sandbox_image_persists_for_cross_process_reattach() {
         file_system_mounts: None,
         durable_file_systems: None,
         enable_networking: Some(true),
+        network_policy: None,
         idle_seconds: Some(60),
     };
     let sandbox_id = agent
@@ -2647,6 +2826,241 @@ async fn restored_sandbox_image_persists_for_cross_process_reattach() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn create_sandbox_persists_and_reuses_network_policy() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let backend = Arc::new(RestoreImageTestBackend::default());
+    let harness = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        backend.clone(),
+    )
+    .await
+    .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let agent_id = agent.record().id;
+    let network_policy = SandboxNetworkPolicy {
+        allowed_domains: vec!["api.github.com".to_string()],
+        ..SandboxNetworkPolicy::default()
+    };
+    let request = CreateSandboxRequest {
+        name: Some("policy-test".to_string()),
+        provider: SandboxProvider::LocalProcess,
+        image: "original-image".to_string(),
+        resources: Default::default(),
+        default_workdir: Some("/".to_string()),
+        file_system_mounts: None,
+        durable_file_systems: None,
+        enable_networking: None,
+        network_policy: Some(network_policy.clone()),
+        idle_seconds: Some(60),
+    };
+
+    let sandbox_id = agent
+        .create_sandbox(request.clone())
+        .await
+        .expect("sandbox should be created");
+    assert_eq!(
+        backend.acquired_network_policies.lock().await.as_slice(),
+        &[network_policy.clone()]
+    );
+
+    backend.acquired_network_policies.lock().await.clear();
+    let reloaded = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        backend.clone(),
+    )
+    .await
+    .expect("reloaded harness should initialize");
+    let reloaded_agent = reloaded
+        .get_agent(&agent_id)
+        .await
+        .expect("agent lookup should succeed")
+        .expect("agent should exist");
+    assert_eq!(
+        reloaded_agent
+            .create_sandbox(request)
+            .await
+            .expect("named sandbox should be reused"),
+        sandbox_id
+    );
+    assert_eq!(
+        backend.acquired_network_policies.lock().await.as_slice(),
+        &[network_policy]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn create_sandbox_rejects_unsupported_network_before_backend_acquisition() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let backend = Arc::new(TestProviderStateBackend::new(Value::Null));
+    let harness = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(tempdir.path()),
+        backend.clone(),
+    )
+    .await
+    .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+
+    let error = agent
+        .create_sandbox(CreateSandboxRequest {
+            name: None,
+            provider: SandboxProvider::LocalProcess,
+            image: "test-sandbox".to_string(),
+            resources: Default::default(),
+            default_workdir: Some("/".to_string()),
+            file_system_mounts: None,
+            durable_file_systems: None,
+            enable_networking: None,
+            network_policy: Some(SandboxNetworkPolicy::default()),
+            idle_seconds: Some(60),
+        })
+        .await
+        .expect_err("unsupported network policy should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot enforce default-deny network")
+    );
+    assert!(backend.requests.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fork_sandbox_validates_both_policies_before_calling_the_backend() {
+    for invalid_source in [true, false] {
+        let tempdir = TempDir::new().expect("tempdir");
+        let config = local_test_config(tempdir.path());
+        let harness = BasicExoHarness::new_with_sandbox_backend(
+            config.clone(),
+            Arc::new(RestoreImageTestBackend::default()),
+        )
+        .await
+        .expect("harness");
+        let agent = harness
+            .new_agent(NewAgentRequest {
+                slug: "agent".into(),
+                name: "Agent".into(),
+            })
+            .await
+            .expect("agent");
+        let agent_id = agent.record().id;
+        let restricted = SandboxNetworkPolicy {
+            allowed_domains: vec!["api.github.com".into()],
+            ..SandboxNetworkPolicy::default()
+        };
+        let mut source = provider_state_test_create_request();
+        if invalid_source {
+            source.enable_networking = None;
+            source.network_policy = Some(restricted.clone());
+        }
+        let source_id = agent.create_sandbox(source).await.expect("source");
+        // Reload with a provider that cannot enforce the stored source policy.
+        let backend = Arc::new(TestProviderStateBackend::new(Value::Null));
+        let reloaded = BasicExoHarness::new_with_sandbox_backend(config, backend.clone())
+            .await
+            .expect("reload");
+        let agent = reloaded.get_agent(&agent_id).await.unwrap().unwrap();
+        let mut target = provider_state_test_create_request();
+        target.name = Some("target".into());
+        if !invalid_source {
+            target.enable_networking = None;
+            target.network_policy = Some(restricted);
+        }
+        let error = agent
+            .fork_sandbox(ForkSandboxRequest {
+                source_id,
+                sandbox: target,
+            })
+            .await
+            .expect_err("unsupported policy");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot enforce default-deny network"),
+            "{error:#}"
+        );
+        assert_eq!(
+            backend
+                .fork_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "invalid_source={invalid_source}: backend fork must not run"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn attach_sandbox_persists_unknown_network_policy() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let mut config = local_test_config(tempdir.path());
+    config.sandbox_default = SandboxProvider::Docker;
+    config.sandbox_backends = vec![SandboxBackendRegistration::docker()];
+    let backend = Arc::new(TestProviderStateBackend::new(Value::Null));
+    let harness = BasicExoHarness::new_with_sandbox_backend(config.clone(), backend.clone())
+        .await
+        .expect("harness should initialize");
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            slug: "agent".to_string(),
+            name: "Agent".to_string(),
+        })
+        .await
+        .expect("agent");
+    let agent_id = agent.record().id;
+    let sandbox_id = agent
+        .attach_sandbox(AttachSandboxRequest {
+            attachment: SandboxAttachment::DockerContainer {
+                container_id: "container".to_string(),
+            },
+            default_workdir: None,
+        })
+        .await
+        .expect("attach sandbox");
+
+    assert_eq!(
+        backend.network_policies.lock().await.as_slice(),
+        &[SandboxNetworkPolicy::allow_all()]
+    );
+    #[derive(serde::Deserialize)]
+    struct StoredPolicy {
+        network_policy: Option<SandboxNetworkPolicy>,
+    }
+    let bytes = fs::read(
+        tempdir
+            .path()
+            .join("agents")
+            .join(agent_id.to_string())
+            .join("sandboxes")
+            .join(format!("{sandbox_id}.json")),
+    )
+    .await
+    .unwrap();
+    let stored: StoredPolicy = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(stored.network_policy, None);
+    let backend = Arc::new(TestProviderStateBackend::new(Value::Null));
+    let reloaded = BasicExoHarness::new_with_sandbox_backend(config, backend.clone())
+        .await
+        .unwrap();
+    let agent = reloaded.get_agent(&agent_id).await.unwrap().unwrap();
+    // Querying capabilities in a fresh harness reattaches using stored state.
+    assert!(!agent.sandbox_supports_tcp(sandbox_id).await.unwrap());
+    assert_eq!(
+        backend.network_policies.lock().await.as_slice(),
+        &[SandboxNetworkPolicy::allow_all()]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
     let tempdir = TempDir::new().expect("tempdir");
     let first_backend = Arc::new(RestoreImageTestBackend::default());
@@ -2675,6 +3089,7 @@ async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(true),
+            network_policy: None,
             idle_seconds: Some(60),
         })
         .await
@@ -2694,6 +3109,7 @@ async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
         file_system_mounts: None,
         durable_file_systems: None,
         enable_networking: Some(true),
+        network_policy: None,
         idle_seconds: Some(60),
     };
     let target_id = agent
@@ -2732,12 +3148,21 @@ async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
 #[derive(Default)]
 struct RestoreImageTestBackend {
     acquired_images: Arc<AsyncMutex<Vec<String>>>,
+    acquired_network_policies: Arc<AsyncMutex<Vec<SandboxNetworkPolicy>>>,
 }
 
 #[async_trait]
 impl ManagedSandboxBackend for RestoreImageTestBackend {
     fn is_local(&self) -> bool {
         false
+    }
+
+    fn network_policy_capabilities(&self) -> crate::NetworkPolicyCapabilities {
+        crate::NetworkPolicyCapabilities {
+            default_deny: true,
+            domain_allowlist: true,
+            ..crate::NetworkPolicyCapabilities::default()
+        }
     }
 
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
@@ -2749,6 +3174,10 @@ impl ManagedSandboxBackend for RestoreImageTestBackend {
         &self,
         request: SandboxRequest,
     ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        self.acquired_network_policies
+            .lock()
+            .await
+            .push(request.spec.network_policy.clone());
         self.acquired_images
             .lock()
             .await

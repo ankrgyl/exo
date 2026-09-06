@@ -1343,6 +1343,7 @@ fn default_agent_config() -> AgentConfig {
             provider: SandboxProvider::LocalProcess,
             mounts: Vec::new(),
             enable_networking: false,
+            network_policy: None,
             scope: crate::SandboxScope::Conversation,
         },
         model: "test-model".to_string(),

@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::SandboxAttachment;
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput,
-    SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
-    sandbox_spec_hash, validate_durable_file_systems,
+    SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload, sandbox_spec_hash,
+    validate_durable_file_systems,
 };
 use crate::sandbox_provider::process_bridge;
 
@@ -101,6 +101,7 @@ impl ManagedSandboxBackend for AwsAgentCoreSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        self.validate_network_policy(&request.spec.network_policy)?;
         reject_unsupported_request(&request, self.session_storage_mount_path.as_deref())?;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let runtime_session_id = agentcore_runtime_session_id(&request, &spec_hash);
@@ -409,7 +410,7 @@ fn reject_unsupported_request(
             bail!("AgentCore sandbox backend supports at most one durable file system");
         }
     }
-    if matches!(request.spec.network, SandboxNetworkPolicy::Disabled) {
+    if request.spec.network_policy.default_deny {
         bail!("AgentCore sandbox backend cannot enforce disabled networking");
     }
     Ok(())
@@ -516,40 +517,34 @@ mod tests {
     };
 
     #[test]
-    fn durable_file_system_requires_configured_session_storage_mount_path() {
-        let request = durable_request("/mnt/workspace", FileSystemMountMode::ReadWrite);
-        let error = reject_unsupported_request(&request, None).expect_err("missing mount path");
-        assert!(
-            error
-                .to_string()
-                .contains("was not configured with a managed session storage mount path")
-        );
-    }
+    fn validates_durable_file_system_session_storage_mount() {
+        let cases = [
+            (
+                "/mnt/workspace",
+                None,
+                Some("was not configured with a managed session storage mount path"),
+            ),
+            (
+                "/mnt/workspace",
+                Some("/mnt/other"),
+                Some("does not match configured managed session storage mount path"),
+            ),
+            ("/mnt/workspace", Some("/mnt/workspace"), None),
+            (
+                "/home/exo/workspace",
+                Some("/mnt/workspace"),
+                Some("must be under /mnt/"),
+            ),
+        ];
 
-    #[test]
-    fn durable_file_system_must_match_configured_session_storage_mount_path() {
-        let request = durable_request("/mnt/workspace", FileSystemMountMode::ReadWrite);
-        let error =
-            reject_unsupported_request(&request, Some("/mnt/other")).expect_err("mount mismatch");
-        assert!(
-            error
-                .to_string()
-                .contains("does not match configured managed session storage mount path")
-        );
-    }
-
-    #[test]
-    fn durable_file_system_accepts_matching_session_storage_mount_path() {
-        let request = durable_request("/mnt/workspace", FileSystemMountMode::ReadWrite);
-        reject_unsupported_request(&request, Some("/mnt/workspace")).expect("matching mount path");
-    }
-
-    #[test]
-    fn durable_file_system_rejects_non_agentcore_mount_path_shape() {
-        let request = durable_request("/home/exo/workspace", FileSystemMountMode::ReadWrite);
-        let error =
-            reject_unsupported_request(&request, Some("/mnt/workspace")).expect_err("bad path");
-        assert!(error.to_string().contains("must be under /mnt/"));
+        for (mount_path, configured_path, expected_error) in cases {
+            let request = durable_request(mount_path, FileSystemMountMode::ReadWrite);
+            let result = reject_unsupported_request(&request, configured_path);
+            match expected_error {
+                Some(message) => assert!(result.unwrap_err().to_string().contains(message)),
+                None => result.expect("matching mount path should be accepted"),
+            }
+        }
     }
 
     fn durable_request(mount_path: &str, mode: FileSystemMountMode) -> SandboxRequest {
@@ -567,7 +562,7 @@ mod tests {
                     mount_path: mount_path.to_string(),
                     mode,
                 }],
-                network: SandboxNetworkPolicy::Enabled,
+                network_policy: SandboxNetworkPolicy::allow_all(),
                 default_workdir: "/mnt/workspace".to_string(),
             },
             lifecycle: SandboxLifecycleConfig::default(),

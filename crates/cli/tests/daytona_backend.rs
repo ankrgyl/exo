@@ -34,7 +34,7 @@ fn make_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
             resources: Default::default(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            network: SandboxNetworkPolicy::Enabled,
+            network_policy: SandboxNetworkPolicy::allow_all(),
             default_workdir: "/".into(),
         },
         lifecycle: SandboxLifecycleConfig {

@@ -78,6 +78,7 @@ async fn filesystem_snapshot_and_rewind_round_trip() {
             file_system_mounts: None,
             durable_file_systems: None,
             enable_networking: Some(false),
+            network_policy: None,
             idle_seconds: Some(60),
         })
         .await

@@ -21,8 +21,8 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::sandbox::{
     BoxSandboxTcpStream, CliContainerSandboxBackend, LocalProcessSandboxBackend,
     ManagedSandboxBackend, ManagedSandboxHandle, SANDBOX_MAIN_MOUNT_DIR, SandboxCommand,
-    SandboxKey, SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxNetworkPolicy,
-    SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload, sandbox_spec_hash,
+    SandboxKey, SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxRequest,
+    SandboxSpec, SnapshotFormat, SnapshotPayload, sandbox_spec_hash,
 };
 #[cfg(feature = "apple-keychain")]
 use crate::secrets::AppleKeychainSecretKeyProvider;
@@ -41,12 +41,13 @@ use crate::{
     ForkSandboxRequest, GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
     ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
     ReadArtifactRequest, RestoreSandboxRequest, Result, RunInSandboxRequest, SandboxAttachment,
-    SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery,
-    SandboxProcessId, SandboxProcessMode, SandboxProcessParts, SandboxProcessRecord,
-    SandboxProcessStatus, SandboxProcessStdin, SandboxProvider, SandboxProviderConfig,
-    SandboxRecord, Secret, SecretId, SecretMetadata, SecretType, SessionId, SnapshotHandle,
-    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord,
-    Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    SandboxHandle, SandboxId, SandboxNetworkPolicy, SandboxProcess, SandboxProcessEvent,
+    SandboxProcessEventQuery, SandboxProcessId, SandboxProcessMode, SandboxProcessParts,
+    SandboxProcessRecord, SandboxProcessStatus, SandboxProcessStdin, SandboxProvider,
+    SandboxProviderConfig, SandboxRecord, Secret, SecretId, SecretMetadata, SecretType, SessionId,
+    SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle,
+    TurnId, TurnRecord, Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest,
+    WriteSandboxProcessInputRequest,
 };
 
 const SANDBOX_PROVIDER_STATE_EVENT: &str = "sandbox_provider_state";
@@ -1918,6 +1919,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .await?;
         let source_request = sandbox_request(self.owner, &request.source_id, &source, None);
         let target_request = sandbox_request(self.owner, &sandbox_id, &sandbox, None);
+        backend.validate_network_policy(&source_request.spec.network_policy)?;
+        backend.validate_network_policy(&target_request.spec.network_policy)?;
         let sandbox_handle = backend.fork_sandbox(source_request, target_request).await?;
         let provider_state_event = sandbox_provider_state_event(
             &sandbox_id,
@@ -1945,11 +1948,10 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .sandbox_backend_for_provider(sandbox.provider.clone())
             .await?;
         ensure_snapshot_format_supported(backend.as_ref(), &sandbox.provider, &payload.format)?;
+        let sandbox_request = sandbox_request(self.owner, &sandbox_id, &sandbox, None);
+        backend.validate_network_policy(&sandbox_request.spec.network_policy)?;
         let sandbox_handle = backend
-            .acquire_from_snapshot(
-                sandbox_request(self.owner, &sandbox_id, &sandbox, None),
-                payload,
-            )
+            .acquire_from_snapshot(sandbox_request, payload)
             .await?;
         if let Some(effective_image) = sandbox_handle.effective_image()
             && effective_image != sandbox.image
@@ -2017,23 +2019,11 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {
         self.ensure_full_sandbox_scope("attach_sandbox")?;
         let sandbox_id = format!("sandbox-{}", Uuid7::now());
-        let provider = request.attachment.provider();
-        let sandbox = StoredSandbox {
-            id: sandbox_id.clone(),
-            name: None,
-            provider,
-            image: String::new(),
-            resources: Default::default(),
-            requested_image: None,
-            default_workdir: Some(request.default_workdir.unwrap_or_default()),
-            file_system_mounts: Vec::new(),
-            durable_file_systems: Vec::new(),
-            enable_networking: true,
-            idle_seconds: 0,
-            running: true,
-            latest_snapshot_id: None,
-            attachment: Some(request.attachment),
-        };
+        let sandbox = StoredSandbox::attached(
+            sandbox_id.clone(),
+            request.attachment,
+            request.default_workdir.unwrap_or_default(),
+        );
         let (sandbox_handle, provider_state_event) = create_sandbox_handle(
             self.harness,
             &self.owner_dir,
@@ -2424,6 +2414,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 file_system_mounts: sandbox.file_system_mounts,
                 durable_file_systems: sandbox.durable_file_systems,
                 enable_networking: sandbox.enable_networking,
+                network_policy: sandbox.network_policy,
                 idle_seconds: sandbox.idle_seconds,
             },
             EventData::SandboxStarted {
@@ -2527,6 +2518,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 file_system_mounts,
                 durable_file_systems,
                 enable_networking,
+                network_policy,
                 idle_seconds,
                 ..
             } = event.data
@@ -2545,7 +2537,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 || default_workdir != request.default_workdir.clone().unwrap_or_default()
                 || file_system_mounts != request.file_system_mounts
                 || durable_file_systems != request.durable_file_systems
-                || enable_networking != request.enable_networking
+                || stored_network_policy(network_policy, enable_networking)
+                    != request.network_policy
                 || idle_seconds != request.idle_seconds
             {
                 bail!("sandbox name {name:?} already exists with a different configuration");
@@ -3464,6 +3457,7 @@ async fn prepare_sandbox_request(
     harness: &BasicExoHarness,
     request: CreateSandboxRequest,
 ) -> Result<PreparedSandboxRequest> {
+    let network_policy = request.resolved_network_policy()?;
     let image = if !request.image.trim().is_empty() {
         request.image.clone()
     } else if let Some(default) = harness
@@ -3484,9 +3478,20 @@ async fn prepare_sandbox_request(
         default_workdir: request.default_workdir,
         file_system_mounts: request.file_system_mounts.unwrap_or_default(),
         durable_file_systems: request.durable_file_systems.unwrap_or_default(),
-        enable_networking: request.enable_networking.unwrap_or(true),
+        network_policy,
         idle_seconds: request.idle_seconds.unwrap_or(60),
     })
+}
+
+/// Returns the policy for stored state. Policy-aware records retain
+/// the legacy boolean projection, while records committed before this feature
+/// contain only `enable_networking`.
+fn stored_network_policy(
+    network_policy: Option<SandboxNetworkPolicy>,
+    enable_networking: bool,
+) -> SandboxNetworkPolicy {
+    network_policy
+        .unwrap_or_else(|| SandboxNetworkPolicy::from_legacy_enable_networking(enable_networking))
 }
 
 async fn find_matching_stored_sandbox(
@@ -3518,7 +3523,8 @@ async fn find_matching_stored_sandbox(
             || sandbox.default_workdir != request.default_workdir
             || sandbox.file_system_mounts != request.file_system_mounts
             || sandbox.durable_file_systems != request.durable_file_systems
-            || sandbox.enable_networking != request.enable_networking
+            || stored_network_policy(sandbox.network_policy.clone(), sandbox.enable_networking)
+                != request.network_policy
             || sandbox.idle_seconds != request.idle_seconds
         {
             bail!("sandbox name {name:?} already exists with a different configuration");
@@ -3625,6 +3631,7 @@ async fn create_sandbox_handle(
         .sandbox_backend_for_provider(sandbox.provider.clone())
         .await?;
     let request = sandbox_request(owner, sandbox_id, sandbox, previous_state.clone());
+    backend.validate_network_policy(&request.spec.network_policy)?;
     let handle = match &sandbox.attachment {
         Some(attachment) => backend.attach(request, attachment.clone()).await?,
         None => backend.acquire(request).await?,
@@ -3915,6 +3922,8 @@ struct StoredSandbox {
     file_system_mounts: Vec<FileSystemMount>,
     #[serde(default)]
     durable_file_systems: Vec<DurableFileSystem>,
+    #[serde(default)]
+    network_policy: Option<SandboxNetworkPolicy>,
     enable_networking: bool,
     idle_seconds: u64,
     running: bool,
@@ -3935,6 +3944,30 @@ impl From<StoredSandbox> for SandboxRecord {
     }
 }
 
+impl StoredSandbox {
+    fn attached(id: SandboxId, attachment: SandboxAttachment, default_workdir: String) -> Self {
+        Self {
+            id,
+            name: None,
+            provider: attachment.provider(),
+            image: String::new(),
+            resources: Default::default(),
+            requested_image: None,
+            default_workdir: Some(default_workdir),
+            file_system_mounts: Vec::new(),
+            durable_file_systems: Vec::new(),
+            enable_networking: true,
+            // The attachment identifies an existing sandbox; Exo cannot inspect or
+            // enforce its network configuration, so its policy is unknown.
+            network_policy: None,
+            idle_seconds: 0,
+            running: true,
+            latest_snapshot_id: None,
+            attachment: Some(attachment),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PreparedSandboxRequest {
     name: Option<String>,
@@ -3944,7 +3977,7 @@ struct PreparedSandboxRequest {
     default_workdir: Option<String>,
     file_system_mounts: Vec<FileSystemMount>,
     durable_file_systems: Vec<DurableFileSystem>,
-    enable_networking: bool,
+    network_policy: SandboxNetworkPolicy,
     idle_seconds: u64,
 }
 
@@ -3960,7 +3993,10 @@ impl PreparedSandboxRequest {
             default_workdir: self.default_workdir.clone(),
             file_system_mounts: self.file_system_mounts.clone(),
             durable_file_systems: self.durable_file_systems.clone(),
-            enable_networking: self.enable_networking,
+            // A lossy legacy projection retained for records written by main.
+            // `network_policy` below is the canonical persisted value.
+            enable_networking: self.network_policy.allows_all(),
+            network_policy: Some(self.network_policy.clone()),
             idle_seconds: self.idle_seconds,
             running: true,
             latest_snapshot_id: None,
@@ -4442,11 +4478,10 @@ fn sandbox_request(
                 })
                 .collect(),
             durable_file_systems: sandbox.durable_file_systems.clone(),
-            network: if sandbox.enable_networking {
-                SandboxNetworkPolicy::Enabled
-            } else {
-                SandboxNetworkPolicy::Disabled
-            },
+            network_policy: stored_network_policy(
+                sandbox.network_policy.clone(),
+                sandbox.enable_networking,
+            ),
             default_workdir: sandbox
                 .default_workdir
                 .clone()
@@ -4816,6 +4851,76 @@ fn build_secret_cipher(
         SecretBackendChoice::Static(key) => Arc::new(StaticSecretKeyProvider::new(key)),
     };
     Ok(SecretCipher::new(provider))
+}
+
+#[cfg(test)]
+mod network_policy_tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_new_and_legacy_network_configuration() {
+        let policy = SandboxNetworkPolicy {
+            allowed_domains: vec!["api.github.com".to_string()],
+            ..SandboxNetworkPolicy::default()
+        };
+
+        let explicit = CreateSandboxRequest {
+            name: None,
+            provider: SandboxProvider::LocalProcess,
+            image: String::new(),
+            resources: Default::default(),
+            default_workdir: None,
+            file_system_mounts: None,
+            durable_file_systems: None,
+            enable_networking: None,
+            network_policy: Some(policy.clone()),
+            idle_seconds: None,
+        };
+        assert_eq!(explicit.resolved_network_policy().unwrap(), policy);
+        assert_eq!(
+            CreateSandboxRequest {
+                enable_networking: Some(false),
+                ..explicit.clone()
+            }
+            .resolved_network_policy()
+            .unwrap(),
+            policy
+        );
+        assert_eq!(
+            explicit
+                .clone()
+                .with_legacy_networking_projection()
+                .unwrap()
+                .enable_networking,
+            Some(false)
+        );
+        assert_eq!(
+            stored_network_policy(None, true),
+            SandboxNetworkPolicy::allow_all()
+        );
+        assert_eq!(
+            stored_network_policy(None, false),
+            SandboxNetworkPolicy::deny_all()
+        );
+        assert_eq!(stored_network_policy(Some(policy.clone()), true), policy);
+        assert_eq!(
+            CreateSandboxRequest {
+                network_policy: None,
+                ..explicit.clone()
+            }
+            .resolved_network_policy()
+            .unwrap(),
+            SandboxNetworkPolicy::allow_all()
+        );
+        assert!(
+            CreateSandboxRequest {
+                enable_networking: Some(true),
+                ..explicit
+            }
+            .resolved_network_policy()
+            .is_err()
+        );
+    }
 }
 
 #[cfg(test)]

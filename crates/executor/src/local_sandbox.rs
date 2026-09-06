@@ -1047,7 +1047,7 @@ impl SandboxHandle for LocalSandboxConversation {
             &local,
             remote_id.clone(),
             local_id,
-            sandbox_created_events(&remote_id, request),
+            sandbox_created_events(&remote_id, request)?,
         )
         .await?;
         Ok(remote_id)
@@ -1066,7 +1066,7 @@ impl SandboxHandle for LocalSandboxConversation {
             &local,
             remote_id.clone(),
             local_id,
-            sandbox_created_events(&remote_id, sandbox),
+            sandbox_created_events(&remote_id, sandbox)?,
         )
         .await?;
         Ok(remote_id)
@@ -1082,7 +1082,7 @@ impl SandboxHandle for LocalSandboxConversation {
         let remote_id = format!("sandbox-{}", Uuid7::now());
         let local = self.local_conversation().await?;
         let local_id = local.restore_sandbox(request).await?;
-        let mut events = sandbox_created_events(&remote_id, sandbox);
+        let mut events = sandbox_created_events(&remote_id, sandbox)?;
         events.push(EventData::SandboxStarted {
             sandbox_id: remote_id.clone(),
             snapshot_id: Some(snapshot_id),
@@ -1243,8 +1243,12 @@ impl SandboxHandle for LocalSandboxConversation {
     }
 }
 
-fn sandbox_created_events(sandbox_id: &SandboxId, request: CreateSandboxRequest) -> Vec<EventData> {
-    vec![
+fn sandbox_created_events(
+    sandbox_id: &SandboxId,
+    request: CreateSandboxRequest,
+) -> Result<Vec<EventData>> {
+    let network_policy = request.resolved_network_policy()?;
+    Ok(vec![
         EventData::SandboxCreated {
             sandbox_id: sandbox_id.clone(),
             name: request.name,
@@ -1253,14 +1257,15 @@ fn sandbox_created_events(sandbox_id: &SandboxId, request: CreateSandboxRequest)
             default_workdir: request.default_workdir.unwrap_or_default(),
             file_system_mounts: request.file_system_mounts.unwrap_or_default(),
             durable_file_systems: request.durable_file_systems.unwrap_or_default(),
-            enable_networking: request.enable_networking.unwrap_or(true),
+            enable_networking: network_policy.allows_all(),
+            network_policy: request.network_policy,
             idle_seconds: request.idle_seconds.unwrap_or(60),
         },
         EventData::SandboxStarted {
             sandbox_id: sandbox_id.clone(),
             snapshot_id: None,
         },
-    ]
+    ])
 }
 
 struct LocalSandboxTurnHandle {
@@ -1392,7 +1397,11 @@ mod tests {
                 default_workdir: Some("/workspace".to_string()),
                 file_system_mounts: Some(Vec::new()),
                 durable_file_systems: None,
-                enable_networking: Some(false),
+                enable_networking: None,
+                network_policy: Some(exoharness::SandboxNetworkPolicy {
+                    default_deny: false,
+                    ..Default::default()
+                }),
                 idle_seconds: Some(120),
             })
             .await
@@ -1411,6 +1420,11 @@ mod tests {
             .expect("remote events should load")
             .events;
         assert_eq!(remote_events.len(), 2);
+        assert!(matches!(
+            &remote_events[0].data,
+            EventData::SandboxCreated { enable_networking: true, network_policy: Some(policy), .. }
+                if policy.allows_all()
+        ));
         let sandboxes = conversation
             .list_sandboxes()
             .await

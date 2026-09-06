@@ -36,6 +36,29 @@ Body: `protocol::ClientMessage`.
 
 The `request` field is one of the tagged variants in `exoharness::protocol::Request`. HTTP does not define a second command schema.
 
+For example, a sandbox request can carry a provider-neutral network policy:
+
+```json
+{
+  "type": "create_sandbox",
+  "scope": "agent",
+  "request": {
+    "provider": "vercel",
+    "image": "node24",
+    "enable_networking": false,
+    "network_policy": {
+      "defaultDeny": true,
+      "allowedDomains": ["api.github.com"]
+    }
+  }
+}
+```
+
+The HTTP client also sends the matching legacy `enable_networking` projection
+when an explicit policy is present. This allows a new client to communicate
+with an older server during a rolling deployment; the full policy remains the
+canonical value on new servers.
+
 ## Response
 
 Success and exoharness-level failures both return HTTP 200 with a `protocol::ServerMessage` body. Malformed HTTP, unsupported methods, or invalid JSON are transport errors and may return non-2xx status codes.

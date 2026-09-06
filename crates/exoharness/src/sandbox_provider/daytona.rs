@@ -30,13 +30,13 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
-use crate::SandboxAttachment;
 use crate::sandbox::{
     ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput,
-    SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
-    WARM_SANDBOX_KEY_LABEL, WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
+    SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload, WARM_SANDBOX_KEY_LABEL,
+    WARM_SANDBOX_SPEC_HASH_LABEL, sandbox_spec_hash,
 };
 use crate::sandbox_provider::shell_quote;
+use crate::{NetworkPolicyCapabilities, SandboxAttachment, SandboxNetworkPolicy};
 
 pub const DEFAULT_DAYTONA_API_URL: &str = "https://app.daytona.io/api";
 
@@ -105,6 +105,15 @@ impl DaytonaSandboxBackend {
         format!("{}{}", self.api_url, path)
     }
 
+    fn compile_network_policy(&self, policy: &SandboxNetworkPolicy) -> Result<bool> {
+        // Daytona only exposes a coarse block-all networking switch. The
+        // capability validation rejects domain/CIDR rules, so
+        // `default_deny` fully captures the remaining policy and maps
+        // directly to Daytona's native field.
+        self.validate_network_policy(policy)?;
+        Ok(policy.default_deny)
+    }
+
     async fn find_sandbox_by_labels(
         &self,
         key_label: &str,
@@ -140,6 +149,7 @@ impl DaytonaSandboxBackend {
         request: &SandboxRequest,
         spec_hash: &str,
         snapshot_name: Option<&str>,
+        network_block_all: bool,
     ) -> Result<DaytonaSandbox> {
         let mut labels = HashMap::new();
         labels.insert(WARM_SANDBOX_KEY_LABEL.to_string(), request.key.to_string());
@@ -170,7 +180,7 @@ impl DaytonaSandboxBackend {
             labels,
             env: HashMap::new(),
             auto_stop_interval: auto_stop_minutes,
-            network_block_all: matches!(request.spec.network, SandboxNetworkPolicy::Disabled),
+            network_block_all,
         };
 
         let response = self
@@ -251,12 +261,20 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
         false
     }
 
+    fn network_policy_capabilities(&self) -> NetworkPolicyCapabilities {
+        NetworkPolicyCapabilities {
+            default_deny: true,
+            ..NetworkPolicyCapabilities::default()
+        }
+    }
+
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
         &CONSUMABLE_SNAPSHOT_FORMATS
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_unsupported_mounts(&request)?;
+        let network_block_all = self.compile_network_policy(&request.spec.network_policy)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
 
         // Reuse a matching sandbox if one exists (also how we recover across exo
@@ -273,7 +291,10 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
                 }
                 existing
             }
-            _ => self.create_sandbox(&request, &spec_hash, None).await?,
+            _ => {
+                self.create_sandbox(&request, &spec_hash, None, network_block_all)
+                    .await?
+            }
         };
 
         self.wait_until_started(&sandbox.id).await?;
@@ -299,6 +320,7 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         reject_unsupported_mounts(&request)?;
+        let network_block_all = self.compile_network_policy(&request.spec.network_policy)?;
         let snapshot_name = if payload.format == SnapshotFormat::DaytonaRef {
             let manifest: DaytonaSnapshotManifest = serde_json::from_slice(&payload.bytes)
                 .context("decoding Daytona snapshot manifest")?;
@@ -313,7 +335,12 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
         };
         let spec_hash = sandbox_spec_hash(&request.spec);
         let sandbox = self
-            .create_sandbox(&request, &spec_hash, Some(&snapshot_name))
+            .create_sandbox(
+                &request,
+                &spec_hash,
+                Some(&snapshot_name),
+                network_block_all,
+            )
             .await?;
         self.wait_until_started(&sandbox.id).await?;
         Ok(Arc::new(DaytonaSandboxHandle {
@@ -1628,20 +1655,51 @@ impl DaytonaSandbox {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_utf8_prefix_len;
+    use super::*;
+
+    fn test_backend() -> DaytonaSandboxBackend {
+        DaytonaSandboxBackend::new(DaytonaConfig {
+            api_key: "test-key".to_string(),
+            api_url: DEFAULT_DAYTONA_API_URL.to_string(),
+            toolbox_url: DEFAULT_DAYTONA_TOOLBOX_URL.to_string(),
+            target: None,
+            organization_id: None,
+        })
+        .expect("create Daytona backend")
+    }
 
     #[test]
-    fn utf8_prefix_waits_for_split_multibyte_character() {
+    fn compiles_supported_network_policy_to_network_block_all() {
+        let backend = test_backend();
+
+        assert!(
+            backend
+                .compile_network_policy(&SandboxNetworkPolicy::default())
+                .expect("compile default-deny policy")
+        );
+        assert!(
+            !backend
+                .compile_network_policy(&SandboxNetworkPolicy::allow_all())
+                .expect("compile unrestricted policy")
+        );
+        assert!(
+            backend
+                .compile_network_policy(&SandboxNetworkPolicy {
+                    allowed_domains: vec!["api.github.com".to_string()],
+                    ..SandboxNetworkPolicy::default()
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn valid_utf8_prefix_handles_split_and_invalid_bytes() {
         let mut bytes = "hello ".as_bytes().to_vec();
         bytes.push(0xc3);
         assert_eq!(valid_utf8_prefix_len(&bytes).unwrap(), Some(6));
 
         bytes.push(0xa9);
         assert_eq!(valid_utf8_prefix_len(&bytes).unwrap(), Some(8));
-    }
-
-    #[test]
-    fn utf8_prefix_rejects_invalid_bytes() {
         let error = valid_utf8_prefix_len(&[0xff]).unwrap_err();
         assert!(
             format!("{error:#}").contains("invalid UTF-8"),

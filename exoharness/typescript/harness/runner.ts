@@ -33,6 +33,7 @@ import {
   type SendRequest,
   type Secret,
   type SecretMetadata,
+  type SandboxNetworkPolicy,
   type ToolRequest,
   type ToolResult,
   type Turn,
@@ -53,7 +54,8 @@ interface RawAgentConfig {
     image?: string | null;
     provider: "daytona" | "apple_container" | "docker" | "local_process";
     mounts?: RawConversationConfig["mounts"] | null;
-    enable_networking: boolean;
+    enable_networking?: boolean;
+    network_policy?: SandboxNetworkPolicy | null;
     scope: "agent" | "conversation";
   };
   model: string;
@@ -842,6 +844,7 @@ function toAgentConfig(raw: RawAgentConfig): AgentConfig {
       provider: raw.sandbox.provider,
       mounts: (raw.sandbox.mounts ?? []).map(toFileSystemMount),
       enableNetworking: raw.sandbox.enable_networking,
+      networkPolicy: raw.sandbox.network_policy ?? null,
       scope: raw.sandbox.scope,
     },
     model: raw.model,

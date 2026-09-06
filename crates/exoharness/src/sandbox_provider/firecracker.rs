@@ -44,13 +44,13 @@ use uuid::Uuid;
 
 use crate::sandbox::{
     BoxSandboxTcpStream, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
-    SandboxCommandOutput, SandboxKey, SandboxNetworkPolicy, SandboxRequest, SandboxSpec,
-    SnapshotFormat, SnapshotPayload, sandbox_spec_hash,
+    SandboxCommandOutput, SandboxKey, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
+    sandbox_spec_hash,
 };
 use crate::sandbox_provider::process_bridge;
 use crate::{
-    FileSystemMountMode, SandboxAttachment, SandboxProcessParts, SandboxResourceShape,
-    SandboxTerminalParts, SandboxTerminalSize,
+    FileSystemMountMode, NetworkPolicyCapabilities, SandboxAttachment, SandboxNetworkPolicy,
+    SandboxProcessParts, SandboxResourceShape, SandboxTerminalParts, SandboxTerminalSize,
 };
 
 use super::firecracker_image::resolve_image;
@@ -174,6 +174,8 @@ pub struct FirecrackerConfig {
     pub workspace_size_gib: u64,
     pub jailer_uid_base: u32,
     pub dns_server: Ipv4Addr,
+    /// Operator-configured destinations permitted only for unrestricted
+    /// sandboxes. A sandbox-level deny-all policy always overrides these.
     pub allowed_egress_cidrs: Vec<Ipv4Net>,
     #[serde(default)]
     pub network_device_policy: FirecrackerNetworkDevicePolicy,
@@ -1100,11 +1102,19 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         true
     }
 
+    fn network_policy_capabilities(&self) -> NetworkPolicyCapabilities {
+        NetworkPolicyCapabilities {
+            default_deny: true,
+            ..NetworkPolicyCapabilities::default()
+        }
+    }
+
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
         &CONSUMABLE_SNAPSHOT_FORMATS
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        self.validate_network_policy(&request.spec.network_policy)?;
         self.reap_stale_machines().await?;
         self.reap_expired_machines().await?;
         self.shared.reap_orphaned_fork_snapshot_templates().await;
@@ -1159,6 +1169,8 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         target: SandboxRequest,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let mut source = prepare_request(source)?;
+        self.validate_network_policy(&source.spec.network_policy)?;
+        self.validate_network_policy(&target.spec.network_policy)?;
         let target = self.resolve_request(target).await?;
         if source.key == target.key {
             bail!("Firecracker fork source and target must be different sandboxes")
@@ -1218,6 +1230,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let manifest = FirecrackerSnapshotManifest::from_payload(payload)?;
+        self.validate_network_policy(&request.spec.network_policy)?;
         let request = self.resolve_request(request).await?;
         self.restore_snapshot(request, manifest, SnapshotTemplateLifecycle::Snapshot, None)
             .await
@@ -1651,7 +1664,7 @@ impl Shared {
         let machine_id = machine_id.to_string();
         let spec_hash = spec_hash.to_string();
         let resolved_image = request.spec.image.clone();
-        let network_enabled = network_device_enabled(&self.config, request.spec.network);
+        let network_enabled = network_device_enabled(&self.config, &request.spec.network_policy);
         let workspace_id = if snapshot.is_none() {
             request
                 .spec
@@ -1722,7 +1735,7 @@ impl Shared {
                     prepare_network(
                         &config,
                         &network,
-                        request.spec.network,
+                        &request.spec.network_policy,
                         jailer_uid(&config, &record)?,
                     )?;
                 }
@@ -2282,9 +2295,9 @@ fn hash_runtime_fingerprint(hasher: &mut Sha256, runtime: &FirecrackerRuntimeFin
 
 fn network_device_enabled(
     config: &FirecrackerConfig,
-    sandbox_policy: SandboxNetworkPolicy,
+    network_policy: &SandboxNetworkPolicy,
 ) -> bool {
-    sandbox_policy == SandboxNetworkPolicy::Enabled
+    network_policy.allows_all()
         || config.network_device_policy == FirecrackerNetworkDevicePolicy::AllSandboxes
 }
 
@@ -2627,7 +2640,7 @@ fn ipv4_add(address: Ipv4Addr, offset: u32) -> Ipv4Addr {
 fn prepare_network(
     config: &FirecrackerConfig,
     network: &NetworkConfig,
-    policy: SandboxNetworkPolicy,
+    policy: &SandboxNetworkPolicy,
     jailer_uid: u32,
 ) -> Result<()> {
     // Firecracker intentionally delegates TAP routing and firewalling to the host.
@@ -2803,7 +2816,7 @@ fn prepare_network(
 fn install_network_firewall(
     config: &FirecrackerConfig,
     network: &NetworkConfig,
-    policy: SandboxNetworkPolicy,
+    policy: &SandboxNetworkPolicy,
 ) -> Result<()> {
     let rules = network_firewall_rules(config, network, policy)?;
     run_checked_input("nft", &["-f", "-"], rules.as_bytes())
@@ -2812,7 +2825,7 @@ fn install_network_firewall(
 fn network_firewall_rules(
     config: &FirecrackerConfig,
     network: &NetworkConfig,
-    policy: SandboxNetworkPolicy,
+    policy: &SandboxNetworkPolicy,
 ) -> Result<String> {
     let mut rules = String::new();
     let table = &network.nft_table;
@@ -2855,18 +2868,23 @@ fn network_firewall_rules(
         rules,
         "add rule inet {table} forward iifname {interface} ip daddr {EXO_NETWORK_CIDR} counter reject"
     )?;
-    for cidr in &config.allowed_egress_cidrs {
-        writeln!(
-            rules,
-            "add rule inet {table} forward iifname {interface} ip daddr {cidr} counter accept"
-        )?;
+    // Host-configured exceptions extend unrestricted sandboxes only. An
+    // explicit sandbox deny-all policy must remain deny-all even when a
+    // network device is present for host reachability.
+    if policy.allows_all() {
+        for cidr in &config.allowed_egress_cidrs {
+            writeln!(
+                rules,
+                "add rule inet {table} forward iifname {interface} ip daddr {cidr} counter accept"
+            )?;
+        }
     }
     writeln!(
         rules,
         "add rule inet {table} forward iifname {interface} ip daddr {{ {} }} counter reject",
         BLOCKED_EGRESS_CIDRS.join(", ")
     )?;
-    let final_egress_verdict = if policy == SandboxNetworkPolicy::Enabled {
+    let final_egress_verdict = if policy.allows_all() {
         "accept"
     } else {
         "reject"
