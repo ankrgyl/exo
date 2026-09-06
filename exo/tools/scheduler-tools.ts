@@ -55,7 +55,7 @@ function createScheduleSandboxTaskTool(): ToolInstance {
           schedule: {
             type: "string",
             description:
-              "Schedule as '@every 10m', '@every 1h', a simple cron interval like '*/30 * * * *', or '@at 2026-07-26T17:00:00Z' for a one-shot. Recurring fires land on the schedule's own grid rather than on when the last run finished, so a slow run does not push later fires later. A one-shot fires once, is then marked completed, and stays listed without ever running again.",
+              "Schedule as '@every 10m', '@every 1h', a simple cron interval like '*/30 * * * *', wall-clock cron like '0 0 5 * * *' (5 fields) or '*/10 * * * * *' (6 fields; sec min hour day month weekday, UTC), or '@at 2026-07-26T17:00:00Z' for a one-shot. Recurring fires land on the schedule's own grid rather than on when the last run finished, so a slow run does not push later fires later. A one-shot fires once, is then marked completed, and stays listed without ever running again.",
           },
           missed: {
             anyOf: [

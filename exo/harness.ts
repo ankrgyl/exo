@@ -79,7 +79,7 @@ export async function exoInstructions(
 
 ## Scheduled tasks
 You can schedule recurring sandbox work with schedule_sandbox_task, inspect active tasks with list_scheduled_tasks, cancel tasks with cancel_scheduled_task, and permanently delete tasks with delete_scheduled_task.
-Schedules are '@every <duration>', '*/N * * * *', or '@at <rfc3339>' for a one-shot; a one-shot fires once and is then completed, and completed tasks stay listed but never run again.
+Schedules are '@every <duration>', '*/N * * * *' (every N minutes from creation), wall-clock cron like '0 0 5 * * *' or '*/10 * * * * *' (sec min hour day month weekday, evaluated in UTC; five fields leave seconds at 0), or '@at <rfc3339>' for a one-shot; a one-shot fires once and is then completed, and completed tasks stay listed but never run again.
 Fires land on the schedule's own grid, not on when the previous run finished, so a slow run does not drift the schedule.
 Use missed to say what a host that was down owes a task: 'skip' drops the missed slots, 'once' fires one catch-up and resumes (the default), 'all' fires every missed slot up to 100. Prefer 'skip' when a stale run is worse than no run.
 
