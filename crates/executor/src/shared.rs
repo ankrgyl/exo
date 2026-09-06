@@ -1,13 +1,9 @@
-use std::collections::HashMap;
 use std::future::Future;
-use std::hash::Hash;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use anyhow::Error;
-use exoharness::{
-    AgentHandle, AgentId, ConversationHandle, ConversationId, EventId, Result, TurnHandle,
-};
+use exoharness::{AgentHandle, ConversationHandle, EventId, Result, TurnHandle};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -15,37 +11,6 @@ use crate::execution_tracing::{ExecutionTracer, TurnExecutionTrace};
 use crate::{AgentConfig, ExecutionStreamEvent, ExecutionStreamHandle, SendResult};
 
 pub(crate) type TurnFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
-
-pub(crate) fn cache_insert<K, V>(cache: &RwLock<HashMap<K, V>>, key: K, value: V, name: &str)
-where
-    K: Eq + Hash,
-{
-    cache.write().expect(name).insert(key, value);
-}
-
-pub(crate) async fn get_or_load_cached<K, V, Load, LoadFuture>(
-    cache: &RwLock<HashMap<K, V>>,
-    key: K,
-    name: &str,
-    load: Load,
-) -> Result<V>
-where
-    K: Eq + Hash + Clone,
-    V: Clone,
-    Load: FnOnce() -> LoadFuture,
-    LoadFuture: Future<Output = Result<V>>,
-{
-    {
-        let cache = cache.read().expect(name);
-        if let Some(value) = cache.get(&key) {
-            return Ok(value.clone());
-        }
-    }
-
-    let value = load().await?;
-    cache_insert(cache, key, value.clone(), name);
-    Ok(value)
-}
 
 pub(crate) async fn execute_prepared_turn<Run>(
     tracer: &dyn ExecutionTracer,
@@ -181,27 +146,4 @@ pub(crate) fn try_send_stream_error(
     if event_tx.send(Err(Error::msg(error.to_string()))).is_err() {}
 }
 
-pub(crate) const AGENT_CONFIG_CACHE_NAME: &str = "agent config cache poisoned";
-pub(crate) const CONVERSATION_CONFIG_CACHE_NAME: &str = "conversation config cache poisoned";
 pub(crate) const HISTORY_CACHE_NAME: &str = "history cache poisoned";
-
-pub(crate) fn cache_agent_config(
-    cache: &RwLock<HashMap<AgentId, AgentConfig>>,
-    agent_id: AgentId,
-    config: AgentConfig,
-) {
-    cache_insert(cache, agent_id, config, AGENT_CONFIG_CACHE_NAME);
-}
-
-pub(crate) fn cache_conversation_config(
-    cache: &RwLock<HashMap<ConversationId, crate::ConversationConfig>>,
-    conversation_id: ConversationId,
-    config: crate::ConversationConfig,
-) {
-    cache_insert(
-        cache,
-        conversation_id,
-        config,
-        CONVERSATION_CONFIG_CACHE_NAME,
-    );
-}

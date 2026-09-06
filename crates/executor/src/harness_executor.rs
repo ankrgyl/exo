@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use exoharness::{AgentHandle, BeginTurnRequest, ConversationHandle, Result, TurnHandle};
@@ -12,11 +11,7 @@ use crate::harness_config::{
 };
 use crate::harness_facade::HarnessRuntime;
 use crate::harness_helpers::get_conversation_model_override;
-use crate::shared::{
-    AGENT_CONFIG_CACHE_NAME, CONVERSATION_CONFIG_CACHE_NAME, cache_agent_config,
-    cache_conversation_config, execute_prepared_turn, get_or_load_cached,
-    spawn_prepared_turn_stream,
-};
+use crate::shared::{execute_prepared_turn, spawn_prepared_turn_stream};
 use crate::{
     AgentConfig, ConversationConfig, ConversationModelConfig, ExecutionStreamEvent,
     ExecutionStreamHandle, SendRequest, SendResult,
@@ -60,8 +55,6 @@ pub(crate) trait HarnessExecutor: Send + Sync + Clone + 'static {
 pub(crate) struct ExecutorHarnessRuntime<E> {
     executor: E,
     tracer: Arc<dyn ExecutionTracer>,
-    agent_config_cache: Arc<RwLock<HashMap<exoharness::AgentId, AgentConfig>>>,
-    conversation_config_cache: Arc<RwLock<HashMap<exoharness::ConversationId, ConversationConfig>>>,
 }
 
 impl<E> ExecutorHarnessRuntime<E> {
@@ -69,8 +62,6 @@ impl<E> ExecutorHarnessRuntime<E> {
         Self {
             executor,
             tracer: Arc::new(BraintrustTracer::new(runtime_config)),
-            agent_config_cache: Arc::new(RwLock::new(HashMap::new())),
-            conversation_config_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -83,8 +74,6 @@ where
         Self {
             executor: self.executor.clone(),
             tracer: Arc::clone(&self.tracer),
-            agent_config_cache: Arc::clone(&self.agent_config_cache),
-            conversation_config_cache: Arc::clone(&self.conversation_config_cache),
         }
     }
 }
@@ -106,35 +95,25 @@ where
     E: HarnessExecutor,
 {
     async fn get_agent_config(&self, agent: &dyn AgentHandle) -> Result<AgentConfig> {
-        let agent_id = agent.record().id;
-        get_or_load_cached(
-            &self.agent_config_cache,
-            agent_id,
-            AGENT_CONFIG_CACHE_NAME,
-            || load_agent_config(agent),
-        )
-        .await
+        // Read the latest config from the agent's artifact store every turn, so an
+        // external `exo agent update` (or the agent rewriting its own config) takes
+        // effect on the next turn without restarting the runner. No cache on
+        // purpose: the config is a tiny artifact and a turn is dominated by the
+        // model call, so a fresh read costs less than keeping a cache correct
+        // across outside writes (the stale-cache bug this replaces).
+        load_agent_config(agent).await
     }
 
     async fn put_agent_config(&self, agent: &dyn AgentHandle, config: AgentConfig) -> Result<()> {
-        let agent_id = agent.record().id;
-        store_agent_config(agent, &config).await?;
-        cache_agent_config(&self.agent_config_cache, agent_id, config);
-        Ok(())
+        store_agent_config(agent, &config).await
     }
 
     async fn get_conversation_config(
         &self,
         conversation: &dyn ConversationHandle,
     ) -> Result<ConversationConfig> {
-        let conversation_id = conversation.record().id;
-        get_or_load_cached(
-            &self.conversation_config_cache,
-            conversation_id,
-            CONVERSATION_CONFIG_CACHE_NAME,
-            || load_conversation_config(conversation),
-        )
-        .await
+        // Read fresh every turn, for the same reasons as get_agent_config.
+        load_conversation_config(conversation).await
     }
 
     async fn put_conversation_config(
@@ -142,10 +121,7 @@ where
         conversation: &dyn ConversationHandle,
         config: ConversationConfig,
     ) -> Result<()> {
-        let conversation_id = conversation.record().id;
-        store_conversation_config(conversation, &config).await?;
-        cache_conversation_config(&self.conversation_config_cache, conversation_id, config);
-        Ok(())
+        store_conversation_config(conversation, &config).await
     }
 
     async fn send(

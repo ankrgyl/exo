@@ -25,7 +25,9 @@ use serde_json::{Map, Value, json};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor};
+use crate::execution_tracing::TurnExecutionTrace;
+use crate::harness_executor::{ExecutorHarnessRuntime, ExecutorStreamMode, HarnessExecutor};
+use crate::harness_facade::HarnessRuntime;
 use crate::*;
 
 #[tokio::test(flavor = "current_thread")]
@@ -618,6 +620,7 @@ struct FakeExoHarness {
 struct FakeState {
     agent: AgentRecord,
     conversation: FakeConversationState,
+    agent_artifact: Option<(u64, String, Vec<u8>)>,
 }
 
 struct FakeConversationState {
@@ -643,6 +646,7 @@ impl FakeExoHarness {
                     },
                     events: Vec::new(),
                 },
+                agent_artifact: None,
             })),
         }
     }
@@ -780,16 +784,52 @@ impl AgentHandle for FakeAgentHandle {
         }))
     }
 
-    async fn write_artifact(&self, _request: WriteArtifactRequest) -> Result<ArtifactVersion> {
-        Err(anyhow!("not implemented"))
+    async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion> {
+        let mut state = self.state.lock().expect("state poisoned");
+        let version = state.agent_artifact.as_ref().map_or(1, |(v, _, _)| v + 1);
+        let size_bytes = request.contents.len() as u64;
+        state.agent_artifact = Some((version, request.path.clone(), request.contents));
+        Ok(ArtifactVersion {
+            artifact_id: Uuid7::now(),
+            path: request.path,
+            version,
+            created_at: artifact_timestamp(),
+            size_bytes,
+        })
     }
 
     async fn read_artifact(&self, _request: ReadArtifactRequest) -> Result<Option<Artifact>> {
-        Ok(None)
+        let state = self.state.lock().expect("state poisoned");
+        Ok(state
+            .agent_artifact
+            .as_ref()
+            .map(|(version, path, contents)| Artifact {
+                version: ArtifactVersion {
+                    artifact_id: Uuid7::now(),
+                    path: path.clone(),
+                    version: *version,
+                    created_at: artifact_timestamp(),
+                    size_bytes: contents.len() as u64,
+                },
+                contents: contents.clone(),
+            }))
     }
 
     async fn list_artifacts(&self) -> Result<Vec<ArtifactVersion>> {
-        Ok(Vec::new())
+        let state = self.state.lock().expect("state poisoned");
+        Ok(state
+            .agent_artifact
+            .as_ref()
+            .map(|(version, path, contents)| {
+                vec![ArtifactVersion {
+                    artifact_id: Uuid7::now(),
+                    path: path.clone(),
+                    version: *version,
+                    created_at: artifact_timestamp(),
+                    size_bytes: contents.len() as u64,
+                }]
+            })
+            .unwrap_or_default())
     }
 }
 
@@ -1350,4 +1390,81 @@ fn default_agent_config() -> AgentConfig {
         max_tool_round_trips: Some(4),
         braintrust: None,
     }
+}
+
+fn artifact_timestamp() -> exoharness::DateTimeUtc {
+    exoharness::DateTimeUtc::from_timestamp(0, 0).expect("valid epoch timestamp")
+}
+
+#[derive(Clone)]
+struct NoopExecutor;
+
+#[async_trait]
+impl HarnessExecutor for NoopExecutor {
+    type Prepared = ();
+
+    fn prepare_request(&self, _request: &SendRequest) -> Result<Self::Prepared> {
+        Ok(())
+    }
+
+    async fn execute_turn(
+        &self,
+        _agent: &dyn AgentHandle,
+        _conversation: &dyn ConversationHandle,
+        _turn: Arc<dyn TurnHandle>,
+        _agent_config: &AgentConfig,
+        _conversation_config: &ConversationConfig,
+        _prepared: &Self::Prepared,
+        _stream_mode: ExecutorStreamMode<'_>,
+        _turn_trace: Option<&dyn TurnExecutionTrace>,
+    ) -> Result<()> {
+        unimplemented!("execute_turn is not exercised by get_agent_config")
+    }
+}
+
+async fn write_agent_config(agent: &dyn AgentHandle, config: &AgentConfig) {
+    agent
+        .write_artifact(WriteArtifactRequest {
+            path: "config/executor.json".to_string(),
+            contents: serde_json::to_vec(config).expect("serialize config"),
+        })
+        .await
+        .expect("write config artifact");
+}
+
+#[tokio::test]
+async fn get_agent_config_reflects_external_update_without_restart() {
+    let agent_id = Uuid7::now();
+    let conversation_id = Uuid7::now();
+    let harness = FakeExoHarness::new(agent_id, conversation_id);
+    let agent = harness
+        .get_agent(&agent_id)
+        .await
+        .expect("get_agent")
+        .expect("agent exists");
+    let runtime = ExecutorHarnessRuntime::new(NoopExecutor, None);
+
+    // Initial config, as written by `exo agent create`.
+    let mut config = default_agent_config();
+    config.enable_networking = false;
+    write_agent_config(agent.as_ref(), &config).await;
+    let loaded = runtime
+        .get_agent_config(agent.as_ref())
+        .await
+        .expect("load config");
+    assert!(!loaded.enable_networking);
+
+    // Rewrite the artifact out of band, as a concurrent `exo agent update` would.
+    config.enable_networking = true;
+    write_agent_config(agent.as_ref(), &config).await;
+
+    // The next turn must observe the new config without restarting the runner.
+    let reloaded = runtime
+        .get_agent_config(agent.as_ref())
+        .await
+        .expect("reload config");
+    assert!(
+        reloaded.enable_networking,
+        "config update should be picked up without a restart"
+    );
 }
