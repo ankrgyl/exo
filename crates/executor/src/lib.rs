@@ -61,12 +61,12 @@ pub use exoharness::{
     ExoHarnessHttpServeOptions, FileSystemMount, FileSystemMountMode, FirecrackerBackendSpec,
     ForkConversationRequest, HTTP_EXOHARNESS_TRACING_TARGET, HttpExoHarness, NewAgentRequest,
     PutSecretRequest, RunInSandboxRequest, SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment,
-    SandboxBackendRegistration, SandboxId, SandboxProcess, SandboxProvider, SandboxProviderConfig,
-    SandboxRecord, SandboxResourceShape, Secret, SecretBackendChoice, SecretMetadata, SessionId,
-    SnapshotId, SpritesBackendSpec, StartSandboxRequest, ToolRequest, Uuid7, VercelBackendSpec,
-    default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
-    default_firecracker_image, default_vercel_image, serve_exoharness_http_listener,
-    serve_exoharness_http_listener_with_options,
+    SandboxBackendRegistration, SandboxId, SandboxNetworkPolicy, SandboxProcess, SandboxProvider,
+    SandboxProviderConfig, SandboxRecord, SandboxResourceShape, Secret, SecretBackendChoice,
+    SecretMetadata, SessionId, SnapshotId, SpritesBackendSpec, StartSandboxRequest, ToolRequest,
+    Uuid7, VercelBackendSpec, default_aws_agentcore_image, default_daytona_image,
+    default_docker_image, default_e2b_template, default_firecracker_image, default_vercel_image,
+    serve_exoharness_http_listener, serve_exoharness_http_listener_with_options,
 };
 #[cfg(feature = "firecracker")]
 pub use exoharness::{

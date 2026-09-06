@@ -1049,7 +1049,7 @@ async function requireCodexSandboxNetworking(
     "codex_networking_required",
     {
       metadata: turnMetadata(context),
-      agent_enable_networking: context.agentConfig.sandbox.enableNetworking,
+      agent_enable_networking: codexEffectiveNetworking(context),
       reason:
         "Codex runs its model stream inside the exoharness sandbox, so the agent sandbox must have networking enabled.",
     },
@@ -1065,7 +1065,21 @@ function codexSandboxNetworkingError(context: TurnContext): string {
 }
 
 function codexEffectiveNetworking(context: TurnContext): boolean {
-  return context.agentConfig.sandbox.enableNetworking;
+  const sandbox = context.agentConfig.sandbox;
+  if (sandbox.enableNetworking !== undefined) {
+    return sandbox.enableNetworking;
+  }
+  const policy = sandbox.networkPolicy;
+  if (!policy) {
+    return true;
+  }
+  return (
+    policy.defaultDeny === false &&
+    (policy.allowedDomains?.length ?? 0) === 0 &&
+    (policy.allowedCidrs?.length ?? 0) === 0 &&
+    (policy.deniedDomains?.length ?? 0) === 0 &&
+    (policy.deniedCidrs?.length ?? 0) === 0
+  );
 }
 
 function codexSandboxCommand(context: TurnContext): string[] {

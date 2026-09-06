@@ -1320,6 +1320,7 @@ function fakeTurnContext(
         provider: "docker",
         mounts: [],
         enableNetworking: false,
+        networkPolicy: null,
         scope: "conversation",
       },
       model: "test-model",

@@ -226,9 +226,15 @@ pub(crate) fn agent_sandbox_spec(agent_config: &AgentConfig) -> ConversationSand
             .unwrap_or_else(|| "/".to_string()),
         file_system_mounts: normalize_mounts(&agent_config.sandbox.mounts),
         durable_file_systems: Vec::new(),
-        network_policy: SandboxNetworkPolicy::from_legacy_enable_networking(
-            agent_config.sandbox.enable_networking,
-        ),
+        network_policy: agent_config
+            .sandbox
+            .network_policy
+            .clone()
+            .unwrap_or_else(|| {
+                SandboxNetworkPolicy::from_legacy_enable_networking(
+                    agent_config.sandbox.enable_networking,
+                )
+            }),
         idle_seconds: 300,
     }
 }
@@ -256,9 +262,15 @@ pub(crate) fn conversation_sandbox_spec(
             .unwrap_or_else(|| "/".to_string()),
         file_system_mounts: normalize_mounts(&config.mounts),
         durable_file_systems: config.durable_file_systems.clone(),
-        network_policy: SandboxNetworkPolicy::from_legacy_enable_networking(
-            agent_config.sandbox.enable_networking,
-        ),
+        network_policy: agent_config
+            .sandbox
+            .network_policy
+            .clone()
+            .unwrap_or_else(|| {
+                SandboxNetworkPolicy::from_legacy_enable_networking(
+                    agent_config.sandbox.enable_networking,
+                )
+            }),
         idle_seconds: 300,
     }
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use exoharness::{
     AgentHandle, AgentRecord, ConversationHandle, ConversationRecord, ExoHarness, Result,
-    SandboxProvider, SessionId,
+    SandboxNetworkPolicy, SandboxProvider, SessionId,
 };
 use lingua::Message;
 
@@ -69,6 +69,7 @@ pub struct CreateAgentRequest {
     pub sandbox_provider: SandboxProvider,
     pub sandbox_scope: Option<SandboxScope>,
     pub enable_networking: bool,
+    pub network_policy: Option<SandboxNetworkPolicy>,
     pub model: String,
     pub max_output_tokens: Option<i64>,
     pub max_tool_round_trips: Option<u32>,

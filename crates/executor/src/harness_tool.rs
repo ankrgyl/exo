@@ -971,11 +971,15 @@ pub(crate) async fn ensure_shell_sandbox(
     let requested_image = config.effective_sandbox_image(agent_config);
     let desired_image = requested_image.map(str::to_string).unwrap_or_default();
     let desired_enable_networking = agent_config.sandbox.enable_networking;
-    let desired_network_policy = if desired_enable_networking {
-        exoharness::SandboxNetworkPolicy::allow_all()
-    } else {
-        exoharness::SandboxNetworkPolicy::deny_all()
-    };
+    let desired_network_policy = agent_config
+        .sandbox
+        .network_policy
+        .clone()
+        .unwrap_or_else(|| {
+            exoharness::SandboxNetworkPolicy::from_legacy_enable_networking(
+                desired_enable_networking,
+            )
+        });
 
     if let Some(sandbox) = latest_shell_sandbox(conversation, &desired_provider).await? {
         // When no image was requested, the stored sandbox holds the provider's

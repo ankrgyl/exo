@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use anyhow::bail;
+use anyhow::{Context as AnyhowContext, bail};
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, Cursor};
@@ -597,6 +597,118 @@ async fn vercel_sandbox_contract_start_process_long_running_protocol() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "uses a real Daytona sandbox; source sandbox-vars.sh and run this test explicitly"]
+async fn daytona_sandbox_contract_enforces_network_policy() {
+    let Some(backend) = daytona_contract_backend().await else {
+        return;
+    };
+
+    for (name, policy, should_connect) in [
+        ("network-allow-all", SandboxNetworkPolicy::allow_all(), true),
+        ("network-deny-all", SandboxNetworkPolicy::deny_all(), false),
+    ] {
+        let request = provider_contract_request(
+            "daytona",
+            name,
+            env_or("DAYTONA_IMAGE", &crate::default_daytona_image()),
+            "/",
+        );
+        let request = SandboxRequest {
+            spec: SandboxSpec {
+                network_policy: policy,
+                ..request.spec
+            },
+            ..request
+        };
+        assert_remote_network_policy(Arc::clone(&backend), request, should_connect)
+            .await
+            .expect("Daytona network policy contract");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "uses a real Vercel sandbox; source sandbox-vars.sh and run this test explicitly"]
+async fn vercel_sandbox_contract_enforces_domain_network_policy() {
+    let Some(backend) = vercel_contract_backend().await else {
+        return;
+    };
+
+    let request = provider_contract_request(
+        "vercel",
+        "network-domain-allowlist",
+        env_or("VERCEL_IMAGE", &crate::default_vercel_image()),
+        "/vercel/sandbox",
+    );
+    let request = SandboxRequest {
+        spec: SandboxSpec {
+            network_policy: SandboxNetworkPolicy {
+                allowed_domains: vec!["api.github.com".to_string()],
+                ..SandboxNetworkPolicy::default()
+            },
+            ..request.spec
+        },
+        ..request
+    };
+
+    assert_remote_network_policy(Arc::clone(&backend), request.clone(), true)
+        .await
+        .expect("Vercel domain allowlist should permit api.github.com");
+    assert_remote_network_policy(backend, request, false)
+        .await
+        .expect("Vercel domain allowlist should block example.com");
+}
+
+async fn assert_remote_network_policy(
+    backend: Arc<dyn ManagedSandboxBackend>,
+    request: SandboxRequest,
+    should_connect: bool,
+) -> crate::Result<()> {
+    let result = async {
+        let handle = backend
+            .acquire(request.clone())
+            .await
+            .context("acquire sandbox for network policy contract")?;
+        let command = if should_connect {
+            "curl --fail --silent --show-error --max-time 15 https://api.github.com/ >/dev/null"
+        } else {
+            "curl --fail --silent --show-error --max-time 15 https://example.com/ >/dev/null"
+        };
+        let output = handle
+            .exec(&SandboxCommand {
+                argv: vec!["bash".to_string(), "-lc".to_string(), command.to_string()],
+                env: Default::default(),
+                display_argv: None,
+                cwd: None,
+                timeout: Some(Duration::from_secs(30)),
+            })
+            .await
+            .context("run outbound network policy check")?;
+        if output.ok != should_connect {
+            bail!(
+                "expected outbound request to be {}, got {}: {}{}",
+                if should_connect { "allowed" } else { "blocked" },
+                if output.ok { "allowed" } else { "blocked" },
+                output.stdout,
+                output.stderr,
+            );
+        }
+        handle
+            .stop()
+            .await
+            .context("stop sandbox after network check")?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let terminate_result = backend
+        .terminate(request)
+        .await
+        .context("terminate sandbox after network check");
+    result?;
+    terminate_result
+}
+
+#[tokio::test(flavor = "current_thread")]
 #[ignore = "uses a real Docker sandbox; run this test explicitly"]
 async fn docker_sandbox_contract_durable_file_system_survives_stop_and_reacquire() {
     let tempdir = TempDir::new().expect("tempdir");
@@ -756,6 +868,21 @@ fn firecracker_durable_contract_request(contract: &str) -> SandboxRequest {
 }
 
 async fn daytona_contract_handle(contract: &str) -> Option<Arc<dyn ManagedSandboxHandle>> {
+    let backend = daytona_contract_backend().await?;
+    Some(
+        backend
+            .acquire(provider_contract_request(
+                "daytona",
+                contract,
+                env_or("DAYTONA_IMAGE", &crate::default_daytona_image()),
+                "/",
+            ))
+            .await
+            .expect("acquire Daytona sandbox"),
+    )
+}
+
+async fn daytona_contract_backend() -> Option<Arc<dyn ManagedSandboxBackend>> {
     let Some(api_key) = nonempty_env("DAYTONA_API_KEY") else {
         eprintln!("skipping real Daytona sandbox contract: DAYTONA_API_KEY is not set");
         return None;
@@ -770,20 +897,25 @@ async fn daytona_contract_handle(contract: &str) -> Option<Arc<dyn ManagedSandbo
         })
         .expect("DaytonaSandboxBackend::new"),
     );
-    Some(
-        backend
-            .acquire(provider_contract_request(
-                "daytona",
-                contract,
-                env_or("DAYTONA_IMAGE", &crate::default_daytona_image()),
-                "/",
-            ))
-            .await
-            .expect("acquire Daytona sandbox"),
-    )
+    Some(backend)
 }
 
 async fn vercel_contract_handle(contract: &str) -> Option<Arc<dyn ManagedSandboxHandle>> {
+    let backend = vercel_contract_backend().await?;
+    Some(
+        backend
+            .acquire(provider_contract_request(
+                "vercel",
+                contract,
+                env_or("VERCEL_IMAGE", &crate::default_vercel_image()),
+                "/vercel/sandbox",
+            ))
+            .await
+            .expect("acquire Vercel sandbox"),
+    )
+}
+
+async fn vercel_contract_backend() -> Option<Arc<dyn ManagedSandboxBackend>> {
     let Some(api_token) = nonempty_env("VERCEL_API_TOKEN").or_else(|| nonempty_env("VERCEL_TOKEN"))
     else {
         eprintln!(
@@ -808,17 +940,7 @@ async fn vercel_contract_handle(contract: &str) -> Option<Arc<dyn ManagedSandbox
         })
         .expect("VercelSandboxBackend::new"),
     );
-    Some(
-        backend
-            .acquire(provider_contract_request(
-                "vercel",
-                contract,
-                env_or("VERCEL_IMAGE", &crate::default_vercel_image()),
-                "/vercel/sandbox",
-            ))
-            .await
-            .expect("acquire Vercel sandbox"),
-    )
+    Some(backend)
 }
 
 #[cfg(feature = "aws-agentcore")]

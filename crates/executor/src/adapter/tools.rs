@@ -1893,6 +1893,7 @@ mod tests {
                 provider: SandboxProvider::Docker,
                 mounts: Vec::new(),
                 enable_networking: false,
+                network_policy: None,
                 scope: crate::SandboxScope::Agent,
             },
             model: "test-model".to_string(),

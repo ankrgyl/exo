@@ -58,6 +58,70 @@ An artifact is an opaque set of bytes that the agent can set and retrieve. Artif
 
 ### Sandbox
 
+Sandbox create requests accept `network_policy` and the legacy `enable_networking`
+boolean. When both are present they must agree: `enable_networking` is the
+coarse projection of whether the policy is unrestricted. This lets new HTTP
+clients safely call an older server: restrictive policies project to `false`,
+so the older server fails closed. Omitting both preserves the existing
+unrestricted default.
+An explicit empty policy (`"network_policy": {}`) denies outbound access. Policy
+fields use camelCase: `defaultDeny`, `allowedDomains`, `allowedCidrs`,
+`deniedDomains`, and `deniedCidrs`. Allowlists require `defaultDeny: true`.
+
+For example, a request that only allows the GitHub API is:
+
+```json
+{
+  "provider": "vercel",
+  "image": "node24",
+  "enable_networking": false,
+  "network_policy": {
+    "defaultDeny": true,
+    "allowedDomains": ["api.github.com"]
+  }
+}
+```
+
+The selected backend declares the policy features it can enforce. Backends
+reject unsupported rules before creating or restoring resources. As currently
+implemented, Vercel supports domain and CIDR allowlists plus CIDR denylists;
+Daytona and E2B support the coarse allow-all/default-deny modes; Docker,
+Apple Container, Firecracker, and SmolVM support default-deny; and
+LocalProcess supports unrestricted networking only. Provider support can grow
+without changing the provider-neutral request shape.
+
+Domain-pattern semantics are provider-specific. Policies are stored with
+sandboxes and forwarded through create, fork, and restore requests. Attached
+sandboxes have no recorded network policy because Exo does not configure or
+inspect the existing container's network. `LocalProcess` runs directly on the
+host and therefore rejects restrictive policies instead of claiming to isolate
+the process. Firecracker's operator-configured `allowed_egress_cidrs` do not
+override an explicit sandbox `deny_all` policy.
+
+The CLI keeps the deprecated `--networking enabled|disabled` option for legacy
+scripts and adds `--network-policy` for the full policy. The latter accepts
+either inline JSON or a path to a JSON file. Pass `--network-policy` at most
+once; it cannot be combined with `--networking`.
+
+The TypeScript API exposes the same policy as one `networkPolicy` object:
+
+```ts
+const sandbox = {
+  provider: "docker",
+  networkPolicy: {
+    defaultDeny: true,
+    allowedDomains: ["api.github.com"],
+  },
+  mounts: [],
+  scope: "agent",
+};
+```
+
+`networkPolicy` is a single object, not a list. Do not provide multiple policy
+objects. The TypeScript `enableNetworking` field is deprecated but remains
+optional for older callers; if both fields
+are provided, they must describe the same access level.
+
 Agents benefit from being able to write and run commands in secure environments. The exoharness supports running virtual machines (sandboxes) with pluggable runtimes and gives the agent the ability to run arbitrary commands and provision longer-running sandboxes with lifecycle commands like `create`, `start`, `stop`, and `snapshot`. Sandboxes can be snapshotted, which writes a snapshot id to the event log. An executor could choose to do this after every action, or let the LLM decide when. Snapshots allow time travel to also rewind sandbox state.
 
 ### Binding and secret

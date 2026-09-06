@@ -218,6 +218,7 @@ mod tests {
             provider: SandboxProvider::LocalProcess,
             mounts: vec![],
             enable_networking: true,
+            network_policy: None,
             scope: SandboxScope::Agent,
         }
     }

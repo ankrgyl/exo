@@ -131,6 +131,7 @@ where
                 provider: request.sandbox_provider,
                 mounts: Vec::new(),
                 enable_networking: request.enable_networking,
+                network_policy: request.network_policy,
                 scope: request.sandbox_scope.unwrap_or_default(),
             },
             model: request.model,
