@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -292,6 +292,20 @@ pub struct Response {
     pub error: Option<String>,
 }
 
+impl Response {
+    fn ensure_ok(&self) -> Result<()> {
+        if !self.ok {
+            bail!(
+                "process bridge request failed: {}",
+                self.error
+                    .as_deref()
+                    .unwrap_or("unknown process bridge error")
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
@@ -453,6 +467,7 @@ async fn poll_output(
 ) -> Result<()> {
     loop {
         let response = client.request(Request::recv()).await?;
+        response.ensure_ok()?;
         if response.timeout {
             continue;
         }
@@ -510,13 +525,15 @@ async fn forward_stdin(
             .await
             .context("reading process bridge stdin")?;
         if bytes_read == 0 {
-            client.request(Request::close_stdin()).await?;
+            let response = client.request(Request::close_stdin()).await?;
+            response.ensure_ok()?;
             return Ok(());
         }
-        client
+        let response = client
             .request(Request::write(&buffer[..bytes_read]))
             .await
             .context("writing process bridge stdin")?;
+        response.ensure_ok()?;
     }
 }
 
@@ -596,6 +613,26 @@ mod tests {
             serde_json::to_value(request).expect("serialize resize request"),
             json!({"type": "resize", "size": {"rows": 24, "cols": 80}})
         );
+    }
+
+    #[tokio::test]
+    async fn process_parts_reports_bridge_error_responses() {
+        let client = Arc::new(FakeClient {
+            responses: Mutex::new(VecDeque::from([Response {
+                ok: false,
+                timeout: false,
+                events: Vec::new(),
+                error: Some("remote process disappeared".to_string()),
+            }])),
+        });
+        let parts = process_parts(client);
+        let _stdin = parts.stdin;
+
+        let result = tokio::time::timeout(Duration::from_secs(1), parts.wait)
+            .await
+            .expect("bridge error should resolve the process wait");
+
+        assert!(result.is_err());
     }
 
     #[tokio::test]
