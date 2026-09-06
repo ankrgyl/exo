@@ -63,21 +63,48 @@ impl PricingTable {
     /// token boundary (next char absent or `-`/`:`), so dated revisions resolve
     /// (`claude-sonnet-4-6-20251022` -> `claude-sonnet-4-6`) without sliding
     /// `gpt-4o-mini` onto a `gpt-4` entry when `gpt-4o` is missing.
+    ///
+    /// Additionally, if no prefix or exact match succeeded, try keys that do
+    /// not contain a `/` (non-route-qualified keys) as a fallback so that
+    /// models reached directly from vendor endpoints (e.g. bare `gpt-4o`)
+    /// can still be priced.
     pub fn lookup(&self, model: &str) -> Option<&ModelEntry> {
+        // 1. Exact match.
         if let Some(entry) = self.entries.get(model) {
             return Some(entry);
         }
-        self.entries
+        // 2. Prefix match against route-qualified keys (contain `/`).
+        let prefix = self.entries
             .iter()
             .filter(|(key, _)| {
                 model.starts_with(key.as_str())
-                    && matches!(
+                    && matches! {
                         model.as_bytes().get(key.len()),
                         None | Some(b'-') | Some(b':')
-                    )
+                    }
             })
             .max_by_key(|(key, _)| key.len())
-            .map(|(_, entry)| entry)
+            .map(|(_, entry)| entry);
+
+        // 3. Fallback against non-route-qualified keys (no `/` in key).
+        let fallback = if prefix.is_none() {
+            self.entries
+                .iter()
+                .filter(|(key, _)| key.as_bytes().iter().all(|b| *b != b'/'))
+                .filter(|(key, _)| {
+                    model.starts_with(key.as_str())
+                        && matches! {
+                            model.as_bytes().get(key.len()),
+                            None | Some(b'-') | Some(b':')
+                        }
+                })
+                .max_by_key(|(key, _)| key.len())
+                .map(|(_, entry)| entry)
+        } else {
+            None
+        };
+
+        prefix.or(fallback)
     }
 
     /// USD cost for one call, or `None` if the model is unknown or unpriced.
