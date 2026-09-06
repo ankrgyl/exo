@@ -29,8 +29,6 @@ use sha2::{Digest, Sha256};
 use tempfile::{Builder as TempBuilder, NamedTempFile};
 use tokio::io::AsyncWriteExt;
 
-use super::firecracker::PhaseTimer;
-
 const MATERIALIZER_VERSION: u32 = 4;
 const EXT4_MAGIC_OFFSET: u64 = 1024 + 0x38;
 const EXT4_MAGIC: [u8; 2] = [0x53, 0xef];
@@ -93,7 +91,6 @@ pub(super) async fn resolve_image(
     allowed_local_images: &[PathBuf],
     allowed_registries: &[String],
 ) -> Result<PathBuf> {
-    let _phase = PhaseTimer::new("resolve_image");
     if looks_like_local_image(source) {
         let state_root = state_root.to_path_buf();
         let source_path = source.to_string();
@@ -152,13 +149,10 @@ pub(super) async fn resolve_image(
     // response size limit in oci-client or a hand-rolled bounded fetch. Layer
     // blobs are NOT affected: pull_blob streams them to disk through
     // LimitedAsyncWriter under declared-size and cumulative budgets.
-    let (manifest, manifest_digest, config_json, list_digest) = {
-        let _phase = PhaseTimer::new("registry_manifest");
-        client
-            .pull_manifest_and_config_and_list_digest(&reference, &auth)
-            .await
-            .with_context(|| format!("resolving OCI image manifest for {source}"))?
-    };
+    let (manifest, manifest_digest, config_json, list_digest) = client
+        .pull_manifest_and_config_and_list_digest(&reference, &auth)
+        .await
+        .with_context(|| format!("resolving OCI image manifest for {source}"))?;
     let source_digest = list_digest.unwrap_or_else(|| manifest_digest.clone());
 
     let image_config: OciImageConfiguration = serde_json::from_str(&config_json)
@@ -385,7 +379,6 @@ fn is_cached_local_image(state_root: &Path, source: &Path) -> bool {
 }
 
 fn registry_auth(reference: &Reference) -> Result<RegistryAuth> {
-    let _phase = PhaseTimer::new("registry_auth");
     let Some(config_path) = docker_config_path() else {
         return Ok(RegistryAuth::Anonymous);
     };
@@ -1211,7 +1204,6 @@ fn validate_cache_entry(
     manifest_digest: Option<&str>,
     platform: &str,
 ) -> Result<PathBuf> {
-    let _phase = PhaseTimer::new("validate_cache_entry");
     let metadata_path = cache_dir.join("metadata.json");
     let metadata: CachedImageMetadata =
         serde_json::from_slice(&fs::read(&metadata_path).with_context(|| {

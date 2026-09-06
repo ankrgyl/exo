@@ -57,34 +57,6 @@ use super::firecracker_image::resolve_image;
 #[cfg(test)]
 use super::firecracker_image::validate_ext4_image;
 
-pub(super) struct PhaseTimer {
-    phase: &'static str,
-    started: Instant,
-    span: tracing::Span,
-}
-
-impl PhaseTimer {
-    pub(super) fn new(phase: &'static str) -> Self {
-        Self {
-            phase,
-            started: Instant::now(),
-            span: tracing::Span::current(),
-        }
-    }
-}
-
-impl Drop for PhaseTimer {
-    fn drop(&mut self) {
-        tracing::info!(
-            parent: &self.span,
-            event = "firecracker.phase",
-            phase = self.phase,
-            duration_ms = self.started.elapsed().as_secs_f64() * 1000.0,
-            "Firecracker phase completed"
-        );
-    }
-}
-
 const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const PID_FILE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -744,7 +716,6 @@ impl FirecrackerSandboxBackend {
     }
 
     async fn reap_stale_machines(&self) -> Result<()> {
-        let _phase = PhaseTimer::new("reap_stale_machines");
         if self.shared.config.max_machines.is_none() {
             return Ok(());
         }
@@ -764,7 +735,6 @@ impl FirecrackerSandboxBackend {
     }
 
     async fn reap_expired_machines(&self) -> Result<()> {
-        let _phase = PhaseTimer::new("reap_expired_machines");
         let now = Instant::now();
         let mut expired = {
             let machines = self.shared.warm_machines.lock().await;
@@ -810,7 +780,6 @@ impl FirecrackerSandboxBackend {
     }
 
     async fn resolve_request(&self, request: SandboxRequest) -> Result<SandboxRequest> {
-        let _phase = PhaseTimer::new("resolve_request");
         let mut request = prepare_request(request)?;
         validate_resource_shape(request.spec.resources)?;
         let image = resolve_image(
@@ -1028,7 +997,6 @@ impl FirecrackerSandboxBackend {
         &self,
         request: SandboxRequest,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        let _phase = PhaseTimer::new("acquire_resolved");
         let spec_hash = sandbox_spec_hash(&request.spec);
         let one_shot = request.lifecycle.idle_ttl.is_none();
         let machine_id = if one_shot {
@@ -1037,10 +1005,7 @@ impl FirecrackerSandboxBackend {
         } else {
             machine_id(&request.key, &spec_hash)
         };
-        let _lifecycle_guard = {
-            let _phase = PhaseTimer::new("lifecycle_lock");
-            self.shared.lifecycle_locks.lock_sandbox(&request.key).await
-        };
+        let _lifecycle_guard = self.shared.lifecycle_locks.lock_sandbox(&request.key).await;
         self.acquire_resolved_locked(request, spec_hash, machine_id, one_shot, None)
             .await
     }
@@ -1140,7 +1105,6 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        let _phase = PhaseTimer::new("acquire");
         self.reap_stale_machines().await?;
         self.reap_expired_machines().await?;
         self.shared.reap_orphaned_fork_snapshot_templates().await;
@@ -1473,7 +1437,6 @@ impl Shared {
     }
 
     async fn reap_orphaned_fork_snapshot_templates(&self) {
-        let _phase = PhaseTimer::new("reap_orphaned_fork_snapshot_templates");
         let config = self.config.clone();
         match tokio::task::spawn_blocking(move || {
             reap_orphaned_fork_snapshot_templates_blocking(&config)
@@ -1507,7 +1470,6 @@ impl Shared {
         &self,
         machine_id: &str,
     ) -> Result<MachineCapacityReservation> {
-        let _phase = PhaseTimer::new("reserve_machine_capacity");
         let Some(max_machines) = self.config.max_machines else {
             return Ok(MachineCapacityReservation::inactive(Arc::clone(
                 &self.starting_machines,
@@ -1567,7 +1529,6 @@ impl Shared {
         machine_id: &str,
         spec_hash: &str,
     ) -> Result<Machine> {
-        let _phase = PhaseTimer::new("ensure_machine");
         let runtime = self.host_fingerprint.for_resources(request.spec.resources);
         let existing = self.load_machine_record(machine_id).await?;
         let reusing_existing_machine = existing
@@ -1656,7 +1617,6 @@ impl Shared {
     }
 
     async fn load_machine_record(&self, machine_id: &str) -> Result<Option<MachineRecord>> {
-        let _phase = PhaseTimer::new("load_machine_record");
         let path = self.manifest_path(machine_id);
         tokio::task::spawn_blocking(move || {
             if !path.try_exists()? {
@@ -1673,7 +1633,6 @@ impl Shared {
     }
 
     async fn touch_machine_lease(&self, machine_id: &str) -> Result<()> {
-        let _phase = PhaseTimer::new("touch_machine_lease");
         let state_root = self.config.state_root.clone();
         let machine_id = machine_id.to_string();
         tokio::task::spawn_blocking(move || touch_machine_lease(&state_root, &machine_id))
@@ -1688,7 +1647,6 @@ impl Shared {
         spec_hash: &str,
         snapshot: Option<SnapshotMachineRecord>,
     ) -> Result<MachineRecord> {
-        let _phase = PhaseTimer::new("new_machine_record");
         let state_root = self.config.state_root.clone();
         let machine_id = machine_id.to_string();
         let spec_hash = spec_hash.to_string();
@@ -1754,13 +1712,10 @@ impl Shared {
         request: &SandboxRequest,
         record: &MachineRecord,
     ) -> Result<GuestReadiness> {
-        let _phase = PhaseTimer::new("prepare_and_launch");
         let config = self.config.clone();
         let request = request.clone();
         let record = record.clone();
-        let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
-            let _entered = span.enter();
             let network = record.network();
             let result = (|| {
                 if record.network_enabled {
@@ -2675,7 +2630,6 @@ fn prepare_network(
     policy: SandboxNetworkPolicy,
     jailer_uid: u32,
 ) -> Result<()> {
-    let _phase = PhaseTimer::new("prepare_network");
     // Firecracker intentionally delegates TAP routing and firewalling to the host.
     // nftables is the upstream-recommended production firewall, and a namespace per
     // VM keeps identical guest interface names and routes from colliding.
@@ -2938,7 +2892,6 @@ fn network_firewall_rules(
 }
 
 fn cleanup_network_blocking(network: &NetworkConfig) {
-    let _phase = PhaseTimer::new("cleanup_network_blocking");
     remove_all_matching_rules(
         "iptables",
         &[
@@ -2974,8 +2927,6 @@ fn cleanup_network_blocking(network: &NetworkConfig) {
 }
 
 fn run_checked(program: &str, arguments: &[&str]) -> Result<()> {
-    let _command = tracing::info_span!("firecracker.command", program = program).entered();
-    let _phase = PhaseTimer::new("host_command");
     let executable = trusted_host_command(program)?;
     let output = Command::new(&executable)
         .args(arguments)
@@ -2993,8 +2944,6 @@ fn run_checked(program: &str, arguments: &[&str]) -> Result<()> {
 }
 
 fn run_checked_input(program: &str, arguments: &[&str], input: &[u8]) -> Result<()> {
-    let _command = tracing::info_span!("firecracker.command", program = program).entered();
-    let _phase = PhaseTimer::new("host_command");
     let executable = trusted_host_command(program)?;
     let mut child = Command::new(&executable)
         .args(arguments)
@@ -3022,8 +2971,6 @@ fn run_checked_input(program: &str, arguments: &[&str], input: &[u8]) -> Result<
 }
 
 fn run_ignoring_status(program: &str, arguments: &[&str]) {
-    let _command = tracing::info_span!("firecracker.command", program = program).entered();
-    let _phase = PhaseTimer::new("host_command");
     let executable = match trusted_host_command(program) {
         Ok(executable) => executable,
         Err(error) => {
@@ -3037,8 +2984,6 @@ fn run_ignoring_status(program: &str, arguments: &[&str]) {
 }
 
 fn remove_all_matching_rules(program: &str, arguments: &[&str]) {
-    let _command = tracing::info_span!("firecracker.command", program = program).entered();
-    let _phase = PhaseTimer::new("host_command");
     let executable = match trusted_host_command(program) {
         Ok(executable) => executable,
         Err(error) => {
@@ -3109,7 +3054,6 @@ fn prepare_and_launch_blocking(
     request: &SandboxRequest,
     record: &MachineRecord,
 ) -> Result<GuestReadiness> {
-    let _phase = PhaseTimer::new("prepare_and_launch_blocking");
     if let Some(template) = record.snapshot_template.as_ref()
         && prepare_snapshot_overlay(config, record, &template.key)?
     {
@@ -3149,7 +3093,6 @@ fn prepare_and_launch_blocking(
     let overlay = root.join("overlay.ext4");
     let created_overlay = !overlay.try_exists()?;
     if created_overlay {
-        let _phase = PhaseTimer::new("create_overlay");
         let file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -3228,7 +3171,6 @@ fn spawn_jailed_firecracker(
     jail_root: &Path,
     firecracker_arguments: &[&str],
 ) -> Result<()> {
-    let _phase = PhaseTimer::new("spawn_jailed_firecracker");
     let host_uid = jailer_uid(config, record)?;
     let memory_max = u64::from(
         record
@@ -4586,7 +4528,6 @@ async fn wait_for_guest(
     machine_id: &str,
     listener: StdUnixListener,
 ) -> Result<()> {
-    let _phase = PhaseTimer::new("wait_for_guest");
     let pid_path = shared.pid_path(machine_id);
     let stderr_path = jail_root(&shared.config, machine_id).join("firecracker.stderr");
     tokio::task::spawn_blocking(move || wait_for_guest_blocking(&pid_path, &stderr_path, listener))
@@ -4595,7 +4536,6 @@ async fn wait_for_guest(
 }
 
 async fn wait_for_restored_guest(shared: &Arc<Shared>, machine: &Machine) -> Result<()> {
-    let _phase = PhaseTimer::new("wait_for_restored_guest");
     let started = Instant::now();
     let pid_path = shared.pid_path(&machine.record.machine_id);
     let stderr_path =
