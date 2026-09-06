@@ -114,7 +114,7 @@ the command line.
 ./exo.sh                # start the full stack (Docker sandbox, ExoChat) and open the CLI chat interface
 ./exo.sh list           # list agents and conversations
 ./exo.sh stop-all       # stop the scheduler and adapter runners; state is preserved
-./exo.sh fresh          # rebuild, delete all agents/conversations, start clean
+./exo.sh fresh          # wipe local agent/conversation/adapter state (prompts unless --force)
 ./exo.sh setup-profile  # update your local profile (name, preferences)
 ./exo.sh --help         # all commands and options
 ```

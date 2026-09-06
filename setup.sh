@@ -864,7 +864,7 @@ EOF
   echo
   echo "That same command starts or reconnects to your agent any time. Also useful:"
   echo "  ./exo.sh stop-all   stop everything; state is preserved"
-  echo "  ./exo.sh fresh      wipe agents and start over"
+  echo "  ./exo.sh fresh      wipe local agent state and start over (prompts unless --force)"
   echo "  ./exo.sh --help     all commands"
 }
 
