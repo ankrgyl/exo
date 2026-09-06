@@ -78,21 +78,19 @@ and your agent's name, and give you the command to start Exo (./exo.sh).
 
 ## Basic Agent Interaction
 
-For the basic setup of Exo, there are two methods of interacting: on the command
-line where you ran the setup script (or `exo.sh`), and through a browser using
-exo-chat.
+For the basic setup of Exo, there are two ways to talk to your agent — either is
+fine; they share the same conversation:
 
-Exo agents are intended to be long-running. For example, if you `/exit` from the
-command line you can still interact with it via exo-chat. And if you do exit,
-you can always connect back to the CLI chat using `./exo.sh`.
+1. **Terminal UI** — the command-line chat from the setup script or `./exo.sh`
+2. **ExoChat** — a minimal text-only web chat (browser or phone) at the URL
+   printed on first start (`https://exoharness.ai/...`)
 
-Exo-chat is a minimal, web-based chat where you can talk to your agent from
-anywhere on the internet. However, Exo also supports standard chat applications
-like IRC, Discord, WhatsApp, Signal, or Slack. To configure them, just ask your
-agent to do so.
+Exo agents are long-running. If you `/exit` or close the terminal chat, **ExoChat
+keeps working** while the agent is up. Reconnect the terminal anytime with
+`./exo.sh`. If you lose the ExoChat URL, ask Exo for it from the CLI.
 
-If you ever forget or lose your exo-chat URL, you can just ask Exo for it from
-the command line.
+Exo also supports IRC, Discord, WhatsApp, Signal, and Slack — ask your agent to
+set those up when you want them.
 
 A good end-to-end test is to have it install a tool in the sandbox and use it with
 the task scheduler. For example, try the following prompt:
@@ -114,7 +112,7 @@ the command line.
 ./exo.sh                # start the full stack (Docker sandbox, ExoChat) and open the CLI chat interface
 ./exo.sh list           # list agents and conversations
 ./exo.sh stop-all       # stop the scheduler and adapter runners; state is preserved
-./exo.sh fresh          # rebuild, delete all agents/conversations, start clean
+./exo.sh fresh          # wipe local agent/conversation/adapter state (prompts unless --force)
 ./exo.sh setup-profile  # update your local profile (name, preferences)
 ./exo.sh --help         # all commands and options
 ```

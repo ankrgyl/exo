@@ -5,10 +5,16 @@ description: Talk to your agent, give it a real task, and teach it who you are.
 
 # Your First Session
 
-After [setup](./installation) you have two ways to talk to your agent:
-the **local REPL** in your terminal, and **ExoChat** — the
-`https://exoharness.ai/chat?...` URL the setup printed, which works from any
-browser.
+After [setup](./installation) you have two ways to talk to your agent — use
+either; they share the same conversation:
+
+- **Terminal UI (REPL)** — the chat in the terminal where you ran `./exo.sh`
+- **ExoChat** — the `https://exoharness.ai/chat?...` URL setup printed,
+  which works from any browser or phone
+
+ExoChat **keeps working** if you close or `/exit` the terminal chat (as long
+as the agent is still running). Bring the terminal back anytime with
+`./exo.sh`. If you lose the URL, ask the agent for it from the CLI.
 
 ## A good end-to-end test
 
@@ -62,7 +68,7 @@ them to take effect.
 ./exo.sh              # create or reuse the agent, start services + REPL
 ./exo.sh list         # list agents and conversations
 ./exo.sh stop-all     # stop scheduler and adapter loops
-./exo.sh fresh        # start over with a fresh agent
+./exo.sh fresh        # wipe local agent state and start over (prompts unless --force)
 ./exo.sh setup-profile
 ```
 

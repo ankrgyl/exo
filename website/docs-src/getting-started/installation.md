@@ -36,12 +36,15 @@ everything:
 4. Starts the canonical agent: a sandbox (Ubuntu 24.04 in Docker), the task
    scheduler, and the ExoChat adapter.
 
-When it finishes, two things happen:
+When it finishes, you get **two equivalent ways** to talk to the same agent:
 
-- It prints a URL like
-  `https://exoharness.ai/chat?role=user&c=...#k=...` — a minimal remote chat
-  interface to your agent. Open it in any browser, including your phone.
-- It drops you into a local REPL where you can talk to the agent directly.
+- **Terminal UI** — a local REPL in the shell where setup ran
+- **ExoChat** — a URL like `https://exoharness.ai/chat?role=user&c=...#k=...`
+  for any browser or phone
+
+Either channel is fine. ExoChat keeps working if you close or `/exit` the
+terminal chat (while the agent is still running). If you lose the URL, ask
+the agent for it from the CLI.
 
 Head to [Your First Session](./first-session) for what to try next.
 

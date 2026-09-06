@@ -1167,10 +1167,18 @@ show_exochat_url_if_needed() {
       ' "$log_file")"
       if [[ -n "$url" ]]; then
         echo
-        echo "Open this ExoChat URL in a browser or on your phone:"
+        echo "You can talk to Exo in either place:"
+        echo "  • this terminal UI (the REPL that opens next)"
+        echo "  • ExoChat in a browser or on your phone (URL below)"
+        echo
+        echo "ExoChat keeps working even if you close or /exit this terminal chat,"
+        echo "as long as the agent is still running (./exo.sh stop-all shuts it down)."
+        echo "If you lose the URL later, ask Exo for it from the CLI."
+        echo
+        echo "Open this ExoChat URL:"
         printf '%s\n' "$url"
         echo
-        read -r -p "Press Enter after opening ExoChat..."
+        read -r -p "Press Enter after opening ExoChat (or to continue to the terminal UI)..."
         return
       fi
     fi
@@ -1178,7 +1186,8 @@ show_exochat_url_if_needed() {
   done
 
   echo "No ExoChat URL found yet. Watch the adapter log with: tail -f $log_file"
-  read -r -p "Press Enter to continue to the REPL..."
+  echo "You can still use the terminal UI next; ask Exo for the ExoChat URL once the adapter is up."
+  read -r -p "Press Enter to continue to the terminal UI..."
 }
 
 show_signal_qr_if_needed() {
