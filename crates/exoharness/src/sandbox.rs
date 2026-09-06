@@ -26,6 +26,9 @@ use crate::{DurableFileSystem, SandboxAttachment};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SandboxKey {
+    StandaloneSandbox {
+        sandbox_id: String,
+    },
     AgentSandbox {
         agent_id: String,
         sandbox_id: String,
@@ -40,6 +43,7 @@ pub enum SandboxKey {
 impl fmt::Display for SandboxKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::StandaloneSandbox { sandbox_id } => write!(f, "sandbox:{sandbox_id}"),
             Self::AgentSandbox {
                 agent_id,
                 sandbox_id,
