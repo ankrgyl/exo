@@ -2700,14 +2700,6 @@ fn prepare_network(
             "peer",
             "name",
             &network.namespace_veth,
-        ],
-    )?;
-    run_checked(
-        "ip",
-        &[
-            "link",
-            "set",
-            &network.namespace_veth,
             "netns",
             &network.namespace,
         ],
@@ -2975,7 +2967,7 @@ fn cleanup_network_blocking(network: &NetworkConfig) {
             "ACCEPT",
         ],
     );
-    run_ignoring_status("nft", &["delete", "table", "inet", &network.nft_table]);
+    run_ignoring_status("nft", &["destroy", "table", "inet", &network.nft_table]);
     run_ignoring_status("ip", &["route", "del", &network.guest_cidr]);
     run_ignoring_status("ip", &["link", "del", &network.host_veth]);
     run_ignoring_status("ip", &["netns", "del", &network.namespace]);
