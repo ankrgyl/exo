@@ -740,6 +740,10 @@ function inboundMessageFromPayload(
       : threadTs === null
         ? channel
         : `${channel}:${threadTs}`;
+  const promptNotes = slackPromptNotes({
+    dmTarget,
+    isActiveThread,
+  });
   const eventId = optionalApiString(payload.event_id);
   const teamId =
     optionalApiString(payload.team_id) ??
@@ -776,8 +780,27 @@ function inboundMessageFromPayload(
       dmThreadTarget,
       progressMode,
       progressEligible: progress !== null,
+      ...(promptNotes.length > 0 ? { promptNotes } : {}),
     },
   };
+}
+
+function slackPromptNotes(input: {
+  dmTarget: string | null;
+  isActiveThread: boolean;
+}): string[] {
+  const notes: string[] = [];
+  if (input.dmTarget !== null) {
+    notes.push(
+      `Slack sender DM target: \`${input.dmTarget}\`. Use this only for appropriate private follow-up; do not use DM to bypass safety policy.`,
+    );
+  }
+  if (input.isActiveThread) {
+    notes.push(
+      "This Slack message is from an active thread, but it may be ambient conversation. Only call send_adapter_message if the message appears directed at Exo, asks Exo to do something, or clearly needs an Exo response. If no response is needed, do nothing.",
+    );
+  }
+  return notes;
 }
 
 function slackProgressRequest(input: {

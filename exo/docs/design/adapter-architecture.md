@@ -165,7 +165,9 @@ Inbound messages follow one shared path:
 2. The Rust runtime records the event and writes an inbound conversation
    artifact.
 3. The runtime wakes the owning conversation with the adapter id, target,
-   sender, and message.
+   sender, and message. Protocol-specific wakeup guidance travels with the
+   event as `metadata.promptNotes` (an array of strings); the host appends
+   those notes generically and does not branch on adapter type.
 4. Exo decides whether the message needs a response.
 
 Outbound messages are always explicit:
