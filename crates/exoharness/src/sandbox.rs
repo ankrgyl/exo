@@ -35,6 +35,10 @@ pub enum SandboxKey {
         thread_id: String,
         sandbox_id: String,
     },
+    PoolSandbox {
+        pool_id: String,
+        entry_id: String,
+    },
 }
 
 impl fmt::Display for SandboxKey {
@@ -48,6 +52,9 @@ impl fmt::Display for SandboxKey {
                 thread_id,
                 sandbox_id,
             } => write!(f, "thread:{thread_id}:{sandbox_id}"),
+            Self::PoolSandbox { pool_id, entry_id } => {
+                write!(f, "pool:{pool_id}:{entry_id}")
+            }
         }
     }
 }
