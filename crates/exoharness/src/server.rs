@@ -3,18 +3,18 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 
-use crate::CreateSandboxFromRecipeRequest;
 use crate::protocol::{
     ClientMessage, ConversationHandleInfo, Request, Response, SandboxScope, ServerMessage,
 };
 use crate::{
     AgentHandle, AgentId, AttachSandboxRequest, CancelSandboxProcessRequest,
-    CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, CreateSandboxRequest,
-    ExoHarness, ForkSandboxRequest, GetSandboxProcessEventsResult, ListConversationsResult,
-    RestoreSandboxRequest, Result, SandboxAttachment, SandboxId, SandboxProcessEventQuery,
-    SandboxProcessRecord, SandboxProcessStatus, SandboxRecord, SessionId, SnapshotId,
-    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord,
-    WaitSandboxProcessRequest, WriteSandboxProcessInputRequest,
+    CloseSandboxProcessInputRequest, ConversationHandle, ConversationId,
+    CreateSandboxFromRecipeRequest, CreateSandboxRequest, ExoHarness, ForkSandboxRequest,
+    GetSandboxProcessEventsResult, ListConversationsResult, RestoreSandboxRequest, Result,
+    SandboxAttachment, SandboxId, SandboxProcessEventQuery, SandboxProcessRecord,
+    SandboxProcessStatus, SandboxRecord, SessionId, SnapshotId, StartSandboxProcessRequest,
+    StartSandboxRequest, TurnHandle, TurnId, TurnRecord, WaitSandboxProcessRequest,
+    WriteSandboxProcessInputRequest,
 };
 
 pub struct ExoHarnessServer {

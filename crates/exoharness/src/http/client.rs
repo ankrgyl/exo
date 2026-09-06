@@ -13,7 +13,6 @@ use super::process::{
     LiveHttpSandboxProcess, spawn_http_sandbox_process_event_poller,
     spawn_http_sandbox_process_stdin_forwarder,
 };
-use crate::CreateSandboxFromRecipeRequest;
 use crate::protocol::{
     ClientMessage, ConversationHandleInfo, Request, Response, SandboxScope, ServerMessage,
 };
@@ -21,9 +20,9 @@ use crate::{
     AddEventsRequest, AddEventsResult, AgentHandle, AgentId, AgentRecord, Artifact,
     ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
     CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, ConversationHandle,
-    ConversationId, ConversationRecord, CreateSandboxRequest, Event, EventData, EventId,
-    EventQuery, EventStream, ExoHarness, ForkConversationRequest, ForkSandboxRequest,
-    GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
+    ConversationId, ConversationRecord, CreateSandboxFromRecipeRequest, CreateSandboxRequest,
+    Event, EventData, EventId, EventQuery, EventStream, ExoHarness, ForkConversationRequest,
+    ForkSandboxRequest, GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
     ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
     ReadArtifactRequest, RestoreSandboxRequest, Result, RunInSandboxRequest, SandboxAttachment,
     SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery, SandboxProcessParts,

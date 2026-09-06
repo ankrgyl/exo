@@ -725,7 +725,9 @@ pub struct SandboxRecipe {
 pub enum SandboxRecipeStep {
     GithubRepository {
         repository: String,
+        // If None, fetches default branch
         branch: Option<String>,
+        // If None, fetches current SHA
         sha: Option<String>,
         destination: String,
         secret_id: Option<SecretId>,
