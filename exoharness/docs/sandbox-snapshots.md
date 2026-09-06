@@ -67,6 +67,28 @@ payload, persists the bytes, updates sandbox metadata, and emits the
 `ManagedSandboxBackend::acquire_from_snapshot` are the backend-specific
 methods that produce and consume the bytes.
 
+### Sandbox recipes
+
+`CreateSandboxFromRecipeRequest` has an optional starting snapshot and an
+ordered list of steps. Without a snapshot it acquires the requested base image;
+with one it restores that filesystem through `acquire_from_snapshot` before
+running any steps. A step can check out a GitHub repository at an exact commit
+SHA or at the latest value of a branch.
+An omitted branch uses the repository's default branch at its current tip;
+when a SHA is also supplied, it is checked out after the clone and fails if it
+is absent from that checkout. Branch-based recipes are intentionally not
+reproducible. A private GitHub step may name an ExoHarness key secret; it is
+resolved only while the controlled Git clone runs and is not stored in the
+sandbox record, recipe output, or repository remote URL. Capture the completed
+sandbox with the normal snapshot API when its full filesystem should be restored
+later.
+
+Two ignored live GitHub recipe tests cover a fixed public repository and a
+private repository. The private test uses `GITHUB_TEST_REPOSITORY` and
+`GITHUB_TEST_SHA`, plus `GITHUB_TEST_TOKEN` (or `GITHUB_TOKEN`) for a
+fine-grained token with read access. Run them explicitly with
+`cargo test -p exoharness --features basic-backend github_recipe -- --ignored`.
+
 ### SnapshotPayload and SnapshotFormat
 
 ```rust
