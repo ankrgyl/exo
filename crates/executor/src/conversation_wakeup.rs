@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use exoharness::Result;
@@ -9,7 +8,19 @@ use lingua::Message;
 use lingua::universal::UserContent;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::inbox::{Inbox, InboxItem};
 use crate::{HarnessConversation, SendRequest, SendResult};
+
+/// Default on-disk location of the durable conversation inbox.
+///
+/// Overridable via `EXO_INBOX_DIR` so deployments can place it on a
+/// volume with the same durability guarantees as the event log.
+pub fn default_inbox() -> Inbox {
+    let root = std::env::var_os("EXO_INBOX_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("exo-inbox"));
+    Inbox::new(root)
+}
 
 pub async fn send_conversation_wakeup(
     conversation: &dyn HarnessConversation,
@@ -20,83 +31,60 @@ pub async fn send_conversation_wakeup(
 
 /// Wakeup variant for multimodal content, e.g. adapter messages that carry
 /// inbound images for the model to analyze.
+///
+/// The content is first appended to the conversation's durable inbox and
+/// only then injected. This gives producers FIFO delivery (items drain in
+/// UUIDv7 arrival order) and crash safety (an unacked item survives a
+/// restart and is redelivered), replacing the old race-prone lock-file
+/// handoff (issue #207).
 pub async fn send_conversation_wakeup_content(
     conversation: &dyn HarnessConversation,
     content: UserContent,
 ) -> Result<SendResult> {
-    let _file_guard = WakeupFileLock::acquire(&conversation.record().id.to_string()).await?;
+    let conversation_id = conversation.record().id.to_string();
+    let inbox = default_inbox();
+    let pending = inbox.enqueue(&conversation_id, content).await?;
+
+    // Serialize turn start across tasks in this process; items drain in
+    // arrival order under this per-conversation lock.
+    let send_lock = conversation_send_lock(&conversation_id);
+    let _send_guard = send_lock.lock().await;
+
+    let items = inbox.drain(&conversation_id).await?;
+    let mut result = None;
+    for item in items {
+        let sent = deliver_item(conversation, &item).await?;
+        if item.item_id == pending {
+            result = Some(sent);
+        }
+        inbox.ack(&conversation_id, item.item_id).await?;
+    }
+    match result {
+        Some(result) => Ok(result),
+        // The just-enqueued item was already drained+acked by another task
+        // between our enqueue and drain; treat it as delivered.
+        None => Err(anyhow::anyhow!(
+            "wakeup item {} was consumed by a concurrent sender",
+            pending
+        )
+        .into()),
+    }
+}
+
+async fn deliver_item(
+    conversation: &dyn HarnessConversation,
+    item: &InboxItem,
+) -> Result<SendResult> {
     let result = conversation
         .send(SendRequest {
-            input: vec![Message::User { content }],
+            input: vec![Message::User {
+                content: item.content.clone(),
+            }],
             session_id: None,
         })
         .await?;
     conversation.close_session(result.session_id).await?;
     Ok(result)
-}
-
-struct WakeupFileLock {
-    path: PathBuf,
-}
-
-impl WakeupFileLock {
-    async fn acquire(conversation_id: &str) -> Result<Self> {
-        let dir = std::env::temp_dir().join("exo-wakeup-locks");
-        tokio::fs::create_dir_all(&dir).await?;
-        let path = dir.join(format!("{conversation_id}.lock"));
-        loop {
-            match tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .await
-            {
-                Ok(_) => return Ok(Self { path }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    remove_stale_lock(&path).await?;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("failed to acquire wakeup lock {}", path.display())
-                    });
-                }
-            }
-        }
-    }
-}
-
-impl Drop for WakeupFileLock {
-    fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(&self.path) {
-            tracing::error!(
-                path = %self.path.display(),
-                %error,
-                "failed to remove wakeup lock"
-            );
-        }
-    }
-}
-
-async fn remove_stale_lock(path: &PathBuf) -> Result<()> {
-    const STALE_AFTER: Duration = Duration::from_secs(30 * 60);
-    let Ok(metadata) = tokio::fs::metadata(path).await else {
-        return Ok(());
-    };
-    let Ok(modified) = metadata.modified() else {
-        return Ok(());
-    };
-    if SystemTime::now()
-        .duration_since(modified)
-        .is_ok_and(|age| age > STALE_AFTER)
-    {
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn conversation_send_lock(conversation_id: &str) -> Arc<AsyncMutex<()>> {
@@ -114,30 +102,33 @@ pub(crate) fn conversation_send_lock(conversation_id: &str) -> Arc<AsyncMutex<()
 
 #[cfg(test)]
 mod tests {
-    use std::pin::pin;
-
-    use exoharness::Uuid7;
-
     use super::*;
 
     #[tokio::test]
-    async fn wakeup_file_lock_serializes_conversation_ids() {
-        let conversation_id = format!("test-{}", Uuid7::now());
-        let first = WakeupFileLock::acquire(&conversation_id).await.unwrap();
-        let mut second = pin!(WakeupFileLock::acquire(&conversation_id));
+    async fn send_lock_serializes_same_conversation_only() {
+        let id = "test-lock-conv";
+        let first_lock = conversation_send_lock(id);
+        let guard = first_lock.lock().await;
+        let second = conversation_send_lock(id);
 
-        tokio::select! {
-            _ = &mut second => {
-                panic!("second lock acquired while first lock was held");
-            }
-            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
-        }
+        // A different conversation is never blocked by ours.
+        let other_conv = conversation_send_lock("other-conv");
+        let other =
+            tokio::time::timeout(std::time::Duration::from_millis(20), other_conv.lock()).await;
+        assert!(other.is_ok(), "unrelated conversation lock was blocked");
 
-        drop(first);
-        let second = tokio::time::timeout(Duration::from_secs(1), second)
-            .await
-            .unwrap()
-            .unwrap();
-        drop(second);
+        // The same conversation cannot re-enter while held.
+        let reentry =
+            tokio::time::timeout(std::time::Duration::from_millis(20), second.lock()).await;
+        assert!(
+            reentry.is_err(),
+            "same conversation acquired lock twice concurrently"
+        );
+
+        drop(guard);
+        let same_conv = conversation_send_lock(id);
+        let again =
+            tokio::time::timeout(std::time::Duration::from_secs(1), same_conv.lock()).await;
+        assert!(again.is_ok(), "lock was not released after guard drop");
     }
 }
