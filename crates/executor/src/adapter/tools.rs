@@ -98,6 +98,7 @@ enum AdapterCreationConfig {
     Signal(SignalAdapterCreationConfig),
     Discord(DiscordAdapterCreationConfig),
     Slack(SlackAdapterCreationConfig),
+    Feishu(FeishuAdapterCreationConfig),
     Exochat(ExochatAdapterCreationConfig),
     AgentCli(AgentCliAdapterCreationConfig),
 }
@@ -185,6 +186,22 @@ struct SlackAdapterCreationConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FeishuAdapterCreationConfig {
+    #[serde(rename = "type")]
+    _adapter_type: FeishuAdapterType,
+    app_id: String,
+    app_secret_secret_id: String,
+    // Required, matching the model-facing schema: defaulting an international
+    // Lark tenant to the feishu domain would silently target the wrong API
+    // endpoint.
+    domain: FeishuDomain,
+    trigger: FeishuTrigger,
+    #[serde(default)]
+    default_target: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ExochatAdapterCreationConfig {
     #[serde(rename = "type")]
     _adapter_type: ExochatAdapterType,
@@ -248,6 +265,19 @@ enum SlackAdapterType {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
+enum FeishuAdapterType {
+    Feishu,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum FeishuDomain {
+    Feishu,
+    Lark,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum ExochatAdapterType {
     Exochat,
 }
@@ -276,6 +306,13 @@ enum DiscordTrigger {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SlackTrigger {
+    AllMessages,
+    MentionsOnly,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FeishuTrigger {
     AllMessages,
     MentionsOnly,
 }
@@ -322,6 +359,7 @@ impl AdapterCreationConfig {
             Self::Signal(_) => "signal",
             Self::Discord(_) => "discord",
             Self::Slack(_) => "slack",
+            Self::Feishu(_) => "feishu",
             Self::Exochat(_) => "exochat",
             Self::AgentCli(_) => "agent-cli",
         }
@@ -473,6 +511,28 @@ impl AdapterCreationConfig {
                     ],
                 })
             }
+            Self::Feishu(config) => {
+                require_source(source, AdapterSource::Library, "feishu")?;
+                if config.app_id.trim().is_empty() {
+                    bail!("feishu appId must not be empty");
+                }
+                Ok(AdapterConfig {
+                    adapter_type: "feishu".to_string(),
+                    worker_command: options.worker_command("feishu"),
+                    initialization: serde_json::json!({
+                        "appId": config.app_id,
+                        "appSecretEnv": "EXO_FEISHU_APP_SECRET",
+                        "domain": config.domain.as_str(),
+                        "trigger": config.trigger.as_str(),
+                        "defaultTarget": config.default_target,
+                    }),
+                    state_dir: None,
+                    secret_env: vec![WorkerSecretEnvVar {
+                        env: "EXO_FEISHU_APP_SECRET".to_string(),
+                        secret_id: config.app_secret_secret_id,
+                    }],
+                })
+            }
             Self::Exochat(config) => {
                 require_source(source, AdapterSource::Library, "exochat")?;
                 let channel_id = config.channel_id.filter(|value| !value.trim().is_empty());
@@ -579,6 +639,24 @@ impl SlackProgressMode {
             Self::Update => "update",
             Self::Stream => "stream",
             Self::Off => "off",
+        }
+    }
+}
+
+impl FeishuTrigger {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::AllMessages => "all_messages",
+            Self::MentionsOnly => "mentions_only",
+        }
+    }
+}
+
+impl FeishuDomain {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Feishu => "feishu",
+            Self::Lark => "lark",
         }
     }
 }
@@ -1379,6 +1457,62 @@ mod tests {
             resolve_send_target("slack", Some("C123:1700000000.000000"), Some("dm:U123")).unwrap(),
             Some("dm:U123".into())
         );
+    }
+
+    #[tokio::test]
+    async fn create_feishu_adapter_binds_app_secret() {
+        let tempdir = TempDir::new().unwrap();
+        let exoharness = BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
+            .await
+            .unwrap();
+        let agent = exoharness
+            .new_agent(NewAgentRequest {
+                slug: "agent".to_string(),
+                name: "Agent".to_string(),
+            })
+            .await
+            .unwrap();
+        let conversation = agent
+            .new_conversation(NewConversationRequest {
+                slug: Some("conversation".to_string()),
+                name: Some("Conversation".to_string()),
+            })
+            .await
+            .unwrap();
+        let store = AdapterStore::new(tempdir.path().join("adapters"));
+        let create_result = execute_create_adapter_tool(
+            agent.as_ref(),
+            conversation.as_ref(),
+            &store,
+            &test_creation_options(),
+            &tool_request(
+                "create_adapter",
+                serde_json::json!({
+                    "name": "feishu",
+                    "source": "library",
+                    "config": {
+                        "type": "feishu",
+                        "appId": "cli_test_app",
+                        "appSecretSecretId": "feishu-app-secret",
+                        "domain": "lark",
+                        "trigger": "mentions_only",
+                        "defaultTarget": null
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(create_result["ok"], true);
+        let adapter_id = create_result["adapter"]["id"].as_str().unwrap();
+        let adapter = store.get_adapter(adapter_id).await.unwrap().unwrap();
+        assert!(adapter.config.worker_command[2].ends_with("/tmp/exo-adapters/feishu/worker.ts"));
+        assert_eq!(adapter.config.secret_env.len(), 1);
+        assert_eq!(adapter.config.secret_env[0].env, "EXO_FEISHU_APP_SECRET");
+        assert_eq!(adapter.config.secret_env[0].secret_id, "feishu-app-secret");
+        assert_eq!(adapter.config.initialization["appId"], "cli_test_app");
+        assert_eq!(adapter.config.initialization["domain"], "lark");
+        assert_eq!(adapter.config.initialization["trigger"], "mentions_only");
     }
 
     #[tokio::test]

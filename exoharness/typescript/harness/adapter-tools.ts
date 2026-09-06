@@ -357,6 +357,48 @@ function adapterConfigSchema(): ToolDefinition["parameters"] {
         type: "object",
         additionalProperties: false,
         properties: {
+          type: { type: "string", enum: ["feishu"] },
+          appId: {
+            type: "string",
+            description:
+              "Feishu/Lark app id (cli_...) from the open platform console. Not a secret.",
+          },
+          appSecretSecretId: {
+            type: "string",
+            description:
+              "Secret name or id containing the Feishu/Lark app secret. The worker receives it as EXO_FEISHU_APP_SECRET.",
+          },
+          domain: {
+            type: "string",
+            enum: ["feishu", "lark"],
+            description:
+              "API domain. Use feishu for feishu.cn tenants and lark for international larksuite.com tenants.",
+          },
+          trigger: {
+            type: "string",
+            enum: ["all_messages", "mentions_only"],
+            description:
+              "Wake policy for group chats. mentions_only wakes on @-mentions and always wakes on direct messages. all_messages wakes on every subscribed message.",
+          },
+          defaultTarget: {
+            type: ["string", "null"],
+            description:
+              "Optional chat id (oc_...) or user open id (ou_...) used when send_adapter_message target is null.",
+          },
+        },
+        required: [
+          "type",
+          "appId",
+          "appSecretSecretId",
+          "domain",
+          "trigger",
+          "defaultTarget",
+        ],
+      },
+      {
+        type: "object",
+        additionalProperties: false,
+        properties: {
           type: { type: "string", enum: ["signal"] },
           account: {
             type: ["string", "null"],
@@ -572,7 +614,8 @@ function validateAdapterSource(source: string, type: string): void {
       type === "whatsapp" ||
       type === "signal" ||
       type === "discord" ||
-      type === "slack") &&
+      type === "slack" ||
+      type === "feishu") &&
     source !== "library"
   ) {
     throw new Error(`${type} adapters must use source 'library'`);
