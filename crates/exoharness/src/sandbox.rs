@@ -2147,52 +2147,9 @@ fn is_already_exists_error(message: &str) -> bool {
 }
 
 pub(crate) fn sandbox_spec_hash(spec: &SandboxSpec) -> String {
-    if let Some(enable_networking) = spec.network_policy.legacy_enable_networking() {
-        legacy_sandbox_spec_hash(spec, enable_networking)
-    } else {
-        let mut hasher = DefaultHasher::new();
-        spec.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
-    }
-}
-
-// The v1 hash was persisted by main in provider state, labels, and snapshot
-// manifests. Keep it only for policies the old boolean could express.
-fn legacy_sandbox_spec_hash(spec: &SandboxSpec, enable_networking: bool) -> String {
     let mut hasher = DefaultHasher::new();
-    LegacySandboxSpec::new(spec, enable_networking).hash(&mut hasher);
+    spec.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
-}
-
-#[derive(Hash)]
-enum LegacySandboxNetworkPolicy {
-    Enabled,
-    Disabled,
-}
-
-#[derive(Hash)]
-struct LegacySandboxSpec<'a> {
-    image: &'a String,
-    mounts: &'a Vec<SandboxMount>,
-    durable_file_systems: &'a Vec<DurableFileSystem>,
-    network: LegacySandboxNetworkPolicy,
-    default_workdir: &'a String,
-}
-
-impl<'a> LegacySandboxSpec<'a> {
-    fn new(spec: &'a SandboxSpec, enable_networking: bool) -> Self {
-        Self {
-            image: &spec.image,
-            mounts: &spec.mounts,
-            durable_file_systems: &spec.durable_file_systems,
-            network: if enable_networking {
-                LegacySandboxNetworkPolicy::Enabled
-            } else {
-                LegacySandboxNetworkPolicy::Disabled
-            },
-            default_workdir: &spec.default_workdir,
-        }
-    }
 }
 
 fn render_command_error(stderr: &[u8]) -> String {
@@ -2349,62 +2306,6 @@ async fn docker_load_image(container_bin: &Path, payload: &Bytes) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(Hash)]
-    enum LegacySandboxNetworkPolicy {
-        Enabled,
-        Disabled,
-    }
-
-    #[derive(Hash)]
-    struct LegacySandboxSpecFromMain<'a> {
-        image: &'a String,
-        mounts: &'a Vec<SandboxMount>,
-        durable_file_systems: &'a Vec<DurableFileSystem>,
-        network: LegacySandboxNetworkPolicy,
-        default_workdir: &'a String,
-    }
-
-    fn legacy_sandbox_spec_hash_from_main(
-        spec: &SandboxSpec,
-        network: LegacySandboxNetworkPolicy,
-    ) -> String {
-        let mut hasher = DefaultHasher::new();
-        LegacySandboxSpecFromMain {
-            image: &spec.image,
-            mounts: &spec.mounts,
-            durable_file_systems: &spec.durable_file_systems,
-            network,
-            default_workdir: &spec.default_workdir,
-        }
-        .hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
-    }
-
-    #[test]
-    fn legacy_network_policies_keep_main_sandbox_hashes() {
-        let spec = SandboxSpec {
-            image: "example".to_string(),
-            resources: Default::default(),
-            mounts: Vec::new(),
-            durable_file_systems: Vec::new(),
-            network_policy: SandboxNetworkPolicy::allow_all(),
-            default_workdir: "/workspace".to_string(),
-        };
-        assert_eq!(
-            sandbox_spec_hash(&spec),
-            legacy_sandbox_spec_hash_from_main(&spec, LegacySandboxNetworkPolicy::Enabled)
-        );
-
-        let spec = SandboxSpec {
-            network_policy: SandboxNetworkPolicy::deny_all(),
-            ..spec
-        };
-        assert_eq!(
-            sandbox_spec_hash(&spec),
-            legacy_sandbox_spec_hash_from_main(&spec, LegacySandboxNetworkPolicy::Disabled)
-        );
-    }
 
     #[test]
     fn network_policy_constructors_and_default_are_unambiguous() {
