@@ -1135,7 +1135,7 @@ mod tests {
     #[test]
     fn machine_name_is_stable_and_key_specific() {
         let a = "sandbox-1".into();
-        let b = "sandbox-1".into();
+        let b = "sandbox-2".into();
         assert_eq!(machine_name(&a), machine_name(&a));
         assert_ne!(machine_name(&a), machine_name(&b));
         assert!(machine_name(&a).starts_with("exo-"));
