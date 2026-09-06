@@ -1056,6 +1056,58 @@ async fn turn_artifact_write_allows_interleaved_conversation_writes() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn finished_turn_rejects_writes_after_rehydration() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
+        .await
+        .expect("harness");
+    let conversation = test_conversation(&harness).await;
+    let turn = conversation
+        .begin_turn(BeginTurnRequest {
+            session_id: None,
+            input: vec![user_message("ping")],
+        })
+        .await
+        .expect("turn");
+    let record = turn.record().clone();
+    let finish_event_id = turn.finish().await.expect("finish");
+
+    let event_error = turn
+        .add_events(vec![EventData::Custom {
+            event_type: "too_late".to_string(),
+            payload: Value::Null,
+        }])
+        .await
+        .expect_err("finished turn must reject events");
+    assert!(event_error.to_string().contains("already finished"));
+    let artifact_error = turn
+        .write_artifact(WriteArtifactRequest {
+            path: "too-late.txt".to_string(),
+            contents: Vec::new(),
+        })
+        .await
+        .expect_err("finished turn must reject artifacts");
+    assert!(artifact_error.to_string().contains("already finished"));
+
+    let rehydrated = conversation.turn_handle(record).await.expect("turn handle");
+    assert_eq!(
+        rehydrated.finish().await.expect("idempotent finish"),
+        finish_event_id
+    );
+    assert!(
+        rehydrated
+            .add_events(vec![EventData::Custom {
+                event_type: "still_too_late".to_string(),
+                payload: Value::Null,
+            }])
+            .await
+            .expect_err("rehydrated turn must remain finished")
+            .to_string()
+            .contains("already finished")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn artifacts_are_versioned_by_path() {
     let tempdir = TempDir::new().expect("tempdir");
     let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
