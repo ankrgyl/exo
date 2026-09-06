@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::{Builder as TempBuilder, NamedTempFile};
 use tokio::io::AsyncWriteExt;
+use tracing::Instrument;
 
 const MATERIALIZER_VERSION: u32 = 4;
 const EXT4_MAGIC_OFFSET: u64 = 1024 + 0x38;
@@ -84,6 +85,11 @@ enum Whiteout {
     Opaque(PathBuf),
 }
 
+#[tracing::instrument(
+    name = "firecracker.resolve_image",
+    skip_all,
+    fields(cache_hit = tracing::field::Empty, registry_lookup = false)
+)]
 pub(super) async fn resolve_image(
     state_root: &Path,
     source: &str,
@@ -124,10 +130,13 @@ pub(super) async fn resolve_image(
     if let Some(source_digest) = immutable_reference_digest(&reference)? {
         let cache_dir = cache_image_dir(&cache_root, &platform, source_digest)?;
         if cache_dir.try_exists()? {
+            tracing::Span::current().record("cache_hit", true);
             return validate_cache_entry(&cache_dir, source_digest, None, &platform);
         }
     }
 
+    tracing::Span::current().record("cache_hit", false);
+    tracing::Span::current().record("registry_lookup", true);
     let auth = registry_auth(&reference)?;
 
     let client = Client::default();
@@ -151,6 +160,7 @@ pub(super) async fn resolve_image(
     // LimitedAsyncWriter under declared-size and cumulative budgets.
     let (manifest, manifest_digest, config_json, list_digest) = client
         .pull_manifest_and_config_and_list_digest(&reference, &auth)
+        .instrument(tracing::info_span!("firecracker.registry_manifest"))
         .await
         .with_context(|| format!("resolving OCI image manifest for {source}"))?;
     let source_digest = list_digest.unwrap_or_else(|| manifest_digest.clone());
@@ -160,6 +170,7 @@ pub(super) async fn resolve_image(
     validate_platform(&image_config)?;
     let cache_dir = cache_image_dir(&cache_root, &platform, &source_digest)?;
     if cache_dir.try_exists()? {
+        tracing::Span::current().record("cache_hit", true);
         return validate_cache_entry(
             &cache_dir,
             &source_digest,
