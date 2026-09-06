@@ -101,7 +101,8 @@ override an explicit sandbox `deny_all` policy.
 The CLI keeps the deprecated `--networking enabled|disabled` option for legacy
 scripts and adds `--network-policy` for the full policy. The latter accepts
 either inline JSON or a path to a JSON file. Pass `--network-policy` at most
-once; it cannot be combined with `--networking`.
+once. It can be combined with the deprecated `--networking` option when both
+values describe the same access level; conflicting values are rejected.
 
 The TypeScript API exposes the same policy as one `networkPolicy` object:
 

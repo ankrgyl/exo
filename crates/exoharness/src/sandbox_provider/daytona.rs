@@ -106,6 +106,10 @@ impl DaytonaSandboxBackend {
     }
 
     fn compile_network_policy(&self, policy: &SandboxNetworkPolicy) -> Result<bool> {
+        // Daytona only exposes a coarse block-all networking switch. The
+        // capability validation rejects domain/CIDR rules, so
+        // `default_deny` fully captures the remaining policy and maps
+        // directly to Daytona's native field.
         self.validate_network_policy(policy)?;
         Ok(policy.default_deny)
     }

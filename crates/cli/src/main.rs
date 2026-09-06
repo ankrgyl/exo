@@ -549,10 +549,14 @@ fn resolve_networking_options(
     networking: Option<EnabledDisabled>,
     network_policy: Option<SandboxNetworkPolicy>,
 ) -> Result<(Option<bool>, Option<SandboxNetworkPolicy>)> {
-    if networking.is_some() && network_policy.is_some() {
-        bail!("--networking and --network-policy cannot be used together");
-    }
     Ok(match (networking, network_policy) {
+        (Some(networking), Some(policy)) => {
+            let enabled = networking.enabled();
+            if enabled != policy.allows_all() {
+                bail!("--networking and --network-policy specify different network access");
+            }
+            (Some(enabled), Some(policy))
+        }
         (Some(networking), None) => {
             let enabled = networking.enabled();
             (
@@ -562,7 +566,6 @@ fn resolve_networking_options(
         }
         (None, Some(policy)) => (Some(policy.allows_all()), Some(policy)),
         (None, None) => (None, None),
-        (Some(_), Some(_)) => unreachable!(),
     })
 }
 
@@ -678,14 +681,13 @@ enum AgentCommands {
         sandbox_provider: Option<SandboxProviderArg>,
         #[arg(long, value_enum)]
         sandbox_scope: Option<SandboxScopeArg>,
-        #[arg(long, value_enum, conflicts_with = "network_policy")]
+        #[arg(long, value_enum)]
         /// Deprecated: use `--network-policy` instead. Supports only enabled/disabled.
         networking: Option<EnabledDisabled>,
         #[arg(
             long = "network-policy",
             value_parser = parse_network_policy,
-            value_name = "FILE|JSON",
-            conflicts_with = "networking"
+            value_name = "FILE|JSON"
         )]
         /// Provider-neutral network policy as inline JSON or a JSON file path.
         network_policy: Option<SandboxNetworkPolicy>,
@@ -724,14 +726,13 @@ enum AgentCommands {
         sandbox_provider: Option<SandboxProviderArg>,
         #[arg(long, value_enum)]
         sandbox_scope: Option<SandboxScopeArg>,
-        #[arg(long, value_enum, conflicts_with = "network_policy")]
+        #[arg(long, value_enum)]
         /// Deprecated: use `--network-policy` instead. Supports only enabled/disabled.
         networking: Option<EnabledDisabled>,
         #[arg(
             long = "network-policy",
             value_parser = parse_network_policy,
-            value_name = "FILE|JSON",
-            conflicts_with = "networking"
+            value_name = "FILE|JSON"
         )]
         /// Provider-neutral network policy as inline JSON or a JSON file path.
         network_policy: Option<SandboxNetworkPolicy>,
@@ -1010,14 +1011,13 @@ struct SandboxCreateArgs {
     memory_mib: u32,
     #[arg(long)]
     workdir: Option<String>,
-    #[arg(long, value_enum, conflicts_with = "network_policy")]
+    #[arg(long, value_enum)]
     /// Deprecated: use `--network-policy` instead. Supports only enabled/disabled.
     networking: Option<EnabledDisabled>,
     #[arg(
         long = "network-policy",
         value_parser = parse_network_policy,
-        value_name = "FILE|JSON",
-        conflicts_with = "networking"
+        value_name = "FILE|JSON"
     )]
     /// Provider-neutral network policy as inline JSON or a JSON file path.
     network_policy: Option<SandboxNetworkPolicy>,
@@ -3891,17 +3891,20 @@ mod create_tests {
     }
 
     #[test]
-    fn networking_options_are_mutually_exclusive() {
-        let error = super::resolve_networking_options(
+    fn networking_options_must_agree() {
+        let (_, policy) = super::resolve_networking_options(
             Some(super::EnabledDisabled::Disabled),
             Some(exoharness::SandboxNetworkPolicy::deny_all()),
         )
-        .expect_err("legacy and explicit network options should conflict");
-        assert!(
-            error
-                .to_string()
-                .contains("--networking and --network-policy")
-        );
+        .expect("equivalent legacy and explicit network options should agree");
+        assert_eq!(policy, Some(exoharness::SandboxNetworkPolicy::deny_all()));
+
+        let error = super::resolve_networking_options(
+            Some(super::EnabledDisabled::Enabled),
+            Some(exoharness::SandboxNetworkPolicy::deny_all()),
+        )
+        .expect_err("conflicting legacy and explicit network options should fail");
+        assert!(error.to_string().contains("different network access"));
     }
 
     #[test]

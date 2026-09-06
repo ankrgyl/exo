@@ -18,8 +18,9 @@ The `codex`, `claude-code`, and `cursor` harness presets select the matching
 TypeScript module, sandbox image, and networking defaults.
 
 To give an agent more precise network access, pass one policy as inline JSON or
-as a JSON file. The policy replaces the old on/off choice for this request; do
-not pass it together with `--networking`.
+as a JSON file. The policy replaces the old on/off choice for this request. If
+`--networking` is also supplied, both values must describe the same access
+level.
 
 ```bash
 ./target/debug/exo --harness codex agent create "Restricted Codex" \
