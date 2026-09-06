@@ -992,17 +992,13 @@ mod connect_tests {
     use super::*;
 
     #[test]
-    fn round_trip_envelope_header() {
+    fn process_stream_encoding_handles_envelopes_and_base64() {
         let payload = br#"{"event":{"data":{"stdout":"hi"}}}"#;
         let encoded = connect_encode_envelope(0, payload).unwrap();
         let decoded = connect_decode_envelopes(&encoded).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].0, 0);
         assert_eq!(decoded[0].1, payload);
-    }
-
-    #[test]
-    fn decode_process_bytes_handles_base64_stdout() {
         assert_eq!(
             super::decode_process_bytes("ZXhvLWUyYi1saXZlCg=="),
             "exo-e2b-live\n"

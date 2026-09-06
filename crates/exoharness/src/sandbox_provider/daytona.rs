@@ -1693,17 +1693,13 @@ mod tests {
     }
 
     #[test]
-    fn utf8_prefix_waits_for_split_multibyte_character() {
+    fn valid_utf8_prefix_handles_split_and_invalid_bytes() {
         let mut bytes = "hello ".as_bytes().to_vec();
         bytes.push(0xc3);
         assert_eq!(valid_utf8_prefix_len(&bytes).unwrap(), Some(6));
 
         bytes.push(0xa9);
         assert_eq!(valid_utf8_prefix_len(&bytes).unwrap(), Some(8));
-    }
-
-    #[test]
-    fn utf8_prefix_rejects_invalid_bytes() {
         let error = valid_utf8_prefix_len(&[0xff]).unwrap_err();
         assert!(
             format!("{error:#}").contains("invalid UTF-8"),

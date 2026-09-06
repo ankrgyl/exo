@@ -2378,35 +2378,26 @@ mod tests {
         let docker = CliContainerSandboxBackend::docker();
         let apple_container = CliContainerSandboxBackend::apple_container();
         let local_process = LocalProcessSandboxBackend::new();
-        let backends: [(&str, &dyn ManagedSandboxBackend); 3] = [
-            ("Docker", &docker),
-            ("Apple Container", &apple_container),
-            ("Local Process", &local_process),
+        let backends: [(&dyn ManagedSandboxBackend, bool); 3] = [
+            (&docker, true),
+            (&apple_container, true),
+            (&local_process, false),
         ];
         let domain_allowlist = SandboxNetworkPolicy {
             allowed_domains: vec!["api.github.com".to_string()],
             ..SandboxNetworkPolicy::default()
         };
 
-        assert!(
-            docker
-                .validate_network_policy(&SandboxNetworkPolicy::default())
-                .is_ok()
-        );
-        assert!(
-            apple_container
-                .validate_network_policy(&SandboxNetworkPolicy::default())
-                .is_ok()
-        );
-        assert!(
-            local_process
-                .validate_network_policy(&SandboxNetworkPolicy::default())
-                .is_err()
-        );
-        for (name, backend) in backends {
+        for (backend, supports_default_deny) in backends {
+            assert_eq!(
+                backend
+                    .validate_network_policy(&SandboxNetworkPolicy::default())
+                    .is_ok(),
+                supports_default_deny
+            );
             assert!(
                 backend.validate_network_policy(&domain_allowlist).is_err(),
-                "{name} must reject unsupported domain allowlists"
+                "backend must reject unsupported domain allowlists"
             );
         }
     }

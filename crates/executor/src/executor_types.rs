@@ -52,6 +52,17 @@ pub struct AgentSandboxConfig {
     pub network_policy: Option<SandboxNetworkPolicy>,
 }
 
+impl AgentSandboxConfig {
+    pub fn set_network_policy(&mut self, network_policy: SandboxNetworkPolicy) -> bool {
+        let enable_networking = network_policy.allows_all();
+        let changed = self.enable_networking != enable_networking
+            || self.network_policy.as_ref() != Some(&network_policy);
+        self.enable_networking = enable_networking;
+        self.network_policy = Some(network_policy);
+        changed
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentHarnessKind {

@@ -73,38 +73,34 @@ impl VercelSandboxBackend {
         policy: &SandboxNetworkPolicy,
     ) -> Result<Option<VercelNetworkPolicy>> {
         self.validate_network_policy(policy)?;
-        if policy.default_deny
-            && policy.allowed_domains.is_empty()
-            && policy.allowed_cidrs.is_empty()
-            && policy.denied_cidrs.is_empty()
-        {
+        if *policy == SandboxNetworkPolicy::deny_all() {
             return Ok(Some(VercelNetworkPolicy::DenyAll { mode: "deny-all" }));
         }
 
-        if !policy.default_deny
-            && policy.allowed_domains.is_empty()
-            && policy.allowed_cidrs.is_empty()
-            && policy.denied_cidrs.is_empty()
-        {
+        if policy.allows_all() {
             return Ok(None);
         }
+
+        let subnets =
+            (!policy.allowed_cidrs.is_empty() || !policy.denied_cidrs.is_empty()).then(|| {
+                VercelSubnetPolicy {
+                    allow: policy
+                        .allowed_cidrs
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    deny: policy
+                        .denied_cidrs
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                }
+            });
 
         Ok(Some(VercelNetworkPolicy::Restricted(
             VercelRestrictedNetworkPolicy {
                 allow: policy.allowed_domains.clone(),
-                subnets: (!policy.allowed_cidrs.is_empty() || !policy.denied_cidrs.is_empty())
-                    .then(|| VercelSubnetPolicy {
-                        allow: policy
-                            .allowed_cidrs
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect(),
-                        deny: policy
-                            .denied_cidrs
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect(),
-                    }),
+                subnets,
             },
         )))
     }
@@ -825,15 +821,19 @@ struct VercelLogError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn reports_and_validates_network_policy_capabilities() {
-        let backend = VercelSandboxBackend::new(VercelConfig {
+    fn test_backend() -> VercelSandboxBackend {
+        VercelSandboxBackend::new(VercelConfig {
             api_token: "test-token".to_string(),
             api_url: DEFAULT_VERCEL_API_URL.to_string(),
             team_id: "team".to_string(),
             project_id: "project".to_string(),
         })
-        .expect("create Vercel backend");
+        .expect("create Vercel backend")
+    }
+
+    #[test]
+    fn compiles_and_validates_network_policies() {
+        let backend = test_backend();
 
         assert_eq!(
             backend.network_policy_capabilities(),
@@ -847,28 +847,13 @@ mod tests {
         );
         assert!(
             backend
-                .validate_network_policy(&SandboxNetworkPolicy::default())
-                .is_ok()
-        );
-        assert!(
-            backend
                 .validate_network_policy(&SandboxNetworkPolicy {
                     denied_domains: vec!["api.github.com".to_string()],
                     ..SandboxNetworkPolicy::default()
                 })
                 .is_err()
         );
-    }
 
-    #[test]
-    fn compiles_supported_network_rules_to_vercel_network_policy() {
-        let backend = VercelSandboxBackend::new(VercelConfig {
-            api_token: "test-token".to_string(),
-            api_url: DEFAULT_VERCEL_API_URL.to_string(),
-            team_id: "team".to_string(),
-            project_id: "project".to_string(),
-        })
-        .expect("create Vercel backend");
         let denylist = SandboxNetworkPolicy {
             default_deny: false,
             denied_cidrs: vec!["198.51.100.0/24".parse().unwrap()],

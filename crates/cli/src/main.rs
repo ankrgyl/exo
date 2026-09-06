@@ -545,28 +545,37 @@ fn parse_network_policy(raw: &str) -> Result<SandboxNetworkPolicy, String> {
     serde_json::from_str(&json).map_err(|error| format!("parsing network policy JSON: {error}"))
 }
 
-fn resolve_networking_options(
+fn resolve_network_policy_option(
     networking: Option<EnabledDisabled>,
     network_policy: Option<SandboxNetworkPolicy>,
-) -> Result<(Option<bool>, Option<SandboxNetworkPolicy>)> {
+) -> Result<Option<SandboxNetworkPolicy>> {
     Ok(match (networking, network_policy) {
         (Some(networking), Some(policy)) => {
             let enabled = networking.enabled();
             if enabled != policy.allows_all() {
                 bail!("--networking and --network-policy specify different network access");
             }
-            (Some(enabled), Some(policy))
+            Some(policy)
         }
         (Some(networking), None) => {
             let enabled = networking.enabled();
-            (
-                Some(enabled),
-                Some(SandboxNetworkPolicy::from_legacy_enable_networking(enabled)),
-            )
+            Some(SandboxNetworkPolicy::from_legacy_enable_networking(enabled))
         }
-        (None, Some(policy)) => (Some(policy.allows_all()), Some(policy)),
-        (None, None) => (None, None),
+        (None, Some(policy)) => Some(policy),
+        (None, None) => None,
     })
+}
+
+fn resolve_network_policy(
+    networking: Option<EnabledDisabled>,
+    network_policy: Option<SandboxNetworkPolicy>,
+    default_enable_networking: bool,
+) -> Result<SandboxNetworkPolicy> {
+    Ok(
+        resolve_network_policy_option(networking, network_policy)?.unwrap_or_else(|| {
+            SandboxNetworkPolicy::from_legacy_enable_networking(default_enable_networking)
+        }),
+    )
 }
 
 impl EnabledDisabled {
@@ -1369,10 +1378,11 @@ async fn main() -> Result<()> {
                                 .map(str::to_string),
                             sandbox_provider: default_sandbox_provider,
                             sandbox_scope: None,
-                            enable_networking: harness_selection
-                                .as_ref()
-                                .is_some_and(HarnessSelection::default_enable_networking),
-                            network_policy: None,
+                            network_policy: SandboxNetworkPolicy::from_legacy_enable_networking(
+                                harness_selection
+                                    .as_ref()
+                                    .is_some_and(HarnessSelection::default_enable_networking),
+                            ),
                             model,
                             max_output_tokens: None,
                             max_tool_round_trips: None,
@@ -1456,13 +1466,13 @@ async fn main() -> Result<()> {
                         .and_then(HarnessSelection::default_sandbox_image)
                         .map(str::to_string)
                 });
-                let (requested_enable_networking, network_policy) =
-                    resolve_networking_options(networking, network_policy)?;
-                let enable_networking = requested_enable_networking.unwrap_or_else(|| {
+                let network_policy = resolve_network_policy(
+                    networking,
+                    network_policy,
                     harness_selection
                         .as_ref()
-                        .is_some_and(HarnessSelection::default_enable_networking)
-                });
+                        .is_some_and(HarnessSelection::default_enable_networking),
+                )?;
                 let agent = harness
                     .create_agent(CreateAgentRequest {
                         slug,
@@ -1477,7 +1487,6 @@ async fn main() -> Result<()> {
                             .map(SandboxProvider::from)
                             .unwrap_or(default_sandbox_provider),
                         sandbox_scope: sandbox_scope.map(SandboxScope::from),
-                        enable_networking,
                         network_policy,
                         model,
                         max_output_tokens,
@@ -1661,19 +1670,10 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                let (requested_enable_networking, requested_network_policy) =
-                    resolve_networking_options(networking, network_policy)?;
-                if let Some(enable_networking) = requested_enable_networking {
-                    if config.sandbox.enable_networking != enable_networking {
-                        config.sandbox.enable_networking = enable_networking;
-                        changed = true;
-                    }
-                }
-                if let Some(network_policy) = requested_network_policy {
-                    if config.sandbox.network_policy.as_ref() != Some(&network_policy) {
-                        config.sandbox.network_policy = Some(network_policy);
-                        changed = true;
-                    }
+                if let Some(network_policy) =
+                    resolve_network_policy_option(networking, network_policy)?
+                {
+                    changed |= config.sandbox.set_network_policy(network_policy);
                 }
 
                 if let Some(model) = model {
@@ -2898,8 +2898,7 @@ async fn start_sandbox(
         mount.internal = Some(true);
     }
     mounts.extend(internal_mounts);
-    let (enable_networking, network_policy) =
-        resolve_networking_options(networking, network_policy)?;
+    let network_policy = resolve_network_policy(networking, network_policy, true)?;
 
     let agent = sandbox_owner(harness, agent.as_deref()).await?;
     let sandbox_id = agent
@@ -2913,8 +2912,8 @@ async fn start_sandbox(
             file_system_mounts: (!mounts.is_empty()).then_some(mounts),
             durable_file_systems: (!durable_file_systems.is_empty())
                 .then_some(durable_file_systems),
-            enable_networking,
-            network_policy,
+            enable_networking: None,
+            network_policy: Some(network_policy),
             idle_seconds,
         })
         .await?;
@@ -3892,14 +3891,14 @@ mod create_tests {
 
     #[test]
     fn networking_options_must_agree() {
-        let (_, policy) = super::resolve_networking_options(
+        let policy = super::resolve_network_policy_option(
             Some(super::EnabledDisabled::Disabled),
             Some(exoharness::SandboxNetworkPolicy::deny_all()),
         )
         .expect("equivalent legacy and explicit network options should agree");
         assert_eq!(policy, Some(exoharness::SandboxNetworkPolicy::deny_all()));
 
-        let error = super::resolve_networking_options(
+        let error = super::resolve_network_policy_option(
             Some(super::EnabledDisabled::Enabled),
             Some(exoharness::SandboxNetworkPolicy::deny_all()),
         )
