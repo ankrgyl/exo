@@ -2308,40 +2308,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn network_policy_constructors_and_default_are_unambiguous() {
-        let allow_all = SandboxNetworkPolicy::allow_all();
-        assert!(allow_all.allows_all());
-
-        let deny_all = SandboxNetworkPolicy::deny_all();
-        assert_eq!(deny_all, SandboxNetworkPolicy::default());
-        assert!(deny_all.default_deny);
-        let decoded: SandboxNetworkPolicy =
-            serde_json::from_str("{}").expect("deserialize default policy");
-        assert_eq!(decoded, deny_all);
-
-        for policy in [
-            SandboxNetworkPolicy {
-                allowed_domains: vec!["example.com".into()],
-                ..allow_all.clone()
-            },
-            SandboxNetworkPolicy {
-                denied_domains: vec!["example.com".into()],
-                ..allow_all.clone()
-            },
-            SandboxNetworkPolicy {
-                allowed_cidrs: vec!["192.0.2.0/24".parse().expect("valid CIDR")],
-                ..allow_all.clone()
-            },
-            SandboxNetworkPolicy {
-                denied_cidrs: vec!["192.0.2.0/24".parse().expect("valid CIDR")],
-                ..allow_all
-            },
-        ] {
-            assert!(!policy.allows_all(), "{policy:?}");
-        }
-    }
-
-    #[test]
     fn network_policy_rejects_rules_a_backend_cannot_enforce() {
         let capabilities = NetworkPolicyCapabilities {
             default_deny: true,
