@@ -24,37 +24,7 @@ use uuid::Uuid;
 
 use crate::{DurableFileSystem, SandboxAttachment};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum SandboxKey {
-    StandaloneSandbox {
-        sandbox_id: String,
-    },
-    AgentSandbox {
-        agent_id: String,
-        sandbox_id: String,
-    },
-    ConversationSandbox {
-        #[serde(alias = "conversation_id")]
-        thread_id: String,
-        sandbox_id: String,
-    },
-}
-
-impl fmt::Display for SandboxKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::StandaloneSandbox { sandbox_id } => write!(f, "sandbox:{sandbox_id}"),
-            Self::AgentSandbox {
-                agent_id,
-                sandbox_id,
-            } => write!(f, "agent:{agent_id}:{sandbox_id}"),
-            Self::ConversationSandbox {
-                thread_id,
-                sandbox_id,
-            } => write!(f, "thread:{thread_id}:{sandbox_id}"),
-        }
-    }
-}
+pub type SandboxKey = String;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxLifecycleConfig {
@@ -2301,35 +2271,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn conversation_sandbox_key_uses_thread_id_and_reads_conversation_id() {
-        let key = SandboxKey::ConversationSandbox {
-            thread_id: "thread-1".to_string(),
-            sandbox_id: "sandbox-1".to_string(),
-        };
-
-        assert_eq!(
-            serde_json::to_value(&key).unwrap(),
-            serde_json::json!({
-                "ConversationSandbox": {
-                    "thread_id": "thread-1",
-                    "sandbox_id": "sandbox-1"
-                }
-            })
-        );
-        assert_eq!(
-            serde_json::from_value::<SandboxKey>(serde_json::json!({
-                "ConversationSandbox": {
-                    "conversation_id": "thread-1",
-                    "sandbox_id": "sandbox-1"
-                }
-            }))
-            .unwrap(),
-            key
-        );
-        assert_eq!(key.to_string(), "thread:thread-1:sandbox-1");
-    }
-
-    #[test]
     fn apple_container_list_item_reads_current_status_shape() {
         let container: ContainerListItem = serde_json::from_value(serde_json::json!({
             "configuration": {
@@ -2440,10 +2381,7 @@ mod tests {
         fs::set_permissions(&script_path, permissions).expect("chmod fake docker");
 
         let request = SandboxRequest {
-            key: SandboxKey::ConversationSandbox {
-                thread_id: "thread".to_string(),
-                sandbox_id: "sandbox".to_string(),
-            },
+            key: "sandbox".to_string(),
             spec: SandboxSpec {
                 image: "docker.io/library/ubuntu:24.04".to_string(),
                 resources: Default::default(),
@@ -2517,10 +2455,7 @@ mod tests {
             warm_sandboxes: Arc::new(Mutex::new(HashMap::new())),
         };
         let request = SandboxRequest {
-            key: SandboxKey::ConversationSandbox {
-                thread_id: "thread".to_string(),
-                sandbox_id: "sandbox".to_string(),
-            },
+            key: "sandbox".to_string(),
             spec: SandboxSpec {
                 image: "docker.io/library/ubuntu:24.04".to_string(),
                 resources: Default::default(),
@@ -2610,10 +2545,7 @@ esac
             warm_sandboxes: Arc::new(Mutex::new(HashMap::new())),
         };
         let request = SandboxRequest {
-            key: SandboxKey::ConversationSandbox {
-                thread_id: "thread".to_string(),
-                sandbox_id: "sandbox".to_string(),
-            },
+            key: "sandbox".to_string(),
             spec: SandboxSpec {
                 image: "docker.io/library/ubuntu:24.04".to_string(),
                 resources: Default::default(),
@@ -2722,10 +2654,7 @@ esac
             warm_sandboxes: Arc::new(Mutex::new(HashMap::new())),
         };
         let request = SandboxRequest {
-            key: SandboxKey::ConversationSandbox {
-                thread_id: "thread".to_string(),
-                sandbox_id: "sandbox".to_string(),
-            },
+            key: "sandbox".to_string(),
             spec: SandboxSpec {
                 image: "task-image".to_string(),
                 resources: Default::default(),

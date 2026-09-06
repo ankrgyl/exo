@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use exoharness::{
-    ManagedSandboxBackend, SandboxCommand, SandboxKey, SandboxLifecycleConfig,
-    SandboxNetworkPolicy, SandboxRequest, SandboxSpec, VercelConfig, VercelSandboxBackend,
+    ManagedSandboxBackend, SandboxCommand, SandboxLifecycleConfig, SandboxNetworkPolicy,
+    SandboxRequest, SandboxSpec, VercelConfig, VercelSandboxBackend,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -15,10 +15,7 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 fn make_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
-        key: SandboxKey::ConversationSandbox {
-            thread_id: thread_id.into(),
-            sandbox_id: sandbox_id.into(),
-        },
+        key: sandbox_id.into(),
         spec: SandboxSpec {
             image: "node24".into(),
             resources: Default::default(),
