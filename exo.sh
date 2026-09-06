@@ -1051,8 +1051,20 @@ send_startup_prompt() {
   fi
 }
 
+adapter_configured() {
+  # `exo adapters list` prints one row per adapter with the name last. It
+  # covers every conversation in this checkout, which is fine because exo.sh
+  # drives one; a name it cannot match just falls through to the prompt.
+  exo adapters list 2>/dev/null |
+    awk -v name="$1" 'NR > 1 && $NF == name { found = 1 } END { exit !found }'
+}
+
 send_adapter_setup_prompt() {
   local adapter="$1"
+  if adapter_configured "$adapter"; then
+    echo "Adapter $adapter is already configured; skipping its setup prompt."
+    return
+  fi
   local file prompt
   file="$(adapter_setup_prompt_file "$adapter")"
   prompt="$(<"$file")"
