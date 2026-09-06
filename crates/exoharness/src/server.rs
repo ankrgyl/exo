@@ -3,18 +3,18 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 
+use crate::CreateSandboxFromRecipeRequest;
 use crate::protocol::{
     ClientMessage, ConversationHandleInfo, Request, Response, SandboxScope, ServerMessage,
 };
 use crate::{
     AgentHandle, AgentId, AttachSandboxRequest, CancelSandboxProcessRequest,
-    CloseSandboxProcessInputRequest, ConversationHandle, ConversationId,
-    CreateSandboxFromRecipeRequest, CreateSandboxRequest, ExoHarness, ForkSandboxRequest,
-    GetSandboxProcessEventsResult, ListConversationsResult, RestoreSandboxRequest, Result,
-    SandboxAttachment, SandboxHandle, SandboxId, SandboxProcessEventQuery, SandboxProcessRecord,
-    SandboxProcessStatus, SandboxRecord, SessionId, SnapshotId, StartSandboxProcessRequest,
-    StartSandboxRequest, TurnHandle, TurnId, TurnRecord, WaitSandboxProcessRequest,
-    WriteSandboxProcessInputRequest,
+    CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, CreateSandboxRequest,
+    ExoHarness, ForkSandboxRequest, GetSandboxProcessEventsResult, ListConversationsResult,
+    RestoreSandboxRequest, Result, SandboxAttachment, SandboxId, SandboxProcessEventQuery,
+    SandboxProcessRecord, SandboxProcessStatus, SandboxRecord, SessionId, SnapshotId,
+    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord,
+    WaitSandboxProcessRequest, WriteSandboxProcessInputRequest,
 };
 
 pub struct ExoHarnessServer {
@@ -490,17 +490,46 @@ impl ExoHarnessServer {
         scope: SandboxScope,
         request: CreateSandboxRequest,
     ) -> Result<SandboxId> {
-        self.require_full_sandbox(scope, "create_sandbox")
-            .await?
-            .create_sandbox(request)
-            .await
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id)
+                    .await?
+                    .create_sandbox(request)
+                    .await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .create_sandbox(request)
+                    .await
+            }
+            SandboxScope::Turn { .. } => {
+                Err(anyhow!("create_sandbox is not supported on a turn scope"))
+            }
+        }
     }
 
     async fn list_sandboxes(&self, scope: SandboxScope) -> Result<Vec<SandboxRecord>> {
-        self.require_full_sandbox(scope, "list_sandboxes")
-            .await?
-            .list_sandboxes()
-            .await
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id).await?.list_sandboxes().await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .list_sandboxes()
+                    .await
+            }
+            SandboxScope::Turn { .. } => {
+                Err(anyhow!("list_sandboxes is not supported on a turn scope"))
+            }
+        }
     }
 
     async fn fork_sandbox(
@@ -508,10 +537,26 @@ impl ExoHarnessServer {
         scope: SandboxScope,
         request: ForkSandboxRequest,
     ) -> Result<SandboxId> {
-        self.require_full_sandbox(scope, "fork_sandbox")
-            .await?
-            .fork_sandbox(request)
-            .await
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id)
+                    .await?
+                    .fork_sandbox(request)
+                    .await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .fork_sandbox(request)
+                    .await
+            }
+            SandboxScope::Turn { .. } => {
+                Err(anyhow!("fork_sandbox is not supported on a turn scope"))
+            }
+        }
     }
 
     async fn restore_sandbox(
@@ -519,10 +564,26 @@ impl ExoHarnessServer {
         scope: SandboxScope,
         request: RestoreSandboxRequest,
     ) -> Result<SandboxId> {
-        self.require_full_sandbox(scope, "restore_sandbox")
-            .await?
-            .restore_sandbox(request)
-            .await
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id)
+                    .await?
+                    .restore_sandbox(request)
+                    .await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .restore_sandbox(request)
+                    .await
+            }
+            SandboxScope::Turn { .. } => {
+                Err(anyhow!("restore_sandbox is not supported on a turn scope"))
+            }
+        }
     }
 
     async fn create_sandbox_from_recipe(
@@ -530,17 +591,49 @@ impl ExoHarnessServer {
         scope: SandboxScope,
         request: CreateSandboxFromRecipeRequest,
     ) -> Result<SandboxId> {
-        self.require_full_sandbox(scope, "create_sandbox_from_recipe")
-            .await?
-            .create_sandbox_from_recipe(request)
-            .await
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id)
+                    .await?
+                    .create_sandbox_from_recipe(request)
+                    .await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .create_sandbox_from_recipe(request)
+                    .await
+            }
+            SandboxScope::Turn { .. } => Err(anyhow!(
+                "create_sandbox_from_recipe is not supported on a turn scope"
+            )),
+        }
     }
 
     async fn terminate_sandbox(&self, scope: SandboxScope, sandbox_id: SandboxId) -> Result<()> {
-        self.require_full_sandbox(scope, "terminate_sandbox")
-            .await?
-            .terminate_sandbox(sandbox_id)
-            .await
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id)
+                    .await?
+                    .terminate_sandbox(sandbox_id)
+                    .await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .terminate_sandbox(sandbox_id)
+                    .await
+            }
+            SandboxScope::Turn { .. } => Err(anyhow!(
+                "terminate_sandbox is not supported on a turn scope"
+            )),
+        }
     }
 
     async fn attach_sandbox(
@@ -548,10 +641,26 @@ impl ExoHarnessServer {
         scope: SandboxScope,
         request: AttachSandboxRequest,
     ) -> Result<SandboxId> {
-        self.require_full_sandbox(scope, "attach_sandbox")
-            .await?
-            .attach_sandbox(request)
-            .await
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id)
+                    .await?
+                    .attach_sandbox(request)
+                    .await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .attach_sandbox(request)
+                    .await
+            }
+            SandboxScope::Turn { .. } => {
+                Err(anyhow!("attach_sandbox is not supported on a turn scope"))
+            }
+        }
     }
 
     async fn detach_sandbox(
@@ -559,10 +668,26 @@ impl ExoHarnessServer {
         scope: SandboxScope,
         sandbox_id: SandboxId,
     ) -> Result<SandboxAttachment> {
-        self.require_full_sandbox(scope, "detach_sandbox")
-            .await?
-            .detach_sandbox(sandbox_id)
-            .await
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id)
+                    .await?
+                    .detach_sandbox(sandbox_id)
+                    .await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .detach_sandbox(sandbox_id)
+                    .await
+            }
+            SandboxScope::Turn { .. } => {
+                Err(anyhow!("detach_sandbox is not supported on a turn scope"))
+            }
+        }
     }
 
     async fn snapshot_sandbox(
@@ -632,10 +757,26 @@ impl ExoHarnessServer {
     }
 
     async fn stop_sandbox(&self, scope: SandboxScope, sandbox_id: SandboxId) -> Result<()> {
-        self.require_full_sandbox(scope, "stop_sandbox")
-            .await?
-            .stop_sandbox(sandbox_id)
-            .await
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id)
+                    .await?
+                    .stop_sandbox(sandbox_id)
+                    .await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .stop_sandbox(sandbox_id)
+                    .await
+            }
+            SandboxScope::Turn { .. } => {
+                Err(anyhow!("stop_sandbox is not supported on a turn scope"))
+            }
+        }
     }
 
     async fn start_sandbox_process(
@@ -643,10 +784,26 @@ impl ExoHarnessServer {
         scope: SandboxScope,
         request: StartSandboxProcessRequest,
     ) -> Result<SandboxProcessRecord> {
-        self.require_full_sandbox(scope, "start_sandbox_process")
-            .await?
-            .start_sandbox_process(request)
-            .await
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id)
+                    .await?
+                    .start_sandbox_process(request)
+                    .await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .start_sandbox_process(request)
+                    .await
+            }
+            SandboxScope::Turn { .. } => Err(anyhow!(
+                "start_sandbox_process is not supported on a turn scope"
+            )),
+        }
     }
 
     async fn write_sandbox_process_input(
@@ -654,10 +811,26 @@ impl ExoHarnessServer {
         scope: SandboxScope,
         request: WriteSandboxProcessInputRequest,
     ) -> Result<()> {
-        self.require_full_sandbox(scope, "write_sandbox_process_input")
-            .await?
-            .write_sandbox_process_input(request)
-            .await
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id)
+                    .await?
+                    .write_sandbox_process_input(request)
+                    .await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .write_sandbox_process_input(request)
+                    .await
+            }
+            SandboxScope::Turn { .. } => Err(anyhow!(
+                "write_sandbox_process_input is not supported on a turn scope"
+            )),
+        }
     }
 
     async fn close_sandbox_process_input(
@@ -665,10 +838,26 @@ impl ExoHarnessServer {
         scope: SandboxScope,
         request: CloseSandboxProcessInputRequest,
     ) -> Result<()> {
-        self.require_full_sandbox(scope, "close_sandbox_process_input")
-            .await?
-            .close_sandbox_process_input(request)
-            .await
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id)
+                    .await?
+                    .close_sandbox_process_input(request)
+                    .await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .close_sandbox_process_input(request)
+                    .await
+            }
+            SandboxScope::Turn { .. } => Err(anyhow!(
+                "close_sandbox_process_input is not supported on a turn scope"
+            )),
+        }
     }
 
     async fn get_sandbox_process_events(
@@ -676,10 +865,26 @@ impl ExoHarnessServer {
         scope: SandboxScope,
         query: SandboxProcessEventQuery,
     ) -> Result<GetSandboxProcessEventsResult> {
-        self.require_full_sandbox(scope, "get_sandbox_process_events")
-            .await?
-            .get_sandbox_process_events(query)
-            .await
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id)
+                    .await?
+                    .get_sandbox_process_events(query)
+                    .await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .get_sandbox_process_events(query)
+                    .await
+            }
+            SandboxScope::Turn { .. } => Err(anyhow!(
+                "get_sandbox_process_events is not supported on a turn scope"
+            )),
+        }
     }
 
     async fn wait_sandbox_process(
@@ -687,10 +892,26 @@ impl ExoHarnessServer {
         scope: SandboxScope,
         request: WaitSandboxProcessRequest,
     ) -> Result<SandboxProcessStatus> {
-        self.require_full_sandbox(scope, "wait_sandbox_process")
-            .await?
-            .wait_sandbox_process(request)
-            .await
+        match scope {
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id)
+                    .await?
+                    .wait_sandbox_process(request)
+                    .await
+            }
+            SandboxScope::Conversation {
+                agent_id,
+                conversation_id,
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .wait_sandbox_process(request)
+                    .await
+            }
+            SandboxScope::Turn { .. } => Err(anyhow!(
+                "wait_sandbox_process is not supported on a turn scope"
+            )),
+        }
     }
 
     async fn cancel_sandbox_process(
@@ -698,27 +919,25 @@ impl ExoHarnessServer {
         scope: SandboxScope,
         request: CancelSandboxProcessRequest,
     ) -> Result<SandboxProcessStatus> {
-        self.require_full_sandbox(scope, "cancel_sandbox_process")
-            .await?
-            .cancel_sandbox_process(request)
-            .await
-    }
-
-    async fn require_full_sandbox(
-        &self,
-        scope: SandboxScope,
-        operation: &str,
-    ) -> Result<Arc<dyn SandboxHandle>> {
         match scope {
-            SandboxScope::Agent { agent_id } => Ok(self.require_agent(&agent_id).await?),
+            SandboxScope::Agent { agent_id } => {
+                self.require_agent(&agent_id)
+                    .await?
+                    .cancel_sandbox_process(request)
+                    .await
+            }
             SandboxScope::Conversation {
                 agent_id,
                 conversation_id,
-            } => Ok(self.require_conversation(agent_id, conversation_id).await?),
-            // Turns can use a sandbox, but they do not own durable sandbox state.
-            SandboxScope::Turn { .. } => {
-                Err(anyhow!("{operation} is not supported on a turn scope"))
+            } => {
+                self.require_conversation(agent_id, conversation_id)
+                    .await?
+                    .cancel_sandbox_process(request)
+                    .await
             }
+            SandboxScope::Turn { .. } => Err(anyhow!(
+                "cancel_sandbox_process is not supported on a turn scope"
+            )),
         }
     }
 

@@ -4,19 +4,20 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
+use exoharness::CreateSandboxFromRecipeRequest;
 use exoharness::{
     AddEventsRequest, AddEventsResult, AgentHandle, AgentId, Artifact, ArtifactVersion,
     AttachSandboxRequest, Binding, BindingId, BindingRecord, BoxSandboxTcpStream,
     CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, ConversationHandle,
-    ConversationId, CreateSandboxFromRecipeRequest, CreateSandboxRequest, Event, EventData,
-    EventId, EventKind, EventStream, ExoHarness, ForkConversationRequest, ForkSandboxRequest,
-    GetEventsResult, ListConversationsRequest, ListConversationsResult, NewAgentRequest,
-    NewConversationRequest, PutSecretRequest, ReadArtifactRequest, RestoreSandboxRequest, Result,
-    RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess,
-    SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, SandboxProvider,
-    SandboxRecord, Secret, SecretId, SecretMetadata, SnapshotHandle, SnapshotId,
-    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnRecord, Uuid7,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    ConversationId, CreateSandboxRequest, Event, EventData, EventId, EventKind, EventStream,
+    ExoHarness, ForkConversationRequest, ForkSandboxRequest, GetEventsResult,
+    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
+    PutSecretRequest, ReadArtifactRequest, RestoreSandboxRequest, Result, RunInSandboxRequest,
+    SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery,
+    SandboxProcessRecord, SandboxProcessStatus, SandboxProvider, SandboxRecord, Secret, SecretId,
+    SecretMetadata, SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest,
+    TurnHandle, TurnRecord, Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest,
+    WriteSandboxProcessInputRequest,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -1064,7 +1065,7 @@ impl SandboxHandle for LocalSandboxConversation {
             &local,
             remote_id.clone(),
             local_id,
-            sandbox_created_events(&remote_id, request, None),
+            sandbox_created_events(&remote_id, request),
         )
         .await?;
         Ok(remote_id)
@@ -1083,7 +1084,7 @@ impl SandboxHandle for LocalSandboxConversation {
             &local,
             remote_id.clone(),
             local_id,
-            sandbox_created_events(&remote_id, sandbox, None),
+            sandbox_created_events(&remote_id, sandbox),
         )
         .await?;
         Ok(remote_id)
@@ -1099,7 +1100,11 @@ impl SandboxHandle for LocalSandboxConversation {
         let remote_id = format!("sandbox-{}", Uuid7::now());
         let local = self.local_conversation().await?;
         let local_id = local.restore_sandbox(request).await?;
-        let events = sandbox_created_events(&remote_id, sandbox, Some(snapshot_id));
+        let mut events = sandbox_created_events(&remote_id, sandbox);
+        events.push(EventData::SandboxStarted {
+            sandbox_id: remote_id.clone(),
+            snapshot_id: Some(snapshot_id),
+        });
         self.commit_local_sandbox(&local, remote_id.clone(), local_id, events)
             .await?;
         Ok(remote_id)
@@ -1112,7 +1117,6 @@ impl SandboxHandle for LocalSandboxConversation {
         if !self.wants_local_sandbox(&request.sandbox) {
             return self.remote.create_sandbox_from_recipe(request).await;
         }
-        let snapshot_id = request.recipe.snapshot_id;
         let sandbox = request.sandbox.clone();
         let remote_id = format!("sandbox-{}", Uuid7::now());
         let local = self.local_conversation().await?;
@@ -1121,7 +1125,7 @@ impl SandboxHandle for LocalSandboxConversation {
             &local,
             remote_id.clone(),
             local_id,
-            sandbox_created_events(&remote_id, sandbox, snapshot_id),
+            sandbox_created_events(&remote_id, sandbox),
         )
         .await?;
         Ok(remote_id)
@@ -1278,11 +1282,7 @@ impl SandboxHandle for LocalSandboxConversation {
     }
 }
 
-fn sandbox_created_events(
-    sandbox_id: &SandboxId,
-    request: CreateSandboxRequest,
-    snapshot_id: Option<SnapshotId>,
-) -> Vec<EventData> {
+fn sandbox_created_events(sandbox_id: &SandboxId, request: CreateSandboxRequest) -> Vec<EventData> {
     vec![
         EventData::SandboxCreated {
             sandbox_id: sandbox_id.clone(),
@@ -1297,7 +1297,7 @@ fn sandbox_created_events(
         },
         EventData::SandboxStarted {
             sandbox_id: sandbox_id.clone(),
-            snapshot_id,
+            snapshot_id: None,
         },
     ]
 }
