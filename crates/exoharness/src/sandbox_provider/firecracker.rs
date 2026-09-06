@@ -4067,12 +4067,6 @@ fn stop_machine_process_blocking(machine_id: &str, pid_path: &Path) -> Result<()
     if !is_firecracker || !has_machine_id || !in_machine_cgroup {
         bail!("refusing to stop pid {pid}: it does not match Firecracker machine {machine_id}");
     }
-    if !signal_pidfd(&pidfd, Signal::TERM)? {
-        return Ok(());
-    }
-    if wait_for_pidfd(&pidfd, PROCESS_STOP_TIMEOUT)? {
-        return Ok(());
-    }
     if !signal_pidfd(&pidfd, Signal::KILL)? {
         return Ok(());
     }
