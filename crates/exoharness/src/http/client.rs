@@ -208,10 +208,11 @@ async fn http_create_sandbox(
     scope: SandboxScope,
     request: CreateSandboxRequest,
 ) -> Result<SandboxId> {
-    match harness
-        .request(Request::CreateSandbox { scope, request })
-        .await?
-    {
+    http_sandbox_id(harness, Request::CreateSandbox { scope, request }).await
+}
+
+async fn http_sandbox_id(harness: &HttpExoHarness, request: Request) -> Result<SandboxId> {
+    match harness.request(request).await? {
         Response::SandboxId { sandbox_id } => Ok(sandbox_id),
         response => unexpected_response(response, "sandbox_id"),
     }
@@ -222,13 +223,7 @@ async fn http_fork_sandbox(
     scope: SandboxScope,
     request: ForkSandboxRequest,
 ) -> Result<SandboxId> {
-    match harness
-        .request(Request::ForkSandbox { scope, request })
-        .await?
-    {
-        Response::SandboxId { sandbox_id } => Ok(sandbox_id),
-        response => unexpected_response(response, "sandbox_id"),
-    }
+    http_sandbox_id(harness, Request::ForkSandbox { scope, request }).await
 }
 
 async fn http_restore_sandbox(
@@ -236,13 +231,7 @@ async fn http_restore_sandbox(
     scope: SandboxScope,
     request: RestoreSandboxRequest,
 ) -> Result<SandboxId> {
-    match harness
-        .request(Request::RestoreSandbox { scope, request })
-        .await?
-    {
-        Response::SandboxId { sandbox_id } => Ok(sandbox_id),
-        response => unexpected_response(response, "sandbox_id"),
-    }
+    http_sandbox_id(harness, Request::RestoreSandbox { scope, request }).await
 }
 
 async fn http_create_sandbox_from_recipe(
@@ -250,13 +239,7 @@ async fn http_create_sandbox_from_recipe(
     scope: SandboxScope,
     request: CreateSandboxFromRecipeRequest,
 ) -> Result<SandboxId> {
-    match harness
-        .request(Request::CreateSandboxFromRecipe { scope, request })
-        .await?
-    {
-        Response::SandboxId { sandbox_id } => Ok(sandbox_id),
-        response => unexpected_response(response, "sandbox_id"),
-    }
+    http_sandbox_id(harness, Request::CreateSandboxFromRecipe { scope, request }).await
 }
 
 async fn http_list_sandboxes(
@@ -288,13 +271,7 @@ async fn http_attach_sandbox(
     scope: SandboxScope,
     request: AttachSandboxRequest,
 ) -> Result<SandboxId> {
-    match harness
-        .request(Request::AttachSandbox { scope, request })
-        .await?
-    {
-        Response::SandboxId { sandbox_id } => Ok(sandbox_id),
-        response => unexpected_response(response, "sandbox_id"),
-    }
+    http_sandbox_id(harness, Request::AttachSandbox { scope, request }).await
 }
 
 async fn http_detach_sandbox(

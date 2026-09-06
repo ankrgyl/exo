@@ -1064,7 +1064,7 @@ impl SandboxHandle for LocalSandboxConversation {
             &local,
             remote_id.clone(),
             local_id,
-            sandbox_created_events(&remote_id, request),
+            sandbox_created_events(&remote_id, request, None),
         )
         .await?;
         Ok(remote_id)
@@ -1083,7 +1083,7 @@ impl SandboxHandle for LocalSandboxConversation {
             &local,
             remote_id.clone(),
             local_id,
-            sandbox_created_events(&remote_id, sandbox),
+            sandbox_created_events(&remote_id, sandbox, None),
         )
         .await?;
         Ok(remote_id)
@@ -1099,11 +1099,7 @@ impl SandboxHandle for LocalSandboxConversation {
         let remote_id = format!("sandbox-{}", Uuid7::now());
         let local = self.local_conversation().await?;
         let local_id = local.restore_sandbox(request).await?;
-        let mut events = sandbox_created_events(&remote_id, sandbox);
-        events.push(EventData::SandboxStarted {
-            sandbox_id: remote_id.clone(),
-            snapshot_id: Some(snapshot_id),
-        });
+        let events = sandbox_created_events(&remote_id, sandbox, Some(snapshot_id));
         self.commit_local_sandbox(&local, remote_id.clone(), local_id, events)
             .await?;
         Ok(remote_id)
@@ -1116,6 +1112,7 @@ impl SandboxHandle for LocalSandboxConversation {
         if !self.wants_local_sandbox(&request.sandbox) {
             return self.remote.create_sandbox_from_recipe(request).await;
         }
+        let snapshot_id = request.recipe.snapshot_id;
         let sandbox = request.sandbox.clone();
         let remote_id = format!("sandbox-{}", Uuid7::now());
         let local = self.local_conversation().await?;
@@ -1124,7 +1121,7 @@ impl SandboxHandle for LocalSandboxConversation {
             &local,
             remote_id.clone(),
             local_id,
-            sandbox_created_events(&remote_id, sandbox),
+            sandbox_created_events(&remote_id, sandbox, snapshot_id),
         )
         .await?;
         Ok(remote_id)
@@ -1281,7 +1278,11 @@ impl SandboxHandle for LocalSandboxConversation {
     }
 }
 
-fn sandbox_created_events(sandbox_id: &SandboxId, request: CreateSandboxRequest) -> Vec<EventData> {
+fn sandbox_created_events(
+    sandbox_id: &SandboxId,
+    request: CreateSandboxRequest,
+    snapshot_id: Option<SnapshotId>,
+) -> Vec<EventData> {
     vec![
         EventData::SandboxCreated {
             sandbox_id: sandbox_id.clone(),
@@ -1296,7 +1297,7 @@ fn sandbox_created_events(sandbox_id: &SandboxId, request: CreateSandboxRequest)
         },
         EventData::SandboxStarted {
             sandbox_id: sandbox_id.clone(),
-            snapshot_id: None,
+            snapshot_id,
         },
     ]
 }
