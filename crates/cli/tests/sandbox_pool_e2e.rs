@@ -13,10 +13,12 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::bail;
+use async_trait::async_trait;
 use exoharness::{
-    CliContainerSandboxBackend, LeasedSandbox, LocalProcessSandboxBackend, ManagedSandboxBackend,
-    PoolCapacity, SandboxCommand, SandboxNetworkPolicy, SandboxPool, SandboxPoolKey,
-    SandboxPoolSeed, SandboxProvider, SandboxSpec,
+    CliContainerSandboxBackend, EmptySandboxPoolRecipe, LeasedSandbox, LocalProcessSandboxBackend,
+    ManagedSandboxBackend, PoolCapacity, SandboxCommand, SandboxNetworkPolicy, SandboxPool,
+    SandboxPoolKey, SandboxPoolRecipe, SandboxProvider, SandboxSpec,
 };
 use tokio::sync::watch;
 use tokio::time::{self, timeout};
@@ -58,6 +60,7 @@ fn pool(
     provider: SandboxProvider,
     backend: Arc<dyn ManagedSandboxBackend>,
     default_workdir: String,
+    recipe: Arc<dyn SandboxPoolRecipe>,
 ) -> SandboxPool {
     SandboxPool::new(
         SandboxPoolKey {
@@ -80,9 +83,40 @@ fn pool(
             lease_ttl: Duration::from_secs(60),
             idle_ttl: Duration::from_secs(120),
         },
-        SandboxPoolSeed::Empty,
+        recipe,
     )
     .expect("valid pool capacity")
+}
+
+struct CommandSeeder;
+
+#[async_trait]
+impl SandboxPoolRecipe for CommandSeeder {
+    async fn acquire(
+        &self,
+        backend: &dyn ManagedSandboxBackend,
+        request: exoharness::SandboxRequest,
+    ) -> exoharness::Result<Arc<dyn exoharness::ManagedSandboxHandle>> {
+        let sandbox = backend.acquire(request.clone()).await?;
+        let output = sandbox
+            .exec(&SandboxCommand {
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "printf recipe-seeded > /tmp/exo-pool-recipe-marker".to_string(),
+                ],
+                env: HashMap::new(),
+                display_argv: None,
+                cwd: None,
+                timeout: Some(Duration::from_secs(20)),
+            })
+            .await?;
+        if !output.ok {
+            backend.terminate(request).await?;
+            bail!("pool recipe seed command failed: {}", output.stderr.trim());
+        }
+        Ok(sandbox)
+    }
 }
 
 /// Helper to print out a value for testing
@@ -142,7 +176,12 @@ async fn warm_pool_acquires_executes_replaces_and_drains() {
     let Some((provider, backend, default_workdir)) = backend_from_environment() else {
         return;
     };
-    let pool = Arc::new(pool(provider, backend, default_workdir));
+    let pool = Arc::new(pool(
+        provider,
+        backend,
+        default_workdir,
+        Arc::new(EmptySandboxPoolRecipe),
+    ));
     let (shutdown, receiver) = watch::channel(false);
     let reconciler = tokio::spawn({
         let pool = Arc::clone(&pool);
@@ -195,6 +234,52 @@ async fn warm_pool_acquires_executes_replaces_and_drains() {
 }
 
 #[tokio::test]
+#[ignore = "spawns real local-process or Docker sandboxes; CI runs ignored integration tests"]
+async fn recipe_seeded_pool_exposes_the_initialized_filesystem() {
+    let Some((provider, backend, default_workdir)) = backend_from_environment() else {
+        return;
+    };
+    let pool = Arc::new(pool(
+        provider,
+        backend,
+        default_workdir,
+        Arc::new(CommandSeeder),
+    ));
+    let (shutdown, receiver) = watch::channel(false);
+    let reconciler = tokio::spawn({
+        let pool = Arc::clone(&pool);
+        async move { pool.run_reconciler(receiver).await }
+    });
+
+    let (lease, sandbox) = acquire(&pool, "recipe-worker").await;
+    assert_eq!(
+        sandbox
+            .exec(&SandboxCommand {
+                argv: vec![
+                    "/bin/cat".to_string(),
+                    "/tmp/exo-pool-recipe-marker".to_string()
+                ],
+                env: HashMap::new(),
+                display_argv: None,
+                cwd: None,
+                timeout: Some(Duration::from_secs(20)),
+            })
+            .await
+            .unwrap()
+            .stdout,
+        "recipe-seeded"
+    );
+
+    pool.release(&lease).await.unwrap();
+    pool.drain().await.unwrap();
+    shutdown.send(true).unwrap();
+    time::timeout(Duration::from_secs(10), reconciler)
+        .await
+        .expect("reconciler should stop")
+        .expect("reconciler task should not panic");
+}
+
+#[tokio::test]
 #[ignore = "spawns and kills a real Docker sandbox; CI runs ignored integration tests"]
 async fn docker_runtime_loss_is_recovered_for_an_active_pool_lease() {
     let Some((provider, backend, default_workdir)) = backend_from_environment() else {
@@ -205,7 +290,12 @@ async fn docker_runtime_loss_is_recovered_for_an_active_pool_lease() {
         return;
     }
 
-    let pool = Arc::new(pool(provider, backend, default_workdir));
+    let pool = Arc::new(pool(
+        provider,
+        backend,
+        default_workdir,
+        Arc::new(EmptySandboxPoolRecipe),
+    ));
     let (shutdown, receiver) = watch::channel(false);
     let reconciler = tokio::spawn({
         let pool = Arc::clone(&pool);

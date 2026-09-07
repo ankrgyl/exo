@@ -2,7 +2,12 @@
 //!
 //! Start one reconciler alongside callers:
 //! ```ignore
-//! let pool = Arc::new(SandboxPool::new(key, backend, capacity, SandboxPoolSeed::Empty)?);
+//! let pool = Arc::new(SandboxPool::new(
+//!     key,
+//!     backend,
+//!     capacity,
+//!     Arc::new(EmptySandboxPoolRecipe),
+//! )?);
 //! let (shutdown, receiver) = tokio::sync::watch::channel(false);
 //! let task = tokio::spawn({
 //!     let pool = Arc::clone(&pool);
@@ -29,12 +34,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail};
+use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore, watch};
 use tokio::time::{self, MissedTickBehavior};
 
 use crate::{
     ManagedSandboxBackend, ManagedSandboxHandle, Result, SandboxCommand, SandboxId,
-    SandboxProvider, SandboxRequest, SandboxSpec, SnapshotPayload, Uuid7,
+    SandboxProvider, SandboxRequest, SandboxSpec, Uuid7,
 };
 
 /// The immutable sandbox configuration shared by entries in one pool.
@@ -58,14 +64,31 @@ pub struct PoolCapacity {
     pub idle_ttl: Duration,
 }
 
-/// Filesystem state used when the pool creates a fresh runtime.
+/// Materializes a clean runtime for a newly-created pool entry.
 ///
-/// Mounts and durable file systems remain part of [`SandboxSpec`]. A snapshot
-/// copies an immutable codebase or toolchain into each new pool entry.
-#[derive(Debug, Clone)]
-pub enum SandboxPoolSeed {
-    Empty,
-    Snapshot(SnapshotPayload),
+/// A recipe owns snapshot resolution, credentials, setup steps, and cleanup
+/// when materialization fails. The pool owns only capacity and lease lifecycle.
+#[async_trait]
+pub trait SandboxPoolRecipe: Send + Sync {
+    async fn acquire(
+        &self,
+        backend: &dyn ManagedSandboxBackend,
+        request: SandboxRequest,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>>;
+}
+
+/// A recipe that provisions an empty runtime from the configured provider.
+pub struct EmptySandboxPoolRecipe;
+
+#[async_trait]
+impl SandboxPoolRecipe for EmptySandboxPoolRecipe {
+    async fn acquire(
+        &self,
+        backend: &dyn ManagedSandboxBackend,
+        request: SandboxRequest,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        backend.acquire(request).await
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +141,7 @@ struct PoolEntry {
 pub struct SandboxPool {
     key: SandboxPoolKey,
     backend: Arc<dyn ManagedSandboxBackend>,
-    seed: SandboxPoolSeed,
+    recipe: Arc<dyn SandboxPoolRecipe>,
     entries: Arc<Mutex<HashMap<String, PoolEntry>>>,
     capacity: PoolCapacity,
     notify: Arc<Notify>,
@@ -163,7 +186,7 @@ impl SandboxPool {
         key: SandboxPoolKey,
         backend: Arc<dyn ManagedSandboxBackend>,
         capacity: PoolCapacity,
-        seed: SandboxPoolSeed,
+        recipe: Arc<dyn SandboxPoolRecipe>,
     ) -> Result<Self> {
         if capacity.max_total == 0
             || capacity.target_ready == 0
@@ -178,7 +201,7 @@ impl SandboxPool {
         Ok(Self {
             key,
             backend,
-            seed,
+            recipe,
             entries: Arc::new(Mutex::new(HashMap::new())),
             capacity,
             notify: Arc::new(Notify::new()),
@@ -246,7 +269,7 @@ impl SandboxPool {
         let _operation = lifecycle.read().await;
         let handle = match live_handle {
             Some(handle) => handle,
-            None => match self.acquire_seeded(request).await {
+            None => match self.acquire_from_recipe(request).await {
                 Ok(handle) => handle,
                 Err(error) => {
                     self.mark_unknown(&entry_id, &lease).await;
@@ -623,7 +646,7 @@ impl SandboxPool {
             }
 
             drop(entries);
-            match self.acquire_seeded(request).await {
+            match self.acquire_from_recipe(request).await {
                 Ok(handle) => {
                     let mut entries = self.entries.lock().await;
                     if let Some(entry) = entries.get_mut(&entry_id) {
@@ -714,26 +737,18 @@ impl SandboxPool {
         }
     }
 
-    async fn acquire_seeded(
+    async fn acquire_from_recipe(
         &self,
         request: SandboxRequest,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let _permit = self.provider_operations.acquire().await.map_err(|error| {
             anyhow!("sandbox pool provider-operation semaphore closed: {error}")
         })?;
-        match &self.seed {
-            SandboxPoolSeed::Empty => {
-                time::timeout(Duration::from_secs(120), self.backend.acquire(request)).await?
-            }
-            SandboxPoolSeed::Snapshot(snapshot) => {
-                time::timeout(
-                    Duration::from_secs(120),
-                    self.backend
-                        .acquire_from_snapshot(request, snapshot.clone()),
-                )
-                .await?
-            }
-        }
+        time::timeout(
+            Duration::from_secs(120),
+            self.recipe.acquire(self.backend.as_ref(), request),
+        )
+        .await?
     }
 
     async fn terminate_with_provider(&self, request: SandboxRequest) -> Result<()> {
@@ -943,6 +958,54 @@ mod tests {
         healthy: Arc<AtomicBool>,
     }
 
+    struct FakeRecipe {
+        seed_count: AtomicUsize,
+        fail: AtomicBool,
+        snapshot: Option<SnapshotPayload>,
+    }
+
+    impl FakeRecipe {
+        fn new() -> Self {
+            Self {
+                seed_count: AtomicUsize::new(0),
+                fail: AtomicBool::new(false),
+                snapshot: None,
+            }
+        }
+
+        fn from_snapshot(snapshot: SnapshotPayload) -> Self {
+            Self {
+                seed_count: AtomicUsize::new(0),
+                fail: AtomicBool::new(false),
+                snapshot: Some(snapshot),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SandboxPoolRecipe for FakeRecipe {
+        async fn acquire(
+            &self,
+            backend: &dyn ManagedSandboxBackend,
+            request: SandboxRequest,
+        ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+            self.seed_count.fetch_add(1, Ordering::SeqCst);
+            let handle = match &self.snapshot {
+                Some(snapshot) => {
+                    backend
+                        .acquire_from_snapshot(request.clone(), snapshot.clone())
+                        .await?
+                }
+                None => backend.acquire(request.clone()).await?,
+            };
+            if self.fail.load(Ordering::SeqCst) {
+                backend.terminate(request).await?;
+                bail!("fake recipe failed for {}", handle.id());
+            }
+            Ok(handle)
+        }
+    }
+
     #[async_trait]
     impl ManagedSandboxHandle for FakeHandle {
         fn id(&self) -> &str {
@@ -1045,7 +1108,7 @@ mod tests {
                 lease_ttl: Duration::from_secs(60),
                 idle_ttl: Duration::from_secs(300),
             },
-            SandboxPoolSeed::Empty,
+            Arc::new(EmptySandboxPoolRecipe),
         )
         .unwrap()
     }
@@ -1233,10 +1296,10 @@ mod tests {
                 lease_ttl: Duration::from_secs(60),
                 idle_ttl: Duration::from_secs(300),
             },
-            SandboxPoolSeed::Snapshot(SnapshotPayload {
+            Arc::new(FakeRecipe::from_snapshot(SnapshotPayload {
                 format: SnapshotFormat::WorkspaceChunksV1,
                 bytes: bytes::Bytes::from_static(b"seeded codebase"),
-            }),
+            })),
         )
         .unwrap();
 
@@ -1244,6 +1307,83 @@ mod tests {
 
         assert_eq!(backend.snapshot_acquire_count.load(Ordering::SeqCst), 1);
         assert_eq!(backend.acquire_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn recipe_seed_initializes_each_fresh_pool_entry_before_it_is_ready() {
+        let backend = Arc::new(FakeBackend::new());
+        let recipe = Arc::new(FakeRecipe::from_snapshot(SnapshotPayload {
+            format: SnapshotFormat::WorkspaceChunksV1,
+            bytes: bytes::Bytes::from_static(b"base codebase"),
+        }));
+        let pool = SandboxPool::new(
+            SandboxPoolKey {
+                pool_id: "recipe-seeded-pool".to_string(),
+                provider: SandboxProvider::from_static("fake"),
+                spec: request("entry").spec,
+            },
+            Arc::clone(&backend) as Arc<dyn ManagedSandboxBackend>,
+            PoolCapacity {
+                min_ready: 0,
+                target_ready: 1,
+                max_total: 1,
+                lease_ttl: Duration::from_secs(60),
+                idle_ttl: Duration::from_secs(300),
+            },
+            recipe.clone(),
+        )
+        .unwrap();
+
+        pool.reconcile_once().await.unwrap();
+
+        assert_eq!(backend.acquire_count.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.snapshot_acquire_count.load(Ordering::SeqCst), 1);
+        assert_eq!(recipe.seed_count.load(Ordering::SeqCst), 1);
+        assert!(
+            pool.entries
+                .lock()
+                .await
+                .values()
+                .all(|entry| entry.state == PoolEntryState::Ready)
+        );
+    }
+
+    #[tokio::test]
+    async fn recipe_seed_failure_terminates_the_unusable_runtime() {
+        let backend = Arc::new(FakeBackend::new());
+        let recipe = Arc::new(FakeRecipe::new());
+        recipe.fail.store(true, Ordering::SeqCst);
+        let pool = SandboxPool::new(
+            SandboxPoolKey {
+                pool_id: "failing-recipe-seeded-pool".to_string(),
+                provider: SandboxProvider::from_static("fake"),
+                spec: request("entry").spec,
+            },
+            Arc::clone(&backend) as Arc<dyn ManagedSandboxBackend>,
+            PoolCapacity {
+                min_ready: 0,
+                target_ready: 1,
+                max_total: 1,
+                lease_ttl: Duration::from_secs(60),
+                idle_ttl: Duration::from_secs(300),
+            },
+            recipe.clone(),
+        )
+        .unwrap();
+
+        assert!(pool.reconcile_once().await.is_err());
+
+        assert_eq!(backend.acquire_count.load(Ordering::SeqCst), 1);
+        assert_eq!(recipe.seed_count.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.terminate_count.load(Ordering::SeqCst), 1);
+        assert!(
+            pool.entries
+                .lock()
+                .await
+                .values()
+                .all(|entry| entry.state == PoolEntryState::Unknown)
+        );
+        assert!(pool.try_acquire("worker-a").await.is_err());
     }
 
     #[tokio::test]
