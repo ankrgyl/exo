@@ -11,3 +11,5 @@ website/dist
 website/.wrangler
 .exo
 .brain
+.vercel
+.env*

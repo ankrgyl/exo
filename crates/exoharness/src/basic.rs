@@ -1933,8 +1933,6 @@ impl<'a> BasicScopedSandboxHandle<'a> {
 
     async fn restore_sandbox(&self, request: RestoreSandboxRequest) -> Result<SandboxId> {
         self.ensure_full_sandbox_scope("restore_sandbox")?;
-        let payload =
-            load_snapshot_payload(self.harness, &self.owner_dir, request.snapshot_id).await?;
         let prepared = prepare_sandbox_request(self.harness, request.sandbox).await?;
         let sandbox_id = format!("sandbox-{}", Uuid7::now());
         let mut sandbox = prepared.stored_sandbox(sandbox_id.clone());
@@ -1944,6 +1942,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .inner
             .sandbox_backend_for_provider(sandbox.provider.clone())
             .await?;
+        let payload =
+            load_snapshot_payload(self.harness, &self.owner_dir, request.snapshot_id).await?;
         ensure_snapshot_format_supported(backend.as_ref(), &sandbox.provider, &payload.format)?;
         let sandbox_handle = backend
             .acquire_from_snapshot(
@@ -3311,7 +3311,6 @@ async fn start_sandbox_side_effect(
         .sandbox_backend_for_provider(sandbox.provider.clone())
         .await?;
     ensure_snapshot_format_supported(backend.as_ref(), &sandbox.provider, &payload.format)?;
-
     // Two orders, chosen by whether the restore changes providers:
     //   - Cross-provider (teleport): make-before-break. Boot the new sandbox
     //     first and stop the old one only once it's up, so a failed restore

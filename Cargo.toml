@@ -3,6 +3,7 @@ members = [
   "crates/cli",
   "crates/cost",
   "crates/exoharness",
+  "crates/excode",
   "crates/firecracker-protocol",
   "crates/firecracker-guest",
   "crates/executor",

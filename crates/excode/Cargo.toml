@@ -1,0 +1,21 @@
+[package]
+name = "excode"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+exoharness = { path = "../exoharness", features = ["basic-backend"] }
+futures.workspace = true
+shlex.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+url.workspace = true
+tempfile.workspace = true
+base64 = "0.22.1"
+
+[dev-dependencies]
+bytes.workspace = true
