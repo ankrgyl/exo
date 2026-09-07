@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs::TryLockError;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::Context;
 use exoharness::Result;
@@ -24,7 +24,7 @@ pub async fn send_conversation_wakeup_content(
     conversation: &dyn HarnessConversation,
     content: UserContent,
 ) -> Result<SendResult> {
-    let _file_guard = WakeupFileLock::acquire(&conversation.record().id.to_string()).await?;
+    let _file_guard = acquire_wakeup_lock(&conversation.record().id.to_string()).await?;
     let result = conversation
         .send(SendRequest {
             input: vec![Message::User { content }],
@@ -35,68 +35,44 @@ pub async fn send_conversation_wakeup_content(
     Ok(result)
 }
 
-struct WakeupFileLock {
-    path: PathBuf,
+fn wakeup_lock_path(conversation_id: &str) -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join("exo-wakeup-locks")
+        .join(format!("{conversation_id}.lock"))
 }
 
-impl WakeupFileLock {
-    async fn acquire(conversation_id: &str) -> Result<Self> {
-        let dir = std::env::temp_dir().join("exo-wakeup-locks");
-        tokio::fs::create_dir_all(&dir).await?;
-        let path = dir.join(format!("{conversation_id}.lock"));
-        loop {
-            match tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .await
-            {
-                Ok(_) => return Ok(Self { path }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    remove_stale_lock(&path).await?;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("failed to acquire wakeup lock {}", path.display())
-                    });
-                }
+/// Cross-process exclusion for wakeup turns on one conversation, held as an
+/// OS advisory lock on a per-conversation file. The returned file holds the
+/// lock until it is dropped.
+///
+/// The lock lives in the open file description, so the kernel releases it
+/// when the holder exits or dies — there is no stale-lock heuristic to get
+/// wrong, and a holder whose turn outlives any timeout keeps its exclusivity.
+/// The file itself is never removed: unlinking a lock file lets a waiter that
+/// already opened the old inode and a newcomer that creates a fresh one both
+/// "win", so the (empty, per-conversation) files are left in place.
+async fn acquire_wakeup_lock(conversation_id: &str) -> Result<std::fs::File> {
+    let path = wakeup_lock_path(conversation_id);
+    let dir = path.parent().expect("wakeup lock path has a parent");
+    tokio::fs::create_dir_all(dir).await?;
+    let file = std::fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("failed to open wakeup lock {}", path.display()))?;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(TryLockError::Error(error)) => {
+                return Err(error)
+                    .with_context(|| format!("failed to acquire wakeup lock {}", path.display()));
             }
         }
     }
-}
-
-impl Drop for WakeupFileLock {
-    fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(&self.path) {
-            tracing::error!(
-                path = %self.path.display(),
-                %error,
-                "failed to remove wakeup lock"
-            );
-        }
-    }
-}
-
-async fn remove_stale_lock(path: &PathBuf) -> Result<()> {
-    const STALE_AFTER: Duration = Duration::from_secs(30 * 60);
-    let Ok(metadata) = tokio::fs::metadata(path).await else {
-        return Ok(());
-    };
-    let Ok(modified) = metadata.modified() else {
-        return Ok(());
-    };
-    if SystemTime::now()
-        .duration_since(modified)
-        .is_ok_and(|age| age > STALE_AFTER)
-    {
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn conversation_send_lock(conversation_id: &str) -> Arc<AsyncMutex<()>> {
@@ -119,12 +95,19 @@ mod tests {
     use exoharness::Uuid7;
 
     use super::*;
+    use crate::test_support::backdate_file;
 
     #[tokio::test]
     async fn wakeup_file_lock_serializes_conversation_ids() {
         let conversation_id = format!("test-{}", Uuid7::now());
-        let first = WakeupFileLock::acquire(&conversation_id).await.unwrap();
-        let mut second = pin!(WakeupFileLock::acquire(&conversation_id));
+        let first = acquire_wakeup_lock(&conversation_id).await.unwrap();
+        // Backdated past the old 30-minute staleness window: the lock file's
+        // age must never let a waiter steal a live holder's lock.
+        backdate_file(
+            &wakeup_lock_path(&conversation_id),
+            Duration::from_secs(31 * 60),
+        );
+        let mut second = pin!(acquire_wakeup_lock(&conversation_id));
 
         tokio::select! {
             _ = &mut second => {
