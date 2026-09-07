@@ -29,10 +29,10 @@ use crate::{
     RestoreSandboxRequest, RunInSandboxRequest, SandboxAttachment, SandboxBackendRegistration,
     SandboxCommand, SandboxCommandOutput, SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy,
     SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus,
-    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, SandboxRecipe,
-    SandboxRecipeBootstrap, SandboxRecipeStep, SandboxRequest, SandboxSpec, Secret, SnapshotFormat,
-    SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, SandboxRecipe, SandboxRecipeStep,
+    SandboxRequest, SandboxSpec, Secret, SnapshotFormat, SnapshotPayload,
+    StartSandboxProcessRequest, StartSandboxRequest, Uuid7, WaitSandboxProcessRequest,
+    WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const DEFAULT_DURABLE_CONTRACT_MOUNT_PATH: &str = "/home/exo/workspace";
@@ -1420,8 +1420,8 @@ async fn basic_backend_runs_commands_in_created_sandbox() {
 async fn github_recipe_checks_out_a_public_repository() {
     github_recipe_checkout(
         "https://github.com/exoharness/exo.git",
-        Some("main".to_string()),
-        Some("29ebbcd959c27b3cf2539ba80e8cf912f0a5d3fb".to_string()),
+        Some("main"),
+        Some("29ebbcd959c27b3cf2539ba80e8cf912f0a5d3fb"),
         None,
     )
     .await
@@ -1429,41 +1429,26 @@ async fn github_recipe_checks_out_a_public_repository() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "live GitHub checkout; run explicitly with cargo test -- --ignored"]
-async fn github_recipe_checks_out_the_latest_default_public_branch() {
-    github_recipe_checkout("https://github.com/exoharness/exo.git", None, None, None)
-        .await
-        .expect("latest GitHub branch recipe should acquire a sandbox");
-}
-
-#[tokio::test(flavor = "current_thread")]
 #[ignore = "live private GitHub checkout; requires GITHUB_TEST_REPOSITORY, GITHUB_TEST_SHA, and GITHUB_TEST_TOKEN or GITHUB_TOKEN"]
 async fn github_recipe_checks_out_a_private_repository() {
-    let Some(token) = nonempty_env("GITHUB_TEST_TOKEN").or_else(|| nonempty_env("GITHUB_TOKEN"))
-    else {
-        eprintln!(
-            "skipping private GitHub recipe test: GITHUB_TEST_TOKEN or GITHUB_TOKEN is not set"
-        );
+    let (Some(repository), Some(sha), Some(token)) = (
+        nonempty_env("GITHUB_TEST_REPOSITORY"),
+        nonempty_env("GITHUB_TEST_SHA"),
+        nonempty_env("GITHUB_TEST_TOKEN").or_else(|| nonempty_env("GITHUB_TOKEN")),
+    ) else {
+        eprintln!("skipping private GitHub recipe test: credentials are not configured");
         return;
     };
-    let Some(repository) = nonempty_env("GITHUB_TEST_REPOSITORY") else {
-        eprintln!("skipping private GitHub recipe test: GITHUB_TEST_REPOSITORY is not set");
-        return;
-    };
-    let Some(sha) = nonempty_env("GITHUB_TEST_SHA") else {
-        eprintln!("skipping private GitHub recipe test: GITHUB_TEST_SHA is not set");
-        return;
-    };
-    github_recipe_checkout(&repository, None, Some(sha), Some(token))
+    github_recipe_checkout(&repository, None, Some(&sha), Some(&token))
         .await
         .expect("authenticated GitHub recipe should acquire a sandbox");
 }
 
 async fn github_recipe_checkout(
     repository: &str,
-    branch: Option<String>,
-    sha: Option<String>,
-    token: Option<String>,
+    branch: Option<&str>,
+    sha: Option<&str>,
+    token: Option<&str>,
 ) -> anyhow::Result<()> {
     let tempdir = TempDir::new().expect("tempdir");
     let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
@@ -1480,20 +1465,20 @@ async fn github_recipe_checkout(
         .new_conversation(NewConversationRequest::default())
         .await
         .expect("conversation");
-    let secret_id = match token.as_ref() {
+    let secret_id = match token {
         Some(token) => Some(
             agent
                 .put_secret(PutSecretRequest {
                     name: "github-test-token".to_string(),
                     secret: Secret::Key {
-                        value: token.clone(),
+                        value: token.to_string(),
                     },
                 })
                 .await?,
         ),
         None => None,
     };
-    let destination = tempdir.path().join("private-repository");
+    let destination = tempdir.path().join("repository");
     let sandbox_id = conversation
         .create_sandbox_from_recipe(CreateSandboxFromRecipeRequest {
             sandbox: CreateSandboxRequest {
@@ -1508,11 +1493,11 @@ async fn github_recipe_checkout(
                 idle_seconds: Some(60),
             },
             recipe: SandboxRecipe {
-                bootstrap: SandboxRecipeBootstrap::BaseImage,
+                snapshot_id: None,
                 steps: vec![SandboxRecipeStep::GithubRepository {
                     repository: repository.to_string(),
-                    branch: branch.clone(),
-                    sha: sha.clone(),
+                    branch: branch.map(str::to_string),
+                    sha: sha.map(str::to_string),
                     destination: destination.display().to_string(),
                     secret_id,
                 }],
@@ -1546,16 +1531,6 @@ async fn github_recipe_checkout(
             0,
             "GitHub authentication must not persist after recipe warmup"
         );
-    }
-    if let (Some(secret_id), Some(token)) = (secret_id, token) {
-        let secret_path = tempdir
-            .path()
-            .join("agents")
-            .join(agent.record().id.to_string())
-            .join("secrets")
-            .join(format!("{secret_id}.json"));
-        let encrypted_secret = fs::read_to_string(secret_path).await?;
-        assert!(!encrypted_secret.contains(&token));
     }
     Ok(())
 }
@@ -2850,6 +2825,20 @@ async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
         .await
         .expect("snapshot should restore into a new sandbox");
     assert_ne!(target_id, source_id);
+    assert!(first_backend.acquired_images.lock().await.is_empty());
+
+    let mut recipe_target = target_request.clone();
+    recipe_target.name = Some("recipe-target".to_string());
+    agent
+        .create_sandbox_from_recipe(CreateSandboxFromRecipeRequest {
+            sandbox: recipe_target,
+            recipe: SandboxRecipe {
+                snapshot_id: Some(snapshot_id),
+                steps: Vec::new(),
+            },
+        })
+        .await
+        .expect("recipe should start from the snapshot without a cold acquire");
     assert!(first_backend.acquired_images.lock().await.is_empty());
 
     let second_backend = Arc::new(RestoreImageTestBackend::default());

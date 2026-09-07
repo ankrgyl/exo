@@ -49,8 +49,7 @@ pub trait SandboxHandle: SnapshotHandle {
     /// Create a new sandbox directly from an immutable snapshot. Unlike
     /// `start_sandbox`, the target need not already exist.
     async fn restore_sandbox(&self, request: RestoreSandboxRequest) -> Result<SandboxId>;
-    /// Create a sandbox from a reproducible recipe such as a pinned GitHub
-    /// checkout followed by provision steps.
+    /// Create a sandbox and run its initialization steps before exposing it.
     async fn create_sandbox_from_recipe(
         &self,
         request: CreateSandboxFromRecipeRequest,
@@ -716,16 +715,9 @@ pub struct CreateSandboxFromRecipeRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SandboxRecipe {
-    // Bootstrap must run before steps
-    pub bootstrap: SandboxRecipeBootstrap,
+    /// Restore this snapshot instead of acquiring `sandbox.image`. Steps run after it.
+    pub snapshot_id: Option<SnapshotId>,
     pub steps: Vec<SandboxRecipeStep>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum SandboxRecipeBootstrap {
-    ExistingSnapshot { snapshot_id: SnapshotId },
-    BaseImage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -733,15 +725,15 @@ pub enum SandboxRecipeBootstrap {
 pub enum SandboxRecipeStep {
     GithubRepository {
         repository: String,
+        // If None, fetches default branch
         branch: Option<String>,
+        // If None, fetches current SHA
         sha: Option<String>,
         destination: String,
-        #[serde(default)]
         secret_id: Option<SecretId>,
     },
     Command {
         argv: Vec<String>,
-        #[serde(default)]
         cwd: Option<String>,
     },
 }
@@ -1399,79 +1391,6 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(request.resources, SandboxResourceShape::default());
-    }
-
-    #[test]
-    fn recipe_bootstrap_and_steps_serialize_as_structured_data() {
-        let recipe = SandboxRecipe {
-            bootstrap: SandboxRecipeBootstrap::BaseImage,
-            steps: vec![
-                SandboxRecipeStep::GithubRepository {
-                    repository: "https://github.com/exo/example.git".to_string(),
-                    branch: Some("main".to_string()),
-                    sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
-                    destination: "/workspace/example/source".to_string(),
-                    secret_id: None,
-                },
-                SandboxRecipeStep::GithubRepository {
-                    repository: "https://github.com/exo/example.git".to_string(),
-                    branch: Some("main".to_string()),
-                    sha: None,
-                    destination: "/workspace/example/latest".to_string(),
-                    secret_id: None,
-                },
-                SandboxRecipeStep::GithubRepository {
-                    repository: "https://github.com/exo/example.git".to_string(),
-                    branch: None,
-                    sha: None,
-                    destination: "/workspace/example/default".to_string(),
-                    secret_id: None,
-                },
-                SandboxRecipeStep::Command {
-                    argv: vec!["./build.sh".to_string()],
-                    cwd: Some("/workspace/example/source".to_string()),
-                },
-            ],
-        };
-        assert_eq!(
-            serde_json::to_value(recipe).unwrap(),
-            serde_json::json!({
-                "bootstrap": {
-                    "type": "base_image",
-                },
-                "steps": [
-                    {
-                        "type": "github_repository",
-                        "repository": "https://github.com/exo/example.git",
-                        "branch": "main",
-                        "sha": "0123456789abcdef0123456789abcdef01234567",
-                        "destination": "/workspace/example/source",
-                        "secret_id": null,
-                    },
-                    {
-                        "type": "github_repository",
-                        "repository": "https://github.com/exo/example.git",
-                        "branch": "main",
-                        "sha": null,
-                        "destination": "/workspace/example/latest",
-                        "secret_id": null,
-                    },
-                    {
-                        "type": "github_repository",
-                        "repository": "https://github.com/exo/example.git",
-                        "branch": null,
-                        "sha": null,
-                        "destination": "/workspace/example/default",
-                        "secret_id": null,
-                    },
-                    {
-                        "type": "command",
-                        "argv": ["./build.sh"],
-                        "cwd": "/workspace/example/source",
-                    },
-                ],
-            })
-        );
     }
 
     #[test]

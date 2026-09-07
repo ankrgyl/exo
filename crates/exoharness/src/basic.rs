@@ -44,10 +44,10 @@ use crate::{
     SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEvent,
     SandboxProcessEventQuery, SandboxProcessId, SandboxProcessMode, SandboxProcessParts,
     SandboxProcessRecord, SandboxProcessStatus, SandboxProcessStdin, SandboxProvider,
-    SandboxProviderConfig, SandboxRecipeBootstrap, SandboxRecipeStep, SandboxRecord, Secret,
-    SecretId, SecretMetadata, SecretType, SessionId, SnapshotHandle, SnapshotId,
-    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord, Uuid7,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    SandboxProviderConfig, SandboxRecipeStep, SandboxRecord, Secret, SecretId, SecretMetadata,
+    SecretType, SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
+    StartSandboxRequest, TurnHandle, TurnId, TurnRecord, Uuid7, WaitSandboxProcessRequest,
+    WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const SANDBOX_PROVIDER_STATE_EVENT: &str = "sandbox_provider_state";
@@ -1993,8 +1993,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .sandbox_backend_for_provider(sandbox.provider.clone())
             .await?;
         let target_request = sandbox_request(self.owner, &sandbox_id, &sandbox, None);
-        let sandbox_handle = match request.recipe.bootstrap {
-            SandboxRecipeBootstrap::ExistingSnapshot { snapshot_id } => {
+        let sandbox_handle = match request.recipe.snapshot_id {
+            Some(snapshot_id) => {
                 let payload =
                     load_snapshot_payload(self.harness, &self.owner_dir, snapshot_id).await?;
                 ensure_snapshot_format_supported(
@@ -2007,7 +2007,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                     .acquire_from_snapshot(target_request.clone(), payload)
                     .await?
             }
-            SandboxRecipeBootstrap::BaseImage => backend.acquire(target_request.clone()).await?,
+            None => backend.acquire(target_request.clone()).await?,
         };
         let result = async {
             for step in request.recipe.steps {
@@ -2402,6 +2402,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         Ok(Box::new(LiveSandboxProcess::new(parts)))
     }
 
+    /// For now, used only for getting the Github token to pull private repositories
     async fn resolve_key_secret(&self, secret_id: &SecretId) -> Result<String> {
         let mut secret_dirs = vec![self.harness.secrets_dir()];
         match self.owner {
@@ -2460,12 +2461,6 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 destination,
                 secret_id,
             } => {
-                crate::github::validate_repository_source(
-                    &repository,
-                    branch.as_deref(),
-                    sha.as_deref(),
-                    &destination,
-                )?;
                 if !networking_enabled {
                     bail!("GitHub recipe steps require sandbox networking");
                 }
@@ -2473,7 +2468,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                     Some(secret_id) => Some(self.resolve_key_secret(&secret_id).await?),
                     None => None,
                 };
-                crate::github::clone_repository_branch(
+                crate::github::clone_branch(
                     sandbox,
                     &repository,
                     branch.as_deref(),
