@@ -853,7 +853,7 @@ function buildChatStreamingBody(
   };
 }
 
-function messagesToChatMessages(
+export function messagesToChatMessages(
   messages: Message[],
 ): ChatCompletionMessageParam[] {
   return messages.map(messageToChatMessage);
@@ -1065,13 +1065,30 @@ function assistantToolCalls(content: unknown): ChatCompletionMessageToolCall[] {
         type: "function",
         function: {
           name: part.tool_name,
+          // Unwrap the lingua typed-value envelope {"type":"valid","value":{...}}
+          // before replaying history to the model — otherwise the model imitates
+          // the wrapped shape in its own new tool calls (compounding when it
+          // copies itself from history). Strip every layer, defensively.
           arguments: JSON.stringify(
-            isRecord(part.arguments) ? part.arguments : {},
+            unwrapTypedValue(isRecord(part.arguments) ? part.arguments : {}),
           ),
         },
       },
     ];
   });
+}
+
+function unwrapTypedValue(value: unknown): unknown {
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (!isRecord(value)) break;
+    const keys = Object.keys(value);
+    if (keys.length === 2 && value.type === "valid" && isRecord(value.value)) {
+      value = value.value;
+      continue;
+    }
+    break;
+  }
+  return value;
 }
 
 function assistantTextContent(content: unknown): string | null {
@@ -1332,13 +1349,14 @@ type JsonObjectParseResult =
 function parseJsonObject(json: string): JsonObjectParseResult {
   try {
     const value = JSON.parse(json) as unknown;
-    if (!isRecord(value)) {
+    const unwrapped = unwrapTypedValue(value);
+    if (!isRecord(unwrapped)) {
       return {
         ok: false,
         error: "function call arguments must be a JSON object",
       };
     }
-    return { ok: true, value: value as JsonObject };
+    return { ok: true, value: unwrapped as JsonObject };
   } catch (error) {
     return {
       ok: false,
