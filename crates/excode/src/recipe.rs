@@ -51,6 +51,9 @@ impl RecipeService {
         Self { sandbox, secrets }
     }
 
+    /// Create a sandbox an run a setup recipe
+    ///
+    /// Returns an error if the setup script fails
     pub async fn create_sandbox(
         &self,
         request: CreateSandboxFromRecipeRequest,
@@ -84,6 +87,10 @@ impl RecipeService {
         Ok(sandbox_id)
     }
 
+    /// Runs an individual step of the recipe
+    ///
+    /// 1. GithubRepository clones or checkouts a repository
+    /// 2. Command runds commands on the sandbox
     async fn run_step(&self, sandbox_id: &SandboxId, step: SandboxRecipeStep) -> Result<()> {
         match step {
             SandboxRecipeStep::GithubRepository {

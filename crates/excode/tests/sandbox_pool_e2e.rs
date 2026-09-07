@@ -4,8 +4,8 @@
 //! `EXO_TEST_SANDBOX_BACKEND` and runs ignored tests. Run locally with:
 //!
 //! ```text
-//! EXO_TEST_SANDBOX_BACKEND=local-process cargo test -p exo --test sandbox_pool_e2e -- --ignored
-//! EXO_TEST_SANDBOX_BACKEND=docker cargo test -p exo --test sandbox_pool_e2e -- --ignored
+//! EXO_TEST_SANDBOX_BACKEND=local-process cargo test -p excode --test sandbox_pool_e2e -- --ignored
+//! EXO_TEST_SANDBOX_BACKEND=docker cargo test -p excode --test sandbox_pool_e2e -- --ignored
 //! ```
 
 use std::collections::HashMap;
@@ -15,10 +15,13 @@ use std::time::Duration;
 
 use anyhow::bail;
 use async_trait::async_trait;
+use excode::{
+    EmptySandboxPoolProvisioner, LeasedSandbox, PoolCapacity, SandboxPool, SandboxPoolKey,
+    SandboxPoolProvisioner,
+};
 use exoharness::{
-    CliContainerSandboxBackend, EmptySandboxPoolRecipe, LeasedSandbox, LocalProcessSandboxBackend,
-    ManagedSandboxBackend, PoolCapacity, SandboxCommand, SandboxNetworkPolicy, SandboxPool,
-    SandboxPoolKey, SandboxPoolRecipe, SandboxProvider, SandboxSpec,
+    CliContainerSandboxBackend, LocalProcessSandboxBackend, ManagedSandboxBackend, SandboxCommand,
+    SandboxNetworkPolicy, SandboxProvider, SandboxSpec,
 };
 use tokio::sync::watch;
 use tokio::time::{self, timeout};
@@ -60,7 +63,7 @@ fn pool(
     provider: SandboxProvider,
     backend: Arc<dyn ManagedSandboxBackend>,
     default_workdir: String,
-    recipe: Arc<dyn SandboxPoolRecipe>,
+    recipe: Arc<dyn SandboxPoolProvisioner>,
 ) -> SandboxPool {
     SandboxPool::new(
         SandboxPoolKey {
@@ -91,7 +94,7 @@ fn pool(
 struct CommandSeeder;
 
 #[async_trait]
-impl SandboxPoolRecipe for CommandSeeder {
+impl SandboxPoolProvisioner for CommandSeeder {
     async fn acquire(
         &self,
         backend: &dyn ManagedSandboxBackend,
@@ -163,7 +166,7 @@ fn running_docker_container(sandbox: &LeasedSandbox) -> String {
     containers[0].to_string()
 }
 
-async fn acquire(pool: &SandboxPool, worker: &str) -> (exoharness::SandboxLease, LeasedSandbox) {
+async fn acquire(pool: &SandboxPool, worker: &str) -> (excode::SandboxLease, LeasedSandbox) {
     timeout(ACQUIRE_TIMEOUT, pool.acquire_any(worker))
         .await
         .expect("pool acquisition timed out")
@@ -180,7 +183,7 @@ async fn warm_pool_acquires_executes_replaces_and_drains() {
         provider,
         backend,
         default_workdir,
-        Arc::new(EmptySandboxPoolRecipe),
+        Arc::new(EmptySandboxPoolProvisioner),
     ));
     let (shutdown, receiver) = watch::channel(false);
     let reconciler = tokio::spawn({
@@ -294,7 +297,7 @@ async fn docker_runtime_loss_is_recovered_for_an_active_pool_lease() {
         provider,
         backend,
         default_workdir,
-        Arc::new(EmptySandboxPoolRecipe),
+        Arc::new(EmptySandboxPoolProvisioner),
     ));
     let (shutdown, receiver) = watch::channel(false);
     let reconciler = tokio::spawn({

@@ -16,8 +16,6 @@ mod http_tests;
 pub mod protocol;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 mod sandbox;
-#[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
-mod sandbox_pool;
 mod sandbox_provider;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 mod secrets;
@@ -37,8 +35,6 @@ pub use error::*;
 pub use http::*;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub use sandbox::*;
-#[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
-pub use sandbox_pool::*;
 pub use sandbox_provider::*;
 pub use types::*;
 pub use uuid7::*;

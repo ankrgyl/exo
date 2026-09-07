@@ -6,7 +6,7 @@
 //!     key,
 //!     backend,
 //!     capacity,
-//!     Arc::new(EmptySandboxPoolRecipe),
+//!     Arc::new(EmptySandboxPoolProvisioner),
 //! )?);
 //! let (shutdown, receiver) = tokio::sync::watch::channel(false);
 //! let task = tokio::spawn({
@@ -18,7 +18,7 @@
 //! ).await??;
 //! let output = sandbox.exec(&command).await?;
 //! pool.heartbeat(&lease).await?;
-//! // Save any files you need before release: release destroys the runtime.
+//! // Release keeps the runtime and filesystem warm; use reset to destroy it.
 //! pool.release(&lease).await?;
 //! shutdown.send(true)?;
 //! task.await?;
@@ -38,7 +38,7 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore, watch};
 use tokio::time::{self, MissedTickBehavior};
 
-use crate::{
+use exoharness::{
     ManagedSandboxBackend, ManagedSandboxHandle, Result, SandboxCommand, SandboxId,
     SandboxProvider, SandboxRequest, SandboxSpec, Uuid7,
 };
@@ -55,6 +55,22 @@ pub struct SandboxPoolKey {
     pub spec: SandboxSpec,
 }
 
+/// Identity of one runtime entry owned by an [`SandboxPool`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PoolSandboxKey {
+    pub pool_id: String,
+    pub entry_id: String,
+}
+
+impl From<PoolSandboxKey> for exoharness::SandboxKey {
+    fn from(key: PoolSandboxKey) -> Self {
+        exoharness::SandboxKey::AgentSandbox {
+            agent_id: format!("__excode_pool__:{}", key.pool_id),
+            sandbox_id: key.entry_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PoolCapacity {
     pub min_ready: usize,
@@ -69,7 +85,7 @@ pub struct PoolCapacity {
 /// A recipe owns snapshot resolution, credentials, setup steps, and cleanup
 /// when materialization fails. The pool owns only capacity and lease lifecycle.
 #[async_trait]
-pub trait SandboxPoolRecipe: Send + Sync {
+pub trait SandboxPoolProvisioner: Send + Sync {
     async fn acquire(
         &self,
         backend: &dyn ManagedSandboxBackend,
@@ -78,10 +94,10 @@ pub trait SandboxPoolRecipe: Send + Sync {
 }
 
 /// A recipe that provisions an empty runtime from the configured provider.
-pub struct EmptySandboxPoolRecipe;
+pub struct EmptySandboxPoolProvisioner;
 
 #[async_trait]
-impl SandboxPoolRecipe for EmptySandboxPoolRecipe {
+impl SandboxPoolProvisioner for EmptySandboxPoolProvisioner {
     async fn acquire(
         &self,
         backend: &dyn ManagedSandboxBackend,
@@ -141,7 +157,7 @@ struct PoolEntry {
 pub struct SandboxPool {
     key: SandboxPoolKey,
     backend: Arc<dyn ManagedSandboxBackend>,
-    recipe: Arc<dyn SandboxPoolRecipe>,
+    provisioner: Arc<dyn SandboxPoolProvisioner>,
     entries: Arc<Mutex<HashMap<String, PoolEntry>>>,
     capacity: PoolCapacity,
     notify: Arc<Notify>,
@@ -186,7 +202,7 @@ impl SandboxPool {
         key: SandboxPoolKey,
         backend: Arc<dyn ManagedSandboxBackend>,
         capacity: PoolCapacity,
-        recipe: Arc<dyn SandboxPoolRecipe>,
+        provisioner: Arc<dyn SandboxPoolProvisioner>,
     ) -> Result<Self> {
         if capacity.max_total == 0
             || capacity.target_ready == 0
@@ -201,7 +217,7 @@ impl SandboxPool {
         Ok(Self {
             key,
             backend,
-            recipe,
+            provisioner,
             entries: Arc::new(Mutex::new(HashMap::new())),
             capacity,
             notify: Arc::new(Notify::new()),
@@ -341,10 +357,29 @@ impl SandboxPool {
         Ok(())
     }
 
+    /// Release the sandbox back to the pool without destroying its runtime.
+    ///
+    /// The caller must already be authorized for this pool's workspace scope,
+    /// because the runtime filesystem remains intact for the next lease.
     // This operation should remain behind the pool manager's authorization
     // boundary when the pool is exposed to remote workers.
     pub async fn release(&self, lease: &SandboxLease) -> Result<()> {
-        self.reset(lease).await
+        let lifecycle = self.entry_lifecycle(&lease.entry_id).await?;
+        let _operation = lifecycle.write().await;
+        let mut entries = self.entries.lock().await;
+        let entry = entries
+            .get_mut(&lease.entry_id)
+            .ok_or_else(|| anyhow!("sandbox pool entry not found: {}", lease.entry_id))?;
+        validate_lease(entry, lease)?;
+        if entry.handle.is_none() {
+            bail!("sandbox lease is still acquiring: {}", lease.id);
+        }
+        entry.lease = None;
+        entry.state = PoolEntryState::Ready;
+        entry.last_used_at = Instant::now();
+        self.notify.notify_one();
+        self.changed.notify_waiters();
+        Ok(())
     }
 
     // This operation should remain behind the pool manager's authorization
@@ -725,12 +760,13 @@ impl SandboxPool {
 
     fn pool_request(&self, entry_id: &str) -> SandboxRequest {
         SandboxRequest {
-            key: crate::SandboxKey::PoolSandbox {
+            key: PoolSandboxKey {
                 pool_id: self.key.pool_id.clone(),
                 entry_id: entry_id.to_string(),
-            },
+            }
+            .into(),
             spec: self.key.spec.clone(),
-            lifecycle: crate::SandboxLifecycleConfig {
+            lifecycle: exoharness::SandboxLifecycleConfig {
                 idle_ttl: Some(self.capacity.idle_ttl),
             },
             provider_state: None,
@@ -746,7 +782,7 @@ impl SandboxPool {
         })?;
         time::timeout(
             Duration::from_secs(120),
-            self.recipe.acquire(self.backend.as_ref(), request),
+            self.provisioner.acquire(self.backend.as_ref(), request),
         )
         .await?
     }
@@ -789,7 +825,7 @@ impl LeasedSandbox {
         self.handle.id()
     }
 
-    pub async fn exec(&self, command: &SandboxCommand) -> Result<crate::SandboxCommandOutput> {
+    pub async fn exec(&self, command: &SandboxCommand) -> Result<exoharness::SandboxCommandOutput> {
         let operation = self.lifecycle.read().await;
         {
             let entries = self.entries.lock().await;
@@ -879,9 +915,9 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::{
-        SandboxAttachment, SandboxCommandOutput, SandboxKey, SandboxLifecycleConfig,
-        SandboxProcessParts, SnapshotFormat, SnapshotPayload,
+    use exoharness::{
+        SandboxAttachment, SandboxCommandOutput, SandboxLifecycleConfig, SandboxProcessParts,
+        SnapshotFormat, SnapshotPayload,
     };
 
     struct FakeBackend {
@@ -983,7 +1019,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl SandboxPoolRecipe for FakeRecipe {
+    impl SandboxPoolProvisioner for FakeRecipe {
         async fn acquire(
             &self,
             backend: &dyn ManagedSandboxBackend,
@@ -1075,16 +1111,17 @@ mod tests {
 
     fn request(entry_id: &str) -> SandboxRequest {
         SandboxRequest {
-            key: SandboxKey::PoolSandbox {
+            key: PoolSandboxKey {
                 pool_id: "pool".to_string(),
                 entry_id: entry_id.to_string(),
-            },
+            }
+            .into(),
             spec: SandboxSpec {
                 image: "fake-image".to_string(),
                 resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: crate::SandboxNetworkPolicy::Disabled,
+                network: exoharness::SandboxNetworkPolicy::Disabled,
                 default_workdir: "/".to_string(),
             },
             lifecycle: SandboxLifecycleConfig::default(),
@@ -1108,7 +1145,7 @@ mod tests {
                 lease_ttl: Duration::from_secs(60),
                 idle_ttl: Duration::from_secs(300),
             },
-            Arc::new(EmptySandboxPoolRecipe),
+            Arc::new(EmptySandboxPoolProvisioner),
         )
         .unwrap()
     }
@@ -1141,7 +1178,10 @@ mod tests {
         assert_eq!(backend.acquire_count.load(Ordering::SeqCst), 1);
 
         pool.release(&lease).await.unwrap();
-        assert_eq!(pool.entry_count().await, 0);
+        assert_eq!(pool.entry_count().await, 1);
+        assert_eq!(state(&pool, "entry").await, PoolEntryState::Ready);
+        let (_, reused) = pool.try_acquire("worker-b").await.unwrap();
+        assert_eq!(reused.id(), handle.id());
         assert_eq!(backend.acquire_count.load(Ordering::SeqCst), 1);
     }
 
@@ -1489,13 +1529,12 @@ mod tests {
             async move { pool.acquire_any("second").await }
         });
         pool.release(&first).await.unwrap();
-        assert!(old_handle.exec(&command()).await.is_err());
         let (second, new_handle) = time::timeout(Duration::from_secs(2), waiter)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_ne!(old_handle.id(), new_handle.id());
+        assert_eq!(old_handle.id(), new_handle.id());
         assert!(pool.release(&first).await.is_err());
         assert!(new_handle.exec(&command()).await.unwrap().ok);
         pool.release(&second).await.unwrap();
