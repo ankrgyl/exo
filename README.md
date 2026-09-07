@@ -150,6 +150,12 @@ pnpm events:tail exo-agent dev --history 0  # new events only
 
 Press `Ctrl-C` to stop following events.
 
+For headless integrations, [`exo agent-server`](docs/agent-server.md) runs the
+executor harness as a long-lived JSON-RPC 2.0 server over newline-delimited
+stdin/stdout. It streams model and tool events while Exoharness remains the
+authority for durable history. This is separate from `exo serve`, which exposes
+the Exoharness substrate API over HTTP.
+
 The scheduler and adapter services have separate host-side logs:
 
 ```bash

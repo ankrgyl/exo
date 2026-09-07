@@ -480,6 +480,100 @@ async fn send_stream_emits_chunks_and_persists_final_response() {
     }));
 }
 
+#[tokio::test]
+async fn cancelling_owned_stream_finishes_the_turn() {
+    let agent_id = Uuid7::now();
+    let conversation_id = Uuid7::now();
+    let exoharness = Arc::new(FakeExoHarness::new(agent_id, conversation_id));
+    let agent = exoharness
+        .get_agent(&agent_id)
+        .await
+        .expect("get agent should succeed")
+        .expect("agent should exist");
+    let conversation = agent
+        .get_conversation(&conversation_id)
+        .await
+        .expect("get conversation should succeed")
+        .expect("conversation should exist");
+    let turn = conversation
+        .begin_turn(BeginTurnRequest {
+            session_id: None,
+            input: vec![user_message("pending")],
+        })
+        .await
+        .expect("begin turn should succeed");
+    let mut stream = crate::shared::spawn_prepared_turn_stream(
+        Arc::new(NoopExecutionTracer),
+        agent,
+        Arc::clone(&conversation),
+        turn,
+        default_agent_config(),
+        |_turn_trace, _event_tx| Box::pin(std::future::pending()),
+    );
+
+    stream.cancel().await.expect("stream should cancel");
+    let error = stream
+        .next()
+        .await
+        .expect("cancel should emit a terminal error")
+        .expect_err("cancel should fail the stream");
+    assert_eq!(error.to_string(), "execution cancelled");
+
+    let events = conversation
+        .get_events(Some(EventQuery {
+            cursor: None,
+            direction: Some(EventQueryDirection::Asc),
+            limit: None,
+            session_id: None,
+            turn_id: None,
+            types: None,
+        }))
+        .await
+        .expect("get events should succeed")
+        .events;
+    assert!(matches!(
+        events.last().expect("turn ended event").data,
+        EventData::TurnEnded
+    ));
+}
+
+#[tokio::test]
+async fn cancelling_unowned_stream_is_explicitly_unsupported() {
+    let (_event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut stream = ExecutionStreamHandle::new(UnboundedReceiverStream::new(event_rx));
+
+    let error = stream
+        .cancel()
+        .await
+        .expect_err("unowned stream cancellation should be unsupported");
+    assert_eq!(
+        error.to_string(),
+        "execution stream does not support cancellation"
+    );
+}
+
+struct NoopExecutionTracer;
+
+#[async_trait]
+impl crate::execution_tracing::ExecutionTracer for NoopExecutionTracer {
+    async fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn start_turn(
+        &self,
+        _config: Option<&BraintrustTracingConfig>,
+        _agent: &AgentRecord,
+        _conversation: &ConversationRecord,
+        _agent_config: &AgentConfig,
+        _session_id: SessionId,
+        _turn_id: TurnId,
+        _streamed: bool,
+    ) -> Option<Box<dyn crate::execution_tracing::TurnExecutionTrace>> {
+        None
+    }
+}
+
 struct FakeModelClient {
     responses: Mutex<VecDeque<ModelResponse>>,
     streams: Mutex<VecDeque<FakeStreamResponse>>,

@@ -10,6 +10,7 @@ use exoharness::{
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::execution_tracing::{ExecutionTracer, TurnExecutionTrace};
 use crate::{AgentConfig, ExecutionStreamEvent, ExecutionStreamHandle, SendResult};
@@ -99,12 +100,14 @@ where
         + 'static,
 {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let session_id = turn.record().session_id;
         let turn_id = turn.record().id;
-        let turn_trace = tracer
-            .start_turn(
+        let turn_trace = tokio::select! {
+            turn_trace = tracer.start_turn(
                 agent_config.braintrust.as_ref(),
                 agent.record(),
                 conversation.record(),
@@ -112,35 +115,69 @@ where
                 session_id,
                 turn_id,
                 true,
-            )
-            .await;
-        let send_result = finalize_turn(turn.as_ref(), run(turn_trace.as_deref(), &event_tx).await)
-            .await
-            .map(|latest_event_id| SendResult {
-                session_id,
-                turn_id,
-                latest_event_id,
-            });
-
-        if let Some(turn_trace) = turn_trace {
-            match &send_result {
-                Ok(result) => {
-                    turn_trace
-                        .finish_success(Some(result.latest_event_id))
-                        .await
-                }
-                Err(error) => turn_trace.finish_error(error).await,
+            ) => turn_trace,
+            () = task_cancellation.cancelled() => {
+                complete_stream_turn(
+                    turn.as_ref(),
+                    session_id,
+                    turn_id,
+                    None,
+                    Err(Error::msg("execution cancelled")),
+                    &event_tx,
+                ).await;
+                return;
             }
-        }
-
-        if let Err(error) = &send_result {
-            try_send_stream_error(&event_tx, error);
-        } else if let Ok(result) = &send_result {
-            try_send_stream_event(&event_tx, ExecutionStreamEvent::Completed(result.clone()));
-        }
+        };
+        let run_result = tokio::select! {
+            result = run(turn_trace.as_deref(), &event_tx) => result,
+            () = task_cancellation.cancelled() => Err(Error::msg("execution cancelled")),
+        };
+        complete_stream_turn(
+            turn.as_ref(),
+            session_id,
+            turn_id,
+            turn_trace,
+            run_result,
+            &event_tx,
+        )
+        .await;
     });
 
-    ExecutionStreamHandle::new(UnboundedReceiverStream::new(event_rx))
+    ExecutionStreamHandle::with_task(UnboundedReceiverStream::new(event_rx), cancellation, task)
+}
+
+async fn complete_stream_turn(
+    turn: &dyn TurnHandle,
+    session_id: exoharness::SessionId,
+    turn_id: exoharness::TurnId,
+    turn_trace: Option<Box<dyn TurnExecutionTrace>>,
+    run_result: Result<()>,
+    event_tx: &mpsc::UnboundedSender<Result<ExecutionStreamEvent>>,
+) {
+    let send_result = finalize_turn(turn, run_result)
+        .await
+        .map(|latest_event_id| SendResult {
+            session_id,
+            turn_id,
+            latest_event_id,
+        });
+
+    if let Some(turn_trace) = turn_trace {
+        match &send_result {
+            Ok(result) => {
+                turn_trace
+                    .finish_success(Some(result.latest_event_id))
+                    .await
+            }
+            Err(error) => turn_trace.finish_error(error).await,
+        }
+    }
+
+    if let Err(error) = &send_result {
+        try_send_stream_error(event_tx, error);
+    } else if let Ok(result) = &send_result {
+        try_send_stream_event(event_tx, ExecutionStreamEvent::Completed(result.clone()));
+    }
 }
 
 async fn finish_turn_trace(

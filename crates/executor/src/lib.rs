@@ -1,5 +1,6 @@
 mod adapter;
 mod agent_sandbox;
+mod agent_server;
 mod basic;
 #[cfg(test)]
 mod basic_tests;
@@ -40,6 +41,7 @@ pub use adapter::{
     AdapterRecord, AdapterSource, NewAdapter, WorkerSecretEnvVar,
 };
 pub use adapter::{AdapterRunOptions, run_adapters_watch};
+pub use agent_server::{AGENT_SERVER_TRACING_TARGET, serve_agent_server_stdio};
 pub use braintrust::{BraintrustProject, BraintrustRuntimeConfig, BraintrustTracingConfig};
 pub use conversation_events::{
     HOST_EVENT_ADAPTER_RUNNER_DRAINING, HOST_EVENT_ADAPTER_RUNNER_STARTED, HOST_EVENT_REBOOT,

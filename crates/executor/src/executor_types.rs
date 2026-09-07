@@ -13,7 +13,9 @@ use lingua::{Message, UniversalStreamChunk, UniversalUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::OwnedMutexGuard;
+use tokio::task::JoinHandle;
 use tokio_stream::{Stream, wrappers::UnboundedReceiverStream};
+use tokio_util::sync::CancellationToken;
 
 use crate::braintrust::BraintrustTracingConfig;
 
@@ -244,6 +246,8 @@ pub struct SendResult {
 
 pub struct ExecutionStreamHandle {
     event_stream: UnboundedReceiverStream<Result<ExecutionStreamEvent>>,
+    cancellation: Option<CancellationToken>,
+    task: Option<JoinHandle<()>>,
     _send_guard: Option<OwnedMutexGuard<()>>,
 }
 
@@ -251,8 +255,47 @@ impl ExecutionStreamHandle {
     pub fn new(event_stream: UnboundedReceiverStream<Result<ExecutionStreamEvent>>) -> Self {
         Self {
             event_stream,
+            cancellation: None,
+            task: None,
             _send_guard: None,
         }
+    }
+
+    pub(crate) fn with_task(
+        event_stream: UnboundedReceiverStream<Result<ExecutionStreamEvent>>,
+        cancellation: CancellationToken,
+        task: JoinHandle<()>,
+    ) -> Self {
+        Self {
+            event_stream,
+            cancellation: Some(cancellation),
+            task: Some(task),
+            _send_guard: None,
+        }
+    }
+
+    pub async fn cancel(&mut self) -> Result<()> {
+        let cancellation = self
+            .cancellation
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("execution stream does not support cancellation"))?;
+        cancellation.cancel();
+        self.join().await
+    }
+
+    pub(crate) fn supports_cancellation(&self) -> bool {
+        self.cancellation.is_some()
+    }
+
+    pub(crate) async fn join(&mut self) -> Result<()> {
+        let result = if let Some(task) = self.task.take() {
+            task.await
+                .map_err(|error| anyhow::anyhow!("execution stream task failed: {error}"))
+        } else {
+            Ok(())
+        };
+        self._send_guard.take();
+        result
     }
 
     pub(crate) fn with_send_guard(mut self, send_guard: OwnedMutexGuard<()>) -> Self {

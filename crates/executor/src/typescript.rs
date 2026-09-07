@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{Context as AnyhowContext, anyhow, bail};
@@ -24,7 +25,7 @@ use lingua::UniversalStreamChunk;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter, Lines};
 use tokio::process::{Child, ChildStdout, Command};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, MutexGuard, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::execution_tracing::TurnExecutionTrace;
@@ -42,7 +43,7 @@ pub struct TypeScriptExecutor<T> {
     workspace_root: PathBuf,
     env: Arc<HashMap<String, String>>,
     tools: Arc<T>,
-    runners: Arc<Mutex<HashMap<String, Arc<Mutex<TypeScriptRunnerProcess>>>>>,
+    runners: Arc<StdMutex<HashMap<String, Arc<TypeScriptRunner>>>>,
 }
 
 impl<T> TypeScriptExecutor<T> {
@@ -57,7 +58,7 @@ impl<T> TypeScriptExecutor<T> {
             workspace_root,
             env: Arc::new(env),
             tools,
-            runners: Arc::new(Mutex::new(HashMap::new())),
+            runners: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 }
@@ -117,10 +118,20 @@ where
             bail!("typescript harness module does not exist: {module_path}");
         }
 
-        let runner = self.runner(&module_path).await?;
-        let result = {
-            let mut runner = runner.lock().await;
-            runner
+        loop {
+            let runner = self.runner(&module_path)?;
+            let process = runner.process.lock().await;
+            if !runner.valid.load(Ordering::Acquire) {
+                drop(process);
+                continue;
+            }
+            let mut run = TypeScriptRunnerRun::new(
+                process,
+                runner.as_ref(),
+                self.runners.as_ref(),
+                &module_path,
+            );
+            let result = run
                 .execute_turn(
                     self,
                     TypeScriptTurn {
@@ -134,14 +145,12 @@ where
                         turn_trace,
                     },
                 )
-                .await
-        };
+                .await;
+            run.reusable = result.is_ok();
+            drop(run);
 
-        if result.is_err() {
-            self.remove_runner(&module_path, &runner).await;
+            return result;
         }
-
-        result
     }
 }
 
@@ -149,28 +158,28 @@ impl<T> TypeScriptExecutor<T>
 where
     T: ToolRuntime + 'static,
 {
-    async fn runner(&self, module_path: &str) -> Result<Arc<Mutex<TypeScriptRunnerProcess>>> {
-        let mut runners = self.runners.lock().await;
-        if let Some(runner) = runners.get(module_path) {
+    fn runner(&self, module_path: &str) -> Result<Arc<TypeScriptRunner>> {
+        let mut runners = self
+            .runners
+            .lock()
+            .expect("typescript runner cache poisoned");
+        if let Some(runner) = runners
+            .get(module_path)
+            .filter(|runner| runner.valid.load(Ordering::Acquire))
+        {
             return Ok(Arc::clone(runner));
         }
 
-        let runner = Arc::new(Mutex::new(TypeScriptRunnerProcess::start(
-            &self.workspace_root,
-            self.env.as_ref(),
-            module_path,
-        )?));
+        let runner = Arc::new(TypeScriptRunner {
+            process: Mutex::new(TypeScriptRunnerProcess::start(
+                &self.workspace_root,
+                self.env.as_ref(),
+                module_path,
+            )?),
+            valid: AtomicBool::new(true),
+        });
         runners.insert(module_path.to_string(), Arc::clone(&runner));
         Ok(runner)
-    }
-
-    async fn remove_runner(&self, module_path: &str, runner: &Arc<Mutex<TypeScriptRunnerProcess>>) {
-        let mut runners = self.runners.lock().await;
-        if let Some(current) = runners.get(module_path)
-            && Arc::ptr_eq(current, runner)
-        {
-            runners.remove(module_path);
-        }
     }
 
     async fn execute_runtime_request(
@@ -207,6 +216,73 @@ where
 }
 
 const RUNNER_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+struct TypeScriptRunner {
+    process: Mutex<TypeScriptRunnerProcess>,
+    valid: AtomicBool,
+}
+
+struct TypeScriptRunnerRun<'a> {
+    process: MutexGuard<'a, TypeScriptRunnerProcess>,
+    runner: &'a TypeScriptRunner,
+    runners: &'a StdMutex<HashMap<String, Arc<TypeScriptRunner>>>,
+    module_path: &'a str,
+    reusable: bool,
+}
+
+impl<'a> TypeScriptRunnerRun<'a> {
+    fn new(
+        process: MutexGuard<'a, TypeScriptRunnerProcess>,
+        runner: &'a TypeScriptRunner,
+        runners: &'a StdMutex<HashMap<String, Arc<TypeScriptRunner>>>,
+        module_path: &'a str,
+    ) -> Self {
+        Self {
+            process,
+            runner,
+            runners,
+            module_path,
+            reusable: false,
+        }
+    }
+}
+
+impl std::ops::Deref for TypeScriptRunnerRun<'_> {
+    type Target = TypeScriptRunnerProcess;
+
+    fn deref(&self) -> &Self::Target {
+        &self.process
+    }
+}
+
+impl std::ops::DerefMut for TypeScriptRunnerRun<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.process
+    }
+}
+
+impl Drop for TypeScriptRunnerRun<'_> {
+    fn drop(&mut self) {
+        if !self.reusable {
+            self.runner.valid.store(false, Ordering::Release);
+            if let Err(error) = self.process.child.start_kill() {
+                tracing::warn!(%error, "failed to terminate unusable TypeScript harness runner");
+            }
+            match self.runners.lock() {
+                Ok(mut runners) => {
+                    if let Some(current) = runners.get(self.module_path)
+                        && std::ptr::eq(current.as_ref(), self.runner)
+                    {
+                        runners.remove(self.module_path);
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "failed to remove unusable TypeScript harness runner");
+                }
+            }
+        }
+    }
+}
 
 struct TypeScriptRunnerProcess {
     child: Child,
@@ -1299,9 +1375,255 @@ fn format_error_chain(error: &anyhow::Error, context: std::fmt::Arguments<'_>) -
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex as StdMutex;
 
+    #[cfg(unix)]
+    use lingua::Message;
+    #[cfg(unix)]
+    use lingua::universal::UserContent;
+    #[cfg(unix)]
+    use tempfile::TempDir;
+    #[cfg(unix)]
+    use tokio_stream::StreamExt;
+
     use super::*;
+    #[cfg(unix)]
+    use crate::test_support::local_test_config;
+    #[cfg(unix)]
+    use crate::{
+        AgentHarnessKind, CreateAgentRequest, CreateConversationRequest, ExecutionStreamHandle,
+        Harness, SandboxProvider, SandboxScope, SendRequest, TypeScriptHarnessConfig,
+    };
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_turns_replace_cancelled_and_failed_runners() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let bin_dir = tempdir.path().join("bin");
+        fs::create_dir(&bin_dir).expect("fake node bin should exist");
+        let node_path = bin_dir.join("node");
+        fs::write(
+            &node_path,
+            r#"#!/bin/sh
+pending=0
+while IFS= read -r line; do
+  if [ "$pending" -eq 1 ]; then
+    printf '%s\n' '{"kind":"done"}'
+    pending=0
+  fi
+  case "$line" in
+    *pending*)
+      printf '%s\n' '{"kind":"stream_event","event":{"type":"first_chunk","ttft_ms":1}}'
+      pending=1
+      ;;
+    *fail*)
+      printf '%s\n' '{"kind":"stream_event","event":{"type":"first_chunk","ttft_ms":1}}'
+      while [ ! -f "$FAIL_SIGNAL" ]; do sleep 0.01; done
+      printf '%s\n' '{"kind":"error","message":"expected failure","stack":"private stack"}'
+      exit 1
+      ;;
+    *fresh*)
+      printf '%s\n' '{"kind":"stream_event","event":{"type":"text_delta","text":"fresh"}}'
+      printf '%s\n' '{"kind":"done"}'
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("fake node should be written");
+        let mut permissions = fs::metadata(&node_path)
+            .expect("fake node metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&node_path, permissions).expect("fake node should be executable");
+        let module_path = tempdir.path().join("harness.ts");
+        fs::write(&module_path, "export default {};").expect("module should be written");
+        let module_path = module_path.to_string_lossy().into_owned();
+        let fail_signal = tempdir.path().join("fail");
+
+        let exoharness = Arc::new(
+            BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
+                .await
+                .expect("basic exoharness should initialize"),
+        ) as Arc<dyn ExoHarness>;
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = std::env::var("PATH").unwrap_or_default();
+        let executor = TypeScriptExecutor::new(
+            Arc::clone(&exoharness),
+            workspace_root,
+            HashMap::from([
+                ("PATH".to_string(), format!("{}:{path}", bin_dir.display())),
+                (
+                    "FAIL_SIGNAL".to_string(),
+                    fail_signal.to_string_lossy().into_owned(),
+                ),
+            ]),
+            Arc::new(BasicToolRuntime),
+        );
+        let executor_state = executor.clone();
+        let harness = TypeScriptHarness {
+            inner: SharedHarness::new(exoharness, ExecutorHarnessRuntime::new(executor, None)),
+        };
+        let agent = harness
+            .create_agent(CreateAgentRequest {
+                slug: "typescript".to_string(),
+                name: None,
+                harness: AgentHarnessKind::TypeScript,
+                typescript: Some(TypeScriptHarnessConfig {
+                    module_path: module_path.clone(),
+                    tool_module_paths: Vec::new(),
+                }),
+                enable_agent_tool_creation: false,
+                sandbox_image: None,
+                sandbox_provider: SandboxProvider::LocalProcess,
+                sandbox_scope: Some(SandboxScope::Conversation),
+                enable_networking: false,
+                model: "test".to_string(),
+                max_output_tokens: None,
+                max_tool_round_trips: None,
+                braintrust: None,
+            })
+            .await
+            .expect("agent should be created");
+        let first_conversation = agent
+            .create_conversation(CreateConversationRequest::default())
+            .await
+            .expect("first conversation should be created");
+        let second_conversation = agent
+            .create_conversation(CreateConversationRequest::default())
+            .await
+            .expect("second conversation should be created");
+        let third_conversation = agent
+            .create_conversation(CreateConversationRequest::default())
+            .await
+            .expect("third conversation should be created");
+        let fourth_conversation = agent
+            .create_conversation(CreateConversationRequest::default())
+            .await
+            .expect("fourth conversation should be created");
+
+        let mut first = first_conversation
+            .send_stream(SendRequest {
+                input: vec![Message::User {
+                    content: UserContent::String("pending".to_string()),
+                }],
+                session_id: None,
+            })
+            .await
+            .expect("first stream should start");
+        tokio::time::timeout(Duration::from_secs(1), first.next())
+            .await
+            .expect("first runner should start")
+            .expect("first runner should emit an event")
+            .expect("first runner event should succeed");
+        let mut second = second_conversation
+            .send_stream(SendRequest {
+                input: vec![Message::User {
+                    content: UserContent::String("fresh".to_string()),
+                }],
+                session_id: None,
+            })
+            .await
+            .expect("second stream should start");
+        wait_for_queued_turn(&executor_state, &module_path).await;
+        tokio::time::timeout(Duration::from_secs(1), first.cancel())
+            .await
+            .expect("first stream should cancel promptly")
+            .expect("first stream should support cancellation");
+
+        assert_eq!(stream_text(&mut second).await, "fresh");
+        second.join().await.expect("second stream task should join");
+
+        let mut failed = third_conversation
+            .send_stream(SendRequest {
+                input: vec![Message::User {
+                    content: UserContent::String("fail".to_string()),
+                }],
+                session_id: None,
+            })
+            .await
+            .expect("failing stream should start");
+        tokio::time::timeout(Duration::from_secs(1), failed.next())
+            .await
+            .expect("failing runner should start")
+            .expect("failing runner should emit an event")
+            .expect("failing runner event should succeed");
+        let mut after_failure = fourth_conversation
+            .send_stream(SendRequest {
+                input: vec![Message::User {
+                    content: UserContent::String("fresh".to_string()),
+                }],
+                session_id: None,
+            })
+            .await
+            .expect("queued stream should start");
+        wait_for_queued_turn(&executor_state, &module_path).await;
+        fs::write(&fail_signal, "").expect("failure signal should be written");
+        tokio::time::timeout(Duration::from_secs(1), failed.next())
+            .await
+            .expect("first queued turn should fail promptly")
+            .expect("first queued turn should emit its failure")
+            .expect_err("first queued turn should fail");
+        failed.join().await.expect("failed stream task should join");
+
+        assert_eq!(stream_text(&mut after_failure).await, "fresh");
+        after_failure
+            .join()
+            .await
+            .expect("replacement stream task should join");
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_queued_turn(
+        executor: &TypeScriptExecutor<BasicToolRuntime>,
+        module_path: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let queued = executor
+                    .runners
+                    .lock()
+                    .expect("typescript runner cache poisoned")
+                    .get(module_path)
+                    .is_some_and(|runner| Arc::strong_count(runner) >= 3);
+                if queued {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("turn should queue on the active runner");
+    }
+
+    #[cfg(unix)]
+    async fn stream_text(stream: &mut ExecutionStreamHandle) -> String {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut text = String::new();
+            while let Some(event) = stream.next().await {
+                match event.expect("stream event should succeed") {
+                    ExecutionStreamEvent::Chunk(chunk) => {
+                        for choice in chunk.choices {
+                            if let Some(delta) = choice.delta_view()
+                                && let Some(content) = delta.content
+                            {
+                                text.push_str(&content);
+                            }
+                        }
+                    }
+                    ExecutionStreamEvent::Completed(_) => break,
+                    _ => {}
+                }
+            }
+            text
+        })
+        .await
+        .expect("stream should complete promptly")
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn latest_sandbox_process_event_cursor_pages_to_latest_cursor() {
