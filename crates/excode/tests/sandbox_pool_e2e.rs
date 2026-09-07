@@ -1,4 +1,4 @@
-//! Real-provider lifecycle coverage for `SandboxPool`.
+//! Real-provider lifecycle coverage for `LocalSandboxPool`.
 //!
 //! The integration workflow selects `local-process` and Docker through
 //! `EXO_TEST_SANDBOX_BACKEND` and runs ignored tests. Run locally with:
@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::bail;
 use async_trait::async_trait;
 use excode::{
-    EmptySandboxPoolProvisioner, LeasedSandbox, PoolCapacity, SandboxPool, SandboxPoolKey,
+    EmptySandboxPoolProvisioner, LeasedSandbox, LocalSandboxPool, PoolCapacity, SandboxPoolKey,
     SandboxPoolProvisioner,
 };
 use exoharness::{
@@ -64,8 +64,8 @@ fn pool(
     backend: Arc<dyn ManagedSandboxBackend>,
     default_workdir: String,
     recipe: Arc<dyn SandboxPoolProvisioner>,
-) -> SandboxPool {
-    SandboxPool::new(
+) -> LocalSandboxPool {
+    LocalSandboxPool::new(
         SandboxPoolKey {
             pool_id: "sandbox-pool-e2e".to_string(),
             provider,
@@ -166,7 +166,7 @@ fn running_docker_container(sandbox: &LeasedSandbox) -> String {
     containers[0].to_string()
 }
 
-async fn acquire(pool: &SandboxPool, worker: &str) -> (excode::SandboxLease, LeasedSandbox) {
+async fn acquire(pool: &LocalSandboxPool, worker: &str) -> (excode::SandboxLease, LeasedSandbox) {
     timeout(ACQUIRE_TIMEOUT, pool.acquire_any(worker))
         .await
         .expect("pool acquisition timed out")

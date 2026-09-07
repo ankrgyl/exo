@@ -2,7 +2,7 @@
 //!
 //! Start one reconciler alongside callers:
 //! ```ignore
-//! let pool = Arc::new(SandboxPool::new(
+//! let pool = Arc::new(LocalSandboxPool::new(
 //!     key,
 //!     backend,
 //!     capacity,
@@ -55,7 +55,7 @@ pub struct SandboxPoolKey {
     pub spec: SandboxSpec,
 }
 
-/// Identity of one runtime entry owned by an [`SandboxPool`].
+/// Identity of one runtime entry owned by a [`LocalSandboxPool`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PoolSandboxKey {
     pub pool_id: String,
@@ -154,7 +154,7 @@ struct PoolEntry {
 /// Owns the runtime lifecycle of managing multiple Sandboxes organized into a pool
 ///
 ///
-pub struct SandboxPool {
+pub struct LocalSandboxPool {
     key: SandboxPoolKey,
     backend: Arc<dyn ManagedSandboxBackend>,
     provisioner: Arc<dyn SandboxPoolProvisioner>,
@@ -171,6 +171,78 @@ const DEFAULT_PROVIDER_OPERATION_LIMIT: usize = 8;
 /// Reconciler runs a tick based check every 10 seconds
 const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Operations available through an active pool lease.
+#[async_trait]
+pub trait ManagedSandboxCapability: Send + Sync {
+    fn id(&self) -> &str;
+    async fn exec(&self, command: &SandboxCommand) -> Result<exoharness::SandboxCommandOutput>;
+}
+
+/// A lease and its fenced sandbox capability.
+pub struct ManagedSandboxLease {
+    pub lease: SandboxLease,
+    pub sandbox: Arc<dyn ManagedSandboxCapability>,
+}
+
+/// Common lifecycle operations for sandbox-pool implementations.
+///
+/// The local implementation also exposes [`LocalSandboxPool::try_acquire`],
+/// which returns the stronger fenced [`LeasedSandbox`] capability. This trait
+/// is the portable control-plane boundary; remote implementations can provide
+/// their own provider handle representation.
+#[async_trait]
+pub trait ManagedSandboxPool: Send + Sync {
+    async fn acquire_any(&self, worker_id: String) -> Result<ManagedSandboxLease>;
+    async fn heartbeat(&self, lease: &SandboxLease) -> Result<()>;
+    async fn release(&self, lease: &SandboxLease) -> Result<()>;
+    async fn reset(&self, lease: &SandboxLease) -> Result<()>;
+    async fn health_check(&self, entry_id: &str) -> Result<()>;
+    async fn drain(&self) -> Result<()>;
+}
+
+/// Kubernetes-backed pool placeholder. The Kubernetes controller and API
+/// integration will be added without changing [`ManagedSandboxPool`].
+pub struct KubernetesSandboxPool;
+
+impl KubernetesSandboxPool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for KubernetesSandboxPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ManagedSandboxPool for KubernetesSandboxPool {
+    async fn acquire_any(&self, _worker_id: String) -> Result<ManagedSandboxLease> {
+        bail!("KubernetesSandboxPool is not implemented")
+    }
+
+    async fn heartbeat(&self, _lease: &SandboxLease) -> Result<()> {
+        bail!("KubernetesSandboxPool is not implemented")
+    }
+
+    async fn release(&self, _lease: &SandboxLease) -> Result<()> {
+        bail!("KubernetesSandboxPool is not implemented")
+    }
+
+    async fn reset(&self, _lease: &SandboxLease) -> Result<()> {
+        bail!("KubernetesSandboxPool is not implemented")
+    }
+
+    async fn health_check(&self, _entry_id: &str) -> Result<()> {
+        bail!("KubernetesSandboxPool is not implemented")
+    }
+
+    async fn drain(&self) -> Result<()> {
+        bail!("KubernetesSandboxPool is not implemented")
+    }
+}
 
 #[cfg(test)]
 impl PoolEntry {
@@ -197,7 +269,7 @@ impl PoolEntry {
     }
 }
 
-impl SandboxPool {
+impl LocalSandboxPool {
     pub fn new(
         key: SandboxPoolKey,
         backend: Arc<dyn ManagedSandboxBackend>,
@@ -808,9 +880,40 @@ impl SandboxPool {
     }
 }
 
+#[async_trait]
+impl ManagedSandboxPool for LocalSandboxPool {
+    async fn acquire_any(&self, worker_id: String) -> Result<ManagedSandboxLease> {
+        let (lease, sandbox) = LocalSandboxPool::acquire_any(self, worker_id).await?;
+        Ok(ManagedSandboxLease {
+            lease,
+            sandbox: Arc::new(sandbox),
+        })
+    }
+
+    async fn heartbeat(&self, lease: &SandboxLease) -> Result<()> {
+        LocalSandboxPool::heartbeat(self, lease).await
+    }
+
+    async fn release(&self, lease: &SandboxLease) -> Result<()> {
+        LocalSandboxPool::release(self, lease).await
+    }
+
+    async fn reset(&self, lease: &SandboxLease) -> Result<()> {
+        LocalSandboxPool::reset(self, lease).await
+    }
+
+    async fn health_check(&self, entry_id: &str) -> Result<()> {
+        LocalSandboxPool::health_check(self, entry_id).await
+    }
+
+    async fn drain(&self) -> Result<()> {
+        LocalSandboxPool::drain(self).await
+    }
+}
+
 /// A capability valid only while its pool lease is active.
-/// Runtime lifecycle stays with the pool. Release destroys the runtime, including
-/// background work and local files; checkpoint durable data before releasing.
+/// Runtime lifecycle stays with the pool. Release invalidates this capability
+/// while keeping the runtime warm for the next lease.
 pub struct LeasedSandbox {
     lease: SandboxLease,
     handle: Arc<dyn ManagedSandboxHandle>,
@@ -869,6 +972,17 @@ impl LeasedSandbox {
             self.notify.notify_one();
             self.changed.notify_waiters();
         }
+    }
+}
+
+#[async_trait]
+impl ManagedSandboxCapability for LeasedSandbox {
+    fn id(&self) -> &str {
+        LeasedSandbox::id(self)
+    }
+
+    async fn exec(&self, command: &SandboxCommand) -> Result<exoharness::SandboxCommandOutput> {
+        LeasedSandbox::exec(self, command).await
     }
 }
 
@@ -1129,9 +1243,9 @@ mod tests {
         }
     }
 
-    fn pool(backend: Arc<FakeBackend>) -> SandboxPool {
+    fn pool(backend: Arc<FakeBackend>) -> LocalSandboxPool {
         let spec = request("entry").spec;
-        SandboxPool::new(
+        LocalSandboxPool::new(
             SandboxPoolKey {
                 pool_id: "pool".to_string(),
                 provider: SandboxProvider::from_static("fake"),
@@ -1150,7 +1264,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn state(pool: &SandboxPool, entry_id: &str) -> PoolEntryState {
+    async fn state(pool: &LocalSandboxPool, entry_id: &str) -> PoolEntryState {
         pool.entries
             .lock()
             .await
@@ -1322,7 +1436,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_seed_initializes_each_fresh_pool_entry() {
         let backend = Arc::new(FakeBackend::new());
-        let pool = SandboxPool::new(
+        let pool = LocalSandboxPool::new(
             SandboxPoolKey {
                 pool_id: "seeded-pool".to_string(),
                 provider: SandboxProvider::from_static("fake"),
@@ -1356,7 +1470,7 @@ mod tests {
             format: SnapshotFormat::WorkspaceChunksV1,
             bytes: bytes::Bytes::from_static(b"base codebase"),
         }));
-        let pool = SandboxPool::new(
+        let pool = LocalSandboxPool::new(
             SandboxPoolKey {
                 pool_id: "recipe-seeded-pool".to_string(),
                 provider: SandboxProvider::from_static("fake"),
@@ -1393,7 +1507,7 @@ mod tests {
         let backend = Arc::new(FakeBackend::new());
         let recipe = Arc::new(FakeRecipe::new());
         recipe.fail.store(true, Ordering::SeqCst);
-        let pool = SandboxPool::new(
+        let pool = LocalSandboxPool::new(
             SandboxPoolKey {
                 pool_id: "failing-recipe-seeded-pool".to_string(),
                 provider: SandboxProvider::from_static("fake"),
