@@ -1942,12 +1942,13 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .inner
             .sandbox_backend_for_provider(sandbox.provider.clone())
             .await?;
-        let sandbox_handle = SnapshotService::new(self.harness, &self.owner_dir)
-            .restore(
-                request.snapshot_id,
-                backend.as_ref(),
-                &sandbox.provider,
+        let payload =
+            load_snapshot_payload(self.harness, &self.owner_dir, request.snapshot_id).await?;
+        ensure_snapshot_format_supported(backend.as_ref(), &sandbox.provider, &payload.format)?;
+        let sandbox_handle = backend
+            .acquire_from_snapshot(
                 sandbox_request(self.owner, &sandbox_id, &sandbox, None),
+                payload,
             )
             .await?;
         if let Some(effective_image) = sandbox_handle.effective_image()
@@ -3280,8 +3281,7 @@ async fn start_sandbox_side_effect(
     owner: SandboxOwner,
     request: StartSandboxRequest,
 ) -> Result<EventData> {
-    let snapshots = SnapshotService::new(harness, owner_dir);
-    let snapshot = snapshots.resolve(request.snapshot_id).await?;
+    let payload = load_snapshot_payload(harness, owner_dir, request.snapshot_id).await?;
 
     // Keep the state transition and backend replacement behind the same
     // barrier as stop, terminate, and owner deletion. Otherwise one of those
@@ -3310,6 +3310,7 @@ async fn start_sandbox_side_effect(
         .inner
         .sandbox_backend_for_provider(sandbox.provider.clone())
         .await?;
+    ensure_snapshot_format_supported(backend.as_ref(), &sandbox.provider, &payload.format)?;
     // Two orders, chosen by whether the restore changes providers:
     //   - Cross-provider (teleport): make-before-break. Boot the new sandbox
     //     first and stop the old one only once it's up, so a failed restore
@@ -3320,13 +3321,8 @@ async fn start_sandbox_side_effect(
     //     handle after the new one exists would tear down the new container's
     //     warm-cache entry (both handles share the same SandboxKey).
     let sandbox_handle = if cross_provider {
-        let sandbox_handle = snapshots
-            .restore_resolved(
-                &snapshot,
-                backend.as_ref(),
-                &sandbox.provider,
-                sandbox_request(owner, &request.id, &sandbox, None),
-            )
+        let sandbox_handle = backend
+            .acquire_from_snapshot(sandbox_request(owner, &request.id, &sandbox, None), payload)
             .await?;
         let previous_handle = harness
             .inner
@@ -3357,13 +3353,8 @@ async fn start_sandbox_side_effect(
         if let Some(previous_handle) = previous_handle {
             previous_handle.stop().await?;
         }
-        snapshots
-            .restore_resolved(
-                &snapshot,
-                backend.as_ref(),
-                &sandbox.provider,
-                sandbox_request(owner, &request.id, &sandbox, None),
-            )
+        backend
+            .acquire_from_snapshot(sandbox_request(owner, &request.id, &sandbox, None), payload)
             .await?
     };
 
@@ -3402,57 +3393,6 @@ async fn start_sandbox_side_effect(
         sandbox_id: request.id,
         snapshot_id: Some(request.snapshot_id),
     })
-}
-
-/// Application-owned access to durable snapshots.
-///
-/// Snapshot ids are resolved from the owner's storage and validated against
-/// the selected provider here. Higher-level operations such as recipe
-/// execution never receive provider snapshot bytes directly.
-struct SnapshotService<'a> {
-    harness: &'a BasicExoHarness,
-    owner_dir: &'a Path,
-}
-
-struct ResolvedSnapshot {
-    payload: SnapshotPayload,
-}
-
-impl<'a> SnapshotService<'a> {
-    fn new(harness: &'a BasicExoHarness, owner_dir: &'a Path) -> Self {
-        Self { harness, owner_dir }
-    }
-
-    async fn restore(
-        &self,
-        snapshot_id: SnapshotId,
-        backend: &dyn ManagedSandboxBackend,
-        provider: &SandboxProvider,
-        request: SandboxRequest,
-    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        let snapshot = self.resolve(snapshot_id).await?;
-        self.restore_resolved(&snapshot, backend, provider, request)
-            .await
-    }
-
-    async fn resolve(&self, snapshot_id: SnapshotId) -> Result<ResolvedSnapshot> {
-        Ok(ResolvedSnapshot {
-            payload: load_snapshot_payload(self.harness, self.owner_dir, snapshot_id).await?,
-        })
-    }
-
-    async fn restore_resolved(
-        &self,
-        snapshot: &ResolvedSnapshot,
-        backend: &dyn ManagedSandboxBackend,
-        provider: &SandboxProvider,
-        request: SandboxRequest,
-    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        ensure_snapshot_format_supported(backend, provider, &snapshot.payload.format)?;
-        backend
-            .acquire_from_snapshot(request, snapshot.payload.clone())
-            .await
-    }
 }
 
 async fn load_snapshot_payload(

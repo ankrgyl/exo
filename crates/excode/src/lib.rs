@@ -2,4 +2,6 @@
 
 mod recipe;
 
-pub use recipe::{RecipeService, SecretResolver};
+pub use recipe::{
+    CreateSandboxFromRecipeRequest, RecipeService, SandboxRecipe, SandboxRecipeStep, SecretResolver,
+};

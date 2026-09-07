@@ -2531,6 +2531,7 @@ dependencies = [
  "exoharness",
  "futures",
  "shlex",
+ "tempfile",
  "tokio",
  "tracing",
  "url",
