@@ -2522,6 +2522,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "excode"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "exoharness",
+ "futures",
+ "shlex",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "executor"
 version = "0.1.0"
 dependencies = [
