@@ -4,10 +4,10 @@ use crate::{
     AddEventsRequest, AddEventsResult, AgentId, AgentRecord, Artifact, ArtifactVersion,
     AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
     CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, ConversationId,
-    CreateSandboxFromRecipeRequest, CreateSandboxRequest, Event, EventData, EventId, EventQuery,
-    ForkConversationRequest, ForkSandboxRequest, GetEventsResult, GetSandboxProcessEventsResult,
-    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
-    PutSecretRequest, ReadArtifactRequest, RestoreSandboxRequest, SandboxAttachment, SandboxId,
+    CreateSandboxRequest, Event, EventData, EventId, EventQuery, ForkConversationRequest,
+    ForkSandboxRequest, GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
+    ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
+    ReadArtifactRequest, RestoreSandboxRequest, SandboxAttachment, SandboxId,
     SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, SandboxRecord, Secret,
     SecretId, SecretMetadata, SessionId, SnapshotId, StartSandboxProcessRequest,
     StartSandboxRequest, ThreadRecord, TurnId, TurnRecord, WaitSandboxProcessRequest,
@@ -142,10 +142,6 @@ pub enum Request {
     RestoreSandbox {
         scope: SandboxScope,
         request: RestoreSandboxRequest,
-    },
-    CreateSandboxFromRecipe {
-        scope: SandboxScope,
-        request: CreateSandboxFromRecipeRequest,
     },
     TerminateSandbox {
         scope: SandboxScope,
@@ -339,7 +335,6 @@ impl Request {
             Self::CreateSandbox { .. } => "create_sandbox",
             Self::ForkSandbox { .. } => "fork_sandbox",
             Self::RestoreSandbox { .. } => "restore_sandbox",
-            Self::CreateSandboxFromRecipe { .. } => "create_sandbox_from_recipe",
             Self::TerminateSandbox { .. } => "terminate_sandbox",
             Self::AttachSandbox { .. } => "attach_sandbox",
             Self::DetachSandbox { .. } => "detach_sandbox",
