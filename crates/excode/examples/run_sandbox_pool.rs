@@ -16,10 +16,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use excode::{EmptySandboxPoolProvisioner, LocalSandboxPool, PoolCapacity, SandboxPoolKey};
+use async_trait::async_trait;
+use excode::{LocalSandboxPool, PoolCapacity, SandboxPoolKey, SandboxPoolProvisioner};
 use exoharness::{
-    ManagedSandboxBackend, SandboxCommand, SandboxNetworkPolicy, SandboxSpec, VercelConfig,
-    VercelSandboxBackend, default_vercel_image,
+    ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand, SandboxNetworkPolicy,
+    SandboxRequest, SandboxSpec, VercelConfig, VercelSandboxBackend, default_vercel_image,
 };
 use futures::future::join_all;
 use tokio::sync::watch;
@@ -27,6 +28,40 @@ use tokio::sync::watch;
 struct Options {
     workers: usize,
     data: String,
+}
+
+struct ExoRepositoryProvisioner;
+
+#[async_trait]
+impl SandboxPoolProvisioner for ExoRepositoryProvisioner {
+    async fn acquire(
+        &self,
+        backend: &dyn ManagedSandboxBackend,
+        request: SandboxRequest,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        let sandbox = backend.acquire(request.clone()).await?;
+        let output = sandbox
+            .exec(&SandboxCommand {
+                argv: vec![
+                    "git".to_string(),
+                    "clone".to_string(),
+                    "--depth".to_string(),
+                    "1".to_string(),
+                    "https://github.com/exoharness/exo.git".to_string(),
+                    "/vercel/sandbox/exo".to_string(),
+                ],
+                env: HashMap::new(),
+                display_argv: None,
+                cwd: Some("/vercel/sandbox".to_string()),
+                timeout: None,
+            })
+            .await?;
+        if !output.ok {
+            backend.terminate(request).await?;
+            bail!("failed cloning Exo: {}", output.stderr.trim());
+        }
+        Ok(sandbox)
+    }
 }
 
 fn options() -> Result<Options> {
@@ -103,7 +138,7 @@ async fn main() -> Result<()> {
             lease_ttl: Duration::from_secs(300),
             idle_ttl: Duration::from_secs(30),
         },
-        Arc::new(EmptySandboxPoolProvisioner),
+        Arc::new(ExoRepositoryProvisioner),
     )?);
 
     // Surface authentication/provider errors before workers wait for capacity.
@@ -135,7 +170,12 @@ async fn main() -> Result<()> {
                         argv: vec![
                             "/bin/sh".to_string(),
                             "-lc".to_string(),
-                            format!("printf '%s\\n' \"$EXCODE_TEST_DATA\" > {path}; cat {path}"),
+                            format!(
+                                "printf '%s\\n' \"$EXCODE_TEST_DATA\" > {path}; \
+                                 cat {path}; cd /vercel/sandbox/exo; \
+                                 printf '\\n--- Exo repository ---\\n'; pwd; ls -la; \
+                                 printf '\\n--- README ---\\n'; sed -n '1,20p' README.md"
+                            ),
                         ],
                         env,
                         display_argv: None,
