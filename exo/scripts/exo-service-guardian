@@ -209,7 +209,9 @@ pid_running() {
 }
 
 exo_global_args() {
-  printf '%s\0' --env-file-if-exists "$ENV_FILE"
+  # --root defaults to the relative path .exo, and the guardian is started
+  # from wherever the caller happens to be, so pin it to STATE_DIR.
+  printf '%s\0' --root "$STATE_DIR" --env-file-if-exists "$ENV_FILE"
 }
 
 read_exo_global_args() {
@@ -243,7 +245,7 @@ start_scheduler() {
   fi
   rm -f "$(scheduler_lock_file)" "$(scheduler_restart_file)"
   echo "Starting scheduler..."
-  local scheduler_args=(--env-file-if-exists "$ENV_FILE")
+  local scheduler_args=(--root "$STATE_DIR" --env-file-if-exists "$ENV_FILE")
   nohup "$SCHEDULER_BIN" "${scheduler_args[@]}" run --watch \
     --interval-seconds "$SCHEDULER_INTERVAL_SECONDS" >>"$log_file" 2>&1 &
   echo "$!" >"$pid_file"
