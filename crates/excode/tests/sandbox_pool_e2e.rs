@@ -16,8 +16,8 @@ use std::time::Duration;
 use anyhow::bail;
 use async_trait::async_trait;
 use excode::{
-    EmptySandboxPoolProvisioner, LeasedSandbox, LocalSandboxPool, PoolCapacity, SandboxPoolKey,
-    SandboxPoolProvisioner,
+    EmptySandboxPoolProvisioner, LocalSandboxPool, ManagedSandboxCapability, PoolCapacity,
+    SandboxPoolKey, SandboxPoolProvisioner,
 };
 use exoharness::{
     CliContainerSandboxBackend, LocalProcessSandboxBackend, ManagedSandboxBackend, SandboxCommand,
@@ -60,7 +60,6 @@ fn backend_from_environment() -> Option<(SandboxProvider, Arc<dyn ManagedSandbox
 }
 
 fn pool(
-    provider: SandboxProvider,
     backend: Arc<dyn ManagedSandboxBackend>,
     default_workdir: String,
     recipe: Arc<dyn SandboxPoolProvisioner>,
@@ -68,7 +67,6 @@ fn pool(
     LocalSandboxPool::new(
         SandboxPoolKey {
             pool_id: "sandbox-pool-e2e".to_string(),
-            provider,
             spec: SandboxSpec {
                 image: SANDBOX_IMAGE.to_string(),
                 resources: Default::default(),
@@ -137,7 +135,7 @@ fn command(value: &str) -> SandboxCommand {
     }
 }
 
-fn running_docker_container(sandbox: &LeasedSandbox) -> String {
+fn running_docker_container(sandbox: &dyn ManagedSandboxCapability) -> String {
     let key = sandbox
         .id()
         .strip_prefix("warm:")
@@ -166,21 +164,24 @@ fn running_docker_container(sandbox: &LeasedSandbox) -> String {
     containers[0].to_string()
 }
 
-async fn acquire(pool: &LocalSandboxPool, worker: &str) -> (excode::SandboxLease, LeasedSandbox) {
-    timeout(ACQUIRE_TIMEOUT, pool.acquire_any(worker))
+async fn acquire(
+    pool: &LocalSandboxPool,
+    worker: &str,
+) -> (excode::SandboxLease, Arc<dyn ManagedSandboxCapability>) {
+    let acquired = timeout(ACQUIRE_TIMEOUT, pool.acquire_any(worker))
         .await
         .expect("pool acquisition timed out")
-        .expect("pool acquisition failed")
+        .expect("pool acquisition failed");
+    (acquired.lease, acquired.sandbox)
 }
 
 #[tokio::test]
 #[ignore = "spawns real local-process or Docker sandboxes; CI runs ignored integration tests"]
 async fn warm_pool_acquires_executes_replaces_and_drains() {
-    let Some((provider, backend, default_workdir)) = backend_from_environment() else {
+    let Some((_provider, backend, default_workdir)) = backend_from_environment() else {
         return;
     };
     let pool = Arc::new(pool(
-        provider,
         backend,
         default_workdir,
         Arc::new(EmptySandboxPoolProvisioner),
@@ -205,27 +206,23 @@ async fn warm_pool_acquires_executes_replaces_and_drains() {
     );
     pool.heartbeat(&first_lease).await.unwrap();
 
-    let retired_id = first.id().to_string();
+    let released_id = first.id().to_string();
     pool.release(&first_lease).await.unwrap();
     assert!(first.exec(&command("stale")).await.is_err());
 
-    let (replacement_lease, replacement) = acquire(&pool, "worker-three").await;
-    assert_ne!(
-        replacement.id(),
-        retired_id,
-        "released runtime must be replaced"
+    let (reused_lease, reused) = acquire(&pool, "worker-three").await;
+    assert_eq!(
+        reused.id(),
+        released_id,
+        "released runtime should remain warm"
     );
     assert_eq!(
-        replacement
-            .exec(&command("replacement"))
-            .await
-            .unwrap()
-            .stdout,
-        "replacement"
+        reused.exec(&command("reused")).await.unwrap().stdout,
+        "reused"
     );
 
     pool.release(&second_lease).await.unwrap();
-    pool.release(&replacement_lease).await.unwrap();
+    pool.release(&reused_lease).await.unwrap();
     pool.drain().await.unwrap();
     assert_eq!(pool.entry_count().await, 0);
 
@@ -239,15 +236,10 @@ async fn warm_pool_acquires_executes_replaces_and_drains() {
 #[tokio::test]
 #[ignore = "spawns real local-process or Docker sandboxes; CI runs ignored integration tests"]
 async fn recipe_seeded_pool_exposes_the_initialized_filesystem() {
-    let Some((provider, backend, default_workdir)) = backend_from_environment() else {
+    let Some((_provider, backend, default_workdir)) = backend_from_environment() else {
         return;
     };
-    let pool = Arc::new(pool(
-        provider,
-        backend,
-        default_workdir,
-        Arc::new(CommandSeeder),
-    ));
+    let pool = Arc::new(pool(backend, default_workdir, Arc::new(CommandSeeder)));
     let (shutdown, receiver) = watch::channel(false);
     let reconciler = tokio::spawn({
         let pool = Arc::clone(&pool);
@@ -294,7 +286,6 @@ async fn docker_runtime_loss_is_recovered_for_an_active_pool_lease() {
     }
 
     let pool = Arc::new(pool(
-        provider,
         backend,
         default_workdir,
         Arc::new(EmptySandboxPoolProvisioner),
@@ -310,7 +301,7 @@ async fn docker_runtime_loss_is_recovered_for_an_active_pool_lease() {
         sandbox.exec(&command("before")).await.unwrap().stdout,
         "before"
     );
-    let old_container = running_docker_container(&sandbox);
+    let old_container = running_docker_container(sandbox.as_ref());
     let killed = Command::new("docker")
         .args(["kill", &old_container])
         .output()
@@ -325,7 +316,7 @@ async fn docker_runtime_loss_is_recovered_for_an_active_pool_lease() {
         sandbox.exec(&command("after")).await.unwrap().stdout,
         "after"
     );
-    let replacement_container = running_docker_container(&sandbox);
+    let replacement_container = running_docker_container(sandbox.as_ref());
     assert_ne!(old_container, replacement_container);
     pool.heartbeat(&lease).await.unwrap();
 

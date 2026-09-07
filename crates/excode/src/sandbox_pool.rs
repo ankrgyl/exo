@@ -13,13 +13,13 @@
 //!     let pool = Arc::clone(&pool);
 //!     async move { pool.run_reconciler(receiver).await }
 //! });
-//! let (lease, sandbox) = tokio::time::timeout(
+//! let acquired = tokio::time::timeout(
 //!     Duration::from_secs(150), pool.acquire_any("conversation:123"),
 //! ).await??;
-//! let output = sandbox.exec(&command).await?;
-//! pool.heartbeat(&lease).await?;
+//! let output = acquired.sandbox.exec(&command).await?;
+//! pool.heartbeat(&acquired.lease).await?;
 //! // Release keeps the runtime and filesystem warm; use reset to destroy it.
-//! pool.release(&lease).await?;
+//! pool.release(&acquired.lease).await?;
 //! shutdown.send(true)?;
 //! task.await?;
 //! ```
@@ -39,8 +39,8 @@ use tokio::sync::{Mutex, Notify, RwLock, Semaphore, watch};
 use tokio::time::{self, MissedTickBehavior};
 
 use exoharness::{
-    ManagedSandboxBackend, ManagedSandboxHandle, Result, SandboxCommand, SandboxId,
-    SandboxProvider, SandboxRequest, SandboxSpec, Uuid7,
+    ManagedSandboxBackend, ManagedSandboxHandle, Result, SandboxCommand, SandboxRequest,
+    SandboxSpec, Uuid7,
 };
 
 /// The immutable sandbox configuration shared by entries in one pool.
@@ -51,7 +51,6 @@ use exoharness::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SandboxPoolKey {
     pub pool_id: String,
-    pub provider: SandboxProvider,
     pub spec: SandboxSpec,
 }
 
@@ -108,46 +107,35 @@ impl SandboxPoolProvisioner for EmptySandboxPoolProvisioner {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PoolEntryState {
-    /// The provider state has not been confirmed, usually after a manager
-    /// restart or an ambiguous provider operation.
-    Unknown,
+enum PoolEntryState {
     Creating,
     Checking,
     Ready,
     Leased,
-    Evicting,
-    Resetting,
-    Unhealthy,
-    Draining,
+    /// The entry must not be leased and will be destroyed by reconciliation.
+    Retiring,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxLease {
-    pub id: String,
     pub entry_id: String,
     pub worker_id: String,
     pub fencing_token: String,
-    pub issued_at: Instant,
     pub expires_at: Instant,
 }
 
 struct PoolEntry {
-    pub id: String,
-    pub request: SandboxRequest,
-    pub sandbox_id: SandboxId,
+    id: String,
+    request: SandboxRequest,
     /// The live provider capability. This is absent after a manager restart or
     /// while an entry is being reattached/recreated from its durable record.
-    pub handle: Option<Arc<dyn ManagedSandboxHandle>>,
-    pub state: PoolEntryState,
-    pub lease: Option<SandboxLease>,
-    pub last_used_at: Instant,
-    pub last_health_check_at: Option<Instant>,
-    pub next_retry_at: Option<Instant>,
-    pub failure_count: u32,
-    /// The workspace is durable outside this runtime, so the runtime may be
-    /// terminated and recreated when it becomes idle.
-    pub evictable: bool,
+    handle: Option<Arc<dyn ManagedSandboxHandle>>,
+    state: PoolEntryState,
+    lease: Option<SandboxLease>,
+    last_used_at: Instant,
+    last_health_check_at: Option<Instant>,
+    next_retry_at: Option<Instant>,
+    failure_count: u32,
     lifecycle: Arc<RwLock<()>>,
 }
 
@@ -187,35 +175,20 @@ pub struct ManagedSandboxLease {
 
 /// Common lifecycle operations for sandbox-pool implementations.
 ///
-/// The local implementation also exposes [`LocalSandboxPool::try_acquire`],
-/// which returns the stronger fenced [`LeasedSandbox`] capability. This trait
-/// is the portable control-plane boundary; remote implementations can provide
-/// their own provider handle representation.
+/// Acquisitions return a fenced capability rather than a raw provider handle,
+/// so every implementation preserves lease validity during sandbox access.
 #[async_trait]
 pub trait ManagedSandboxPool: Send + Sync {
     async fn acquire_any(&self, worker_id: String) -> Result<ManagedSandboxLease>;
     async fn heartbeat(&self, lease: &SandboxLease) -> Result<()>;
     async fn release(&self, lease: &SandboxLease) -> Result<()>;
     async fn reset(&self, lease: &SandboxLease) -> Result<()>;
-    async fn health_check(&self, entry_id: &str) -> Result<()>;
     async fn drain(&self) -> Result<()>;
 }
 
 /// Kubernetes-backed pool placeholder. The Kubernetes controller and API
 /// integration will be added without changing [`ManagedSandboxPool`].
 pub struct KubernetesSandboxPool;
-
-impl KubernetesSandboxPool {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for KubernetesSandboxPool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 #[async_trait]
 impl ManagedSandboxPool for KubernetesSandboxPool {
@@ -235,10 +208,6 @@ impl ManagedSandboxPool for KubernetesSandboxPool {
         bail!("KubernetesSandboxPool is not implemented")
     }
 
-    async fn health_check(&self, _entry_id: &str) -> Result<()> {
-        bail!("KubernetesSandboxPool is not implemented")
-    }
-
     async fn drain(&self) -> Result<()> {
         bail!("KubernetesSandboxPool is not implemented")
     }
@@ -249,13 +218,11 @@ impl PoolEntry {
     fn new(
         id: String,
         request: SandboxRequest,
-        sandbox_id: SandboxId,
         handle: Option<Arc<dyn ManagedSandboxHandle>>,
     ) -> Self {
         Self {
             id,
             request,
-            sandbox_id,
             handle,
             state: PoolEntryState::Ready,
             lease: None,
@@ -263,7 +230,6 @@ impl PoolEntry {
             last_health_check_at: None,
             next_retry_at: None,
             failure_count: 0,
-            evictable: false,
             lifecycle: Arc::new(RwLock::new(())),
         }
     }
@@ -276,8 +242,7 @@ impl LocalSandboxPool {
         capacity: PoolCapacity,
         provisioner: Arc<dyn SandboxPoolProvisioner>,
     ) -> Result<Self> {
-        if capacity.max_total == 0
-            || capacity.target_ready == 0
+        if capacity.target_ready == 0
             || capacity.min_ready > capacity.target_ready
             || capacity.target_ready > capacity.max_total
             || capacity.lease_ttl.is_zero()
@@ -318,7 +283,7 @@ impl LocalSandboxPool {
 
     /// Lease a ready sandbox. If the entry has no live handle, acquire one
     /// from the provider using the request persisted on the entry.
-    pub async fn try_acquire(
+    async fn try_acquire(
         &self,
         worker_id: impl Into<String>,
     ) -> Result<(SandboxLease, LeasedSandbox)> {
@@ -335,11 +300,9 @@ impl LocalSandboxPool {
                 .ok_or_else(|| anyhow::Error::new(NoReadyCapacity))?;
             // Create lease and mark in entry table
             let lease = SandboxLease {
-                id: Uuid7::now().to_string(),
                 entry_id: entry.id.clone(),
                 worker_id,
                 fencing_token: Uuid7::now().to_string(),
-                issued_at: Instant::now(),
                 expires_at: Instant::now() + self.capacity.lease_ttl,
             };
             entry.state = PoolEntryState::Leased;
@@ -360,7 +323,7 @@ impl LocalSandboxPool {
             None => match self.acquire_from_recipe(request).await {
                 Ok(handle) => handle,
                 Err(error) => {
-                    self.mark_unknown(&entry_id, &lease).await;
+                    self.mark_retiring(&entry_id, &lease).await;
                     return Err(error);
                 }
             },
@@ -383,7 +346,6 @@ impl LocalSandboxPool {
         }
         // Record the live provider handle for this pool entry.
         entry.handle = Some(Arc::clone(&handle));
-        entry.sandbox_id = handle.id().to_string();
         self.notify.notify_one();
         self.changed.notify_waiters();
         let leased = LeasedSandbox {
@@ -399,17 +361,19 @@ impl LocalSandboxPool {
 
     /// Wait for clean capacity. Run `run_reconciler` concurrently.
     /// Dropping this future cancels the wait; callers can use tokio::time::timeout.
-    pub async fn acquire_any(
-        &self,
-        worker_id: impl Into<String>,
-    ) -> Result<(SandboxLease, LeasedSandbox)> {
+    pub async fn acquire_any(&self, worker_id: impl Into<String>) -> Result<ManagedSandboxLease> {
         let worker_id = worker_id.into();
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
             match self.try_acquire(worker_id.clone()).await {
-                Ok(lease) => return Ok(lease),
+                Ok((lease, sandbox)) => {
+                    return Ok(ManagedSandboxLease {
+                        lease,
+                        sandbox: Arc::new(sandbox),
+                    });
+                }
                 Err(error) if error.is::<NoReadyCapacity>() => {}
                 Err(error) => return Err(error),
             }
@@ -444,7 +408,7 @@ impl LocalSandboxPool {
             .ok_or_else(|| anyhow!("sandbox pool entry not found: {}", lease.entry_id))?;
         validate_lease(entry, lease)?;
         if entry.handle.is_none() {
-            bail!("sandbox lease is still acquiring: {}", lease.id);
+            bail!("sandbox lease is still acquiring: {}", lease.fencing_token);
         }
         entry.lease = None;
         entry.state = PoolEntryState::Ready;
@@ -465,14 +429,14 @@ impl LocalSandboxPool {
                 .get_mut(&lease.entry_id)
                 .ok_or_else(|| anyhow!("sandbox pool entry not found: {}", lease.entry_id))?;
             validate_lease(entry, lease)?;
-            entry.state = PoolEntryState::Resetting;
+            entry.state = PoolEntryState::Retiring;
             (entry.id.clone(), entry.request.clone())
         };
 
         if let Err(error) = self.terminate_with_provider(request).await {
             let mut entries = self.entries.lock().await;
             if let Some(entry) = entries.get_mut(&entry_id) {
-                entry.state = PoolEntryState::Unknown;
+                entry.state = PoolEntryState::Retiring;
                 entry.lease = None;
                 entry.handle = None;
                 entry.failure_count = entry.failure_count.saturating_add(1);
@@ -500,7 +464,7 @@ impl LocalSandboxPool {
             entries
                 .values_mut()
                 .map(|entry| {
-                    entry.state = PoolEntryState::Draining;
+                    entry.state = PoolEntryState::Retiring;
                     entry.lease = None;
                     entry.id.clone()
                 })
@@ -514,7 +478,7 @@ impl LocalSandboxPool {
         Ok(())
     }
 
-    pub async fn health_check(&self, entry_id: &str) -> Result<()> {
+    async fn health_check(&self, entry_id: &str) -> Result<()> {
         let lifecycle = self.entry_lifecycle(entry_id).await?;
         let _operation = lifecycle.write().await;
         let handle = {
@@ -523,7 +487,7 @@ impl LocalSandboxPool {
                 .get_mut(entry_id)
                 .ok_or_else(|| anyhow!("sandbox pool entry not found: {entry_id}"))?;
             if entry.state != PoolEntryState::Ready {
-                bail!("sandbox pool entry is draining: {entry_id}");
+                bail!("sandbox pool entry is not ready: {entry_id}");
             }
             let handle = entry
                 .handle
@@ -557,7 +521,7 @@ impl LocalSandboxPool {
         if let Err(error) = result {
             let mut entries = self.entries.lock().await;
             if let Some(entry) = entries.get_mut(entry_id) {
-                entry.state = PoolEntryState::Unhealthy;
+                entry.state = PoolEntryState::Retiring;
                 entry.last_health_check_at = Some(Instant::now());
                 entry.failure_count = entry.failure_count.saturating_add(1);
                 entry.next_retry_at = Some(Instant::now() + retry_delay(entry.failure_count));
@@ -581,11 +545,11 @@ impl LocalSandboxPool {
     pub async fn reconcile_once(&self) -> Result<()> {
         let _reconcile = self.reconcile.lock().await;
         self.evict_idle().await?;
-        let (ready_entries, unhealthy_entries) = {
+        let (ready_entries, retiring_entries) = {
             let mut entries = self.entries.lock().await;
             let now = Instant::now();
             let mut ready_entries = Vec::new();
-            let mut unhealthy_entries = Vec::new();
+            let mut retiring_entries = Vec::new();
             for entry in entries.values_mut() {
                 if entry.state == PoolEntryState::Leased
                     && entry
@@ -594,8 +558,8 @@ impl LocalSandboxPool {
                         .is_some_and(|lease| lease.expires_at <= now)
                 {
                     // The old worker is fenced from lifecycle operations, but
-                    // the provider state is still unknown until reconciliation.
-                    entry.state = PoolEntryState::Unknown;
+                    // the provider state is ambiguous until reconciliation.
+                    entry.state = PoolEntryState::Retiring;
                 }
                 match entry.state {
                     PoolEntryState::Ready
@@ -605,20 +569,15 @@ impl LocalSandboxPool {
                     {
                         ready_entries.push(entry.id.clone())
                     }
-                    PoolEntryState::Unhealthy
-                    | PoolEntryState::Unknown
-                    | PoolEntryState::Resetting
-                    | PoolEntryState::Creating
-                    | PoolEntryState::Checking
-                    | PoolEntryState::Evicting
+                    PoolEntryState::Retiring
                         if entry.next_retry_at.is_none_or(|retry| retry <= now) =>
                     {
-                        unhealthy_entries.push(entry.id.clone())
+                        retiring_entries.push(entry.id.clone())
                     }
                     _ => {}
                 }
             }
-            (ready_entries, unhealthy_entries)
+            (ready_entries, retiring_entries)
         };
 
         for entry_id in ready_entries {
@@ -627,9 +586,9 @@ impl LocalSandboxPool {
             }
         }
 
-        for entry_id in unhealthy_entries {
+        for entry_id in retiring_entries {
             if let Err(error) = self.retire_entry(&entry_id).await {
-                tracing::warn!(%error, entry_id, "failed retiring unhealthy sandbox pool entry");
+                tracing::warn!(%error, entry_id, "failed retiring sandbox pool entry");
             }
         }
 
@@ -683,22 +642,21 @@ impl LocalSandboxPool {
                 .values()
                 .filter(|entry| entry.state == PoolEntryState::Ready)
                 .count();
-            let evictable_count = ready_count.saturating_sub(self.capacity.min_ready);
+            let removable_count = ready_count.saturating_sub(self.capacity.min_ready);
             let mut candidates = entries
                 .values_mut()
                 .filter(|entry| {
                     entry.state == PoolEntryState::Ready
                         && entry.lease.is_none()
-                        && entry.evictable
                         && now.duration_since(entry.last_used_at) >= self.capacity.idle_ttl
                 })
                 .collect::<Vec<_>>();
             candidates.sort_unstable_by_key(|entry| entry.last_used_at);
             candidates
                 .into_iter()
-                .take(evictable_count)
+                .take(removable_count)
                 .map(|entry| {
-                    entry.state = PoolEntryState::Evicting;
+                    entry.state = PoolEntryState::Retiring;
                     entry.id.clone()
                 })
                 .collect::<Vec<_>>()
@@ -725,8 +683,9 @@ impl LocalSandboxPool {
                     )
                 })
                 .count();
-            let desired_ready = self.capacity.target_ready.max(self.capacity.min_ready);
-            if ready_or_creating >= desired_ready || entries.len() >= self.capacity.max_total {
+            if ready_or_creating >= self.capacity.target_ready
+                || entries.len() >= self.capacity.max_total
+            {
                 return Ok(());
             }
 
@@ -738,7 +697,6 @@ impl LocalSandboxPool {
                     PoolEntry {
                         id: entry_id.clone(),
                         request: request.clone(),
-                        sandbox_id: String::new(),
                         handle: None,
                         state: PoolEntryState::Creating,
                         lease: None,
@@ -746,7 +704,6 @@ impl LocalSandboxPool {
                         last_health_check_at: None,
                         next_retry_at: None,
                         failure_count: 0,
-                        evictable: true,
                         lifecycle: Arc::new(RwLock::new(())),
                     },
                 );
@@ -757,7 +714,6 @@ impl LocalSandboxPool {
                 Ok(handle) => {
                     let mut entries = self.entries.lock().await;
                     if let Some(entry) = entries.get_mut(&entry_id) {
-                        entry.sandbox_id = handle.id().to_string();
                         entry.request.provider_state = handle.provider_state();
                         entry.handle = Some(handle);
                         entry.state = PoolEntryState::Ready;
@@ -769,7 +725,7 @@ impl LocalSandboxPool {
                 Err(error) => {
                     let mut entries = self.entries.lock().await;
                     if let Some(entry) = entries.get_mut(&entry_id) {
-                        entry.state = PoolEntryState::Unknown;
+                        entry.state = PoolEntryState::Retiring;
                         entry.failure_count = entry.failure_count.saturating_add(1);
                         entry.next_retry_at =
                             Some(Instant::now() + retry_delay(entry.failure_count));
@@ -799,26 +755,16 @@ impl LocalSandboxPool {
             let entry = entries
                 .get_mut(entry_id)
                 .ok_or_else(|| anyhow!("sandbox pool entry not found: {entry_id}"))?;
-            if !matches!(
-                entry.state,
-                PoolEntryState::Unknown
-                    | PoolEntryState::Creating
-                    | PoolEntryState::Checking
-                    | PoolEntryState::Draining
-                    | PoolEntryState::Unhealthy
-                    | PoolEntryState::Evicting
-                    | PoolEntryState::Resetting
-            ) {
+            if entry.state != PoolEntryState::Retiring {
                 return Ok(());
             }
-            entry.state = PoolEntryState::Resetting;
             entry.request.clone()
         };
 
         if let Err(error) = self.terminate_with_provider(request).await {
             let mut entries = self.entries.lock().await;
             if let Some(entry) = entries.get_mut(entry_id) {
-                entry.state = PoolEntryState::Unknown;
+                entry.state = PoolEntryState::Retiring;
                 entry.failure_count = entry.failure_count.saturating_add(1);
                 entry.next_retry_at = Some(Instant::now() + retry_delay(entry.failure_count));
             }
@@ -866,12 +812,12 @@ impl LocalSandboxPool {
         time::timeout(Duration::from_secs(120), self.backend.terminate(request)).await?
     }
 
-    async fn mark_unknown(&self, entry_id: &str, lease: &SandboxLease) {
+    async fn mark_retiring(&self, entry_id: &str, lease: &SandboxLease) {
         let mut entries = self.entries.lock().await;
         if let Some(entry) = entries.get_mut(entry_id)
             && entry.lease.as_ref() == Some(lease)
         {
-            entry.state = PoolEntryState::Unknown;
+            entry.state = PoolEntryState::Retiring;
             entry.lease = None;
             entry.handle = None;
             self.notify.notify_one();
@@ -883,11 +829,7 @@ impl LocalSandboxPool {
 #[async_trait]
 impl ManagedSandboxPool for LocalSandboxPool {
     async fn acquire_any(&self, worker_id: String) -> Result<ManagedSandboxLease> {
-        let (lease, sandbox) = LocalSandboxPool::acquire_any(self, worker_id).await?;
-        Ok(ManagedSandboxLease {
-            lease,
-            sandbox: Arc::new(sandbox),
-        })
+        LocalSandboxPool::acquire_any(self, worker_id).await
     }
 
     async fn heartbeat(&self, lease: &SandboxLease) -> Result<()> {
@@ -902,10 +844,6 @@ impl ManagedSandboxPool for LocalSandboxPool {
         LocalSandboxPool::reset(self, lease).await
     }
 
-    async fn health_check(&self, entry_id: &str) -> Result<()> {
-        LocalSandboxPool::health_check(self, entry_id).await
-    }
-
     async fn drain(&self) -> Result<()> {
         LocalSandboxPool::drain(self).await
     }
@@ -914,7 +852,7 @@ impl ManagedSandboxPool for LocalSandboxPool {
 /// A capability valid only while its pool lease is active.
 /// Runtime lifecycle stays with the pool. Release invalidates this capability
 /// while keeping the runtime warm for the next lease.
-pub struct LeasedSandbox {
+struct LeasedSandbox {
     lease: SandboxLease,
     handle: Arc<dyn ManagedSandboxHandle>,
     entries: Arc<Mutex<HashMap<String, PoolEntry>>>,
@@ -924,11 +862,11 @@ pub struct LeasedSandbox {
 }
 
 impl LeasedSandbox {
-    pub fn id(&self) -> &str {
+    fn id(&self) -> &str {
         self.handle.id()
     }
 
-    pub async fn exec(&self, command: &SandboxCommand) -> Result<exoharness::SandboxCommandOutput> {
+    async fn exec(&self, command: &SandboxCommand) -> Result<exoharness::SandboxCommandOutput> {
         let operation = self.lifecycle.read().await;
         {
             let entries = self.entries.lock().await;
@@ -961,7 +899,7 @@ impl LeasedSandbox {
             {
                 return;
             }
-            entry.state = PoolEntryState::Unknown;
+            entry.state = PoolEntryState::Retiring;
             entry.lease = None;
             entry.handle = None;
             entry.failure_count = entry.failure_count.saturating_add(1);
@@ -987,7 +925,7 @@ impl ManagedSandboxCapability for LeasedSandbox {
 }
 
 #[derive(Debug)]
-pub struct NoReadyCapacity;
+struct NoReadyCapacity;
 impl std::fmt::Display for NoReadyCapacity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("sandbox pool has no ready capacity")
@@ -1008,16 +946,14 @@ fn validate_lease(entry: &PoolEntry, lease: &SandboxLease) -> Result<()> {
         bail!("sandbox pool entry is not leased: {}", entry.id);
     }
     if entry.lease.as_ref().expect("validated lease").expires_at <= Instant::now() {
-        bail!("sandbox lease has expired: {}", lease.id);
+        bail!("sandbox lease has expired: {}", lease.fencing_token);
     }
     Ok(())
 }
 
 fn lease_matches(current: Option<&SandboxLease>, lease: &SandboxLease) -> bool {
     current.is_some_and(|current| {
-        current.id == lease.id
-            && current.fencing_token == lease.fencing_token
-            && current.worker_id == lease.worker_id
+        current.fencing_token == lease.fencing_token && current.worker_id == lease.worker_id
     })
 }
 
@@ -1248,7 +1184,6 @@ mod tests {
         LocalSandboxPool::new(
             SandboxPoolKey {
                 pool_id: "pool".to_string(),
-                provider: SandboxProvider::from_static("fake"),
                 spec,
             },
             backend,
@@ -1277,14 +1212,9 @@ mod tests {
     async fn acquire_and_release_transitions_entry() {
         let backend = Arc::new(FakeBackend::new());
         let pool = pool(Arc::clone(&backend));
-        pool.insert_entry(PoolEntry::new(
-            "entry".to_string(),
-            request("entry"),
-            "placeholder".to_string(),
-            None,
-        ))
-        .await
-        .unwrap();
+        pool.insert_entry(PoolEntry::new("entry".to_string(), request("entry"), None))
+            .await
+            .unwrap();
 
         let (lease, handle) = pool.try_acquire("worker-a").await.unwrap();
         assert_eq!(handle.id(), "fake-sandbox-1");
@@ -1303,14 +1233,9 @@ mod tests {
     async fn acquire_skips_leased_entries() {
         let backend = Arc::new(FakeBackend::new());
         let pool = pool(Arc::clone(&backend));
-        pool.insert_entry(PoolEntry::new(
-            "entry".to_string(),
-            request("entry"),
-            "placeholder".to_string(),
-            None,
-        ))
-        .await
-        .unwrap();
+        pool.insert_entry(PoolEntry::new("entry".to_string(), request("entry"), None))
+            .await
+            .unwrap();
 
         let _lease = pool.try_acquire("worker-a").await.unwrap();
         assert!(pool.try_acquire("worker-b").await.is_err());
@@ -1320,14 +1245,9 @@ mod tests {
     async fn stale_lease_cannot_release_entry() {
         let backend = Arc::new(FakeBackend::new());
         let pool = pool(Arc::clone(&backend));
-        pool.insert_entry(PoolEntry::new(
-            "entry".to_string(),
-            request("entry"),
-            "placeholder".to_string(),
-            None,
-        ))
-        .await
-        .unwrap();
+        pool.insert_entry(PoolEntry::new("entry".to_string(), request("entry"), None))
+            .await
+            .unwrap();
 
         let (lease, _) = pool.try_acquire("worker-a").await.unwrap();
         let mut stale = lease.clone();
@@ -1338,35 +1258,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acquire_failure_marks_entry_unknown() {
+    async fn acquire_failure_marks_entry_retiring() {
         let backend = Arc::new(FakeBackend::new());
         backend.fail_acquire.store(true, Ordering::SeqCst);
         let pool = pool(Arc::clone(&backend));
-        pool.insert_entry(PoolEntry::new(
-            "entry".to_string(),
-            request("entry"),
-            "placeholder".to_string(),
-            None,
-        ))
-        .await
-        .unwrap();
+        pool.insert_entry(PoolEntry::new("entry".to_string(), request("entry"), None))
+            .await
+            .unwrap();
 
         assert!(pool.try_acquire("worker-a").await.is_err());
-        assert_eq!(state(&pool, "entry").await, PoolEntryState::Unknown);
+        assert_eq!(state(&pool, "entry").await, PoolEntryState::Retiring);
     }
 
     #[tokio::test]
     async fn reset_terminates_and_removes_entry() {
         let backend = Arc::new(FakeBackend::new());
         let pool = pool(Arc::clone(&backend));
-        pool.insert_entry(PoolEntry::new(
-            "entry".to_string(),
-            request("entry"),
-            "placeholder".to_string(),
-            None,
-        ))
-        .await
-        .unwrap();
+        pool.insert_entry(PoolEntry::new("entry".to_string(), request("entry"), None))
+            .await
+            .unwrap();
 
         let (lease, _) = pool.try_acquire("worker-a").await.unwrap();
         pool.reset(&lease).await.unwrap();
@@ -1375,26 +1285,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_failure_marks_entry_unknown() {
+    async fn reset_failure_keeps_entry_retiring() {
         let backend = Arc::new(FakeBackend::new());
         backend.fail_terminate.store(true, Ordering::SeqCst);
         let pool = pool(Arc::clone(&backend));
-        pool.insert_entry(PoolEntry::new(
-            "entry".to_string(),
-            request("entry"),
-            "placeholder".to_string(),
-            None,
-        ))
-        .await
-        .unwrap();
+        pool.insert_entry(PoolEntry::new("entry".to_string(), request("entry"), None))
+            .await
+            .unwrap();
 
         let (lease, _) = pool.try_acquire("worker-a").await.unwrap();
         assert!(pool.reset(&lease).await.is_err());
-        assert_eq!(state(&pool, "entry").await, PoolEntryState::Unknown);
+        assert_eq!(state(&pool, "entry").await, PoolEntryState::Retiring);
     }
 
     #[tokio::test]
-    async fn health_check_marks_failed_entry_unhealthy() {
+    async fn health_check_marks_failed_entry_retiring() {
         let backend = Arc::new(FakeBackend::new());
         let pool = pool(Arc::clone(&backend));
         let handle: Arc<dyn ManagedSandboxHandle> = Arc::new(FakeHandle {
@@ -1404,7 +1309,6 @@ mod tests {
         pool.insert_entry(PoolEntry::new(
             "entry".to_string(),
             request("entry"),
-            "fake-sandbox".to_string(),
             Some(handle),
         ))
         .await
@@ -1413,7 +1317,7 @@ mod tests {
         pool.health_check("entry").await.unwrap();
         backend.healthy.store(false, Ordering::SeqCst);
         assert!(pool.health_check("entry").await.is_err());
-        assert_eq!(state(&pool, "entry").await, PoolEntryState::Unhealthy);
+        assert_eq!(state(&pool, "entry").await, PoolEntryState::Retiring);
     }
 
     #[tokio::test]
@@ -1439,7 +1343,6 @@ mod tests {
         let pool = LocalSandboxPool::new(
             SandboxPoolKey {
                 pool_id: "seeded-pool".to_string(),
-                provider: SandboxProvider::from_static("fake"),
                 spec: request("entry").spec,
             },
             Arc::clone(&backend) as Arc<dyn ManagedSandboxBackend>,
@@ -1473,7 +1376,6 @@ mod tests {
         let pool = LocalSandboxPool::new(
             SandboxPoolKey {
                 pool_id: "recipe-seeded-pool".to_string(),
-                provider: SandboxProvider::from_static("fake"),
                 spec: request("entry").spec,
             },
             Arc::clone(&backend) as Arc<dyn ManagedSandboxBackend>,
@@ -1510,7 +1412,6 @@ mod tests {
         let pool = LocalSandboxPool::new(
             SandboxPoolKey {
                 pool_id: "failing-recipe-seeded-pool".to_string(),
-                provider: SandboxProvider::from_static("fake"),
                 spec: request("entry").spec,
             },
             Arc::clone(&backend) as Arc<dyn ManagedSandboxBackend>,
@@ -1535,7 +1436,7 @@ mod tests {
                 .lock()
                 .await
                 .values()
-                .all(|entry| entry.state == PoolEntryState::Unknown)
+                .all(|entry| entry.state == PoolEntryState::Retiring)
         );
         assert!(pool.try_acquire("worker-a").await.is_err());
     }
@@ -1555,7 +1456,6 @@ mod tests {
         pool.insert_entry(PoolEntry::new(
             "old".to_string(),
             request("old"),
-            "old-sandbox".to_string(),
             Some(old_handle),
         ))
         .await
@@ -1563,7 +1463,6 @@ mod tests {
         pool.insert_entry(PoolEntry::new(
             "new".to_string(),
             request("new"),
-            "new-sandbox".to_string(),
             Some(new_handle),
         ))
         .await
@@ -1592,13 +1491,11 @@ mod tests {
         let mut entry = PoolEntry::new(
             "entry".to_string(),
             request("entry"),
-            "sandbox".to_string(),
             Some(Arc::new(FakeHandle {
                 id: "sandbox".to_string(),
                 healthy: Arc::clone(&backend.healthy),
             })),
         );
-        entry.evictable = true;
         entry.last_used_at = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
         pool.insert_entry(entry).await.unwrap();
 
@@ -1627,7 +1524,10 @@ mod tests {
             let pool = Arc::clone(&pool);
             async move { pool.run_reconciler(receiver).await }
         });
-        let (first, old_handle) = time::timeout(Duration::from_secs(2), pool.acquire_any("first"))
+        let ManagedSandboxLease {
+            lease: first,
+            sandbox: old_handle,
+        } = time::timeout(Duration::from_secs(2), pool.acquire_any("first"))
             .await
             .unwrap()
             .unwrap();
@@ -1643,7 +1543,10 @@ mod tests {
             async move { pool.acquire_any("second").await }
         });
         pool.release(&first).await.unwrap();
-        let (second, new_handle) = time::timeout(Duration::from_secs(2), waiter)
+        let ManagedSandboxLease {
+            lease: second,
+            sandbox: new_handle,
+        } = time::timeout(Duration::from_secs(2), waiter)
             .await
             .unwrap()
             .unwrap()
@@ -1677,7 +1580,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_creation_recovers_after_backoff() {
+    async fn failed_creation_recovers_after_backoff() {
         let backend = Arc::new(FakeBackend::new());
         let pool = pool(Arc::clone(&backend));
         backend.fail_acquire.store(true, Ordering::SeqCst);
@@ -1776,7 +1679,10 @@ mod tests {
 
         backend.healthy.store(false, Ordering::SeqCst);
         assert!(handle.exec(&command()).await.is_err());
-        assert_eq!(state(&pool, &lease.entry_id).await, PoolEntryState::Unknown);
+        assert_eq!(
+            state(&pool, &lease.entry_id).await,
+            PoolEntryState::Retiring
+        );
         assert!(pool.heartbeat(&lease).await.is_err());
 
         backend.healthy.store(true, Ordering::SeqCst);
@@ -1801,7 +1707,6 @@ mod tests {
         pool.insert_entry(PoolEntry::new(
             "slow".to_string(),
             request("slow"),
-            "slow-sandbox".to_string(),
             Some(Arc::new(SlowHandle)),
         ))
         .await
@@ -1811,7 +1716,10 @@ mod tests {
         timed.timeout = Some(Duration::from_millis(1));
 
         assert!(sandbox.exec(&timed).await.is_err());
-        assert_eq!(state(&pool, &lease.entry_id).await, PoolEntryState::Unknown);
+        assert_eq!(
+            state(&pool, &lease.entry_id).await,
+            PoolEntryState::Retiring
+        );
         assert!(pool.release(&lease).await.is_err());
     }
 }

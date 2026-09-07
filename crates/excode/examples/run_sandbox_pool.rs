@@ -18,8 +18,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use excode::{EmptySandboxPoolProvisioner, LocalSandboxPool, PoolCapacity, SandboxPoolKey};
 use exoharness::{
-    ManagedSandboxBackend, SandboxCommand, SandboxNetworkPolicy, SandboxProvider, SandboxSpec,
-    VercelConfig, VercelSandboxBackend, default_vercel_image,
+    ManagedSandboxBackend, SandboxCommand, SandboxNetworkPolicy, SandboxSpec, VercelConfig,
+    VercelSandboxBackend, default_vercel_image,
 };
 use futures::future::join_all;
 use tokio::sync::watch;
@@ -86,7 +86,6 @@ async fn main() -> Result<()> {
     let pool = Arc::new(LocalSandboxPool::new(
         SandboxPoolKey {
             pool_id: format!("excode-example-{}", std::process::id()),
-            provider: SandboxProvider::Vercel,
             spec: SandboxSpec {
                 image,
                 resources: Default::default(),
@@ -125,7 +124,9 @@ async fn main() -> Result<()> {
             let data = options.data.clone();
             tokio::spawn(async move {
                 tokio::time::timeout(Duration::from_secs(180), async move {
-                    let (lease, sandbox) = pool.acquire_any(format!("worker-{worker}")).await?;
+                    let acquired = pool.acquire_any(format!("worker-{worker}")).await?;
+                    let lease = acquired.lease;
+                    let sandbox = acquired.sandbox;
                     let sandbox_id = sandbox.id().to_string();
                     let path = format!("/tmp/excode-worker-{worker}.txt");
                     let mut env = HashMap::new();

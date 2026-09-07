@@ -2570,12 +2570,10 @@ name = "exo"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "bytes",
  "clap",
  "cost",
  "crossterm",
- "excode",
  "executor",
  "exoharness",
  "futures",
