@@ -36,17 +36,18 @@ use crate::{
     ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
     BindingType, BoxAsyncRead, BoxAsyncWrite, CancelSandboxProcessRequest,
     CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, ConversationRecord,
-    CreateSandboxRequest, DurableFileSystem, Event, EventData, EventId, EventKind, EventQuery,
-    EventQueryDirection, EventStream, ExoHarness, FileSystemMount, ForkConversationRequest,
-    ForkSandboxRequest, GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
-    ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
-    ReadArtifactRequest, RestoreSandboxRequest, Result, RunInSandboxRequest, SandboxAttachment,
-    SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery,
-    SandboxProcessId, SandboxProcessMode, SandboxProcessParts, SandboxProcessRecord,
-    SandboxProcessStatus, SandboxProcessStdin, SandboxProvider, SandboxProviderConfig,
-    SandboxRecord, Secret, SecretId, SecretMetadata, SecretType, SessionId, SnapshotHandle,
-    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord,
-    Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    CreateSandboxFromRecipeRequest, CreateSandboxRequest, DurableFileSystem, Event, EventData,
+    EventId, EventKind, EventQuery, EventQueryDirection, EventStream, ExoHarness, FileSystemMount,
+    ForkConversationRequest, ForkSandboxRequest, GetEventsResult, GetSandboxProcessEventsResult,
+    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
+    PutSecretRequest, ReadArtifactRequest, RestoreSandboxRequest, Result, RunInSandboxRequest,
+    SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEvent,
+    SandboxProcessEventQuery, SandboxProcessId, SandboxProcessMode, SandboxProcessParts,
+    SandboxProcessRecord, SandboxProcessStatus, SandboxProcessStdin, SandboxProvider,
+    SandboxProviderConfig, SandboxRecipeStep, SandboxRecord, Secret, SecretId, SecretMetadata,
+    SecretType, SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
+    StartSandboxRequest, TurnHandle, TurnId, TurnRecord, Uuid7, WaitSandboxProcessRequest,
+    WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const SANDBOX_PROVIDER_STATE_EVENT: &str = "sandbox_provider_state";
@@ -1227,6 +1228,15 @@ where
         self.sandbox_handle().restore_sandbox(request).await
     }
 
+    async fn create_sandbox_from_recipe(
+        &self,
+        request: CreateSandboxFromRecipeRequest,
+    ) -> Result<SandboxId> {
+        self.sandbox_handle()
+            .create_sandbox_from_recipe(request)
+            .await
+    }
+
     async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {
         self.sandbox_handle().terminate_sandbox(id).await
     }
@@ -1969,6 +1979,71 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .await
     }
 
+    async fn create_sandbox_from_recipe(
+        &self,
+        request: CreateSandboxFromRecipeRequest,
+    ) -> Result<SandboxId> {
+        self.ensure_full_sandbox_scope("create_sandbox_from_recipe")?;
+        let prepared = prepare_sandbox_request(self.harness, request.sandbox).await?;
+        let sandbox_id = format!("sandbox-{}", Uuid7::now());
+        let mut sandbox = prepared.stored_sandbox(sandbox_id.clone());
+        let backend = self
+            .harness
+            .inner
+            .sandbox_backend_for_provider(sandbox.provider.clone())
+            .await?;
+        let target_request = sandbox_request(self.owner, &sandbox_id, &sandbox, None);
+        let sandbox_handle = match request.recipe.snapshot_id {
+            Some(snapshot_id) => {
+                let payload =
+                    load_snapshot_payload(self.harness, &self.owner_dir, snapshot_id).await?;
+                ensure_snapshot_format_supported(
+                    backend.as_ref(),
+                    &sandbox.provider,
+                    &payload.format,
+                )?;
+                sandbox.latest_snapshot_id = Some(snapshot_id);
+                backend
+                    .acquire_from_snapshot(target_request.clone(), payload)
+                    .await?
+            }
+            None => backend.acquire(target_request.clone()).await?,
+        };
+        let result = async {
+            for step in request.recipe.steps {
+                self.run_recipe_step(sandbox_handle.as_ref(), step, sandbox.enable_networking)
+                    .await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            if let Err(terminate_error) = backend.terminate(target_request).await {
+                tracing::warn!(%terminate_error, sandbox_id, "failed terminating sandbox after recipe error");
+                if let Err(stop_error) = sandbox_handle.stop().await {
+                    tracing::warn!(%stop_error, sandbox_id, "failed stopping sandbox after recipe error");
+                }
+            }
+            return Err(error);
+        }
+        if let Some(effective_image) = sandbox_handle.effective_image()
+            && effective_image != sandbox.image
+        {
+            sandbox.requested_image = Some(sandbox.image.clone());
+            sandbox.image = effective_image;
+        }
+        let provider_state_event = sandbox_provider_state_event(
+            &sandbox_id,
+            sandbox.provider.clone(),
+            sandbox_provider_state_key(self.owner, &sandbox_id, &sandbox),
+            None,
+            &sandbox_handle,
+        )?;
+        let _guard = self.harness.inner.write_lock.lock().await;
+        self.persist_created_sandbox_locked(sandbox, sandbox_handle, provider_state_event)
+            .await
+    }
+
     async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {
         self.ensure_full_sandbox_scope("terminate_sandbox")?;
         let _guard = self.harness.inner.write_lock.lock().await;
@@ -2325,6 +2400,106 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .await
             .with_context(|| format!("failed to run command in sandbox {}", request.id))?;
         Ok(Box::new(LiveSandboxProcess::new(parts)))
+    }
+
+    /// For now, used only for getting the Github token to pull private repositories
+    async fn resolve_key_secret(&self, secret_id: &SecretId) -> Result<String> {
+        let mut secret_dirs = vec![self.harness.secrets_dir()];
+        match self.owner {
+            SandboxOwner::Agent(agent_id) => {
+                secret_dirs.push(
+                    self.harness
+                        .agents_dir()
+                        .join(agent_id.to_string())
+                        .join("secrets"),
+                );
+            }
+            SandboxOwner::Conversation(_) => {
+                let agent_dir = self
+                    .owner_dir
+                    .parent()
+                    .and_then(Path::parent)
+                    .context("conversation sandbox owner has no agent directory")?;
+                secret_dirs.push(agent_dir.join("secrets"));
+                secret_dirs.push(self.owner_dir.join("secrets"));
+            }
+        }
+        for directory in secret_dirs.into_iter().rev() {
+            let path = directory.join(format!("{secret_id}.json"));
+            if let Some(record) = self
+                .harness
+                .inner
+                .storage
+                .get_json_if_exists::<StoredSecret>(&path)
+                .await?
+            {
+                return match self
+                    .harness
+                    .inner
+                    .secret_cipher
+                    .decrypt_secret(&record.secret)?
+                {
+                    Secret::Key { value } => Ok(value),
+                    Secret::Oauth { .. } => bail!("secret must be a key secret"),
+                };
+            }
+        }
+        bail!("secret not found: {secret_id}")
+    }
+
+    async fn run_recipe_step(
+        &self,
+        sandbox: &dyn ManagedSandboxHandle,
+        step: SandboxRecipeStep,
+        networking_enabled: bool,
+    ) -> Result<()> {
+        match step {
+            SandboxRecipeStep::GithubRepository {
+                repository,
+                branch,
+                sha,
+                destination,
+                secret_id,
+            } => {
+                if !networking_enabled {
+                    bail!("GitHub recipe steps require sandbox networking");
+                }
+                let token = match secret_id {
+                    Some(secret_id) => Some(self.resolve_key_secret(&secret_id).await?),
+                    None => None,
+                };
+                crate::github::clone_branch(
+                    sandbox,
+                    &repository,
+                    branch.as_deref(),
+                    &destination,
+                    token.as_deref(),
+                )
+                .await?;
+                if let Some(sha) = sha {
+                    crate::github::checkout_sha(sandbox, &destination, &sha).await?;
+                }
+                Ok(())
+            }
+            SandboxRecipeStep::Command { argv, cwd } => {
+                if argv.is_empty() || argv[0].trim().is_empty() {
+                    bail!("sandbox recipe command argv must not be empty");
+                }
+                let output = sandbox
+                    .exec(&SandboxCommand {
+                        argv,
+                        env: HashMap::new(),
+                        display_argv: None,
+                        cwd,
+                        timeout: None,
+                    })
+                    .await?;
+                if !output.ok {
+                    bail!("sandbox recipe command failed: {}", output.stderr.trim());
+                }
+                Ok(())
+            }
+        }
     }
 
     fn ensure_full_sandbox_scope(&self, operation: &str) -> Result<()> {

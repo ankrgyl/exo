@@ -49,6 +49,11 @@ pub trait SandboxHandle: SnapshotHandle {
     /// Create a new sandbox directly from an immutable snapshot. Unlike
     /// `start_sandbox`, the target need not already exist.
     async fn restore_sandbox(&self, request: RestoreSandboxRequest) -> Result<SandboxId>;
+    /// Create a sandbox and run its initialization steps before exposing it.
+    async fn create_sandbox_from_recipe(
+        &self,
+        request: CreateSandboxFromRecipeRequest,
+    ) -> Result<SandboxId>;
     async fn terminate_sandbox(&self, id: SandboxId) -> Result<()>;
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId>;
     async fn detach_sandbox(&self, id: SandboxId) -> Result<SandboxAttachment>;
@@ -700,6 +705,37 @@ pub struct ForkSandboxRequest {
 pub struct RestoreSandboxRequest {
     pub snapshot_id: SnapshotId,
     pub sandbox: CreateSandboxRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateSandboxFromRecipeRequest {
+    pub sandbox: CreateSandboxRequest,
+    pub recipe: SandboxRecipe,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SandboxRecipe {
+    /// Restore this snapshot instead of acquiring `sandbox.image`. Steps run after it.
+    pub snapshot_id: Option<SnapshotId>,
+    pub steps: Vec<SandboxRecipeStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SandboxRecipeStep {
+    GithubRepository {
+        repository: String,
+        // If None, fetches default branch
+        branch: Option<String>,
+        // If None, fetches current SHA
+        sha: Option<String>,
+        destination: String,
+        secret_id: Option<SecretId>,
+    },
+    Command {
+        argv: Vec<String>,
+        cwd: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
