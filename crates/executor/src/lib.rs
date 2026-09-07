@@ -22,6 +22,7 @@ mod harness_js_repl;
 mod harness_runtime;
 mod harness_tool;
 mod harness_types;
+mod json_store;
 mod local_sandbox;
 mod rlm;
 #[cfg(test)]
