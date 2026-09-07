@@ -20,9 +20,9 @@ use crate::{
     AddEventsRequest, AddEventsResult, AgentHandle, AgentId, AgentRecord, Artifact,
     ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
     CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, ConversationHandle,
-    ConversationId, ConversationRecord, CreateSandboxFromRecipeRequest, CreateSandboxRequest,
-    Event, EventData, EventId, EventQuery, EventStream, ExoHarness, ForkConversationRequest,
-    ForkSandboxRequest, GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
+    ConversationId, ConversationRecord, CreateSandboxRequest, Event, EventData, EventId,
+    EventQuery, EventStream, ExoHarness, ForkConversationRequest, ForkSandboxRequest,
+    GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
     ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
     ReadArtifactRequest, RestoreSandboxRequest, Result, RunInSandboxRequest, SandboxAttachment,
     SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery, SandboxProcessParts,
@@ -238,20 +238,6 @@ async fn http_restore_sandbox(
 ) -> Result<SandboxId> {
     match harness
         .request(Request::RestoreSandbox { scope, request })
-        .await?
-    {
-        Response::SandboxId { sandbox_id } => Ok(sandbox_id),
-        response => unexpected_response(response, "sandbox_id"),
-    }
-}
-
-async fn http_create_sandbox_from_recipe(
-    harness: &HttpExoHarness,
-    scope: SandboxScope,
-    request: CreateSandboxFromRecipeRequest,
-) -> Result<SandboxId> {
-    match harness
-        .request(Request::CreateSandboxFromRecipe { scope, request })
         .await?
     {
         Response::SandboxId { sandbox_id } => Ok(sandbox_id),
@@ -747,12 +733,6 @@ impl SandboxHandle for HttpAgentHandle {
     async fn restore_sandbox(&self, request: RestoreSandboxRequest) -> Result<SandboxId> {
         http_restore_sandbox(&self.harness, self.sandbox_scope(), request).await
     }
-    async fn create_sandbox_from_recipe(
-        &self,
-        request: CreateSandboxFromRecipeRequest,
-    ) -> Result<SandboxId> {
-        http_create_sandbox_from_recipe(&self.harness, self.sandbox_scope(), request).await
-    }
     async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {
         http_terminate_sandbox(&self.harness, self.sandbox_scope(), id).await
     }
@@ -1143,12 +1123,6 @@ impl SandboxHandle for HttpConversationHandle {
 
     async fn restore_sandbox(&self, request: RestoreSandboxRequest) -> Result<SandboxId> {
         http_restore_sandbox(&self.harness, self.sandbox_scope(), request).await
-    }
-    async fn create_sandbox_from_recipe(
-        &self,
-        request: CreateSandboxFromRecipeRequest,
-    ) -> Result<SandboxId> {
-        http_create_sandbox_from_recipe(&self.harness, self.sandbox_scope(), request).await
     }
     async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {
         http_terminate_sandbox(&self.harness, self.sandbox_scope(), id).await

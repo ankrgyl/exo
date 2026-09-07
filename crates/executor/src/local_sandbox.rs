@@ -8,15 +8,15 @@ use exoharness::{
     AddEventsRequest, AddEventsResult, AgentHandle, AgentId, Artifact, ArtifactVersion,
     AttachSandboxRequest, Binding, BindingId, BindingRecord, BoxSandboxTcpStream,
     CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, ConversationHandle,
-    ConversationId, CreateSandboxFromRecipeRequest, CreateSandboxRequest, Event, EventData,
-    EventId, EventKind, EventStream, ExoHarness, ForkConversationRequest, ForkSandboxRequest,
-    GetEventsResult, ListConversationsRequest, ListConversationsResult, NewAgentRequest,
-    NewConversationRequest, PutSecretRequest, ReadArtifactRequest, RestoreSandboxRequest, Result,
-    RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess,
-    SandboxProcessEventQuery, SandboxProcessRecord, SandboxProcessStatus, SandboxProvider,
-    SandboxRecord, Secret, SecretId, SecretMetadata, SnapshotHandle, SnapshotId,
-    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnRecord, Uuid7,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    ConversationId, CreateSandboxRequest, Event, EventData, EventId, EventKind, EventStream,
+    ExoHarness, ForkConversationRequest, ForkSandboxRequest, GetEventsResult,
+    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
+    PutSecretRequest, ReadArtifactRequest, RestoreSandboxRequest, Result, RunInSandboxRequest,
+    SandboxAttachment, SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEventQuery,
+    SandboxProcessRecord, SandboxProcessStatus, SandboxProvider, SandboxRecord, Secret, SecretId,
+    SecretMetadata, SnapshotHandle, SnapshotId, StartSandboxProcessRequest, StartSandboxRequest,
+    TurnHandle, TurnRecord, Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest,
+    WriteSandboxProcessInputRequest,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -439,23 +439,6 @@ impl SandboxHandle for LocalSandboxAgent {
         }
 
         let local_id = self.local_agent().await?.restore_sandbox(request).await?;
-        let remote_id = local_id.clone();
-        self.map_local_sandbox(remote_id.clone(), local_id).await;
-        Ok(remote_id)
-    }
-
-    async fn create_sandbox_from_recipe(
-        &self,
-        request: CreateSandboxFromRecipeRequest,
-    ) -> Result<SandboxId> {
-        if !self.wants_local_sandbox(&request.sandbox) {
-            return self.remote.create_sandbox_from_recipe(request).await;
-        }
-        let local_id = self
-            .local_agent()
-            .await?
-            .create_sandbox_from_recipe(request)
-            .await?;
         let remote_id = local_id.clone();
         self.map_local_sandbox(remote_id.clone(), local_id).await;
         Ok(remote_id)
@@ -1106,27 +1089,6 @@ impl SandboxHandle for LocalSandboxConversation {
         });
         self.commit_local_sandbox(&local, remote_id.clone(), local_id, events)
             .await?;
-        Ok(remote_id)
-    }
-
-    async fn create_sandbox_from_recipe(
-        &self,
-        request: CreateSandboxFromRecipeRequest,
-    ) -> Result<SandboxId> {
-        if !self.wants_local_sandbox(&request.sandbox) {
-            return self.remote.create_sandbox_from_recipe(request).await;
-        }
-        let sandbox = request.sandbox.clone();
-        let remote_id = format!("sandbox-{}", Uuid7::now());
-        let local = self.local_conversation().await?;
-        let local_id = local.create_sandbox_from_recipe(request).await?;
-        self.commit_local_sandbox(
-            &local,
-            remote_id.clone(),
-            local_id,
-            sandbox_created_events(&remote_id, sandbox),
-        )
-        .await?;
         Ok(remote_id)
     }
 
